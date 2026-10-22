@@ -1,0 +1,34 @@
+node_modules/
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+fanforge.db
+.imports/
+benchmarks/data/
+benchmarks/runs/
+benchmarks/blind/
+
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*credentials*
+*secrets*
+
+# Generated output
+dist/
+coverage/
+*.log
+*.tmp
+
+# Local AI model weights
+*.safetensors
+*.gguf
+*.ggml
+*.onnx
+
+# Local backup files
+*.bak.*

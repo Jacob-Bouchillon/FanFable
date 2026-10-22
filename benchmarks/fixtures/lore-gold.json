@@ -1,0 +1,383 @@
+{
+  "note": "Gold relations for the lore-extraction benchmark. Each window is eight consecutive passages of the imported book, the same window size the production extractor uses. A gold relation is only listed when the window text states it explicitly; the quote must appear verbatim in the window (the harness checks this before scoring, and refuses to score a window whose quotes do not verify). 'from' and 'to' list the accepted names for each side, separated by '|'. 'kinds' lists the accepted relation words, including the opposite phrasing where the relation is symmetric. 'direction' is 'either' for relations whose phrasing is symmetric (a son of X / the father of a son: the same fact either way round) and 'from' where the text fixes the direction.",
+  "windows": [
+    {
+      "id": "w1-dursleys",
+      "seq": [0, 7],
+      "title": "The Dursleys and their secret",
+      "relations": [
+        {
+          "from": "Mrs. Dursley|Aunt Petunia|Petunia Dursley",
+          "to": "Mrs. Potter|Lily Potter",
+          "kinds": ["sister of", "sibling of", "sister", "sibling"],
+          "direction": "either",
+          "quote": "Mrs. Potter was Mrs. Dursley's sister"
+        },
+        {
+          "from": "Mr. Potter|James Potter",
+          "to": "Mrs. Potter|Lily Potter",
+          "kinds": ["husband of", "married to", "spouse of", "wife of", "husband", "married"],
+          "direction": "either",
+          "quote": "her good-for-nothing husband"
+        },
+        {
+          "from": "Mr. Dursley|Uncle Vernon|Vernon Dursley",
+          "to": "Grunnings",
+          "kinds": ["director of", "head of", "runs", "runs", "manager of", "works for", "in charge of"],
+          "direction": "from",
+          "quote": "Mr. Dursley was the director of a firm called Grunnings"
+        },
+        {
+          "from": "Grunnings",
+          "to": "drills",
+          "kinds": ["makes", "made", "produces", "manufactures", "makes drills"],
+          "direction": "from",
+          "quote": "a firm called Grunnings, which made drills"
+        },
+        {
+          "from": "Dudley Dursley|Dudley",
+          "to": "Mr. Dursley|Uncle Vernon|Vernon Dursley",
+          "kinds": ["son of", "child of", "father of", "parent of", "son", "father", "parent"],
+          "direction": "either",
+          "quote": "The Dursleys had a small son called Dudley"
+        },
+        {
+          "from": "Dudley Dursley|Dudley",
+          "to": "Mrs. Dursley|Aunt Petunia|Petunia Dursley",
+          "kinds": ["son of", "child of", "mother of", "parent of", "son", "mother", "parent"],
+          "direction": "either",
+          "quote": "The Dursleys had a small son called Dudley"
+        },
+        {
+          "from": "Mrs. Potter|Lily Potter",
+          "to": "Harry Potter|Harry|their son|the boy",
+          "kinds": ["mother of", "son of", "child of", "parent of", "mother", "son", "parent"],
+          "direction": "either",
+          "quote": "The Dursleys knew that the Potters had a small son, too"
+        },
+        {
+          "from": "Mr. Potter|James Potter",
+          "to": "Harry Potter|Harry|their son|the boy",
+          "kinds": ["father of", "son of", "child of", "parent of", "father", "son", "parent"],
+          "direction": "either",
+          "quote": "The Dursleys knew that the Potters had a small son, too"
+        },
+        {
+          "from": "The Dursleys|Mr. and Mrs. Dursley",
+          "to": "Privet Drive|number four",
+          "kinds": ["live at", "lives at", "live in", "lives in", "home of", "resident of", "at number four"],
+          "direction": "either",
+          "quote": "Mr. and Mrs. Dursley, of number four, Privet Drive"
+        }
+      ]
+    },
+    {
+      "id": "w2-hagrid-arrives",
+      "seq": [55, 62],
+      "title": "Hagrid brings the baby to the Dursleys",
+      "relations": [
+        {
+          "from": "Rubeus Hagrid|Hagrid|the giant",
+          "to": "Sirius Black",
+          "kinds": ["lent", "borrowed", "lent to", "borrowed from", "loaned", "loans"],
+          "direction": "either",
+          "quote": "Young Sirius Black lent it to me"
+        },
+        {
+          "from": "Rubeus Hagrid|Hagrid|the giant",
+          "to": "Sirius Black",
+          "kinds": ["rescued", "rescues", "brought", "carried", "escorted", "saved", "got out"],
+          "direction": "either",
+          "quote": "I got him out all right before the Muggles started swarmin' around"
+        },
+        {
+          "from": "Rubeus Hagrid|Hagrid|the giant",
+          "to": "Albus Dumbledore|Dumbledore|Professor Dumbledore",
+          "kinds": ["reports to", "works for", "serves", "served", "subordinate to"],
+          "direction": "from",
+          "quote": "Borrowed it, Professor Dumbledore, sit"
+        },
+        {
+          "from": "Albus Dumbledore|Dumbledore|Professor Dumbledore",
+          "to": "Harry Potter|Harry|the baby|baby boy",
+          "kinds": ["left", "entrusted", "delivered", "left with", "gave", "handed over"],
+          "direction": "either",
+          "quote": "He laid Harry gently on the doorstep"
+        },
+        {
+          "from": "Albus Dumbledore|Dumbledore|Professor Dumbledore",
+          "to": "Harry Potter|Harry|the baby|baby boy",
+          "kinds": ["gave", "delivered", "left", "sent", "wrote"],
+          "direction": "from",
+          "quote": "took a letter out of his cloak, tucked it inside Harry's blankets"
+        },
+        {
+          "from": "Harry Potter|Harry|the baby|baby boy",
+          "to": "lightning-shaped scar|the scar|his scar|scar",
+          "kinds": ["has", "has a scar", "scar of", "bears", "wears", "scar"],
+          "direction": "either",
+          "quote": "they could see a curiously shaped cut, like a bolt of lightning"
+        },
+        {
+          "from": "Harry Potter|Harry|the baby|baby boy",
+          "to": "Lily Potter|Lily",
+          "kinds": ["child of", "son of", "daughter of", "child", "son", "daughter"],
+          "direction": "either",
+          "quote": "Lily an' James dead"
+        },
+        {
+          "from": "Harry Potter|Harry|the baby|baby boy",
+          "to": "James Potter|James",
+          "kinds": ["child of", "son of", "daughter of", "child", "son", "daughter"],
+          "direction": "either",
+          "quote": "Lily an' James dead"
+        },
+        {
+          "from": "Harry Potter|Harry|the baby|baby boy",
+          "to": "the Dursleys|the Muggles|Muggles",
+          "kinds": ["lives with", "live with", "lives with", "stays with", "leaves with", "lives among"],
+          "direction": "either",
+          "quote": "poor little Harry off ter live with Muggles"
+        }
+      ]
+    },
+    {
+      "id": "w3-zoo",
+      "seq": [102, 109],
+      "title": "The zoo and the boa constrictor",
+      "relations": [
+        {
+          "from": "Dudley Dursley|Dudley",
+          "to": "Mr. Dursley|Uncle Vernon|Vernon Dursley",
+          "kinds": ["son of", "child of", "father of", "parent of", "son", "father", "parent"],
+          "direction": "either",
+          "quote": "he whined at his father"
+        },
+        {
+          "from": "Dudley Dursley|Dudley",
+          "to": "Piers Polkiss|Piers",
+          "kinds": ["friend of", "friends with", "companion of", "plays with", "with"],
+          "direction": "either",
+          "quote": "Dudley and Piers, who were starting to get bored with the animals"
+        },
+        {
+          "from": "Dudley Dursley|Dudley",
+          "to": "the boa constrictor|the snake|Brazilian boa constrictor",
+          "kinds": ["fascinated by", "interested in", "wants to see", "keen on", "watching"],
+          "direction": "either",
+          "quote": "Dudley quickly found the largest snake in the place"
+        }
+      ]
+    },
+    {
+      "id": "w4-letters",
+      "seq": [122, 129],
+      "title": "The letters from no one",
+      "relations": [
+        {
+          "from": "Dudley Dursley|Dudley",
+          "to": "Dudley's gang|his gang|the gang",
+          "kinds": ["leader of", "leads", "head of", "in charge of", "boss of"],
+          "direction": "from",
+          "quote": "as Dudley was the biggest and stupidest of the lot, he was the leader"
+        },
+        {
+          "from": "Piers Polkiss|Piers",
+          "to": "Dudley's gang|his gang|the gang",
+          "kinds": ["member of", "part of", "in", "belongs to", "friend of"],
+          "direction": "either",
+          "quote": "Piers, Dennis, Malcolm, and Gordon were all big and stupid"
+        },
+        {
+          "from": "Dudley Dursley|Dudley",
+          "to": "Smeltings|Smeltings school",
+          "kinds": ["attends", "goes to", "attended", "enrolled at", "student at", "school of"],
+          "direction": "either",
+          "quote": "Dudley had been accepted at Uncle Vernon's old private school, Smeltings"
+        },
+        {
+          "from": "Piers Polkiss|Piers",
+          "to": "Smeltings|Smeltings school",
+          "kinds": ["attends", "goes to", "attended", "enrolled at", "student at", "school of"],
+          "direction": "either",
+          "quote": "Piers Polkiss was going there too"
+        },
+        {
+          "from": "Smeltings|Smeltings school",
+          "to": "Mr. Dursley|Uncle Vernon|Vernon Dursley",
+          "kinds": ["attended by", "alumnus of", "old school of", "was attended by", "old school"],
+          "direction": "either",
+          "quote": "Uncle Vernon's old private school"
+        },
+        {
+          "from": "Harry Potter|Harry",
+          "to": "Stonewall High|Stonewall",
+          "kinds": ["attends", "goes to", "attended", "enrolled at", "student at", "school of"],
+          "direction": "either",
+          "quote": "Harry, on the other hand, was going to Stonewall High, the local public school"
+        },
+        {
+          "from": "Dudley Dursley|Dudley",
+          "to": "Harry Potter|Harry",
+          "kinds": ["bullies", "bullying", "torments", "hunts", "teases", "bully of"],
+          "direction": "either",
+          "quote": "Dudley's favorite sport: Harry Hunting"
+        },
+        {
+          "from": "Mrs. Figg",
+          "to": "her leg|her cats",
+          "kinds": ["broke", "injured", "hurt", "breaks"],
+          "direction": "either",
+          "quote": "she'd broken her leg tripping over one of her cats"
+        },
+        {
+          "from": "Mrs. Figg",
+          "to": "her cats|the cats",
+          "kinds": ["owns", "has", "keeps", "pets", "owner of"],
+          "direction": "either",
+          "quote": "tripping over one of her cats"
+        },
+        {
+          "from": "Aunt Petunia|Mrs. Dursley|Petunia Dursley",
+          "to": "Harry Potter|Harry",
+          "kinds": ["aunt of", "aunt", "guardian of", "uncle of"],
+          "direction": "either",
+          "quote": "Aunt Petunia took Dudley to London to buy his Smeltings uniform, leaving Harry at Mrs. Figg's"
+        },
+        {
+          "from": "Aunt Petunia|Mrs. Dursley|Petunia Dursley",
+          "to": "Harry Potter|Harry",
+          "kinds": ["dyes", "dyed", "made", "prepares", "sews", "dyeing"],
+          "direction": "either",
+          "quote": "I'm dyeing some of Dudley's old things gray for you"
+        },
+        {
+          "from": "Dudley Dursley|Dudley",
+          "to": "the Smeltings uniform|his uniform|Smeltings uniform",
+          "kinds": ["wears", "wearing", "has", "carries", "wore"],
+          "direction": "either",
+          "quote": "Dudley paraded around the living room for the family in his brand-new uniform"
+        }
+      ]
+    },
+    {
+      "id": "w5-hut",
+      "seq": [172, 179],
+      "title": "The letters and the shack on the rock",
+      "relations": [
+        {
+          "from": "the letters|Harry's letters|a hundred letters",
+          "to": "Harry Potter|Harry",
+          "kinds": ["addressed to", "for", "sent to", "intended for", "delivered to", "meant for"],
+          "direction": "either",
+          "quote": ["the green ink address", "Mr. H. Potter"]
+        },
+        {
+          "from": "Mr. Dursley|Uncle Vernon|Vernon Dursley",
+          "to": "the letters|Harry's letters",
+          "kinds": ["takes", "keeps", "grabs", "holds", "snatches", "takes possession of"],
+          "direction": "either",
+          "quote": "I'll take them"
+        },
+        {
+          "from": "Mr. Dursley|Uncle Vernon|Vernon Dursley",
+          "to": "the Dursleys|Aunt Petunia|Dudley|the family",
+          "kinds": ["locks", "locks in", "traps", "confines"],
+          "direction": "either",
+          "quote": "locked them all inside the car"
+        },
+        {
+          "from": "Dudley Dursley|Dudley",
+          "to": "The Great Humberto|the television|television",
+          "kinds": ["watches", "wants to watch", "is a fan of", "keen on"],
+          "direction": "either",
+          "quote": "The Great Humberto's on tonight"
+        },
+        {
+          "from": "Mr. Dursley|Uncle Vernon|Vernon Dursley",
+          "to": "the shack|the hut|the little shack|the house on the rock",
+          "kinds": ["rents", "books", "takes", "finds", "moves to", "stays in"],
+          "direction": "either",
+          "quote": "Perched on top of the rock was the most miserable little shack you could imagine"
+        },
+        {
+          "from": "the old man|the toothless old man",
+          "to": "the boat|the rowboat",
+          "kinds": ["lends", "agrees to lend", "loans"],
+          "direction": "either",
+          "quote": "this gentleman's kindly agreed to lend us his boat"
+        }
+      ]
+    },
+    {
+      "id": "w6-hagrid-breaks-in",
+      "seq": [183, 190],
+      "title": "Hagrid breaks the door in",
+      "relations": [
+        {
+          "from": "Rubeus Hagrid|Hagrid|the giant|the stranger",
+          "to": "the door|the hut|the house",
+          "kinds": ["broke", "breaks", "knocked down", "smashes", "broke open"],
+          "direction": "either",
+          "quote": "The door was hit with such force that it swung clean off its hinges"
+        },
+        {
+          "from": "Rubeus Hagrid|Hagrid|the giant|the stranger",
+          "to": "Harry Potter|Harry",
+          "kinds": ["recognises", "knows", "greets", "identifies", "saw"],
+          "direction": "either",
+          "quote": "An' here's Harry!"
+        },
+        {
+          "from": "Rubeus Hagrid|Hagrid|the giant",
+          "to": "Harry Potter|Harry",
+          "kinds": ["knew", "knows", "saw", "met"],
+          "direction": "either",
+          "quote": "Las' time I saw you, you was only a baby"
+        },
+        {
+          "from": "Rubeus Hagrid|Hagrid|the giant",
+          "to": "James Potter|James|Harry's father|yet dad",
+          "kinds": ["knew", "knows", "friend of", "remembered"],
+          "direction": "either",
+          "quote": "Yeh look a lot like yet dad"
+        },
+        {
+          "from": "Rubeus Hagrid|Hagrid|the giant",
+          "to": "Lily Potter|Lily|Harry's mother|yet mom's",
+          "kinds": ["knew", "knows", "friend of", "remembered"],
+          "direction": "either",
+          "quote": "but yeh've got yet mom's eyes"
+        },
+        {
+          "from": "Mr. Dursley|Uncle Vernon|Vernon Dursley",
+          "to": "the rifle|his rifle|a rifle|the gun",
+          "kinds": ["holds", "carries", "has", "armed with"],
+          "direction": "either",
+          "quote": "He was holding a rifle in his hands"
+        },
+        {
+          "from": "Rubeus Hagrid|Hagrid|the giant",
+          "to": "Mr. Dursley|Uncle Vernon|Vernon Dursley",
+          "kinds": ["disarms", "disarmed", "takes the gun from", "snatches"],
+          "direction": "either",
+          "quote": "jerked the gun out of Uncle Vernon's hands"
+        },
+        {
+          "from": "Dudley Dursley|Dudley",
+          "to": "Rubeus Hagrid|Hagrid|the giant|the stranger",
+          "kinds": ["afraid of", "frightened by", "scared of", "terrified of"],
+          "direction": "either",
+          "quote": "Dudley squeaked and ran to hide behind his mother"
+        },
+        {
+          "from": "Mr. Dursley|Uncle Vernon|Vernon Dursley",
+          "to": "Rubeus Hagrid|Hagrid|the giant|the stranger",
+          "kinds": ["accuses", "complains about", "denounces", "orders out"],
+          "direction": "either",
+          "quote": "You are breaking and entering!"
+        }
+      ]
+    }
+  ]
+}

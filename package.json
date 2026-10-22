@@ -1,0 +1,29 @@
+{
+  "name": "fanforge",
+  "version": "0.1.0",
+  "description": "Local AI fanfiction generator: canon-grounded, continuity-aware long-form storytelling on your own machine.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "bin": {
+    "fanforge": "./src/cli.ts"
+  },
+  "scripts": {
+    "fanforge": "node --no-warnings src/cli.ts",
+    "test": "node --no-warnings --test \"test/*.test.ts\"",
+    "eval:retrieval": "node scripts/evaluate.ts",
+    "eval:continuity": "node scripts/evaluate-continuity.ts",
+    "eval:writing": "node scripts/evaluate-writing.ts",
+    "eval:models": "node scripts/evaluate-models.ts",
+    "eval:blind": "node scripts/evaluate-blind.ts",
+    "eval:long": "node scripts/evaluate-long-story.ts",
+    "bench:corpus": "node scripts/benchmark/corpus.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "@types/node": "^22.10.2"
+  }
+}

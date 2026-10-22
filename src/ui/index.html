@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>fanforge</title>
+<link rel="stylesheet" href="/ui/style.css" />
+<link rel="icon" href="/ui/fanforge.ico" sizes="any" />
+<link rel="apple-touch-icon" href="/ui/fanforge.png" />
+<meta name="theme-color" content="#2f6f6a" />
+</head>
+<body>
+<div class="app">
+
+  <aside class="sidebar">
+    <div class="brand">
+      <img class="brand-mark" src="/ui/fanforge.png" alt="" />
+      <div>
+        <div class="brand-name">FanForge</div>
+        <div class="brand-sub">local story engine</div>
+      </div>
+    </div>
+
+    <div class="project-switch">
+      <label class="field-label" for="project-select">Project</label>
+      <div class="project-row">
+        <select id="project-select" class="input"></select>
+        <button class="icon-btn" id="new-project" title="New project" aria-label="New project">+</button>
+      </div>
+      <div class="new-project" id="new-project-box" hidden>
+        <input class="input" id="new-project-name" placeholder="project name" />
+        <div class="row" style="margin-top:var(--s1)">
+          <button class="btn btn-sm btn-primary" id="create-project">Create</button>
+          <button class="btn btn-sm btn-ghost" id="cancel-project">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <nav class="nav" id="nav">
+      <div class="nav-group">
+        <div class="nav-heading">Overview</div>
+        <button class="nav-item" data-view="dashboard">Dashboard</button>
+      </div>
+      <div class="nav-group">
+        <div class="nav-heading">Source</div>
+        <button class="nav-item" data-view="sources">Sources</button>
+        <button class="nav-item" data-view="lore">Lore research</button>
+        <button class="nav-item" data-view="booklore">Book lore</button>
+        <button class="nav-item" data-view="gaps">Lore gaps</button>
+        <button class="nav-item" data-view="graph">Graph</button>
+        <button class="nav-item" data-view="canon">Canon events</button>
+      </div>
+      <div class="nav-group">
+        <div class="nav-heading">Story</div>
+        <button class="nav-item" data-view="plan">Plan</button>
+        <button class="nav-item" data-view="write">Write</button>
+        <button class="nav-item" data-view="state">Story state</button>
+        <button class="nav-item" data-view="issues">Continuity</button>
+        <button class="nav-item" data-view="conflicts">Conflicts</button>
+      </div>
+      <div class="nav-group">
+        <div class="nav-heading">System</div>
+        <button class="nav-item" data-view="settings">Settings</button>
+      </div>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="model-badge" id="model-badge">model: —</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h1 class="page-title" id="page-title">Dashboard</h1>
+        <p class="page-sub" id="page-sub">Loading…</p>
+      </div>
+      <div class="topbar-actions" id="topbar-actions"></div>
+    </header>
+
+    <div class="content" id="content">
+      <div class="skeleton-list">
+        <div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>
+      </div>
+    </div>
+  </main>
+
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<div class="modal-backdrop" id="modal-backdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true">
+    <div class="modal-head">
+      <h2 id="modal-title">Working…</h2>
+      <button class="icon-btn" id="modal-close" aria-label="Close">✕</button>
+    </div>
+    <div class="modal-body" id="modal-body">
+      <div class="spinner"></div>
+      <p class="muted" id="modal-message">starting</p>
+    </div>
+    <div class="modal-foot" id="modal-foot" hidden>
+      <button class="btn btn-primary" id="modal-ok">Close</button>
+    </div>
+  </div>
+</div>
+
+<script src="/ui/app.js"></script>
+</body>
+</html>

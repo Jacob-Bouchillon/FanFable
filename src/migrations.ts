@@ -1,0 +1,286 @@
+/**
+ * Schema migrations.
+ *
+ * The base schema is applied as migration 1. Later migrations add columns and
+ * tables without touching the data that is already there, so a database
+ * written by an older version of fanforge keeps working and gains the new
+ * capabilities.
+ *
+ * Version tracking uses SQLite's own `user_version`, so it survives copies of
+ * the database and does not need a second source of truth.
+ */
+import type { DatabaseSync } from 'node:sqlite';
+import { SCHEMA_SQL } from './schema.ts';
+
+export interface Migration {
+  version: number;
+  name: string;
+  /** Statements applied to every database. */
+  sql?: string;
+  /** Columns added when missing, so the migration is safe to re-run. */
+  columns?: [table: string, column: string, definition: string][];
+}
+
+/** Does a table exist? */
+export function tableExists(db: DatabaseSync, table: string): boolean {
+  try {
+    const row = db
+      .prepare("SELECT count(*) AS n FROM sqlite_master WHERE type='table' AND name = ?")
+      .get(table) as { n: number } | undefined;
+    return (row?.n ?? 0) > 0;
+  } catch {
+    return false;
+  }
+}
+
+/** Does a column already exist on a table? */
+export function hasColumn(db: DatabaseSync, table: string, column: string): boolean {
+  try {
+    const rows = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+    return rows.some((r) => r.name === column);
+  } catch {
+    return false;
+  }
+}
+
+/** Add a column only when it is missing, so a migration can be re-run safely. */
+function addColumn(db: DatabaseSync, table: string, column: string, definition: string): void {
+  if (hasColumn(db, table, column)) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+
+export const MIGRATIONS: Migration[] = [
+  {
+    version: 1,
+    name: 'base schema',
+    sql: SCHEMA_SQL,
+  },
+  {
+    version: 2,
+    name: 'graph semantics',
+    columns: [
+      // ---- canon: typed edges gain confidence, review status and validity
+      //      (a relationship can be true only between two points in time)
+      ['canon_entity', 'confidence', 'REAL NOT NULL DEFAULT 1.0'],
+      ['canon_entity', 'review_status', "TEXT NOT NULL DEFAULT 'accepted'"],
+      ['canon_relation', 'confidence', 'REAL NOT NULL DEFAULT 1.0'],
+      ['canon_relation', 'review_status', "TEXT NOT NULL DEFAULT 'accepted'"],
+      ['canon_relation', 'valid_from_event_id', 'INTEGER REFERENCES canon_event(id) ON DELETE SET NULL'],
+      ['canon_relation', 'valid_to_event_id', 'INTEGER REFERENCES canon_event(id) ON DELETE SET NULL'],
+      ['canon_fact', 'subject_entity_id', 'INTEGER REFERENCES canon_entity(id) ON DELETE SET NULL'],
+      ['canon_fact', 'confidence', 'REAL NOT NULL DEFAULT 1.0'],
+      ['canon_fact', 'review_status', "TEXT NOT NULL DEFAULT 'accepted'"],
+      ['canon_fact', 'valid_from_event_id', 'INTEGER REFERENCES canon_event(id) ON DELETE SET NULL'],
+      ['canon_fact', 'valid_to_event_id', 'INTEGER REFERENCES canon_event(id) ON DELETE SET NULL'],
+      ['canon_event', 'confidence', 'REAL NOT NULL DEFAULT 1.0'],
+      ['canon_event', 'seq', 'INTEGER NOT NULL DEFAULT 0'],
+      ['canon_timeline', 'confidence', 'REAL NOT NULL DEFAULT 1.0'],
+
+      // ---- story: entity resolution and temporal validity
+      ['character', 'canon_entity_id', 'INTEGER REFERENCES canon_entity(id) ON DELETE SET NULL'],
+      ['character', 'confidence', 'REAL NOT NULL DEFAULT 1.0'],
+      ['character', 'review_status', "TEXT NOT NULL DEFAULT 'accepted'"],
+      ['character_knowledge', 'fact_id', 'INTEGER REFERENCES story_fact(id) ON DELETE SET NULL'],
+      ['character_knowledge', 'valid_until_event_id', 'INTEGER REFERENCES au_event(id) ON DELETE SET NULL'],
+      ['relationship', 'valid_from_event_id', 'INTEGER REFERENCES au_event(id) ON DELETE SET NULL'],
+      ['relationship', 'valid_to_event_id', 'INTEGER REFERENCES au_event(id) ON DELETE SET NULL'],
+      ['relationship', 'confidence', 'REAL NOT NULL DEFAULT 1.0'],
+      ['au_event', 'confidence', 'REAL NOT NULL DEFAULT 1.0'],
+      ['au_event', 'review_status', "TEXT NOT NULL DEFAULT 'accepted'"],
+      ['story_fact', 'subject_entity_id', 'INTEGER REFERENCES canon_entity(id) ON DELETE SET NULL'],
+      ['story_fact', 'confidence', 'REAL NOT NULL DEFAULT 1.0'],
+      ['story_fact', 'review_status', "TEXT NOT NULL DEFAULT 'accepted'"],
+      ['thread_event', 'kind', "TEXT NOT NULL DEFAULT 'developed'"],
+    ],
+    sql: `
+      -- ---- typed edges that had no table of their own
+      CREATE TABLE IF NOT EXISTS canon_event_participant (
+        canon_event_id INTEGER NOT NULL REFERENCES canon_event(id) ON DELETE CASCADE,
+        entity_id      INTEGER NOT NULL REFERENCES canon_entity(id) ON DELETE CASCADE,
+        role           TEXT NOT NULL DEFAULT 'participant',
+        PRIMARY KEY (canon_event_id, entity_id, role)
+      );
+      CREATE INDEX IF NOT EXISTS canon_event_participant_entity ON canon_event_participant(entity_id);
+
+      CREATE TABLE IF NOT EXISTS au_event_participant (
+        au_event_id  INTEGER NOT NULL REFERENCES au_event(id) ON DELETE CASCADE,
+        character_id INTEGER NOT NULL REFERENCES character(id) ON DELETE CASCADE,
+        role         TEXT NOT NULL DEFAULT 'participant',
+        PRIMARY KEY (au_event_id, character_id, role)
+      );
+      CREATE INDEX IF NOT EXISTS au_event_participant_char ON au_event_participant(character_id);
+
+      -- Cause and consequence between events in the story.
+      CREATE TABLE IF NOT EXISTS au_event_link (
+        from_event_id INTEGER NOT NULL REFERENCES au_event(id) ON DELETE CASCADE,
+        to_event_id   INTEGER NOT NULL REFERENCES au_event(id) ON DELETE CASCADE,
+        kind          TEXT NOT NULL DEFAULT 'consequence', -- cause | consequence | foreshadow | contradicts
+        description   TEXT NOT NULL DEFAULT '',
+        confidence    REAL NOT NULL DEFAULT 1.0,
+        created_at    TEXT NOT NULL,
+        PRIMARY KEY (from_event_id, to_event_id, kind)
+      );
+      CREATE INDEX IF NOT EXISTS au_event_link_to ON au_event_link(to_event_id);
+
+      -- A story fact that several characters know (or do not know) about.
+      CREATE TABLE IF NOT EXISTS secret (
+        id           INTEGER PRIMARY KEY,
+        project_id   INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        title        TEXT NOT NULL,
+        statement    TEXT NOT NULL DEFAULT '',
+        subject_entity_id INTEGER REFERENCES canon_entity(id) ON DELETE SET NULL,
+        fact_id      INTEGER REFERENCES story_fact(id) ON DELETE SET NULL,
+        status       TEXT NOT NULL DEFAULT 'open',  -- open | revealed | resolved
+        revealed_at_event_id INTEGER REFERENCES au_event(id) ON DELETE SET NULL,
+        created_at   TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS secret_project_title ON secret(project_id, lower(title));
+
+      -- Motivations and goals, with the character they belong to.
+      CREATE TABLE IF NOT EXISTS motivation (
+        id           INTEGER PRIMARY KEY,
+        project_id   INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        subject_type TEXT NOT NULL DEFAULT 'character', -- character | canon_entity
+        subject_id   INTEGER NOT NULL,
+        kind         TEXT NOT NULL DEFAULT 'motive',  -- motive | goal | fear | wound | want
+        statement    TEXT NOT NULL,
+        evidence     TEXT NOT NULL DEFAULT '',
+        source       TEXT NOT NULL DEFAULT 'inferred', -- canon | au | inference | user
+        confidence   REAL NOT NULL DEFAULT 1.0,
+        valid_from_event_id INTEGER REFERENCES au_event(id) ON DELETE SET NULL,
+        valid_to_event_id   INTEGER REFERENCES au_event(id) ON DELETE SET NULL,
+        created_at   TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS motivation_subject ON motivation(project_id, subject_type, subject_id);
+
+      -- Log of graph writes, so a re-approval can be audited.
+      CREATE TABLE IF NOT EXISTS graph_write (
+        id         INTEGER PRIMARY KEY,
+        project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        chapter_id INTEGER REFERENCES chapter(id) ON DELETE SET NULL,
+        kind       TEXT NOT NULL DEFAULT '',
+        detail     TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS graph_write_project ON graph_write(project_id, id);
+    `,
+  },
+  {
+    version: 7,
+    name: 'state conflicts',
+    // When an approved chapter contradicts what the story already
+    // established, the conflict is recorded with enough provenance for the
+    // author to resolve it. Nothing is overwritten silently.
+    sql: `
+      CREATE TABLE IF NOT EXISTS state_conflict (
+        id            INTEGER PRIMARY KEY,
+        project_id    INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        chapter_id    INTEGER REFERENCES chapter(id) ON DELETE SET NULL,
+        kind          TEXT NOT NULL DEFAULT 'fact',
+        subject       TEXT NOT NULL DEFAULT '',
+        existing_ref  TEXT NOT NULL DEFAULT '',
+        incoming_ref  TEXT NOT NULL DEFAULT '',
+        message       TEXT NOT NULL DEFAULT '',
+        evidence      TEXT NOT NULL DEFAULT '',
+        status        TEXT NOT NULL DEFAULT 'open',   -- open | accepted | resolved
+        created_at    TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS state_conflict_project ON state_conflict(project_id, status);
+    `,
+  },
+  {
+    version: 6,
+    name: 'several relations per pair',
+    // Two people can have more than one relationship ("nephew of" and
+    // "lives with"), so a pair needs one row per kind, not one row per pair.
+    sql: `
+      DROP INDEX IF EXISTS canon_relation_pair;
+      CREATE UNIQUE INDEX IF NOT EXISTS canon_relation_pair_kind
+        ON canon_relation(project_id, from_entity, to_entity, kind);
+    `,
+  },
+  {
+    version: 5,
+    name: 'relationship current flag',
+    // A relationship row is either the current state of a pair or a historical
+    // one. Without the flag, closing a relationship without a known event id
+    // left two "current" rows.
+    columns: [['relationship', 'closed', 'INTEGER NOT NULL DEFAULT 0']],
+  },
+  {
+    version: 4,
+    name: 'relationship history',
+    // A relationship can change over time. The unique index made that
+    // impossible, because a new kind for the same pair overwrote the old one.
+    sql: `
+      DROP INDEX IF EXISTS relationship_pair;
+      CREATE INDEX IF NOT EXISTS relationship_pair_index ON relationship(project_id, character_a, character_b);
+    `,
+  },
+  {
+    version: 3,
+    name: 'chapter references for story graph records',
+    // Knowledge, motives, secrets and relationships have to be removable when
+    // a chapter is re-approved, or a re-approval would leave stale duplicates.
+    columns: [
+      ['au_event_link', 'project_id', 'INTEGER REFERENCES project(id) ON DELETE CASCADE'],
+      ['character_knowledge', 'chapter_id', 'INTEGER REFERENCES chapter(id) ON DELETE SET NULL'],
+      ['motivation', 'chapter_id', 'INTEGER REFERENCES chapter(id) ON DELETE SET NULL'],
+      ['secret', 'chapter_id', 'INTEGER REFERENCES chapter(id) ON DELETE SET NULL'],
+      ['relationship', 'chapter_id', 'INTEGER REFERENCES chapter(id) ON DELETE SET NULL'],
+    ],
+  },
+];
+
+/**
+ * Bring a database up to the latest schema.
+ *
+ * Databases created before versioning existed carry `schema_meta.version = 1`
+ * and `user_version = 0`; they are treated as version 1 and moved forward.
+ */
+export function runMigrations(db: DatabaseSync): number {
+  const version = Number(db.prepare('PRAGMA user_version').get()?.user_version ?? 0);
+
+  // The base schema is written with IF NOT EXISTS throughout, so running it
+  // again is harmless. It is run whenever the database is missing any of its
+  // tables, even if the version number says otherwise — a database written by
+  // an older version can carry a version number without the tables behind it.
+  const BASE_TABLES = [
+    'project',
+    'canon_source',
+    'canon_chunk',
+    'canon_event',
+    'canon_entity',
+    'canon_relation',
+    'canon_fact',
+    'canon_timeline',
+    'chapter',
+    'au_event',
+    'character',
+    'story_fact',
+  ];
+  const missing = BASE_TABLES.filter((t) => !tableExists(db, t));
+
+  const ordered = [...MIGRATIONS].sort((a, b) => a.version - b.version);
+  for (const migration of ordered) {
+    const isBase = migration.version === 1;
+    if (isBase) {
+      if (missing.length === 0) continue;
+    } else if (migration.version <= version) {
+      continue;
+    }
+    db.exec('BEGIN');
+    try {
+      if (migration.sql) db.exec(migration.sql);
+      for (const [table, column, definition] of migration.columns ?? []) {
+        addColumn(db, table, column, definition);
+      }
+      db.exec(`PRAGMA user_version = ${migration.version}`);
+      db.exec('COMMIT');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      throw new Error(`migration ${migration.version} (${migration.name}) failed: ${(err as Error).message}`);
+    }
+  }
+  return Number(db.prepare('PRAGMA user_version').get()?.user_version ?? 0);
+}
