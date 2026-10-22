@@ -337,8 +337,8 @@ All of it is local. On this machine, Node and npm are not on the default
 path, so:
 
 ```bash
-export PATH=/home/jacob/.local/opt/node-v24.22.0-linux-x64/bin:$PATH
-export OLLAMA_MODELS=/home/jacob/.local/share/ollama/models
+export PATH=~/.local/opt/node-v24.22.0-linux-x64/bin:$PATH
+export OLLAMA_MODELS=~/.local/share/ollama/models
 ```
 
 | what | command | what it takes |
