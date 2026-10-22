@@ -142,18 +142,89 @@ export function buildPacket(
   return { dir, entries };
 }
 
+function analyzeRatings(runId: string, outDir = 'benchmarks/blind'): void {
+  const dir = join(outDir, runId);
+  const keyPath = join(dir, 'key.json');
+  const ratingsPath = join(dir, 'ratings.csv');
+  if (!existsSync(keyPath) || !existsSync(ratingsPath)) {
+    console.log(`missing ${keyPath} or ${ratingsPath}`);
+    return;
+  }
+
+  const key = JSON.parse(readFileSync(keyPath, 'utf8')) as {
+    entries: { code: string; model: string }[];
+  };
+  const codeToModel = new Map(key.entries.map((e) => [e.code, e.model]));
+
+  const lines = readFileSync(ratingsPath, 'utf8').trim().split('\n');
+  if (lines.length < 2) {
+    console.log('ratings.csv is empty');
+    return;
+  }
+  const header = lines[0].split(',');
+  const criteriaKeys = header.slice(1);
+  const rows = lines.slice(1).map((l) => l.split(','));
+
+  const modelScores = new Map<string, Map<string, number[]>>();
+  for (const row of rows) {
+    const code = row[0];
+    const model = codeToModel.get(code);
+    if (!model) continue;
+    if (!modelScores.has(model)) modelScores.set(model, new Map());
+    const scores = modelScores.get(model)!;
+    for (let i = 0; i < criteriaKeys.length; i++) {
+      const v = Number(row[i + 1]);
+      if (!Number.isFinite(v)) continue;
+      const k = criteriaKeys[i]!;
+      if (!scores.has(k)) scores.set(k, []);
+      scores.get(k)!.push(v);
+    }
+  }
+
+  const mean = (arr: number[]): number | undefined => {
+    if (!arr.length) return undefined;
+    return arr.reduce((a, b) => a + b, 0) / arr.length;
+  };
+
+  console.log(`\n# Blind human ratings — ${runId}\n`);
+  console.log(`| model | ${criteriaKeys.join(' | ')} | overall | writing* |`);
+  console.log(`| --- | ${criteriaKeys.map(() => '---:').join(' | ')} | ---: | ---: |`);
+  for (const [model, byCriterion] of modelScores) {
+    const cells = criteriaKeys.map((k) => {
+      const m = mean(byCriterion.get(k) ?? []);
+      return m === undefined ? '-' : m.toFixed(1);
+    });
+    const all = criteriaKeys.flatMap((k) => byCriterion.get(k) ?? []);
+    const writingKeys = criteriaKeys.filter((k) => k !== 'repetition');
+    const writing = writingKeys.flatMap((k) => byCriterion.get(k) ?? []);
+    const overall = mean(all);
+    const writingMean = mean(writing);
+    console.log(
+      `| ${model} | ${cells.join(' | ')} | ${overall === undefined ? '-' : overall.toFixed(2)} | ${writingMean === undefined ? '-' : writingMean.toFixed(2)} |`,
+    );
+  }
+  console.log('\n*writing mean excludes the repetition scale.\n');
+}
+
 function main(): void {
   const runId = process.argv[2];
   if (!runId) {
-    console.log('usage: node scripts/evaluate-blind.ts <run-id> [--out benchmarks/blind]');
+    console.log('usage: node scripts/evaluate-blind.ts <run-id> [--out benchmarks/blind] [--analyze]');
     return;
   }
   const outArg = process.argv.indexOf('--out');
   const outDir = outArg >= 0 ? process.argv[outArg + 1] : 'benchmarks/blind';
+
+  if (process.argv.includes('--analyze')) {
+    analyzeRatings(runId, outDir);
+    return;
+  }
+
   const { dir, entries } = buildPacket(runId, outDir);
   console.log(`packet written to ${dir}`);
   for (const e of entries) console.log(`  passage ${e.code}: ${e.model}`);
   console.log('\nrate the passages with the form in ratings.csv, then read key.json to see the result.');
+  console.log(`when ratings are final, run: node scripts/evaluate-blind.ts ${runId} --analyze`);
 }
 
 if (isMain(import.meta.url)) {
