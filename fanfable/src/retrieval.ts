@@ -66,6 +66,13 @@ export interface RetrievalRequest {
    * only; lookup and vague behave exactly as before.
    */
   dense?: boolean;
+  /**
+   * Load the association layer (alias/resemblance/co-occurrence edges) into
+   * the graph. Default off: the blind taste test (9 identical, 2
+   * reorder-only ties, 1 both-miss over 12 real questions) showed the detour
+   * leading nowhere at current index density. Set true to take it.
+   */
+  web?: boolean;
 }
 
 /** What kind of question this is, and therefore which path answers it. */
@@ -269,6 +276,7 @@ export async function retrieve(
             maxWords: Math.round(maxWords * 0.70),
             ...(denseEmbed ? { embed: denseEmbed } : {}),
             recognize: { llm, enabled: req.dense !== false },
+            web: req.web ?? false,
           })
         : graph.buildGraphContext(db, projectId, {
             query,
@@ -279,6 +287,7 @@ export async function retrieve(
             // A two-hop walk needs room: the answer is often at the far end.
             maxNodes: hops > 1 ? 70 : 45,
             maxWords: Math.round(maxWords * 0.70),
+            web: req.web ?? false,
           })
       : emptyGraphContext();
 

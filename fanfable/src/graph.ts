@@ -204,6 +204,8 @@ interface GraphLoadOptions {
   includeFacts?: boolean;
   /** Cap on nodes loaded, so a huge book cannot exhaust memory. */
   maxNodes?: number;
+  /** Load the association layer (alias/resemblance/co-occurrence edges). Default on. */
+  web?: boolean;
 }
 
 function addNode(graph: Graph, node: GraphNode): void {
@@ -595,35 +597,143 @@ export function loadGraph(db: Db, projectId: number, opts: GraphLoadOptions = {}
       }
     }
 
-    // Alias web: pairs the merge rules would join stay linked, recomputed
-    // read-only — merge behavior itself is untouched. A same-name pair is
-    // certain (1.0); a containment the co-speaker veto blocked, or a mere
-    // lookalike, is probable (0.5). One edge per pair: PPR already spreads
-    // every edge both ways.
-    const aliasSpeakers = speakerChunksByEntity(db, projectId);
-    const aliasEntities = db.all<{ id: number; kind: string; name: string }>(
-      'SELECT id, kind, name FROM canon_entity WHERE project_id = ? ORDER BY id',
-      projectId,
-    );
-    for (let i = 0; i < aliasEntities.length; i++) {
-      for (let j = i + 1; j < aliasEntities.length; j++) {
-        const a = aliasEntities[i]!;
-        const b = aliasEntities[j]!;
-        // A person and a place can share a name; they are not the same thing.
-        if (a.kind !== b.kind) continue;
-        const relation = nameRelation(a.name, b.name);
-        let weight: number | null = null;
-        if (relation === 'same') weight = ALIAS_WEIGHT;
-        else if (relation === 'containment') {
-          weight = sharedSpeakerScene(aliasSpeakers, a.id, b.id) ? QUARANTINE_WEIGHT : ALIAS_WEIGHT;
-        } else if (looksAlike(a.name, b.name).alike) weight = QUARANTINE_WEIGHT;
-        if (weight === null) continue;
-        const [x, y] = a.id < b.id ? [a, b] : [b, a];
+    if (opts.web !== false) {
+      // Alias web: pairs the merge rules would join stay linked, recomputed
+      // read-only — merge behavior itself is untouched. A same-name pair is
+      // certain (1.0); a containment the co-speaker veto blocked, or a mere
+      // lookalike, is probable (0.5). One edge per pair: PPR already spreads
+      // every edge both ways.
+      const aliasSpeakers = speakerChunksByEntity(db, projectId);
+      const aliasEntities = db.all<{ id: number; kind: string; name: string }>(
+        'SELECT id, kind, name FROM canon_entity WHERE project_id = ? ORDER BY id',
+        projectId,
+      );
+      for (let i = 0; i < aliasEntities.length; i++) {
+        for (let j = i + 1; j < aliasEntities.length; j++) {
+          const a = aliasEntities[i]!;
+          const b = aliasEntities[j]!;
+          // A person and a place can share a name; they are not the same thing.
+          if (a.kind !== b.kind) continue;
+          const relation = nameRelation(a.name, b.name);
+          let weight: number | null = null;
+          if (relation === 'same') weight = ALIAS_WEIGHT;
+          else if (relation === 'containment') {
+            weight = sharedSpeakerScene(aliasSpeakers, a.id, b.id) ? QUARANTINE_WEIGHT : ALIAS_WEIGHT;
+          } else if (looksAlike(a.name, b.name).alike) weight = QUARANTINE_WEIGHT;
+          if (weight === null) continue;
+          const [x, y] = a.id < b.id ? [a, b] : [b, a];
+          addEdge(graph, {
+            id: `canon:alias:${x.id}:${y.id}`,
+            from: canonEntityId(x.id),
+            to: canonEntityId(y.id),
+            type: 'alias_of',
+            scope: 'canon',
+            description: '',
+            evidence: '',
+            confidence: 1,
+            reviewStatus: 'accepted',
+            extra: { weight },
+          });
+        }
+      }
+
+      // Resemblance web: entities whose stored vectors agree get linked at
+      // their similarity. No vectors, no edges — a purely lexical graph loads
+      // exactly as before. At most RESEMBLANCE_TOPK edges per node, greedy in
+      // id order so the same input always yields the same edges.
+      const activeModel = resolveEmbedConfig(db, projectId, {}).model;
+      const entityVecs = new Map(
+        readVectors(db, projectId, activeModel)
+          .filter((v) => v.kind === 'entity' && v.vec.length > 0)
+          .map((v) => [v.ref, v.vec] as [string, number[]]),
+      );
+      for (const id of [...entityVecs.keys()]) {
+        if (!graph.nodes.has(id)) entityVecs.delete(id);
+      }
+      const resembleDegree = new Map<string, number>();
+      const resembledPairs = new Set<string>();
+      for (const id of [...entityVecs.keys()].sort()) {
+        const scored: { other: string; sim: number }[] = [];
+        for (const other of entityVecs.keys()) {
+          if (other === id) continue;
+          const sim = cosine(entityVecs.get(id)!, entityVecs.get(other)!);
+          if (sim >= RESEMBLANCE_THRESHOLD) scored.push({ other, sim });
+        }
+        scored.sort((a, b) => b.sim - a.sim || (a.other < b.other ? -1 : 1));
+        for (const { other, sim } of scored.slice(0, RESEMBLANCE_TOPK)) {
+          const key = id < other ? `${id}|${other}` : `${other}|${id}`;
+          if (resembledPairs.has(key)) continue;
+          if ((resembleDegree.get(id) ?? 0) >= RESEMBLANCE_TOPK) continue;
+          if ((resembleDegree.get(other) ?? 0) >= RESEMBLANCE_TOPK) continue;
+          resembledPairs.add(key);
+          resembleDegree.set(id, (resembleDegree.get(id) ?? 0) + 1);
+          resembleDegree.set(other, (resembleDegree.get(other) ?? 0) + 1);
+          const [x, y] = id < other ? [id, other] : [other, id];
+          const xn = graph.nodes.get(x)!.numericId;
+          const yn = graph.nodes.get(y)!.numericId;
+          const [nx, ny] = xn < yn ? [xn, yn] : [yn, xn];
+          addEdge(graph, {
+            id: `canon:resembles:${nx}:${ny}`,
+            from: x,
+            to: y,
+            type: 'resembles',
+            scope: 'canon',
+            description: '',
+            evidence: '',
+            confidence: 1,
+            reviewStatus: 'accepted',
+            extra: { weight: sim },
+          });
+        }
+      }
+
+      // Co-occurrence web: pairs mentioned together in at least
+      // COOCCURRENCE_MIN_WINDOWS windows of 8 consecutive passages. One
+      // shared window is noise; a ubiquitous entity is a score sink, so pairs
+      // involving anything above HUB_DF_FRACTION of windows get nothing.
+      const winRows = db.all<{ id: number; source_id: number; seq: number }>(
+        'SELECT id, source_id, seq FROM canon_chunk WHERE project_id = ? ORDER BY source_id, seq',
+        projectId,
+      );
+      const chunkWindow = new Map<number, number>();
+      {
+        let window = -1;
+        let count = 0;
+        let lastSource = -1;
+        for (const row of winRows) {
+          if (row.source_id !== lastSource || count >= 8) {
+            window++;
+            count = 0;
+            lastSource = row.source_id;
+          }
+          chunkWindow.set(row.id, window);
+          count++;
+        }
+      }
+      const totalWindows = chunkWindow.size ? Math.max(...chunkWindow.values()) + 1 : 0;
+      const entityWindows = new Map<number, Set<number>>();
+      for (const node of graph.nodes.values()) {
+        if (node.kind !== 'canon-entity' || node.scope !== 'canon') continue;
+        const windows = new Set<number>();
+        for (const ref of node.sourceRefs) {
+          if (typeof ref.chunk !== 'number') continue;
+          const w = chunkWindow.get(ref.chunk);
+          if (w !== undefined) windows.add(w);
+        }
+        const first = node.extra?.firstChunk;
+        if (typeof first === 'number') {
+          const w = chunkWindow.get(first);
+          if (w !== undefined) windows.add(w);
+        }
+        if (windows.size) entityWindows.set(node.numericId, windows);
+      }
+      for (const { a, b, weight } of cooccurrenceLinks(entityWindows, totalWindows)) {
+        const [x, y] = a < b ? [a, b] : [b, a];
         addEdge(graph, {
-          id: `canon:alias:${x.id}:${y.id}`,
-          from: canonEntityId(x.id),
-          to: canonEntityId(y.id),
-          type: 'alias_of',
+          id: `canon:appears-with:${x}:${y}`,
+          from: canonEntityId(x),
+          to: canonEntityId(y),
+          type: 'appears_with',
           scope: 'canon',
           description: '',
           evidence: '',
@@ -633,113 +743,7 @@ export function loadGraph(db: Db, projectId: number, opts: GraphLoadOptions = {}
         });
       }
     }
-
-    // Resemblance web: entities whose stored vectors agree get linked at
-    // their similarity. No vectors, no edges — a purely lexical graph loads
-    // exactly as before. At most RESEMBLANCE_TOPK edges per node, greedy in
-    // id order so the same input always yields the same edges.
-    const activeModel = resolveEmbedConfig(db, projectId, {}).model;
-    const entityVecs = new Map(
-      readVectors(db, projectId, activeModel)
-        .filter((v) => v.kind === 'entity' && v.vec.length > 0)
-        .map((v) => [v.ref, v.vec] as [string, number[]]),
-    );
-    for (const id of [...entityVecs.keys()]) {
-      if (!graph.nodes.has(id)) entityVecs.delete(id);
     }
-    const resembleDegree = new Map<string, number>();
-    const resembledPairs = new Set<string>();
-    for (const id of [...entityVecs.keys()].sort()) {
-      const scored: { other: string; sim: number }[] = [];
-      for (const other of entityVecs.keys()) {
-        if (other === id) continue;
-        const sim = cosine(entityVecs.get(id)!, entityVecs.get(other)!);
-        if (sim >= RESEMBLANCE_THRESHOLD) scored.push({ other, sim });
-      }
-      scored.sort((a, b) => b.sim - a.sim || (a.other < b.other ? -1 : 1));
-      for (const { other, sim } of scored.slice(0, RESEMBLANCE_TOPK)) {
-        const key = id < other ? `${id}|${other}` : `${other}|${id}`;
-        if (resembledPairs.has(key)) continue;
-        if ((resembleDegree.get(id) ?? 0) >= RESEMBLANCE_TOPK) continue;
-        if ((resembleDegree.get(other) ?? 0) >= RESEMBLANCE_TOPK) continue;
-        resembledPairs.add(key);
-        resembleDegree.set(id, (resembleDegree.get(id) ?? 0) + 1);
-        resembleDegree.set(other, (resembleDegree.get(other) ?? 0) + 1);
-        const [x, y] = id < other ? [id, other] : [other, id];
-        const xn = graph.nodes.get(x)!.numericId;
-        const yn = graph.nodes.get(y)!.numericId;
-        const [nx, ny] = xn < yn ? [xn, yn] : [yn, xn];
-        addEdge(graph, {
-          id: `canon:resembles:${nx}:${ny}`,
-          from: x,
-          to: y,
-          type: 'resembles',
-          scope: 'canon',
-          description: '',
-          evidence: '',
-          confidence: 1,
-          reviewStatus: 'accepted',
-          extra: { weight: sim },
-        });
-      }
-    }
-
-    // Co-occurrence web: pairs mentioned together in at least
-    // COOCCURRENCE_MIN_WINDOWS windows of 8 consecutive passages. One
-    // shared window is noise; a ubiquitous entity is a score sink, so pairs
-    // involving anything above HUB_DF_FRACTION of windows get nothing.
-    const winRows = db.all<{ id: number; source_id: number; seq: number }>(
-      'SELECT id, source_id, seq FROM canon_chunk WHERE project_id = ? ORDER BY source_id, seq',
-      projectId,
-    );
-    const chunkWindow = new Map<number, number>();
-    {
-      let window = -1;
-      let count = 0;
-      let lastSource = -1;
-      for (const row of winRows) {
-        if (row.source_id !== lastSource || count >= 8) {
-          window++;
-          count = 0;
-          lastSource = row.source_id;
-        }
-        chunkWindow.set(row.id, window);
-        count++;
-      }
-    }
-    const totalWindows = chunkWindow.size ? Math.max(...chunkWindow.values()) + 1 : 0;
-    const entityWindows = new Map<number, Set<number>>();
-    for (const node of graph.nodes.values()) {
-      if (node.kind !== 'canon-entity' || node.scope !== 'canon') continue;
-      const windows = new Set<number>();
-      for (const ref of node.sourceRefs) {
-        if (typeof ref.chunk !== 'number') continue;
-        const w = chunkWindow.get(ref.chunk);
-        if (w !== undefined) windows.add(w);
-      }
-      const first = node.extra?.firstChunk;
-      if (typeof first === 'number') {
-        const w = chunkWindow.get(first);
-        if (w !== undefined) windows.add(w);
-      }
-      if (windows.size) entityWindows.set(node.numericId, windows);
-    }
-    for (const { a, b, weight } of cooccurrenceLinks(entityWindows, totalWindows)) {
-      const [x, y] = a < b ? [a, b] : [b, a];
-      addEdge(graph, {
-        id: `canon:appears-with:${x}:${y}`,
-        from: canonEntityId(x),
-        to: canonEntityId(y),
-        type: 'appears_with',
-        scope: 'canon',
-        description: '',
-        evidence: '',
-        confidence: 1,
-        reviewStatus: 'accepted',
-        extra: { weight },
-      });
-    }
-  }
 
   /* ------------------------------------------------------------- story */
   if (scope === 'story' || scope === 'both') {
@@ -1521,6 +1525,11 @@ export interface GraphContextOptions {
    */
   seedMode?: 'entity' | 'triple';
   /**
+   * Load the association layer (alias/resemblance/co-occurrence edges).
+   * Default on; set false for the layer-off arm of a comparison.
+   */
+  web?: boolean;
+  /**
    * Dense PPR seeds (relational path only). When present and vectors are
    * stored for the model, the query is embedded once and cosine top-K
    * triples/entities/passages join the lexical seeds. Absent means purely
@@ -1536,6 +1545,24 @@ export interface GraphContextOptions {
   recognize?: { llm: LlmClient; enabled?: boolean; maxSeeds?: number };
 }
 
+export interface TrailStep {
+  /** Display name of the node. */
+  node: string;
+  /** Graph kind: canon-entity, canon-event, canon-passage, ... */
+  kind: string;
+  /** Edge type traversed to reach this node; null on the seed step. */
+  via: string | null;
+}
+
+export interface PassageTrail {
+  chunkId: number;
+  locator: string;
+  /** PPR weight behind the passage (0 when found by words alone). */
+  score: number;
+  /** Root-first chain from a seed to the passage; [] means found by words. */
+  steps: TrailStep[];
+}
+
 export interface GraphContext {
   nodes: GraphNode[];
   edges: GraphEdge[];
@@ -1543,6 +1570,8 @@ export interface GraphContext {
   passages: { chunkId: number; locator: string; text: string }[];
   text: string;
   truncated: boolean;
+  /** Per-passage receipts, top 4 passages. Absent off the PPR path. */
+  trails?: PassageTrail[];
   stats: {
     nodes: number;
     edges: number;
@@ -1634,7 +1663,7 @@ export function buildGraphContext(
   projectId: number,
   opts: GraphContextOptions = {},
 ): GraphContext {
-  const graph = loadGraph(db, projectId, { scope: opts.scope });
+  const graph = loadGraph(db, projectId, { scope: opts.scope, web: opts.web });
   const queryTerms = terms(opts.query ?? '');
   const focusNames = opts.focus ?? [];
 
@@ -1795,12 +1824,141 @@ export async function resolveDenseSeeds(
  * `stats.ppr`. When PPR finds nothing, the passages fall back to exactly
  * today's reference-backed list (today's FTS5 top-K covers the rest).
  */
+/** Longest chain a trail records; the passage end is always kept. */
+const TRAIL_MAX_STEPS = 6;
+/** BFS horizon for passages PPR surfaced past the walk. */
+const TRAIL_BFS_DEPTH = 8;
+
+/**
+ * Per-passage receipts: the labeled chain from a seed to each passage.
+ *
+ * Each passage resolves to a source node — the PPR passage node by chunk
+ * first, else the ranked node whose references produced the chunk. The chain
+ * is the recorded walk backward from that node; when PPR surfaced a passage
+ * past the walk horizon, the shortest path over the full graph stands in
+ * (PPR did spread along those edges — the walk just didn't record it).
+ * Passages with no path from any seed get empty steps: found by words.
+ */
+export function buildPassageTrails(
+  graph: Graph,
+  result: TraversalResult,
+  ranked: GraphNode[],
+  ppr: PprResult,
+  passages: GraphContext['passages'],
+): PassageTrail[] {
+  const edgeById = new Map(graph.edges.map((e) => [e.id, e]));
+  const nameOf = (id: string): { name: string; kind: string } => {
+    const n = graph.nodes.get(id);
+    return { name: n?.name ?? id, kind: n?.kind ?? 'unknown' };
+  };
+  const linkType = (a: string, b: string): string | null => {
+    for (const edgeId of graph.adjacency.get(a) ?? []) {
+      const edge = edgeById.get(edgeId);
+      if (edge && (edge.from === b || edge.to === b)) return edge.type;
+    }
+    return null;
+  };
+  const toSteps = (nodePath: string[]): TrailStep[] => {
+    const truncated = nodePath.length > TRAIL_MAX_STEPS;
+    const kept = truncated ? nodePath.slice(-TRAIL_MAX_STEPS) : nodePath;
+    return kept.map((id, i) => {
+      const { name, kind } = nameOf(id);
+      if (i === 0 && !truncated) return { node: name, kind, via: null };
+      const prevId = truncated && i === 0 ? nodePath[nodePath.length - kept.length - 1]! : kept[i - 1]!;
+      return { node: name, kind, via: linkType(prevId, id) };
+    });
+  };
+  // Shortest node path from any effective seed root to the target.
+  const bfsPath = (roots: string[], target: string): string[] | undefined => {
+    if (roots.includes(target)) return [target];
+    const prev = new Map<string, string>();
+    const seen = new Set<string>(roots);
+    let frontier = [...roots];
+    for (let depth = 0; depth < TRAIL_BFS_DEPTH && frontier.length; depth++) {
+      const next: string[] = [];
+      for (const id of frontier) {
+        for (const edgeId of graph.adjacency.get(id) ?? []) {
+          const edge = edgeById.get(edgeId);
+          if (!edge) continue;
+          const other = edge.from === id ? edge.to : edge.from;
+          if (seen.has(other)) continue;
+          seen.add(other);
+          prev.set(other, id);
+          if (other === target) {
+            const path: string[] = [target];
+            let cur: string | undefined = target;
+            let guard = graph.nodes.size + 1;
+            while (guard-- > 0) {
+              const step: string | undefined = cur === undefined ? undefined : prev.get(cur);
+              if (step === undefined) break;
+              path.unshift(step);
+              cur = step;
+            }
+            return path;
+          }
+          next.push(other);
+        }
+      }
+      frontier = next;
+    }
+    return undefined;
+  };
+
+  const roots = [...result.paths.keys()].filter((id) => (result.paths.get(id)?.length ?? 0) === 0);
+  const out: PassageTrail[] = [];
+  for (const p of passages.slice(0, 4)) {
+    let source = graph.nodes.get(canonPassageId(p.chunkId));
+    if (source && source.kind !== 'canon-passage') source = undefined;
+    let score = source ? (ppr.scores.get(source.id) ?? 0) : 0;
+    if (!source) {
+      const owner = ranked.find(
+        (n) =>
+          n.sourceRefs.some((r) => r.chunk === p.chunkId) ||
+          n.extra?.firstChunk === p.chunkId ||
+          n.extra?.chunkId === p.chunkId,
+      );
+      if (owner) {
+        source = owner;
+        score = ppr.scores.get(owner.id) ?? 0;
+      }
+    }
+    if (!source) {
+      out.push({ chunkId: p.chunkId, locator: p.locator, score: 0, steps: [] });
+      continue;
+    }
+    let nodePath: string[] | undefined;
+    const recorded = result.paths.get(source.id);
+    if (recorded) {
+      const path = [source.id];
+      let cur = source.id;
+      let ok = true;
+      for (const eid of [...recorded].reverse()) {
+        const edge = edgeById.get(eid);
+        if (!edge || (edge.from !== cur && edge.to !== cur)) {
+          ok = false;
+          break;
+        }
+        cur = edge.from === cur ? edge.to : edge.from;
+        path.unshift(cur);
+      }
+      if (ok) nodePath = path;
+    }
+    nodePath ??= bfsPath(roots, source.id);
+    if (!nodePath) {
+      out.push({ chunkId: p.chunkId, locator: p.locator, score, steps: [] });
+      continue;
+    }
+    out.push({ chunkId: p.chunkId, locator: p.locator, score, steps: toSteps(nodePath) });
+  }
+  return out;
+}
+
 export async function buildPprGraphContext(
   db: Db,
   projectId: number,
   opts: GraphContextOptions = {},
 ): Promise<GraphContext> {
-  const graph = loadGraph(db, projectId, { scope: opts.scope });
+  const graph = loadGraph(db, projectId, { scope: opts.scope, web: opts.web });
   const queryTerms = terms(opts.query ?? '');
   const focusNames = opts.focus ?? [];
 
@@ -1919,6 +2077,10 @@ export async function buildPprGraphContext(
     if (row) passages.push({ chunkId: row.id, locator: row.locator, text: row.text });
   }
 
+  // Receipts: the labeled chain behind each top passage. Recording only:
+  // ranking, order, budgets and text are untouched.
+  const trails = buildPassageTrails(graph, result, ranked, ppr, passages);
+
   const maxWords = opts.maxWords ?? 900;
   const { text: pprText, truncated: textTruncated } = renderGraphContext(
     ranked,
@@ -1935,6 +2097,7 @@ export async function buildPprGraphContext(
     passages,
     text: pprText,
     truncated,
+    trails,
     stats: {
       nodes: ranked.length,
       edges: edges.length,
