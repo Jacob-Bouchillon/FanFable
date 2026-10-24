@@ -1068,6 +1068,15 @@ export interface GraphContextOptions {
   edgeTypes?: string[];
   /** Maximum words of graph context. */
   maxWords?: number;
+  /**
+   * How to choose the roots of the walk.
+   *
+   * 'entity' (the default) starts from the names in the query. 'triple' first
+   * looks for the relations and events the query describes, so "Serena's
+   * sibling" starts from the sibling relation itself rather than from whatever
+   * word happens to match a summary.
+   */
+  seedMode?: 'entity' | 'triple';
 }
 
 export interface GraphContext {
@@ -1077,7 +1086,72 @@ export interface GraphContext {
   passages: { chunkId: number; locator: string; text: string }[];
   text: string;
   truncated: boolean;
-  stats: { nodes: number; edges: number; passages: number; words: number };
+  stats: {
+    nodes: number;
+    edges: number;
+    passages: number;
+    words: number;
+    /** How the traversal was seeded: a relation, an event, or a name. */
+    seedVia?: 'triple' | 'event' | 'entity';
+  };
+}
+
+/**
+ * Choose traversal roots from what the query actually asks about.
+ *
+ * A multi-hop question names a relationship, not an entity: "who is Serena's
+ * sister" is answered by the sibling edge, and starting from the word "sister"
+ * finds nothing. So the relation triples and events that match the query are
+ * tried before falling back to names.
+ */
+export function resolveQuerySeeds(
+  graph: Graph,
+  query: string,
+  focus: string[] = [],
+): { roots: string[]; via: 'triple' | 'event' | 'entity' } {
+  const queryTerms = terms((query ?? '').replace(/['’]s\b/g, ''));
+  const focusNames = focus.map((f) => f.trim().toLowerCase()).filter(Boolean);
+  const roots = new Set<string>();
+
+  const namesInText = (node: GraphNode): boolean =>
+    [node.name, ...node.aliases].some((n) => {
+      const ln = n.toLowerCase();
+      return (
+        focusNames.some((f) => ln.includes(f) || f.includes(ln)) ||
+        queryTerms.some((t) => ln.includes(t))
+      );
+    });
+
+  // 1. A relation triple the query describes, with at least one endpoint named.
+  for (const edge of graph.edges) {
+    const from = graph.nodes.get(edge.from);
+    const to = graph.nodes.get(edge.to);
+    if (!from || !to) continue;
+    if (from.kind !== 'canon-entity' && from.kind !== 'character') continue;
+    if (to.kind !== 'canon-entity' && to.kind !== 'character') continue;
+    const label = `${edge.type} ${edge.description}`.toLowerCase();
+    if (!queryTerms.some((t) => label.includes(t))) continue;
+    if (!namesInText(from) && !namesInText(to)) continue;
+    roots.add(edge.from);
+    roots.add(edge.to);
+  }
+  if (roots.size) return { roots: [...roots].slice(0, 10), via: 'triple' };
+
+  // 2. An event the query names.
+  for (const node of graph.nodes.values()) {
+    if (node.kind !== 'canon-event' && node.kind !== 'au-event') continue;
+    const hay = `${node.name} ${node.summary} ${node.aliases.join(' ')}`.toLowerCase();
+    const hits = queryTerms.filter((t) => hay.includes(t)).length;
+    const focusHit = focusNames.some((f) => hay.includes(f));
+    if (hits >= 2 || (hits >= 1 && focusHit)) roots.add(node.id);
+  }
+  if (roots.size) return { roots: [...roots].slice(0, 10), via: 'event' };
+
+  // 3. The old path: the names in the query.
+  return {
+    roots: resolveRoots(graph, focus.length ? focus : queryTerms.slice(0, 3)).map((r) => r.node.id),
+    via: 'entity',
+  };
 }
 
 /**
@@ -1102,9 +1176,15 @@ export function buildGraphContext(
     if (anchor) beforeOrder = anchor.story_order;
   }
 
-  const roots = resolveRoots(graph, focusNames.length ? focusNames : queryTerms.slice(0, 3));
+  const seed =
+    opts.seedMode === 'triple'
+      ? resolveQuerySeeds(graph, opts.query ?? '', focusNames)
+      : {
+          roots: resolveRoots(graph, focusNames.length ? focusNames : queryTerms.slice(0, 3)).map((r) => r.node.id),
+          via: 'entity' as const,
+        };
   const result = traverse(graph, {
-    roots: roots.map((r) => r.node.id),
+    roots: seed.roots,
     hops: opts.hops ?? 1,
     scope: opts.scope,
     edgeTypes: opts.edgeTypes,
@@ -1157,6 +1237,7 @@ export function buildGraphContext(
       edges: edges.length,
       passages: passages.length,
       words: finalText.split(/\s+/).length,
+      seedVia: seed.via,
     },
   };
 }

@@ -393,6 +393,24 @@ async function cmdLore(args: Args): Promise<void> {
       `${C.green('extracted')} ${stats.entities} entities, ${stats.relations} relationships, ` +
         `${stats.facts} facts, ${stats.timeline} timeline entries`,
     );
+    const v = stats.verification;
+    if (v.claimed) {
+      console.log(
+        C.dim(
+          `  quotes: ${v.verified} verified, ${v.repointed} repointed, ${v.dropped} dropped` +
+            (v.unresolved ? `, ${v.unresolved} relations named an unknown entity` : ''),
+        ),
+      );
+    }
+    if (stats.emptyWindows.length) {
+      console.log(C.dim(`  ${stats.emptyWindows.length} window(s) produced nothing:`));
+      for (const w of stats.emptyWindows) console.log(C.dim(`    #${w.index} ${w.locator}: ${w.reason}`));
+    }
+    if (stats.quarantinedAliases.length) {
+      console.log(
+        C.dim(`  ${stats.quarantinedAliases.length} near-duplicate name(s) left for review; see "fanfable lore merge"`),
+      );
+    }
     console.log(C.dim('  review them with "fanfable lore show"'));
     return;
   }
@@ -480,12 +498,20 @@ async function cmdLore(args: Args): Promise<void> {
 
   if (sub === 'merge') {
     heading('Merging duplicate lore entries');
-    const merged = lorebook.mergeCanonEntities(db, project.id);
+    const result = lorebook.mergeCanonEntities(db, project.id);
     console.log(
-      merged.length
-        ? `${C.green('merged')} ${merged.length} entries:\n  ${merged.join('\n  ')}`
+      result.merged.length
+        ? `${C.green('merged')} ${result.merged.length} entries:\n  ${result.merged.join('\n  ')}`
         : 'nothing to merge',
     );
+    if (result.quarantined.length) {
+      console.log(
+        C.dim(
+          `\n${result.quarantined.length} near-matches were left alone:\n  ` +
+            result.quarantined.map((q) => `${q.name} / ${q.candidate} (${q.reason})`).join('\n  '),
+        ),
+      );
+    }
     return;
   }
 

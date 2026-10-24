@@ -584,7 +584,7 @@ export async function extractCanonEvents(
   } = {},
 ): Promise<CanonEvent[]> {
   const params: unknown[] = [projectId];
-  let sql = `SELECT c.id, c.locator, c.heading, c.text, c.source_id, s.title, s.path
+  let sql = `SELECT c.id, c.seq, c.locator, c.heading, c.text, c.source_id, s.title, s.path
              FROM canon_chunk c JOIN canon_source s ON s.id = c.source_id
              WHERE c.project_id = ?`;
   if (opts.sourceId) {
@@ -596,6 +596,7 @@ export async function extractCanonEvents(
 
   const chunks = db.all<{
     id: number;
+    seq: number;
     locator: string;
     heading: string;
     text: string;
@@ -626,6 +627,9 @@ export async function extractCanonEvents(
     });
     if ((opts.maxEvents ?? 200) && created.length >= (opts.maxEvents ?? 200)) break;
   }
+  // The lore pass may already have written timeline entries; join them to the
+  // events that now exist.
+  lorebook.linkTimelineToEvents(db, projectId);
   return created;
 }
 
@@ -636,6 +640,7 @@ async function extractEventsFromWindow(
   projectId: number,
   chunks: {
     id: number;
+    seq: number;
     locator: string;
     heading: string;
     text: string;
@@ -682,8 +687,8 @@ async function extractEventsFromWindow(
     const participants = toStringArray(obj.participants);
     const kind = String(obj.kind ?? 'event');
     const r = db.run(
-      `INSERT INTO canon_event (project_id, source_id, chunk_id, locator, title, summary, participants, location, time_label, kind, quote, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO canon_event (project_id, source_id, chunk_id, locator, title, summary, participants, location, time_label, kind, quote, seq, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       projectId,
       chunk.source_id,
       chunk.id,
@@ -695,6 +700,7 @@ async function extractEventsFromWindow(
       String(obj.time_label ?? '').trim(),
       kind,
       truncate(chunk.text, 400),
+      chunk.seq,
       nowIso(),
     );
     created.push({

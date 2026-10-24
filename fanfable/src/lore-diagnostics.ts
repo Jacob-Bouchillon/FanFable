@@ -30,7 +30,8 @@ export type GapKind =
   | 'thin-entity'
   | 'contradictory-relation'
   | 'missing-relation'
-  | 'unsupported-claim';
+  | 'unsupported-claim'
+  | 'extraction-quality';
 
 export interface LoreGap {
   kind: GapKind;
@@ -118,6 +119,52 @@ export function diagnose(db: Db, projectId: number, opts: { limit?: number } = {
     projectId,
   );
   if (!entities.length) return gaps;
+
+  // 0. How the last extraction went: the span gate's counters survive the run
+  //    in schema_meta, so they can be reported here.
+  const lastRun = lorebook.lastExtractionReport(db, projectId);
+  if (lastRun) {
+    const v = lastRun.verification;
+    const problems: string[] = [];
+    if (v.dropped) problems.push(`${v.dropped} claim(s) had a quote that appears nowhere and were not written`);
+    if (lastRun.emptyWindows.length) {
+      problems.push(`${lastRun.emptyWindows.length} window(s) produced nothing (${lastRun.emptyWindows.map((w) => w.reason).join(', ')})`);
+    }
+    if (lastRun.quarantinedAliases) problems.push(`${lastRun.quarantinedAliases} near-duplicate name(s) await review`);
+    if (problems.length) {
+      gaps.push({
+        kind: 'extraction-quality',
+        severity: 'note',
+        subject: 'last extraction',
+        message: `${v.verified} quotes verified, ${v.repointed} corrected to a neighbouring passage. ${problems.join('; ')}.`,
+        evidence: `run at ${lastRun.at} over ${lastRun.windows} window(s); nothing was written without a quote`,
+        suggestion: 'Run "fanfable lore merge" for the names, and re-run extraction on the windows that produced nothing.',
+      });
+    }
+  }
+
+  // 0b. Rows that carry no quotation at all: the gate should prevent them, so
+  //     one here means the index predates the gate or was edited by hand.
+  const unsupported = db.all<{ kind: string; subject: string; evidence: string }>(
+    `SELECT 'entity' AS kind, name AS subject, evidence FROM canon_entity
+      WHERE project_id = ? AND (evidence = '' OR source_refs = '[]')
+     UNION ALL
+     SELECT 'fact' AS kind, statement AS subject, evidence FROM canon_fact
+      WHERE project_id = ? AND evidence = ''
+     LIMIT 10`,
+    projectId,
+    projectId,
+  );
+  for (const row of unsupported) {
+    gaps.push({
+      kind: 'unsupported-claim',
+      severity: 'warning',
+      subject: row.subject,
+      message: `This ${row.kind} has no quotation from the source behind it.`,
+      evidence: row.evidence || 'no quote recorded',
+      suggestion: 'Re-extract the passages around it, or remove it if the source does not support it.',
+    });
+  }
 
   const relations = db.all<{
     id: number;
