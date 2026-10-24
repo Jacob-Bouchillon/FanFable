@@ -1082,10 +1082,19 @@ function refsFor(chunk: ChunkRow | undefined): { source: string; locator: string
  */
 function windowEntityNames(db: Db, projectId: number, window: ChunkRow[]): string[] {
   const hay = normalise(window.map((c) => c.text).join(' '));
+  const hayWords = new Set(hay.split(' ').filter((w) => w.length >= 3));
   const names: string[] = [];
   for (const entity of listEntities(db, projectId)) {
     const variants = [entity.name, ...entity.aliases].map(normalise).filter(Boolean);
-    if (variants.some((v) => hay.includes(v))) names.push(entity.name);
+    if (variants.some((v) => hay.includes(v))) {
+      names.push(entity.name);
+      continue;
+    }
+    // Short-form mention: the window says "Dudley" for "Dudley Dursley".
+    // Listing the full name lets the relations call copy it exactly instead
+    // of improvising a short form the resolver would have to guess at.
+    const tokens = variants.flatMap((v) => v.split(' ')).filter((t) => t.length >= 3);
+    if (tokens.some((t) => hayWords.has(t))) names.push(entity.name);
   }
   return names.slice(0, 60);
 }
@@ -2040,9 +2049,34 @@ function resolveEntity(
   const cached = cache.get(key(clean));
   if (cached) return cached;
   const found = findEntityId(db, projectId, 'character', clean)
-    ?? db.get<{ id: number }>('SELECT id FROM canon_entity WHERE project_id = ? AND lower(name) = lower(?)', projectId, clean)?.id;
+    ?? db.get<{ id: number }>('SELECT id FROM canon_entity WHERE project_id = ? AND lower(name) = lower(?)', projectId, clean)?.id
+    ?? resolveShortName(db, projectId, clean);
   if (found) cache.set(key(clean), found);
   return found;
+}
+
+/**
+ * Upward short-name resolution: "Dudley" for the unique "Dudley Dursley".
+ *
+ * Models constantly use the short form even when the KNOWN ENTITIES list
+ * holds the full name. Dropping those relations loses real hits, so a
+ * single-token name that matches exactly one entity as a whole word resolves
+ * to it. Zero or several matches stay unresolved — never guess a person.
+ */
+function resolveShortName(db: Db, projectId: number, clean: string): number | undefined {
+  if (/\s/.test(clean)) return undefined;
+  const needle = clean.toLowerCase();
+  if (needle.length < 3) return undefined;
+  const rows = db.all<{ id: number; name: string; aliases: string }>(
+    'SELECT id, name, aliases FROM canon_entity WHERE project_id = ?',
+    projectId,
+  );
+  const hits = rows.filter((r) =>
+    [r.name, ...strList(r.aliases)].some((v) =>
+      v.toLowerCase().split(/[^a-z0-9']+/).includes(needle),
+    ),
+  );
+  return hits.length === 1 ? hits[0]!.id : undefined;
 }
 
 /* ------------------------------------------------------------- retrieval */
