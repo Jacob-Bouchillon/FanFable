@@ -89,6 +89,8 @@ export interface RetrievalPackage {
     coverage: RetrievalCoverage;
     /** Windows mined on demand for this query, when the lazy path fired. */
     lazyMined?: { windows: number; entities: number; relations: number };
+    /** PageRank diagnostics, when the relational path ranked by PPR. */
+    ppr?: { nodes: number; iterations: number; converged: boolean };
   };
 }
 
@@ -235,17 +237,27 @@ export async function retrieve(
     text: string;
   } => {
     const graphContext = includeGraph
-      ? graph.buildGraphContext(db, projectId, {
-          query,
-          focus: focus.length ? focus : graph.terms(query).slice(0, 3),
-          hops,
-          scope: req.scope,
-          atEventId: req.atEventId,
-          // A two-hop walk needs room: the answer is often at the far end.
-          maxNodes: hops > 1 ? 70 : 45,
-          maxWords: Math.round(maxWords * 0.70),
-          seedMode: relational ? 'triple' : 'entity',
-        })
+      ? relational
+        ? graph.buildPprGraphContext(db, projectId, {
+            query,
+            focus: focus.length ? focus : graph.terms(query).slice(0, 3),
+            hops,
+            scope: req.scope,
+            atEventId: req.atEventId,
+            // A two-hop walk needs room: the answer is often at the far end.
+            maxNodes: hops > 1 ? 70 : 45,
+            maxWords: Math.round(maxWords * 0.70),
+          })
+        : graph.buildGraphContext(db, projectId, {
+            query,
+            focus: focus.length ? focus : graph.terms(query).slice(0, 3),
+            hops,
+            scope: req.scope,
+            atEventId: req.atEventId,
+            // A two-hop walk needs room: the answer is often at the far end.
+            maxNodes: hops > 1 ? 70 : 45,
+            maxWords: Math.round(maxWords * 0.70),
+          })
       : emptyGraphContext();
 
     const supporting: lore.Passage[] = [];
@@ -344,6 +356,7 @@ export async function retrieve(
       route,
       coverage: cov,
       ...(lazyMined ? { lazyMined } : {}),
+      ...(graphContext.stats.ppr ? { ppr: graphContext.stats.ppr } : {}),
     },
   };
 }

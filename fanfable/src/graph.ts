@@ -33,6 +33,7 @@ export type NodeKind =
   | 'canon-event'
   | 'canon-fact'
   | 'canon-timeline'
+  | 'canon-passage'
   | 'character'
   | 'au-event'
   | 'story-fact'
@@ -96,6 +97,7 @@ export const canonEntityId = (id: number) => `canon:entity:${id}`;
 export const canonEventId = (id: number) => `canon:event:${id}`;
 export const canonFactId = (id: number) => `canon:fact:${id}`;
 export const canonTimelineId = (id: number) => `canon:timeline:${id}`;
+export const canonPassageId = (id: number) => `canon:passage:${id}`;
 export const characterId = (id: number) => `story:character:${id}`;
 export const auEventId = (id: number) => `story:event:${id}`;
 export const storyFactId = (id: number) => `story:fact:${id}`;
@@ -420,6 +422,86 @@ export function loadGraph(db: Db, projectId: number, opts: GraphLoadOptions = {}
           evidence: '',
           confidence: 1,
           reviewStatus: 'accepted',
+        });
+      }
+    }
+
+    // Passages as first-class nodes: every canon chunk becomes a node, and
+    // every entity, event and timeline entry points at the passages behind
+    // it. The ranker spreads seed weight along these mention edges, so a
+    // passage two hops out (entity -> relation -> entity -> passage) can
+    // still surface. Derived entirely from canon_chunk plus the existing
+    // source_refs/chunk_id columns: no migration.
+    const chunks = db.all<{
+      id: number;
+      locator: string;
+      heading: string;
+      text: string;
+    }>('SELECT id, locator, heading, text FROM canon_chunk WHERE project_id = ? ORDER BY seq, id', projectId);
+    for (const c of chunks) {
+      if (graph.nodes.size >= maxNodes) break;
+      addNode(graph, {
+        id: canonPassageId(c.id),
+        numericId: c.id,
+        kind: 'canon-passage',
+        scope: 'canon',
+        name: c.locator || `passage ${c.id}`,
+        summary: '',
+        aliases: [],
+        confidence: 1,
+        reviewStatus: 'accepted',
+        evidence: '',
+        sourceRefs: [],
+        order: 0,
+        extra: { heading: c.heading, locator: c.locator, chunkId: c.id, text: truncate(c.text, 400) },
+      });
+    }
+
+    // Entity -> passage for every chunk the entity's references point at.
+    for (const node of graph.nodes.values()) {
+      if (node.kind !== 'canon-entity' || node.scope !== 'canon') continue;
+      const mentioned = new Set<number>();
+      for (const ref of node.sourceRefs) if (typeof ref.chunk === 'number') mentioned.add(ref.chunk);
+      const first = node.extra?.firstChunk;
+      if (typeof first === 'number') mentioned.add(first);
+      for (const chunkId of mentioned) {
+        addEdge(graph, {
+          id: `canon:mentions:${node.numericId}:${chunkId}`,
+          from: node.id,
+          to: canonPassageId(chunkId),
+          type: 'mentions_in',
+          scope: 'canon',
+          description: '',
+          evidence: '',
+          confidence: 1,
+          reviewStatus: 'accepted',
+          extra: { weight: 1 },
+        });
+      }
+    }
+
+    // Event/timeline -> passage for the chunk each came from.
+    for (const node of graph.nodes.values()) {
+      if (node.scope !== 'canon') continue;
+      if (node.kind !== 'canon-event' && node.kind !== 'canon-timeline') continue;
+      const linked = new Set<number>();
+      const chunkId = node.extra?.chunkId;
+      if (typeof chunkId === 'number') linked.add(chunkId);
+      if (node.kind === 'canon-timeline') {
+        for (const ref of node.sourceRefs) if (typeof ref.chunk === 'number') linked.add(ref.chunk);
+      }
+      for (const id of linked) {
+        addEdge(graph, {
+          id: `canon:scene-in:${node.numericId}:${id}`,
+          from: node.id,
+          to: canonPassageId(id),
+          type: 'mentions_in',
+          scope: 'canon',
+          description: '',
+          evidence: '',
+          confidence: 1,
+          reviewStatus: 'accepted',
+          extra: { weight: 1 },
         });
       }
     }
@@ -991,6 +1073,133 @@ export function rankNodes(result: TraversalResult, queryTerms: string[]): GraphN
   return [...result.nodes.values()].sort((a, b) => score(b) - score(a));
 }
 
+/* ------------------------------------------ personalised PageRank */
+
+export interface PprOptions {
+  /** Chance of following an edge rather than jumping back to a seed. Default 0.85. */
+  damping?: number;
+  /** Hard cap on power-iteration rounds. Default 100. */
+  maxIterations?: number;
+  /** Stop when no score moves more than this. Default 1e-6. */
+  tolerance?: number;
+  /** Only these node kinds appear in `ranked`. Default ['canon-passage']. */
+  targetKinds?: NodeKind[];
+}
+
+export interface PprScoredNode {
+  id: string;
+  score: number;
+}
+
+export interface PprResult {
+  /** Final score per node id. Scores sum to ~1. */
+  scores: Map<string, number>;
+  /** Target-kind nodes, best first. */
+  ranked: PprScoredNode[];
+  iterations: number;
+  converged: boolean;
+}
+
+function edgeWeight(edge: GraphEdge): number {
+  const w = edge.extra?.weight;
+  return typeof w === 'number' && Number.isFinite(w) && w > 0 ? w : 1;
+}
+
+/**
+ * Personalised PageRank over the loaded graph: seed scores spread along
+ * edges with damping until they settle, then nodes are ranked by final score.
+ *
+ * Spread is undirected — each edge carries weight both ways — so a passage
+ * two hops out (entity -> relation -> entity -> passage) accumulates score
+ * from every path that reaches it, and a passage mentioned by two seeded
+ * entities outranks one mentioned by one. Nodes with no out-edges spread
+ * their score uniformly instead of leaking it. The graph is a few hundred
+ * nodes, so plain power iteration is plenty.
+ */
+export function personalizedPageRank(
+  graph: Graph,
+  seeds: Map<string, number> | Record<string, number>,
+  opts: PprOptions = {},
+): PprResult {
+  const damping = opts.damping ?? 0.85;
+  const maxIterations = opts.maxIterations ?? 100;
+  const tolerance = opts.tolerance ?? 1e-6;
+  const targetKinds = opts.targetKinds ?? (['canon-passage'] as NodeKind[]);
+
+  const ids = [...graph.nodes.keys()];
+  const n = ids.length;
+  const empty: PprResult = { scores: new Map(), ranked: [], iterations: 0, converged: true };
+  if (!n) return empty;
+
+  const index = new Map(ids.map((id, i) => [id, i]));
+  const out: { to: number; w: number }[][] = ids.map(() => []);
+  for (const edge of graph.edges) {
+    const a = index.get(edge.from);
+    const b = index.get(edge.to);
+    if (a === undefined || b === undefined) continue;
+    const w = edgeWeight(edge);
+    out[a].push({ to: b, w });
+    if (b !== a) out[b].push({ to: a, w });
+  }
+  const outWeight = out.map((list) => list.reduce((sum, e) => sum + e.w, 0));
+
+  const entries = seeds instanceof Map ? [...seeds] : Object.entries(seeds);
+  const personal: number[] = new Array(n).fill(0);
+  let total = 0;
+  for (const [id, w] of entries) {
+    const i = index.get(id);
+    if (i === undefined || !(w > 0)) continue;
+    personal[i] += w;
+    total += w;
+  }
+  if (total <= 0) return empty;
+  for (let i = 0; i < n; i++) personal[i] /= total;
+
+  let rank = [...personal];
+  let iterations = 0;
+  let converged = false;
+  const jump = 1 - damping;
+  while (iterations < maxIterations) {
+    const next: number[] = new Array(n);
+    for (let i = 0; i < n; i++) next[i] = jump * personal[i];
+    let dangling = 0;
+    for (let j = 0; j < n; j++) {
+      const rj = rank[j];
+      if (rj === 0) continue;
+      const ow = outWeight[j];
+      if (ow <= 0) {
+        dangling += rj;
+        continue;
+      }
+      const spread = (damping * rj) / ow;
+      for (const { to, w } of out[j]) next[to] += spread * w;
+    }
+    if (dangling > 0) {
+      const share = (damping * dangling) / n;
+      for (let i = 0; i < n; i++) next[i] += share;
+    }
+    let delta = 0;
+    for (let i = 0; i < n; i++) {
+      const d = Math.abs(next[i] - rank[i]);
+      if (d > delta) delta = d;
+    }
+    rank = next;
+    iterations++;
+    if (delta < tolerance) {
+      converged = true;
+      break;
+    }
+  }
+
+  const scores = new Map(ids.map((id, i) => [id, rank[i]] as [string, number]));
+  const targets = new Set<NodeKind>(targetKinds);
+  const ranked = ids
+    .filter((id) => targets.has(graph.nodes.get(id)!.kind))
+    .map((id) => ({ id, score: scores.get(id)! }))
+    .sort((a, b) => b.score - a.score);
+  return { scores, ranked, iterations, converged };
+}
+
 /* -------------------------------------------------------- root resolution */
 
 export interface RootMatch {
@@ -1093,6 +1302,8 @@ export interface GraphContext {
     words: number;
     /** How the traversal was seeded: a relation, an event, or a name. */
     seedVia?: 'triple' | 'event' | 'entity';
+    /** PageRank diagnostics, when the context was ranked by PPR. */
+    ppr?: { nodes: number; iterations: number; converged: boolean };
   };
 }
 
@@ -1243,6 +1454,130 @@ export function buildGraphContext(
 }
 
 /**
+ * Graph context ranked by personalised PageRank instead of the hop walk.
+ *
+ * Seeds are the same triple/event matches the triple-seeded walk uses, plus
+ * the passages those seeds mention at low weight; PPR then spreads along
+ * every edge — including mention edges — and the top passages fill the
+ * passage budget. The candidate set is the same graph the walk uses; only
+ * the ranking changes. Returns the same shape as buildGraphContext, plus
+ * `stats.ppr`. When PPR finds nothing, the passages fall back to exactly
+ * today's reference-backed list (today's FTS5 top-K covers the rest).
+ */
+export function buildPprGraphContext(
+  db: Db,
+  projectId: number,
+  opts: GraphContextOptions = {},
+): GraphContext {
+  const graph = loadGraph(db, projectId, { scope: opts.scope });
+  const queryTerms = terms(opts.query ?? '');
+  const focusNames = opts.focus ?? [];
+
+  let beforeOrder = opts.beforeOrder;
+  if (opts.atEventId !== undefined) {
+    const anchor = db.get<{ story_order: number }>('SELECT story_order FROM au_event WHERE id = ?', opts.atEventId);
+    if (anchor) beforeOrder = anchor.story_order;
+  }
+
+  // Same triple/event seeding the hop walk uses.
+  const seed = resolveQuerySeeds(graph, opts.query ?? '', focusNames);
+  const weights = new Map<string, number>();
+  for (const root of seed.roots) weights.set(root, 1);
+  // The passages the seeds mention start with a little weight of their own,
+  // so evidence near a seed outranks evidence several hops out.
+  for (const root of seed.roots) {
+    for (const edgeId of graph.adjacency.get(root) ?? []) {
+      const edge = graph.edges.find((e) => e.id === edgeId);
+      if (!edge) continue;
+      const other = edge.from === root ? edge.to : edge.from;
+      const node = graph.nodes.get(other);
+      if (!node || node.kind !== 'canon-passage') continue;
+      if (!weights.has(other)) weights.set(other, 0.2);
+    }
+  }
+  const ppr = personalizedPageRank(graph, weights);
+
+  const result = traverse(graph, {
+    roots: seed.roots,
+    hops: opts.hops ?? 1,
+    scope: opts.scope,
+    edgeTypes: opts.edgeTypes,
+    beforeOrder,
+    temporal: true,
+    maxNodes: opts.maxNodes ?? 40,
+  });
+
+  const ranked = rankNodes(result, queryTerms);
+  const nodeIds = new Set(ranked.map((n) => n.id));
+  const edges = result.edges.filter((e) => nodeIds.has(e.from) && nodeIds.has(e.to));
+
+  // Passages in PPR order first; the reference-backed ones from the walked
+  // nodes after. When PPR finds nothing, this is exactly today's list.
+  const seenChunks = new Set<number>();
+  const orderedChunkIds: number[] = [];
+  for (const { id, score } of ppr.ranked.slice(0, 12)) {
+    if (score <= 0) continue;
+    const chunkId = graph.nodes.get(id)?.numericId;
+    if (typeof chunkId !== 'number' || seenChunks.has(chunkId)) continue;
+    seenChunks.add(chunkId);
+    orderedChunkIds.push(chunkId);
+  }
+  for (const node of ranked) {
+    for (const ref of node.sourceRefs) {
+      if (typeof ref.chunk === 'number' && !seenChunks.has(ref.chunk)) {
+        seenChunks.add(ref.chunk);
+        orderedChunkIds.push(ref.chunk);
+      }
+    }
+    const first = node.extra?.firstChunk;
+    if (typeof first === 'number' && !seenChunks.has(first)) {
+      seenChunks.add(first);
+      orderedChunkIds.push(first);
+    }
+    const chunkId = node.extra?.chunkId;
+    if (typeof chunkId === 'number' && !seenChunks.has(chunkId)) {
+      seenChunks.add(chunkId);
+      orderedChunkIds.push(chunkId);
+    }
+  }
+  const passages: GraphContext['passages'] = [];
+  for (const chunkId of orderedChunkIds) {
+    const row = db.get<{ id: number; locator: string; text: string }>(
+      'SELECT id, locator, text FROM canon_chunk WHERE id = ? AND project_id = ?',
+      chunkId,
+      projectId,
+    );
+    if (row) passages.push({ chunkId: row.id, locator: row.locator, text: row.text });
+  }
+
+  const maxWords = opts.maxWords ?? 900;
+  const { text: pprText, truncated: textTruncated } = renderGraphContext(
+    ranked,
+    edges,
+    passages,
+    queryTerms,
+    maxWords,
+  );
+  const truncated = result.truncated || textTruncated;
+
+  return {
+    nodes: ranked,
+    edges,
+    passages,
+    text: pprText,
+    truncated,
+    stats: {
+      nodes: ranked.length,
+      edges: edges.length,
+      passages: passages.length,
+      words: pprText.split(/\s+/).length,
+      seedVia: seed.via,
+      ppr: { nodes: graph.nodes.size, iterations: ppr.iterations, converged: ppr.converged },
+    },
+  };
+}
+
+/**
  * Render a graph context as the text the model sees.
  *
  * The sections are ordered by how much they help a scene: the connections
@@ -1347,8 +1682,11 @@ export function renderGraphContext(
     'developed_by',
     'resolved_by',
   ]);
-  const relationEdges = edges.filter((e) => !NAVIGATIONAL.has(e.type));
-  const navigational = edges.filter((e) => NAVIGATIONAL.has(e.type));
+  // Mention edges are ranker infrastructure, not claims: they say where an
+  // entity was seen, which the passages underneath already show.
+  const shown = edges.filter((e) => e.type !== 'mentions_in');
+  const relationEdges = shown.filter((e) => !NAVIGATIONAL.has(e.type));
+  const navigational = shown.filter((e) => NAVIGATIONAL.has(e.type));
 
   if (relationEdges.length) {
     const lines = relationEdges
