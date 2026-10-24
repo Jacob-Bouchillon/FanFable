@@ -1,7 +1,7 @@
 # FanFable
 
 <p align="center">
-  <img src="fanfable/src/ui/fanfable.png" alt="FanFable logo" width="250" />
+  <img src="fanfable/src/ui/fanfable.png" alt="FanFable logo" width="120" />
 </p>
 
 <br />
