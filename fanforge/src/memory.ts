@@ -13,7 +13,7 @@
 import { Db, nowIso, strList, toJson } from './db.ts';
 import { extractJson, toStringArray } from './json.ts';
 import type { LlmClient } from './llm.ts';
-import { truncate, wordCount } from './text.ts';
+import { truncate } from './text.ts';
 
 /* ------------------------------------------------------------------ models */
 
@@ -1438,28 +1438,3 @@ function nextStoryOrder(db: Db, projectId: number): number {
   );
   return (row?.n ?? 0) + 1;
 }
-
-/** Summarise a chapter body with the LLM and store it. */
-export async function summarizeChapter(
-  llm: LlmClient,
-  body: string,
-): Promise<{ summary: string; entities: string[] }> {
-  const res = await llm.chat({
-    system:
-      'Summarise the chapter for a story-memory index. Reply with JSON only: ' +
-      '{"summary":"...","entities":["Name","Place","Thing"]}. ' +
-      'The summary must capture plot events, changes in relationships, injuries, locations, ' +
-      'new information revealed, and anything a later writer must remember. ' +
-      'Use third person, no prose outside JSON.',
-    messages: [{ role: 'user', content: truncate(body, 12000) }],
-    temperature: 0.2,
-    maxTokens: 500,
-  });
-  const parsed = extractJson<{ summary?: unknown; entities?: unknown }>(res.text);
-  return {
-    summary: String(parsed?.summary ?? '').trim(),
-    entities: toStringArray(parsed?.entities),
-  };
-}
-
-export { wordCount };

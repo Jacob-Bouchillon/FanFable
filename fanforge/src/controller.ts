@@ -144,11 +144,6 @@ export function getChapter(db: Db, projectId: number, number: number): Chapter |
   return r ? rowToChapter(r) : undefined;
 }
 
-export function getChapterById(db: Db, projectId: number, id: number): Chapter | undefined {
-  const r = db.get<ChapterRow>('SELECT * FROM chapter WHERE project_id = ? AND id = ?', projectId, id);
-  return r ? rowToChapter(r) : undefined;
-}
-
 export function listChapters(db: Db, projectId: number): Chapter[] {
   const rows = db.all<ChapterRow>(
     'SELECT * FROM chapter WHERE project_id = ? ORDER BY number',
@@ -963,12 +958,6 @@ export class App {
   client(): LlmClient {
     return clientFrom(this.project.settings);
   }
-}
-
-export function openApp(db: Db, projectName: string): App {
-  const project = getProjectByName(db, projectName);
-  if (!project) throw new Error(`no project named "${projectName}"`);
-  return new App(db, project.id, clientFrom(project.settings));
 }
 
 export { createClient };

@@ -347,12 +347,6 @@ export interface WriteOptions {
   segments?: number;
 }
 
-export interface WriteTurn {
-  text: string;
-  requests: ContextRequest[];
-  meta: Record<string, unknown> | null;
-}
-
 export interface WriteResult {
   prose: string;
   meta: Record<string, unknown> | null;

@@ -103,7 +103,6 @@ export const threadId = (id: number) => `story:thread:${id}`;
 export const assertionId = (id: number) => `story:assertion:${id}`;
 export const secretId = (id: number) => `story:secret:${id}`;
 export const motivationId = (id: number) => `story:motivation:${id}`;
-export const passageId = (id: number) => `canon:passage:${id}`;
 
 /* --------------------------------------------------------------- loading */
 

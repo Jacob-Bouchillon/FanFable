@@ -272,42 +272,6 @@ export function searchCanon(db: Db, projectId: number, query: string, opts: Sear
   return passages.slice(0, limit);
 }
 
-/** Neighbouring chunks, used to give surrounding context for a hit. */
-export function surroundingChunks(db: Db, chunkId: number, radius = 1): Passage[] {
-  const chunk = db.get<{ source_id: number; seq: number }>(
-    'SELECT source_id, seq FROM canon_chunk WHERE id = ?',
-    chunkId,
-  );
-  if (!chunk) return [];
-  const rows = db.all<{
-    id: number;
-    source_id: number;
-    locator: string;
-    heading: string;
-    text: string;
-    seq: number;
-    title: string;
-    path: string;
-  }>(
-    `SELECT c.id, c.source_id, c.locator, c.heading, c.text, c.seq, s.title, s.path
-     FROM canon_chunk c JOIN canon_source s ON s.id = c.source_id
-     WHERE c.source_id = ? AND c.seq BETWEEN ? AND ? ORDER BY c.seq`,
-    chunk.source_id,
-    chunk.seq - radius,
-    chunk.seq + radius,
-  );
-  return rows.map((r) => ({
-    chunkId: r.id,
-    sourceId: r.source_id,
-    sourceTitle: r.title,
-    path: r.path,
-    locator: r.locator,
-    heading: r.heading,
-    text: r.text,
-    score: 1,
-  }));
-}
-
 export function getChunk(db: Db, chunkId: number): Passage | undefined {
   const r = db.get<{
     id: number;
@@ -784,35 +748,4 @@ export function listCanonEvents(db: Db, projectId: number, limit = 100): CanonEv
     kind: r.kind,
     quote: r.quote,
   }));
-}
-
-/**
- * Find the canon event that best matches a described scene, so the writer can
- * adapt it and record the link.
- */
-export function findCanonEvent(
-  db: Db,
-  projectId: number,
-  description: string,
-  opts: { limit?: number; excludeIds?: number[] } = {},
-): CanonEvent[] {
-  const exclude = new Set(opts.excludeIds ?? []);
-  const expand = toStringArray(description);
-  const passages = searchCanon(db, projectId, expand.join(' '), { limit: 20 });
-  if (!passages.length) return [];
-
-  const scored = new Map<number, number>();
-  for (const p of passages) {
-    const event = db.get<{ id: number; title: string; summary: string; participants: string }>(
-      'SELECT id, title, summary, participants FROM canon_event WHERE chunk_id = ?',
-      p.chunkId,
-    );
-    if (!event || exclude.has(event.id)) continue;
-    scored.set(event.id, (scored.get(event.id) ?? 0) + p.score);
-  }
-  return listCanonEvents(db, projectId, 1000)
-    .filter((e) => scored.has(e.id))
-    .map((e) => ({ ...e, score: scored.get(e.id) ?? 0 }))
-    .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
-    .slice(0, opts.limit ?? 5);
 }

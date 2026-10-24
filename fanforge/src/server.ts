@@ -42,10 +42,23 @@ interface Job {
 const jobs = new Map<string, Job>();
 let jobCounter = 0;
 
+/** Keep the map bounded: finished jobs are only needed long enough to poll. */
+const MAX_FINISHED_JOBS = 50;
+
+function pruneJobs(): void {
+  if (jobs.size <= MAX_FINISHED_JOBS) return;
+  for (const [id, job] of jobs) {
+    if (job.status === 'running') continue;
+    jobs.delete(id);
+    if (jobs.size <= MAX_FINISHED_JOBS) break;
+  }
+}
+
 function startJob(
   name: string,
   fn: (progress: (message: string) => void) => Promise<unknown>,
 ): { id: string } {
+  pruneJobs();
   const id = `job-${++jobCounter}`;
   const job: Job = { id, name, status: 'running', message: 'starting', startedAt: Date.now() };
   jobs.set(id, job);

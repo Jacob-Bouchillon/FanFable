@@ -6,10 +6,6 @@ export function wordCount(text: string): number {
   return t.split(/\s+/).length;
 }
 
-export function normalizeSpace(text: string): string {
-  return (text ?? '').replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
-}
-
 /** Split text into sentences (good enough for chunking and repetition checks). */
 export function splitSentences(text: string): string[] {
   const out: string[] = [];

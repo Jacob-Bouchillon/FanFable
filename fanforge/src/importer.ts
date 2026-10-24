@@ -277,12 +277,6 @@ export function readTextFile(path: string): ImportedText {
 
 /* --------------------------------------------------------------- dispatch */
 
-export function isSupported(path: string): boolean {
-  return ['.txt', '.md', '.markdown', '.text', '.pdf', '.epub', '.docx'].includes(
-    extname(path).toLowerCase(),
-  );
-}
-
 /** Read a source file of any supported format into text with page markers. */
 export async function importFile(path: string): Promise<ImportedText> {
   if (!existsSync(path)) throw new ImportError(`file not found: ${path}`);

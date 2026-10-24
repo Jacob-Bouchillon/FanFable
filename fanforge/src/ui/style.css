@@ -269,11 +269,9 @@ a { color: var(--accent); }
 .faint { color: var(--text-faint); }
 .small { font-size: 12.5px; }
 .mono { font-family: var(--mono); font-size: 12.5px; }
-.stack { display: flex; flex-direction: column; gap: var(--s3); }
 .row { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
 .row-between { display: flex; align-items: center; justify-content: space-between; gap: var(--s3); }
 .spacer { flex: 1; }
-.nowrap { white-space: nowrap; }
 
 /* --------------------------------------------------------------- controls */
 
@@ -298,8 +296,6 @@ a { color: var(--accent); }
 .btn-ghost { border-color: transparent; background: none; color: var(--text-muted); }
 .btn-ghost:hover:not(:disabled) { background: var(--bg-hover); color: var(--text); }
 .btn-sm { padding: 4px 10px; font-size: 12px; }
-.btn-danger { color: var(--error); border-color: var(--border-strong); }
-.btn-danger:hover:not(:disabled) { background: var(--error-soft); }
 
 .input, select.input, textarea.input {
   font: inherit;
@@ -570,7 +566,6 @@ textarea.input.code { font-family: var(--mono); font-size: 13px; min-height: 320
 /* -------------------------------------------------------------- helpers */
 
 .divider { height: 1px; background: var(--border); margin: var(--s4) 0; border: 0; }
-.scroll-x { overflow-x: auto; }
 .tabs { display: flex; gap: var(--s1); border-bottom: 1px solid var(--border); margin-bottom: var(--s4); }
 .tab {
   appearance: none; border: 0; background: none; font: inherit; cursor: pointer;

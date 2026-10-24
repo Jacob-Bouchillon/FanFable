@@ -104,17 +104,6 @@ export function nowIso(): string {
   return new Date().toISOString();
 }
 
-export function asString(value: unknown, fallback = ''): string {
-  if (typeof value === 'string') return value;
-  if (value === null || value === undefined) return fallback;
-  return String(value);
-}
-
-export function asNumber(value: unknown, fallback = 0): number {
-  const n = typeof value === 'number' ? value : Number(value);
-  return Number.isFinite(n) ? n : fallback;
-}
-
 export function asArray(value: unknown): unknown[] {
   if (Array.isArray(value)) return value;
   if (value === null || value === undefined) return [];

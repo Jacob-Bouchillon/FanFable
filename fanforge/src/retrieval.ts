@@ -21,7 +21,6 @@ import { Db } from './db.ts';
 import type { LlmClient } from './llm.ts';
 import * as lore from './lore.ts';
 import * as graph from './graph.ts';
-import { truncate } from './text.ts';
 
 export interface RetrievalRequest {
   /** The question or the scene's subject. */
@@ -197,15 +196,3 @@ export async function retrieveForScene(
     hops: opts.hops ?? 1,
   });
 }
-
-/** A short, plain summary of a package, for logs and the interface. */
-export function describePackage(pkg: RetrievalPackage): string {
-  return [
-    `${pkg.stats.passages} passages`,
-    `${pkg.stats.graphNodes} graph nodes`,
-    `${pkg.stats.graphEdges} connections`,
-    `${pkg.stats.words} words`,
-  ].join(', ');
-}
-
-export { truncate };

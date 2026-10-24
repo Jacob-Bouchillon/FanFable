@@ -18,7 +18,7 @@
  *                 character can be fixed without re-indexing the book.
  */
 import { Db, nowIso, strList, toJson } from './db.ts';
-import { extractJson, toStringArray } from './json.ts';
+import { extractJson } from './json.ts';
 import type { LlmClient } from './llm.ts';
 import * as lorebook from './lorebook.ts';
 import { truncate } from './text.ts';
@@ -453,50 +453,3 @@ export function removeRelation(db: Db, projectId: number, id: number): boolean {
   db.run('DELETE FROM canon_relation WHERE id = ? AND project_id = ?', id, projectId);
   return true;
 }
-
-/** The relations of one entity, for the interface. */
-export function relationsOf(db: Db, projectId: number, name: string): {
-  id: number;
-  kind: string;
-  description: string;
-  evidence: string;
-  other: string;
-  reviewStatus: string;
-  confidence: number;
-}[] {
-  const entity = lorebook.findEntity(db, projectId, name);
-  if (!entity) return [];
-  return db
-    .all<{
-      id: number;
-      kind: string;
-      description: string;
-      evidence: string;
-      review_status: string;
-      confidence: number;
-      other: string;
-      direction: string;
-    }>(
-      `SELECT r.id, r.kind, r.description, r.evidence, r.review_status, r.confidence,
-              o.name AS other, CASE WHEN r.from_entity = ? THEN 'out' ELSE 'in' END AS direction
-       FROM canon_relation r
-       JOIN canon_entity o ON o.id = CASE WHEN r.from_entity = ? THEN r.to_entity ELSE r.from_entity END
-       WHERE r.project_id = ? AND (r.from_entity = ? OR r.to_entity = ?)`,
-      entity.id,
-      entity.id,
-      projectId,
-      entity.id,
-      entity.id,
-    )
-    .map((r) => ({
-      id: r.id,
-      kind: r.kind,
-      description: r.description,
-      evidence: r.evidence,
-      other: r.other,
-      reviewStatus: r.review_status,
-      confidence: r.confidence,
-    }));
-}
-
-export { toStringArray };

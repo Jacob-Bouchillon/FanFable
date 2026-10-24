@@ -9,7 +9,7 @@
 import { Db, nowIso } from './db.ts';
 import { extractJson } from './json.ts';
 import type { LlmClient } from './llm.ts';
-import { similarity, truncate, wordCount } from './text.ts';
+import { similarity, truncate } from './text.ts';
 import type { ContextSlice } from './memory.ts';
 import * as lorebook from './lorebook.ts';
 import { graphContinuityChecks } from './graph-checks.ts';
@@ -504,8 +504,4 @@ export async function checkChapter(
   }
 
   return mergeIssues(mergeIssues(deterministic, graphIssues), model);
-}
-
-export function chapterWordCount(body: string): number {
-  return wordCount(body);
 }
