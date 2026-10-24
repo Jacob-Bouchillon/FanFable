@@ -13,7 +13,7 @@
 import { Db, nowIso, strList, toJson } from './db.ts';
 import { asRecordArray, extractJson, salvageJsonArray, toStringArray } from './json.ts';
 import type { LlmClient } from './llm.ts';
-import { truncate } from './text.ts';
+import { splitSentences, truncate } from './text.ts';
 
 /* ------------------------------------------------------------------ models */
 
@@ -228,6 +228,30 @@ export interface ExtractOptions {
    * The split path is the default.
    */
   singlePrompt?: boolean;
+  /**
+   * Mine at most this many windows, chosen by priority (see scoreWindow).
+   *
+   * Absent means mine everything, which is today's behavior. The budget only
+   * bites when this is passed. Skipped windows keep lore_mined=0 so a later
+   * run — budgeted or --full — can pick them up.
+   */
+  maxWindows?: number;
+  /**
+   * How many of the budget always go to the highest-scoring windows.
+   * Defaults to the whole budget (pure priority order, no sampling).
+   */
+  priorityFirst?: number;
+  /**
+   * Fraction 0-1 of the remaining budget spent on a uniform sample of the
+   * other windows, drawn with a seeded RNG. The floor buys coverage: a lonely
+   * window with a low score still gets mined sometimes. Defaults to 1 when
+   * priorityFirst leaves budget unspent (fill it by sampling), else 0.
+   */
+  randomFloor?: number;
+  /** Seed for the deterministic sample. Default 42. */
+  seed?: number;
+  /** Mine everything, ignoring maxWindows/priorityFirst/randomFloor. */
+  full?: boolean;
   onProgress?: (message: string) => void;
   /** Structured window counts, for a progress monitor rather than the console. */
   onWindow?: (progress: ExtractWindowProgress) => void;
@@ -279,6 +303,8 @@ export interface ExtractLoreResult {
   emptyWindows: EmptyWindowReport[];
   quarantinedAliases: QuarantinedAlias[];
   mergedAliases: string[];
+  /** Budget selection, when a budget applied. Absent means everything ran. */
+  selection?: { selected: number; total: number; skipped: number };
 }
 
 export interface ChunkRow {
@@ -292,11 +318,208 @@ export interface ChunkRow {
   source_id: number;
 }
 
+/* ------------------------------------------------------- window scoring */
+
+/**
+ * Why a window is worth a model call, scored without a model.
+ *
+ * Extraction is the expensive step on a small machine, and not every window
+ * repays it: a bridge window that names the people other windows talk about
+ * is worth more than a landscape. All signals come from text and metadata
+ * already in the chunk rows, so scoring is deterministic and free.
+ */
+export interface WindowScore {
+  score: number;
+  reasons: string[];
+}
+
+/** Words that state a relationship or a role worth extracting. */
+const KINSHIP_CUES = [
+  'sibling', 'brother', 'sister', 'mother', 'father', 'son', 'daughter',
+  'parent', 'child', 'aunt', 'uncle', 'cousin', 'nephew', 'niece',
+  'husband', 'wife', 'spouse', 'married', 'widow',
+  'king', 'queen', 'prince', 'princess', 'lord', 'lady',
+  'master', 'servant', 'knight', 'captain', 'commander', 'heir',
+];
+
+/**
+ * Capitalized words that look like names.
+ *
+ * The first word of a sentence is skipped: it is capitalized by grammar, not
+ * by meaning. Everything else capitalized and at least three letters long is
+ * probably a name, a place or a title — exactly what extraction is for.
+ */
+export function properNamesOf(text: string): string[] {
+  const names: string[] = [];
+  for (const sentence of splitSentences(text)) {
+    const words = sentence.match(/[A-Za-z][a-z']*/g) ?? [];
+    for (let i = 0; i < words.length; i++) {
+      const w = words[i]!;
+      if (w.length < 3 || !/^[A-Z]/.test(w)) continue;
+      if (i === 0) continue;
+      names.push(w.toLowerCase());
+    }
+  }
+  return names;
+}
+
+/**
+ * How many windows mention each proper name.
+ *
+ * A name in two or more windows is a bridge or a hub: the windows around it
+ * talk about the same people, so mining it first grounds the most retrieval.
+ */
+export function buildNameDocFreq(windows: ChunkRow[][]): Map<string, number> {
+  const freq = new Map<string, number>();
+  for (const window of windows) {
+    const seen = new Set(properNamesOf(window.map((c) => c.text).join('\n')));
+    for (const name of seen) freq.set(name, (freq.get(name) ?? 0) + 1);
+  }
+  return freq;
+}
+
+/** Two name tokens that look like one thing under two forms. */
+function aliasPair(a: string, b: string): boolean {
+  if (a === b) return false;
+  return nameRelation(a, b) !== null;
+}
+
+/**
+ * Score one window: bridges and hubs first, then dialogue and relations.
+ *
+ * Dialogue windows are weighted up, not down: the archive showed dialogue
+ * collapsing extraction, which means those windows hold relationships the
+ * index is missing, not that they hold nothing.
+ */
+export function scoreWindow(window: ChunkRow[], docFreq: Map<string, number>): WindowScore {
+  const reasons: string[] = [];
+  let score = 0;
+  const text = window.map((c) => c.text).join('\n');
+
+  const distinct = new Set(properNamesOf(text));
+  score += distinct.size * 2;
+  if (distinct.size) reasons.push(`names:${distinct.size}`);
+
+  const bridges = [...distinct].filter((n) => (docFreq.get(n) ?? 0) >= 2);
+  score += bridges.length * 3;
+  for (const b of bridges.slice(0, 5)) reasons.push(`bridge:${b}`);
+
+  const list = [...distinct];
+  let aliasHits = 0;
+  for (let i = 0; i < list.length; i++) {
+    for (let j = i + 1; j < list.length; j++) {
+      if (aliasPair(list[i]!, list[j]!)) aliasHits++;
+    }
+  }
+  score += aliasHits * 2;
+  if (aliasHits) reasons.push(`aliases:${aliasHits}`);
+
+  const colonSpeakers = (text.match(/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}\s*:/gm) ?? []).length;
+  const dialogue = speakersIn(text).length + colonSpeakers;
+  score += Math.min(dialogue, 5) * 2;
+  if (dialogue) reasons.push(`dialogue:${dialogue}`);
+
+  const lower = text.toLowerCase();
+  let cues = 0;
+  for (const cue of KINSHIP_CUES) {
+    if (lower.includes(cue)) cues++;
+  }
+  score += Math.min(cues, 8);
+  if (cues) reasons.push(`relations:${cues}`);
+
+  return { score, reasons };
+}
+
+/** Deterministic RNG for the coverage sample. Same seed, same windows. */
+export function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+export interface WindowSelection {
+  /** Candidate indices to mine, in original window order. */
+  selected: number[];
+  /** Candidate indices left unmined for a later run. */
+  skipped: number[];
+  /** Score reasons per selected index, plus 'priority' or 'sampled'. */
+  reasons: Map<number, string[]>;
+}
+
+/**
+ * Choose which candidate windows to mine under a budget.
+ *
+ * The top priorityFirst by score always go first; the rest of the budget is a
+ * uniform sample drawn with a seeded RNG, so a low-scoring window still gets
+ * coverage across runs and the freeze stays reproducible. Ties break by
+ * window order. Without a budget (or with full) everything is selected.
+ */
+export function selectWindows(
+  scores: WindowScore[],
+  opts: { maxWindows?: number; priorityFirst?: number; randomFloor?: number; seed?: number; full?: boolean } = {},
+): WindowSelection {
+  const n = scores.length;
+  const empty: WindowSelection = {
+    selected: [],
+    skipped: [],
+    reasons: new Map(),
+  };
+  if (!n) return empty;
+  if (opts.full || opts.maxWindows === undefined || opts.maxWindows >= n) {
+    return {
+      selected: scores.map((_, i) => i),
+      skipped: [],
+      reasons: new Map(scores.map((s, i) => [i, [...s.reasons, 'priority']])),
+    };
+  }
+  const budget = Math.max(0, Math.min(opts.maxWindows, n));
+  const order = scores.map((_, i) => i).sort((a, b) => scores[b]!.score - scores[a]!.score || a - b);
+  const priorityCount = Math.min(opts.priorityFirst ?? budget, budget);
+  const picked = new Set(order.slice(0, priorityCount));
+  const reasons = new Map<number, string[]>();
+  for (const i of picked) reasons.set(i, [...scores[i]!.reasons, 'priority']);
+
+  const rest = order.slice(priorityCount);
+  const remaining = budget - picked.size;
+  const floor = opts.randomFloor ?? 1;
+  let sampleCount = Math.min(remaining, Math.floor(remaining * floor));
+  if (remaining > 0 && floor > 0 && sampleCount === 0) sampleCount = 1;
+  const rand = mulberry32(opts.seed ?? 42);
+  const shuffled = [...rest];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j]!, shuffled[i]!];
+  }
+  for (const i of shuffled.slice(0, sampleCount)) {
+    picked.add(i);
+    reasons.set(i, [...scores[i]!.reasons, 'sampled']);
+  }
+
+  const selected = [...picked].sort((a, b) => a - b);
+  return { selected, skipped: order.filter((i) => !picked.has(i)), reasons };
+}
+
 /**
  * Read the imported material and record its lore.
  *
  * Runs in windows of passages so a whole book does not have to fit in the
  * context, and keeps a record of which passages were already processed.
+ */
+/**
+ * Read the imported material and record its lore.
+ *
+ * Runs in windows of passages so a whole book does not have to fit in the
+ * context, and keeps a record of which passages were already processed.
+ *
+ * With maxWindows set, only a budgeted selection is mined — the top
+ * priorityFirst by score plus a seeded sample of the rest — and the skipped
+ * windows keep lore_mined=0 for a later run. Without a budget (or with full)
+ * everything runs, which is today's behavior.
  */
 export async function extractLore(
   db: Db,
@@ -305,43 +528,237 @@ export async function extractLore(
   opts: ExtractOptions = {},
 ): Promise<ExtractLoreResult> {
   const windowSize = opts.windowSize ?? 8;
-  const params: unknown[] = [projectId];
-  let sql = `SELECT c.id, c.seq, c.heading, c.locator, c.text, s.title AS source_title, s.path, c.source_id
-             FROM canon_chunk c JOIN canon_source s ON s.id = c.source_id
-             WHERE c.project_id = ?`;
-  if (opts.sourceId) {
-    sql += ' AND c.source_id = ?';
-    params.push(opts.sourceId);
-  }
-  sql += ' ORDER BY c.source_id, c.seq';
-  const chunks = db.all<ChunkRow>(sql, ...params);
+  const chunks = loadOrderedChunks(db, projectId, opts.sourceId);
+  const stats = blankResult();
+  if (!chunks.length) return stats;
 
-  const stats = {
+  // Passages that have already been mined are skipped, so re-running the
+  // extraction over a long book is cheap.
+  const mined = loadMinedSet(db, projectId);
+  const ctx = loadChunkContext(db, projectId);
+  const entityIdByName = new Map<string, number>();
+
+  const allWindows = sliceWindows(chunks, windowSize);
+  // Bridges are recurrence across the book, so the frequencies are built over
+  // every window — including already-mined ones — while only candidates run.
+  const docFreq = buildNameDocFreq(allWindows);
+  const candidates: { window: ChunkRow[]; index: number }[] = [];
+  allWindows.forEach((window, index) => {
+    if (opts.incremental !== false && window.every((c) => mined.has(c.id))) return;
+    candidates.push({ window, index });
+  });
+  if (!candidates.length) {
+    opts.onProgress?.('everything has already been read');
+    return stats;
+  }
+
+  const selection = selectWindows(
+    candidates.map(({ window }) => scoreWindow(window, docFreq)),
+    opts,
+  );
+  const chosen = new Set(selection.selected);
+  const runList = candidates.filter((_, i) => chosen.has(i));
+  if (runList.length < candidates.length) {
+    const kinds = new Map<string, number>();
+    for (const i of selection.selected) {
+      for (const reason of selection.reasons.get(i) ?? []) {
+        const kind = reason.split(':')[0]!;
+        kinds.set(kind, (kinds.get(kind) ?? 0) + 1);
+      }
+    }
+    const summary = [...kinds.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([kind, n]) => `${kind}×${n}`)
+      .join(', ');
+    opts.onProgress?.(
+      `selected ${runList.length} of ${candidates.length} windows by priority (${summary}); ` +
+        `${candidates.length - runList.length} left unmined`,
+    );
+    stats.selection = {
+      selected: runList.length,
+      total: candidates.length,
+      skipped: candidates.length - runList.length,
+    };
+  }
+
+  await runWindowBatch(db, llm, projectId, runList, ctx, entityIdByName, stats, {
+    concurrency: Math.max(1, Math.min(opts.concurrency ?? 3, 4)),
+    maxTokens: opts.maxTokens ?? 3000,
+    singlePrompt: opts.singlePrompt === true,
+    windowSize,
+    totalChunks: chunks.length,
+    onProgress: opts.onProgress,
+    onWindow: opts.onWindow,
+  });
+
+  // Fold any duplicates left by earlier runs into one row per pair.
+  dedupeRelations(db, projectId);
+  const merged = mergeCanonEntities(db, projectId);
+  stats.mergedAliases = merged.merged;
+  stats.quarantinedAliases = merged.quarantined;
+  // Now that the entities and the events exist, marry the two.
+  linkTimelineToEvents(db, projectId);
+  stats.windows = runList.length;
+  rememberExtractionReport(db, projectId, stats);
+
+  return stats;
+}
+
+export interface LazyMineOptions {
+  windowSize?: number;
+  sourceId?: number;
+  concurrency?: number;
+  maxTokens?: number;
+  singlePrompt?: boolean;
+  /** Never mine more than this many windows in one call. Default 2. */
+  maxLazyWindows?: number;
+  onProgress?: (message: string) => void;
+  /** Structured window counts, for a progress monitor rather than the console. */
+  onWindow?: (progress: ExtractWindowProgress) => void;
+}
+
+/**
+ * Mine just the windows that hold the given passages.
+ *
+ * A query that touches unmined text should not wait for the whole book: this
+ * runs the same split path over at most maxLazyWindows windows and leaves the
+ * rest alone. Windows are grouped exactly as extractLore groups them, so a
+ * later full run picks up where this left off. On any error the caller falls
+ * back to the unmined passages as today.
+ */
+export async function ensureWindowsForChunks(
+  db: Db,
+  llm: LlmClient,
+  projectId: number,
+  chunkIds: number[],
+  opts: LazyMineOptions = {},
+): Promise<ExtractLoreResult> {
+  const stats = blankResult();
+  const wanted = new Set((chunkIds ?? []).filter((n) => Number.isFinite(n)));
+  if (!wanted.size) return stats;
+
+  const windowSize = opts.windowSize ?? 8;
+  const chunks = loadOrderedChunks(db, projectId, opts.sourceId);
+  if (!chunks.length) return stats;
+  const mined = loadMinedSet(db, projectId);
+  const cap = Math.max(0, opts.maxLazyWindows ?? 2);
+  const targets: { window: ChunkRow[]; index: number }[] = [];
+  sliceWindows(chunks, windowSize).forEach((window, index) => {
+    if (targets.length >= cap) return;
+    if (!window.some((c) => wanted.has(c.id))) return;
+    if (window.every((c) => mined.has(c.id))) return;
+    targets.push({ window, index });
+  });
+  if (!targets.length) return stats;
+
+  const ctx = loadChunkContext(db, projectId);
+  await runWindowBatch(db, llm, projectId, targets, ctx, new Map<string, number>(), stats, {
+    concurrency: Math.max(1, Math.min(opts.concurrency ?? 3, 4)),
+    maxTokens: opts.maxTokens ?? 3000,
+    singlePrompt: opts.singlePrompt === true,
+    windowSize,
+    totalChunks: chunks.length,
+    onProgress: opts.onProgress,
+    onWindow: opts.onWindow,
+  });
+
+  dedupeRelations(db, projectId);
+  const merged = mergeCanonEntities(db, projectId);
+  stats.mergedAliases = merged.merged;
+  stats.quarantinedAliases = merged.quarantined;
+  linkTimelineToEvents(db, projectId);
+  stats.windows = targets.length;
+  return stats;
+}
+
+/**
+ * Mine the windows behind passage hits, best-effort.
+ *
+ * Shared by the query paths that touch unmined text. Never throws: on any
+ * error the caller falls back to the unmined passages as today. Returns the
+ * mini result when at least one window was mined, else undefined.
+ */
+export async function mineUnminedHits(
+  db: Db,
+  llm: LlmClient,
+  projectId: number,
+  chunkIds: number[],
+): Promise<ExtractLoreResult | undefined> {
+  if (!chunkIds.length) return undefined;
+  const unmined = db
+    .all<{ id: number }>(
+      `SELECT id FROM canon_chunk WHERE project_id = ? AND lore_mined = 0 AND id IN (${chunkIds.map(() => '?').join(',')})`,
+      projectId,
+      ...chunkIds,
+    )
+    .map((r) => r.id);
+  if (!unmined.length) return undefined;
+  try {
+    // Window size 8 is the extraction default; a mismatch only regroups,
+    // because mined state is per passage and a later run regroups anyway.
+    const mini = await ensureWindowsForChunks(db, llm, projectId, unmined, { windowSize: 8 });
+    return mini.windows > 0 ? mini : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/* ------------------------------------------------------- batch plumbing */
+function blankResult(): ExtractLoreResult {
+  return {
     entities: 0,
     relations: 0,
     facts: 0,
     timeline: 0,
     passages: 0,
     windows: 0,
-    verification: { claimed: 0, verified: 0, repointed: 0, dropped: 0, unresolved: 0 } as VerificationStats,
-    emptyWindows: [] as EmptyWindowReport[],
-    quarantinedAliases: [] as QuarantinedAlias[],
-    mergedAliases: [] as string[],
+    verification: { claimed: 0, verified: 0, repointed: 0, dropped: 0, unresolved: 0 },
+    emptyWindows: [],
+    quarantinedAliases: [],
+    mergedAliases: [],
   };
-  if (!chunks.length) return stats;
+}
 
-  // Passages that have already been mined are skipped, so re-running the
-  // extraction over a long book is cheap.
-  const mined = new Set(
+/** Every passage of a project (or one source), in window order. */
+function loadOrderedChunks(db: Db, projectId: number, sourceId?: number): ChunkRow[] {
+  const params: unknown[] = [projectId];
+  let sql = `SELECT c.id, c.seq, c.heading, c.locator, c.text, s.title AS source_title, s.path, c.source_id
+             FROM canon_chunk c JOIN canon_source s ON s.id = c.source_id
+             WHERE c.project_id = ?`;
+  if (sourceId) {
+    sql += ' AND c.source_id = ?';
+    params.push(sourceId);
+  }
+  sql += ' ORDER BY c.source_id, c.seq';
+  return db.all<ChunkRow>(sql, ...params);
+}
+
+function loadMinedSet(db: Db, projectId: number): Set<number> {
+  return new Set(
     db
       .all<{ id: number }>('SELECT id FROM canon_chunk WHERE project_id = ? AND lore_mined = 1', projectId)
       .map((r) => r.id),
   );
+}
 
-  const entityIdByName = new Map<string, number>();
+function sliceWindows(chunks: ChunkRow[], windowSize: number): ChunkRow[][] {
+  const windows: ChunkRow[][] = [];
+  for (let start = 0; start < chunks.length; start += windowSize) {
+    windows.push(chunks.slice(start, start + windowSize));
+  }
+  return windows;
+}
 
-  // Every passage of the project, so a quote that belongs to a neighbouring
-  // passage can be found and its reference corrected.
+interface ChunkContext {
+  neighboursOf: (id: number | undefined) => ChunkRow[];
+}
+
+/**
+ * Every passage of the project, so a quote that belongs to a neighbouring
+ * passage can be found and its reference corrected.
+ */
+function loadChunkContext(db: Db, projectId: number): ChunkContext {
   const allChunks = db.all<{
     id: number;
     seq: number;
@@ -366,30 +783,38 @@ export async function extractLore(
     }
     return out;
   };
-  const windows: ChunkRow[][] = [];
-  for (let start = 0; start < chunks.length; start += windowSize) {
-    const window = chunks.slice(start, start + windowSize);
-    if (opts.incremental !== false && window.every((c) => mined.has(c.id))) continue;
-    windows.push(window);
-  }
-  if (!windows.length) {
-    opts.onProgress?.('everything has already been read');
-    return stats;
-  }
+  return { neighboursOf };
+}
 
-  const concurrency = Math.max(1, Math.min(opts.concurrency ?? 3, 4));
-  const maxTokens = opts.maxTokens ?? 3000;
-  const useSinglePrompt = opts.singlePrompt === true;
+interface RunBatchOpts {
+  concurrency: number;
+  maxTokens: number;
+  singlePrompt: boolean;
+  windowSize: number;
+  totalChunks: number;
+  onProgress?: (message: string) => void;
+  onWindow?: (progress: ExtractWindowProgress) => void;
+}
+
+/** Run windows through the split (or legacy) path and mark them mined. */
+async function runWindowBatch(
+  db: Db,
+  llm: LlmClient,
+  projectId: number,
+  entries: { window: ChunkRow[]; index: number }[],
+  ctx: ChunkContext,
+  entityIdByName: Map<string, number>,
+  stats: ExtractLoreResult,
+  batch: RunBatchOpts,
+): Promise<void> {
   let done = 0;
-
-  for (let batch = 0; batch < windows.length; batch += concurrency) {
-    const group = windows.slice(batch, batch + concurrency);
+  for (let start = 0; start < entries.length; start += batch.concurrency) {
+    const group = entries.slice(start, start + batch.concurrency);
     await Promise.all(
-      group.map(async (window, offset) => {
-        const index = batch + offset;
+      group.map(async ({ window, index }) => {
         try {
-          if (useSinglePrompt) {
-            await extractWindowLegacy(db, llm, projectId, window, entityIdByName, stats, neighboursOf, maxTokens);
+          if (batch.singlePrompt) {
+            await extractWindowLegacy(db, llm, projectId, window, entityIdByName, stats, ctx.neighboursOf, batch.maxTokens);
           } else {
             await extractWindowSplit(
               db,
@@ -398,8 +823,8 @@ export async function extractLore(
               window,
               entityIdByName,
               stats,
-              neighboursOf,
-              maxTokens,
+              ctx.neighboursOf,
+              batch.maxTokens,
               index,
             );
           }
@@ -414,34 +839,21 @@ export async function extractLore(
         }
         for (const c of window) db.run('UPDATE canon_chunk SET lore_mined = 1 WHERE id = ?', c.id);
         done++;
-        opts.onProgress?.(
-          `read ${done}/${windows.length} windows (${done * windowSize} of ${chunks.length} passages)`,
+        batch.onProgress?.(
+          `read ${done}/${entries.length} windows (${done * batch.windowSize} of ${batch.totalChunks} passages)`,
         );
-        opts.onWindow?.({
+        batch.onWindow?.({
           phase: 'lore',
           done,
-          total: windows.length,
-          passagesDone: Math.min(done * windowSize, chunks.length),
-          passagesTotal: chunks.length,
+          total: entries.length,
+          passagesDone: Math.min(done * batch.windowSize, batch.totalChunks),
+          passagesTotal: batch.totalChunks,
         });
         return undefined;
       }),
     );
   }
-
-  // Fold any duplicates left by earlier runs into one row per pair.
-  dedupeRelations(db, projectId);
-  const merged = mergeCanonEntities(db, projectId);
-  stats.mergedAliases = merged.merged;
-  stats.quarantinedAliases = merged.quarantined;
-  // Now that the entities and the events exist, marry the two.
-  linkTimelineToEvents(db, projectId);
-  stats.windows = windows.length;
-  rememberExtractionReport(db, projectId, stats);
-
-  return stats;
 }
-
 /**
  * Keep the last extraction's counters where diagnostics can read them.
  *

@@ -350,6 +350,7 @@ export async function resolveContextRequest(
   req: writer.ContextRequest,
   chapterId: number | null,
   limits: { maxRequests: number },
+  opts: { lazyExtract?: boolean } = {},
 ): Promise<{ answer: writer.ResolvedContext | null; log: RequestLogEntry }> {
   const prior = db.get<{ n: number }>(
     'SELECT COUNT(*) AS n FROM context_request WHERE project_id = ? AND chapter_id IS ?',
@@ -385,6 +386,16 @@ export async function resolveContextRequest(
         limit: req.limit ?? 6,
         expand: expanded,
       });
+      // A question that touches unmined text mines those windows first, so the
+      // index below includes them. Best-effort: failures keep today's behavior.
+      if (opts.lazyExtract !== false) {
+        await lorebook.mineUnminedHits(
+          db,
+          llm,
+          projectId,
+          passages.map((p) => p.chunkId),
+        );
+      }
       const index = lorebook.searchLore(db, projectId, req.query, 8);
       const indexText = lore.formatLoreIndex(index);
       resultCount = passages.length + index.entities.length + index.facts.length;

@@ -125,7 +125,10 @@ ${C.bold('SOURCE MATERIAL')}
   sources                          List imported sources
   lore search <query>              Search canon, show passages with references
   lore ask <question>              Answer a lore question with citations
-  lore extract [--model m]        Extract the book's lore (people, places, rules, facts)
+  lore extract [--model m] [--max-windows n] [--priority-first n] [--random-floor f] [--seed n] [--full]
+                           Extract the book's lore: people, places, rules, facts.
+                           No budget flags mines everything; --max-windows caps it (top priority
+                           first, seeded sample of the rest); --full ignores the budget.
   lore merge                       Merge entries that are the same under two names
   lore diagnose                    Report what the index is probably missing
   lore enrich <name>              Re-read the passages about one character
@@ -222,6 +225,12 @@ function flagNumber(args: Args, name: string, fallback: number): number {
   const v = args.flags[name];
   const n = typeof v === 'string' ? Number(v) : NaN;
   return Number.isFinite(n) ? n : fallback;
+}
+
+/** An optional numeric flag: absent (or unparsable) means "no budget". */
+function budgetFlag(args: Args, name: string): number | undefined {
+  const n = flagNumber(args, name, NaN);
+  return Number.isFinite(n) ? n : undefined;
 }
 
 /* ------------------------------------------------------------- commands */
@@ -387,12 +396,25 @@ async function cmdLore(args: Args): Promise<void> {
       sourceId: flagNumber(args, 'source', 0) || undefined,
       windowSize: flagNumber(args, 'window', 8),
       concurrency: flagNumber(args, 'concurrency', 3),
+      maxWindows: budgetFlag(args, 'max-windows'),
+      priorityFirst: budgetFlag(args, 'priority-first'),
+      randomFloor: budgetFlag(args, 'random-floor'),
+      seed: budgetFlag(args, 'seed'),
+      full: args.flags.full === true,
       onProgress: (m) => process.stdout.write(`  ${C.dim(m)}\n`),
     });
     console.log(
       `${C.green('extracted')} ${stats.entities} entities, ${stats.relations} relationships, ` +
         `${stats.facts} facts, ${stats.timeline} timeline entries`,
     );
+    if (stats.selection) {
+      console.log(
+        C.dim(
+          `  budget: mined ${stats.selection.selected} of ${stats.selection.total} windows, ` +
+            `${stats.selection.skipped} left unmined (re-run with --full for the rest)`,
+        ),
+      );
+    }
     const v = stats.verification;
     if (v.claimed) {
       console.log(

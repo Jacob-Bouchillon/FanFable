@@ -338,9 +338,17 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
       }
 
       if (path === '/api/book-lore/extract' && method === 'POST') {
+        const body = await readJson(req);
+        const num = (v: unknown): number | undefined =>
+          typeof v === 'number' && Number.isFinite(v) ? v : undefined;
         const { id } = startJob('extract-lore', async (progress) => {
           const p = project();
           return lorebook.extractLore(db, llm(), p.id, {
+            maxWindows: num(body.maxWindows),
+            priorityFirst: num(body.priorityFirst),
+            randomFloor: num(body.randomFloor),
+            seed: num(body.seed),
+            full: body.full === true,
             onProgress: (m) => progress(m),
           });
         });

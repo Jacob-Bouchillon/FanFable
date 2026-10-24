@@ -26,6 +26,7 @@
 import { Db } from './db.ts';
 import type { LlmClient } from './llm.ts';
 import * as lore from './lore.ts';
+import * as lorebook from './lorebook.ts';
 import * as graph from './graph.ts';
 
 export interface RetrievalRequest {
@@ -49,6 +50,14 @@ export interface RetrievalRequest {
   skipExpansion?: boolean;
   /** Override the router. Used by tests and by a caller that knows better. */
   route?: RetrievalRoute;
+  /**
+   * Mine the windows behind unmined passage hits before assembling the graph.
+   *
+   * Defaults on for everything except the fast lookup path, which answers
+   * from text alone. At most two windows per query; a failure falls back to
+   * today's unmined behavior.
+   */
+  lazyExtract?: boolean;
 }
 
 /** What kind of question this is, and therefore which path answers it. */
@@ -78,6 +87,8 @@ export interface RetrievalPackage {
     truncated: boolean;
     route: RetrievalRoute;
     coverage: RetrievalCoverage;
+    /** Windows mined on demand for this query, when the lazy path fired. */
+    lazyMined?: { windows: number; entities: number; relations: number };
   };
 }
 
@@ -196,6 +207,21 @@ export async function retrieve(
       limit: passageLimit,
       expand,
     });
+  }
+
+  /* ------------------------------- lazy mining of unmined hits */
+  let lazyMined: { windows: number; entities: number; relations: number } | undefined;
+  const lazyOn = req.lazyExtract ?? route !== 'lookup';
+  if (lazyOn && req.includeGraph !== false && passages.length) {
+    const mini = await lorebook.mineUnminedHits(
+      db,
+      llm,
+      projectId,
+      passages.map((p) => p.chunkId),
+    );
+    if (mini) {
+      lazyMined = { windows: mini.windows, entities: mini.entities, relations: mini.relations };
+    }
   }
 
   /**
@@ -317,6 +343,7 @@ export async function retrieve(
       truncated: graphContext.truncated || finalWords > maxWords,
       route,
       coverage: cov,
+      ...(lazyMined ? { lazyMined } : {}),
     },
   };
 }
