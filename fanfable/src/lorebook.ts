@@ -170,6 +170,7 @@ Reply with JSON only:
 Rules:
 - "from" and "to" must both be names from the KNOWN ENTITIES list. Do not invent a name, and do not use a name that is not listed, even if it appears in the passage.
 - Only record a relationship these passages state explicitly. Never infer one.
+- Be thorough: list every relationship the passages state explicitly — most windows contain several. Do not stop after the first one or two.
 - One relation per entry, with one kind. If two people have several relationships, write a separate entry for each.
 - The direction matters: "from" is the one who has the relationship and "to" is the one it is to. If Harry is Petunia's nephew, it is from="Harry", to="Petunia", kind="nephew of".
 - chunk_index is the number shown in front of each passage.
