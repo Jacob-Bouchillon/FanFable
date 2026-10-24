@@ -112,6 +112,14 @@ Rules:
 - If the passages contain no new people or facts, return empty arrays.
 - No prose outside the JSON.`;
 
+export interface ExtractWindowProgress {
+  phase: 'lore';
+  done: number;
+  total: number;
+  passagesDone: number;
+  passagesTotal: number;
+}
+
 export interface ExtractOptions {
   sourceId?: number;
   /** How many passages to send in one request. */
@@ -129,6 +137,8 @@ export interface ExtractOptions {
    */
   maxTokens?: number;
   onProgress?: (message: string) => void;
+  /** Structured window counts, for a progress monitor rather than the console. */
+  onWindow?: (progress: ExtractWindowProgress) => void;
 }
 
 interface ChunkRow {
@@ -231,6 +241,13 @@ export async function extractLore(
         opts.onProgress?.(
           `read ${done}/${windows.length} windows (${done * windowSize} of ${chunks.length} passages)`,
         );
+        opts.onWindow?.({
+          phase: 'lore',
+          done,
+          total: windows.length,
+          passagesDone: Math.min(done * windowSize, chunks.length),
+          passagesTotal: chunks.length,
+        });
         return found;
       }),
     );

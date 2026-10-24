@@ -91,7 +91,7 @@ rather than kept as a false citation.
 | Node 24.22 | `~/.local/opt/node/bin` (added to `~/.bashrc`) |
 | Ollama 0.40.6 | `~/.local/opt/ollama/bin/ollama` |
 | model | `qwen2.5:7b`, already pulled into `~/.local/share/ollama/models` |
-| fanforge | `~/.local/bin/fanforge` → `src/cli.ts` |
+| fanforge | `~/.local/bin/fanforge` → `fanforge/src/cli.ts` |
 
 Start the model server before using it (it does not run as a service):
 
@@ -131,13 +131,13 @@ up is a reasonable floor for a 16 GB GPU.
 ```bash
 cd fanforge
 npm install          # only devDependencies (typescript, @types/node); not needed to run
-chmod +x src/cli.ts
+chmod +x fanforge/src/cli.ts
 
 # run it directly
-node src/cli.ts --help
+node fanforge/src/cli.ts --help
 
 # or put it on your PATH
-ln -s "$PWD/src/cli.ts" ~/.local/bin/fanforge
+ln -s "$PWD/fanforge/src/cli.ts" ~/.local/bin/fanforge
 ```
 
 The database lives in `~/.local/share/fanforge/fanforge.db` (override with
@@ -252,7 +252,7 @@ matters — the range of story time it holds for. Canon entities carry a
 `review_status`, so an extraction the author has not checked can be marked as
 needing review.
 
-**Traversal is configurable and bounded** (`src/graph.ts`):
+**Traversal is configurable and bounded** (`fanforge/src/graph.ts`):
 
 - one or two hops by default, up to four
 - edge-type filters, direction filters, scope filters (canon / story / both)
@@ -272,7 +272,7 @@ needing review.
 
 ### The checks only a graph can do
 
-`src/graph-checks.ts` adds six deterministic checks:
+`fanforge/src/graph-checks.ts` adds six deterministic checks:
 
 - a character acting on something **before the event where they learn it**
 - an event that happens **before the event that caused it**
@@ -297,7 +297,7 @@ de-duplication and limits as the other kinds:
 
 ## Retrieval: text and graph together
 
-`src/retrieval.ts` is the unified service. For one scene it returns:
+`fanforge/src/retrieval.ts` is the unified service. For one scene it returns:
 
 - the passages FTS5 found
 - the graph nodes and connections within a hop or two of the scene's names
@@ -314,13 +314,13 @@ vector index can be added later without changing the callers.
 Two scripts, both offline and deterministic:
 
 ```bash
-node scripts/evaluate.ts <db> <project> scripts/questions/hp.json   # retrieval
-node scripts/evaluate.ts x --story                                 # the story side
-node scripts/evaluate-continuity.ts                                # the checks
-node scripts/evaluate-writing.ts <db> <project>                   # the prose
+node testing/scripts/evaluate.ts <db> <project> testing/scripts/questions/hp.json   # retrieval
+node testing/scripts/evaluate.ts x --story                                 # the story side
+node testing/scripts/evaluate-continuity.ts                                # the checks
+node testing/scripts/evaluate-writing.ts <db> <project>                   # the prose
 ```
 
-Results are in [EVALUATION.md](EVALUATION.md).
+Results are in [EVALUATION.md](docs/EVALUATION.md).
 
 ## Choosing a model
 
@@ -330,20 +330,20 @@ fanfiction, per unit of generation time, and is it worth sending different
 roles to different models.
 
 ```bash
-node scripts/benchmark/corpus.ts          # build the fixed corpus (once)
-node scripts/evaluate-models.ts --role all
-node scripts/evaluate-report.ts <run-id>  # the numbers, as markdown tables
-node scripts/evaluate-blind.ts <run-id>   # a packet for a human to rate
-node scripts/evaluate-judge.ts <run-id>   # a screen, not a verdict
-node scripts/evaluate-long-story.ts --models qwen2.5:7b --chapters 1-8
+node testing/scripts/benchmark/corpus.ts          # build the fixed corpus (once)
+node testing/scripts/evaluate-models.ts --role all
+node testing/scripts/evaluate-report.ts <run-id>  # the numbers, as markdown tables
+node testing/scripts/evaluate-blind.ts <run-id>   # a packet for a human to rate
+node testing/scripts/evaluate-judge.ts <run-id>   # a screen, not a verdict
+node testing/scripts/evaluate-long-story.ts --models qwen2.5:7b --chapters 1-8
 ```
 
 The corpus is the imported book, one extraction of its lore, an approved
 outline and an approved prologue — all built once, by the baseline model, and
 frozen, so that every candidate is given the same passages, the same graph,
 the same plan and the same story state. The method is in
-[BENCHMARK.md](BENCHMARK.md) and the measurements are in
-[RESULTS.md](RESULTS.md).
+[BENCHMARK.md](docs/BENCHMARK.md) and the measurements are in
+[RESULTS.md](docs/RESULTS.md).
 
 **What the models have to support.** All of them are Ollama models on the
 local machine, and the benchmark found three things worth knowing:
@@ -371,7 +371,7 @@ Two other things the benchmark assumes, both stated in the code:
   That is how the comparison stays a comparison.
 - The same seed, context window, temperature and token budget are used for
   every candidate, and every prompt, output, token count and duration is
-  written to `benchmarks/runs/<run-id>/`.
+  written to `testing/benchmarks/runs/<run-id>/`.
 
 ## The browser interface
 
@@ -437,24 +437,24 @@ a narrow window.
 
 | File | Role |
 | --- | --- |
-| `src/controller.ts` | the only component that writes to the database; routes context requests, owns approval state and generation limits |
-| `src/planner.ts` | premise, divergence point, structure, chapter outlines, discussion with the author |
-| `src/writer.ts` | writes chapters; owns the context-request protocol and the length/continuation loop |
-| `src/lore.ts` | imports sources, searches them, answers lore questions with citations, builds the canon event index |
-| `src/lorebook.ts` | extracts the book's lore into people, places, rules, relationships, facts and a timeline, each with evidence |
-| `src/continuity-settings.ts` | how much the continuity checker does and what it reports |
-| `src/graph.ts` | the knowledge graph: nodes, edges, traversal, ranking, rendering |
-| `src/graph-checks.ts` | the six continuity checks only a graph can do |
-| `src/retrieval.ts` | the unified retrieval service (text and graph together) |
-| `src/premise-check.ts` | checks a premise against the canon before a plan is approved |
-| `src/migrations.ts` | versioned schema migrations |
-| `src/memory.ts` | characters, states, knowledge, relationships, threads, facts, summaries, timeline; context assembly |
-| `src/continuity.ts` | deterministic checks (chronology, repetition, canon mixing) plus model-assisted checks |
-| `src/schema.ts` | the database schema, including the separation between canon and story tables |
-| `src/llm.ts` | providers: Ollama, llama.cpp / OpenAI-compatible, and an offline mock for tests |
-| `src/cli.ts` | the command line interface |
-| `src/server.ts` | the local web API and job runner |
-| `src/ui/` | the browser interface (plain HTML, CSS and JS — no build step) |
+| `fanforge/src/controller.ts` | the only component that writes to the database; routes context requests, owns approval state and generation limits |
+| `fanforge/src/planner.ts` | premise, divergence point, structure, chapter outlines, discussion with the author |
+| `fanforge/src/writer.ts` | writes chapters; owns the context-request protocol and the length/continuation loop |
+| `fanforge/src/lore.ts` | imports sources, searches them, answers lore questions with citations, builds the canon event index |
+| `fanforge/src/lorebook.ts` | extracts the book's lore into people, places, rules, relationships, facts and a timeline, each with evidence |
+| `fanforge/src/continuity-settings.ts` | how much the continuity checker does and what it reports |
+| `fanforge/src/graph.ts` | the knowledge graph: nodes, edges, traversal, ranking, rendering |
+| `fanforge/src/graph-checks.ts` | the six continuity checks only a graph can do |
+| `fanforge/src/retrieval.ts` | the unified retrieval service (text and graph together) |
+| `fanforge/src/premise-check.ts` | checks a premise against the canon before a plan is approved |
+| `fanforge/src/migrations.ts` | versioned schema migrations |
+| `fanforge/src/memory.ts` | characters, states, knowledge, relationships, threads, facts, summaries, timeline; context assembly |
+| `fanforge/src/continuity.ts` | deterministic checks (chronology, repetition, canon mixing) plus model-assisted checks |
+| `fanforge/src/schema.ts` | the database schema, including the separation between canon and story tables |
+| `fanforge/src/llm.ts` | providers: Ollama, llama.cpp / OpenAI-compatible, and an offline mock for tests |
+| `fanforge/src/cli.ts` | the command line interface |
+| `fanforge/src/server.ts` | the local web API and job runner |
+| `fanforge/src/ui/` | the browser interface (plain HTML, CSS and JS — no build step) |
 
 ### The database
 
@@ -615,8 +615,8 @@ check, continuity settings, the full plan → write → approve → remember wor
 persistence across a restart, and the web API. The tests use a mock provider,
 so they need no model and no GPU.
 
-The graph has its own suite (`test/graph.test.ts`, `test/graph-checks.test.ts`,
-`test/retrieval.test.ts`, `test/migrations.test.ts`): multi-hop retrieval and
+The graph has its own suite (`testing/tests/graph.test.ts`, `testing/tests/graph-checks.test.ts`,
+`testing/tests/retrieval.test.ts`, `testing/tests/migrations.test.ts`): multi-hop retrieval and
 relationship direction, entity resolution and duplicate prevention, evidence
 provenance, temporal filtering and character knowledge, canon/AU isolation,
 approval-gated updates and re-approval, persistence across restarts, retrieval

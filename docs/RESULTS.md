@@ -1,10 +1,10 @@
 # Benchmark results
 
 The method is in [BENCHMARK.md](BENCHMARK.md). Every number here comes from a
-run in `benchmarks/runs/`, and the tables can be regenerated with:
+run in `testing/benchmarks/runs/`, and the tables can be regenerated with:
 
 ```bash
-node scripts/evaluate-report.ts <run-id> ...
+node testing/scripts/evaluate-report.ts <run-id> ...
 ```
 
 **The setup.** Ubuntu, one RTX 5070 Ti (16 GB), Ollama 0.40.6, Node 24. The
@@ -299,7 +299,7 @@ what the checker can see, and a one-run measurement of it is not a measurement.
 **The human rating has not been done.** The packet is built and waiting:
 
 ```bash
-node scripts/evaluate-blind.ts write-04      # writes benchmarks/blind/write-04/
+node testing/scripts/evaluate-blind.ts write-04      # writes testing/benchmarks/blind/write-04/
 ```
 
 | file | what it is |
@@ -322,7 +322,7 @@ the strength of its prose alone, so the summary is expected to report the two
 groups separately.
 
 A model judge is available as a preliminary screen
-(`node scripts/evaluate-judge.ts <run-id> [judge]`), and it is labelled as
+(`node testing/scripts/evaluate-judge.ts <run-id> [judge]`), and it is labelled as
 one: the judge is itself a candidate, so it may prefer its own style, and a
 model rating prose is not a reader rating prose. It has not been validated
 against human ratings, because there are not any yet. Until somebody reads
@@ -343,23 +343,23 @@ export OLLAMA_MODELS=~/.local/share/ollama/models
 
 | what | command | what it takes |
 | --- | --- | --- |
-| the corpus (once) | `node scripts/benchmark/corpus.ts` | the book import plus a full lore extraction: about an hour on the 7B |
-| the corpus, re-read from scratch | `node scripts/benchmark/corpus.ts --rebuild-lore` | the same, again |
-| lore extraction | `node scripts/evaluate-models.ts --role lore --run <id>` | 6 windows per model, ~2 minutes per model |
-| lore with a bigger budget | `node scripts/evaluate-models.ts --role lore --run <id> --extract-tokens 8000` | the same, slower |
-| planning | `node scripts/evaluate-models.ts --role planning --run <id>` | one call per model |
-| chapter writing | `node scripts/evaluate-models.ts --role writing --run <id>` | one chapter per model |
-| continuity | `node scripts/evaluate-models.ts --role continuity --run <id>` | one call per model |
-| state extraction | `node scripts/evaluate-models.ts --role state --run <id>` | one call per model — **written but never run** |
-| the long story | `node scripts/evaluate-long-story.ts --chapters 1-8 --run <id>` | eight chapters per model, 3–11 minutes per model |
-| the tables above | `node scripts/evaluate-report.ts lore-02 plan-03 write-04 cont-03 long-02` | instant |
-| the blind packet | `node scripts/evaluate-blind.ts write-04` | instant, and deterministic for a given run |
-| the judge screen | `node scripts/evaluate-judge.ts write-04 gemma4:12b-it-q4_K_M` | one call; a screen, not a verdict |
+| the corpus (once) | `node testing/scripts/benchmark/corpus.ts` | the book import plus a full lore extraction: about an hour on the 7B |
+| the corpus, re-read from scratch | `node testing/scripts/benchmark/corpus.ts --rebuild-lore` | the same, again |
+| lore extraction | `node testing/scripts/evaluate-models.ts --role lore --run <id>` | 6 windows per model, ~2 minutes per model |
+| lore with a bigger budget | `node testing/scripts/evaluate-models.ts --role lore --run <id> --extract-tokens 8000` | the same, slower |
+| planning | `node testing/scripts/evaluate-models.ts --role planning --run <id>` | one call per model |
+| chapter writing | `node testing/scripts/evaluate-models.ts --role writing --run <id>` | one chapter per model |
+| continuity | `node testing/scripts/evaluate-models.ts --role continuity --run <id>` | one call per model |
+| state extraction | `node testing/scripts/evaluate-models.ts --role state --run <id>` | one call per model — **written but never run** |
+| the long story | `node testing/scripts/evaluate-long-story.ts --chapters 1-8 --run <id>` | eight chapters per model, 3–11 minutes per model |
+| the tables above | `node testing/scripts/evaluate-report.ts lore-02 plan-03 write-04 cont-03 long-02` | instant |
+| the blind packet | `node testing/scripts/evaluate-blind.ts write-04` | instant, and deterministic for a given run |
+| the judge screen | `node testing/scripts/evaluate-judge.ts write-04 gemma4:12b-it-q4_K_M` | one call; a screen, not a verdict |
 
 The run ids used here are `lore-01` (before the salvage fix), `lore-02`
 (3,000 tokens), `lore-03` (8,000 tokens), `plan-01` (before the context fix),
 `plan-03`, `write-04`, `cont-03` and `long-02`. Everything they contain is in
-`benchmarks/runs/`, including every prompt, every output, every token count
+`testing/benchmarks/runs/`, including every prompt, every output, every token count
 and every duration.
 
 **Caveats when you re-run them.**
@@ -403,7 +403,7 @@ of extracted relations is reported next to the recall.
 long story counts state records per model, but "the model recorded 25 events"
 is not "the model recorded 25 correct events": nothing here checks them
 against the story. The keyword-overlap state scenario that would do that
-(`scripts/benchmark/scenarios/state.ts`) is written and working, but it was
+(`testing/scripts/benchmark/scenarios/state.ts`) is written and working, but it was
 not run, so the long-story counts are the only evidence on state extraction
 and they are counts, not accuracies.
 
@@ -429,7 +429,7 @@ be dull — and every model here did all of those. Those are the things a
 reader does not notice, which is the point.
 
 **One judge, and it is a candidate.** The LLM screen in
-`scripts/evaluate-judge.ts` is disclosed as a screen, and it was not used for
+`testing/scripts/evaluate-judge.ts` is disclosed as a screen, and it was not used for
 any table here.
 
 **Two rows of the extraction budget run are invalid.** In `lore-03`, the
@@ -518,7 +518,7 @@ the argument for having the measurement.
 
 ### The next action, in order
 
-1. **Fill in `benchmarks/blind/write-04/ratings.csv`.** The question that
+1. **Fill in `testing/benchmarks/blind/write-04/ratings.csv`.** The question that
    matters is "does `gemma4` or `ornith` write better prose than
    `qwen2.5:7b`", and it is the one question the benchmark cannot answer
    without a person.

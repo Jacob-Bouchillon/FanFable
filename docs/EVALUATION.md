@@ -5,10 +5,10 @@ judge model: they count what is in the context, check quotations against the
 source, and compare against fixed expected answers.
 
 ```bash
-node scripts/evaluate.ts <db> <project> scripts/questions/hp.json   # retrieval
-node scripts/evaluate.ts x --story                                    # the story side
-node scripts/evaluate-continuity.ts                                   # the checks
-node scripts/evaluate-writing.ts <db> <project>                      # the prose
+node testing/scripts/evaluate.ts <db> <project> testing/scripts/questions/hp.json   # retrieval
+node testing/scripts/evaluate.ts x --story                                    # the story side
+node testing/scripts/evaluate-continuity.ts                                   # the checks
+node testing/scripts/evaluate-writing.ts <db> <project>                      # the prose
 ```
 
 The fixture is a real book: *Harry Potter and the Sorcerer's Stone*, 250
@@ -186,7 +186,7 @@ comparison is like for like. What changed:
 ## The long story
 
 A scripted five-chapter alternate universe, in the test suite
-(`test/long-story.test.ts`): a significant divergence, its consequences, three
+(`testing/tests/long-story.test.ts`): a significant divergence, its consequences, three
 characters who know different subsets of the truth, a secret revealed in the
 middle, a relationship that changes because of an event, a thread opened in
 chapter one and closed in chapter five, a flashback that happens before

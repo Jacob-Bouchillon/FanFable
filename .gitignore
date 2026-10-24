@@ -6,9 +6,8 @@ node_modules/
 .DS_Store
 fanforge.db
 .imports/
-benchmarks/data/
-benchmarks/runs/
-benchmarks/blind/
+# Local-only harness (never pushed): benchmark runs, ratings, corpora, scripts, tests
+testing/
 
 # Secrets and local environment
 .env

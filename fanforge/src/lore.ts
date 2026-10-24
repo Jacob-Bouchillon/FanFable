@@ -609,6 +609,14 @@ export async function extractCanonEvents(
     /** How many passages to read at a time. */
     windowSize?: number;
     onProgress?: (message: string) => void;
+    /** Structured window counts, for a progress monitor rather than the console. */
+    onWindow?: (progress: {
+      phase: 'events';
+      done: number;
+      total: number;
+      passagesDone: number;
+      passagesTotal: number;
+    }) => void;
   } = {},
 ): Promise<CanonEvent[]> {
   const params: unknown[] = [projectId];
@@ -636,12 +644,22 @@ export async function extractCanonEvents(
   // The events of a book are read in windows: one call for the whole book
   // would run out of tokens half way through.
   const windowSize = opts.windowSize ?? 8;
+  const totalWindows = Math.ceil(chunks.length / windowSize);
   const created: CanonEvent[] = [];
+  let done = 0;
   for (let start = 0; start < chunks.length; start += windowSize) {
     const window = chunks.slice(start, start + windowSize);
     const found = await extractEventsFromWindow(db, llm, projectId, window, opts);
     created.push(...found);
+    done++;
     opts.onProgress?.(`read passages ${start + 1}-${start + window.length} of ${chunks.length}`);
+    opts.onWindow?.({
+      phase: 'events',
+      done,
+      total: totalWindows,
+      passagesDone: start + window.length,
+      passagesTotal: chunks.length,
+    });
     if ((opts.maxEvents ?? 200) && created.length >= (opts.maxEvents ?? 200)) break;
   }
   return created;

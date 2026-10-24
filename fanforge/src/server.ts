@@ -122,7 +122,7 @@ export interface ServerOptions {
 
 export function startServer(opts: ServerOptions): import('node:http').Server {
   const { db, port = 8123 } = opts;
-  const importDir = opts.importDir ?? join(import.meta.dirname, '..', '.imports');
+  const importDir = opts.importDir ?? join(import.meta.dirname, '..', '..', '.imports');
   let projectId: number | null = opts.projectId;
 
   const llm = () => clientFrom(controller.getProject(db, projectId ?? -1)?.settings ?? {});

@@ -8,18 +8,21 @@
     "node": ">=22.18.0"
   },
   "bin": {
-    "fanforge": "./src/cli.ts"
+    "fanforge": "./fanforge/src/cli.ts"
   },
   "scripts": {
-    "fanforge": "node --no-warnings src/cli.ts",
-    "test": "node --no-warnings --test \"test/*.test.ts\"",
-    "eval:retrieval": "node scripts/evaluate.ts",
-    "eval:continuity": "node scripts/evaluate-continuity.ts",
-    "eval:writing": "node scripts/evaluate-writing.ts",
-    "eval:models": "node scripts/evaluate-models.ts",
-    "eval:blind": "node scripts/evaluate-blind.ts",
-    "eval:long": "node scripts/evaluate-long-story.ts",
-    "bench:corpus": "node scripts/benchmark/corpus.ts",
+    "fanforge": "node --no-warnings fanforge/src/cli.ts",
+    "test": "node --no-warnings --test \"testing/tests/*.test.ts\"",
+    "eval:retrieval": "node testing/scripts/evaluate.ts",
+    "eval:continuity": "node testing/scripts/evaluate-continuity.ts",
+    "eval:writing": "node testing/scripts/evaluate-writing.ts",
+    "eval:models": "node testing/scripts/evaluate-models.ts",
+    "eval:blind": "node testing/scripts/evaluate-blind.ts",
+    "eval:long": "node testing/scripts/evaluate-long-story.ts",
+    "bench:corpus": "node testing/scripts/benchmark/corpus.ts",
+    "bench:corpus:fresh": "node testing/scripts/benchmark/build-fresh-corpus.ts",
+    "bench:watch": "node --no-warnings testing/scripts/benchmark/watch.ts",
+    "eval:ratings": "node testing/scripts/compare-blind-ratings.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
