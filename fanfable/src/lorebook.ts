@@ -1041,9 +1041,15 @@ export function verifySpan(
 
 /** Parse one section of an answer, salvaging it when the answer was cut off. */
 function parseSection(text: string, key: string): Record<string, unknown>[] {
-  const parsed = extractJson<Record<string, unknown>>(text);
-  if (parsed && typeof parsed === 'object') {
-    const values = asRecordArray(parsed[key]);
+  const parsed = extractJson<unknown>(text);
+  // Models sometimes return the section as a bare list instead of the asked-for
+  // labelled box (e.g. `[{...}]` for relations). That is the same content and
+  // must not be silently dropped.
+  if (Array.isArray(parsed)) {
+    const values = asRecordArray(parsed);
+    if (values.length) return values;
+  } else if (parsed && typeof parsed === 'object') {
+    const values = asRecordArray((parsed as Record<string, unknown>)[key]);
     if (values.length) return values;
   }
   return salvageSection(text, key);
