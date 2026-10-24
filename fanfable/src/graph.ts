@@ -25,6 +25,8 @@
  */
 import { Db, fromJson, strList } from './db.ts';
 import { DEFAULT_EMBED_MODEL, cosine, embedTexts, readVectors, type EmbedFn } from './embeddings.ts';
+import type { LlmClient } from './llm.ts';
+import { filterDenseSeeds } from './recognition.ts';
 import { truncate } from './text.ts';
 
 export type GraphScope = 'canon' | 'story' | 'both';
@@ -1294,6 +1296,13 @@ export interface GraphContextOptions {
    * lexical seeding, exactly as before.
    */
   embed?: { embedFn?: EmbedFn; model?: string; baseUrl?: string };
+  /**
+   * Recognition filter for dense-only seeds (relational path only). When
+   * enabled, seeds with no lexical backing are checked against their passage
+   * text in one model call before PPR runs; lexical seeds are never filtered.
+   * Absent or disabled means no extra call, exactly as before.
+   */
+  recognize?: { llm: LlmClient; enabled?: boolean; maxSeeds?: number };
 }
 
 export interface GraphContext {
@@ -1314,6 +1323,8 @@ export interface GraphContext {
     ppr?: { nodes: number; iterations: number; converged: boolean };
     /** True when PPR found nothing and dense top-K passages filled in. */
     pprFallback?: boolean;
+    /** Recognition-filter counts, when dense-only seeds were checked. */
+    recognition?: { checked: number; kept: number; dropped: number };
   };
 }
 
@@ -1581,10 +1592,30 @@ export async function buildPprGraphContext(
   // Dense seeds: the query embedded once, cosine top-K over stored vectors.
   // Lexical weight wins ties; the PPR call itself is untouched.
   let densePassages: DensePassage[] = [];
+  let recognition: { checked: number; kept: number; dropped: number } | undefined;
+  const lexicalIds = new Set(weights.keys());
   if (opts.embed) {
     const dense = await resolveDenseSeeds(db, projectId, graph, opts.query ?? '', opts.embed);
     weights = mergeSeedWeights(weights, dense.seeds).merged;
     densePassages = dense.passages;
+  }
+  // Recognition filter: dense-only seeds (resemblance without lexical
+  // backing) are checked against their passage text before PPR spreads
+  // their scores. Lexical seeds are never filtered.
+  const rec = opts.recognize;
+  if (rec?.enabled) {
+    const denseOnly = [...weights.keys()]
+      .filter((id) => !lexicalIds.has(id))
+      .map((id) => ({ id, w: weights.get(id)! }));
+    if (denseOnly.length) {
+      const verdicts = await filterDenseSeeds(rec.llm, denseOnly, graph, db, projectId, {
+        query: opts.query ?? '',
+        maxSeeds: rec.maxSeeds,
+        lexicalIds,
+      });
+      for (const d of verdicts.dropped) weights.delete(d.id);
+      recognition = { checked: verdicts.checked, kept: verdicts.kept.length, dropped: verdicts.dropped.length };
+    }
   }
   const ppr = personalizedPageRank(graph, weights);
 
@@ -1675,6 +1706,7 @@ export async function buildPprGraphContext(
       seedVia: seed.via,
       ppr: { nodes: graph.nodes.size, iterations: ppr.iterations, converged: ppr.converged },
       ...(pprFallback ? { pprFallback: true } : {}),
+      ...(recognition ? { recognition } : {}),
     },
   };
 }

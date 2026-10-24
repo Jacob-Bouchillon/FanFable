@@ -101,6 +101,8 @@ export interface RetrievalPackage {
     ppr?: { nodes: number; iterations: number; converged: boolean };
     /** True when dense top-K passages filled an empty PPR package. */
     pprFallback?: boolean;
+    /** Recognition-filter counts, when dense-only seeds were checked. */
+    recognition?: { checked: number; kept: number; dropped: number };
   };
 }
 
@@ -264,6 +266,7 @@ export async function retrieve(
             maxNodes: hops > 1 ? 70 : 45,
             maxWords: Math.round(maxWords * 0.70),
             ...(denseEmbed ? { embed: denseEmbed } : {}),
+            recognize: { llm, enabled: req.dense !== false },
           })
         : graph.buildGraphContext(db, projectId, {
             query,
@@ -375,6 +378,7 @@ export async function retrieve(
       ...(lazyMined ? { lazyMined } : {}),
       ...(graphContext.stats.ppr ? { ppr: graphContext.stats.ppr } : {}),
       ...(graphContext.stats.pprFallback ? { pprFallback: true } : {}),
+      ...(graphContext.stats.recognition ? { recognition: graphContext.stats.recognition } : {}),
     },
   };
 }
