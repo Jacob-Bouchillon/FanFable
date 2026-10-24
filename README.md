@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="fanfable/src/ui/fanfable.png" alt="FanFable" width="250" />
+  <img src="fanfable/src/ui/fanfable-1024.png" alt="FanFable" width="350" />
 </p>
 
 <br />
