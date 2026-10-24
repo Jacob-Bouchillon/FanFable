@@ -89,7 +89,7 @@ export class LlmError extends Error {
 /* --------------------------------------------------------------- config file */
 
 export function configPath(): string {
-  const base = process.env.FANFORGE_CONFIG_DIR || join(homedir(), '.config', 'fanforge');
+  const base = process.env.FANFABLE_CONFIG_DIR || join(homedir(), '.config', 'fanfable');
   return join(base, 'config.json');
 }
 

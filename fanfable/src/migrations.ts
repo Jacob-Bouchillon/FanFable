@@ -3,7 +3,7 @@
  *
  * The base schema is applied as migration 1. Later migrations add columns and
  * tables without touching the data that is already there, so a database
- * written by an older version of fanforge keeps working and gains the new
+ * written by an older version of fanfable keeps working and gains the new
  * capabilities.
  *
  * Version tracking uses SQLite's own `user_version`, so it survives copies of

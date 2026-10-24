@@ -1,5 +1,5 @@
 {
-  "name": "fanforge",
+  "name": "fanfable",
   "version": "0.1.0",
   "description": "Local AI fanfiction generator: canon-grounded, continuity-aware long-form storytelling on your own machine.",
   "type": "module",
@@ -8,10 +8,10 @@
     "node": ">=22.18.0"
   },
   "bin": {
-    "fanforge": "./fanforge/src/cli.ts"
+    "fanfable": "./fanfable/src/cli.ts"
   },
   "scripts": {
-    "fanforge": "node --no-warnings fanforge/src/cli.ts",
+    "fanfable": "node --no-warnings fanfable/src/cli.ts",
     "test": "node --no-warnings --test \"testing/tests/*.test.ts\"",
     "eval:retrieval": "node testing/scripts/evaluate.ts",
     "eval:continuity": "node testing/scripts/evaluate-continuity.ts",

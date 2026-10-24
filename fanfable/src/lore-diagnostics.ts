@@ -149,7 +149,7 @@ export function diagnose(db: Db, projectId: number, opts: { limit?: number } = {
         subject: e.name,
         message: `${e.name} is in the index but has no relationships recorded.`,
         evidence: e.summary || 'no summary recorded',
-        suggestion: 'Run "fanforge lore enrich ' + e.name + '" to read the passages that mention them again.',
+        suggestion: 'Run "fanfable lore enrich ' + e.name + '" to read the passages that mention them again.',
       });
     } else if (e.mentions > 3 && rels.length === 1) {
       gaps.push({
@@ -239,7 +239,7 @@ export function diagnose(db: Db, projectId: number, opts: { limit?: number } = {
             evidence: truncate(sentence.trim(), 200),
             chunkId: passage.id,
             locator: passage.locator,
-            suggestion: `Check the passage, then "fanforge lore enrich ${entity.name}" or correct the relation by hand.`,
+            suggestion: `Check the passage, then "fanfable lore enrich ${entity.name}" or correct the relation by hand.`,
           });
           if (gaps.length >= limit * 4) break outer;
         }

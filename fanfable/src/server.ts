@@ -870,7 +870,7 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
   });
 
   server.listen(port, '127.0.0.1', () => {
-    console.log(`fanforge UI: http://127.0.0.1:${port}`);
+    console.log(`fanfable UI: http://127.0.0.1:${port}`);
   });
   return server;
 }

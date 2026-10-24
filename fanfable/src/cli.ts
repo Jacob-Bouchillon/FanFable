@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * fanforge — local AI fanfiction generator.
+ * fanfable — local AI fanfiction generator.
  *
  * Command line interface. Everything the prototype can do is reachable here:
  * create/reopen a project, import sources, search lore, plan collaboratively,
@@ -83,10 +83,10 @@ function heading(text: string): void {
 /* ------------------------------------------------------------------ paths */
 
 function defaultDbPath(): string {
-  if (process.env.FANFORGE_DB) return process.env.FANFORGE_DB;
+  if (process.env.FANFABLE_DB) return process.env.FANFABLE_DB;
   const base =
-    process.env.FANFORGE_DATA_DIR || join(homedir(), '.local', 'share', 'fanforge');
-  return join(base, 'fanforge.db');
+    process.env.FANFABLE_DATA_DIR || join(homedir(), '.local', 'share', 'fanfable');
+  return join(base, 'fanfable.db');
 }
 
 function globalState(): Record<string, unknown> {
@@ -109,10 +109,10 @@ function setGlobalState(patch: Record<string, unknown>): void {
 /* ------------------------------------------------------------------- help */
 
 const HELP = `
-${C.bold('fanforge')} — local AI fanfiction generator
+${C.bold('fanfable')} — local AI fanfiction generator
 
 ${C.bold('USAGE')}
-  fanforge [--db <path>] [--project <name>] <command> [args]
+  fanfable [--db <path>] [--project <name>] <command> [args]
 
 ${C.bold('PROJECT')}
   project create <name>            Create a project
@@ -200,7 +200,7 @@ function requireProject(args: Args): controller.Project {
   const name = (args.flags.project as string) ?? (globalState().lastProject as string);
   if (!name) {
     throw new Error(
-      'No project selected. Use --project <name>, or run "fanforge project use <name>".',
+      'No project selected. Use --project <name>, or run "fanfable project use <name>".',
     );
   }
   const project = controller.getProjectByName(db, name);
@@ -237,14 +237,14 @@ async function cmdProject(args: Args): Promise<void> {
       setGlobalState({ lastProject: p.name });
       heading(`Created project "${p.name}"`);
       console.log(`id: ${p.id}`);
-      console.log(`Next: fanforge --project ${p.name} import <your book files>`);
+      console.log(`Next: fanfable --project ${p.name} import <your book files>`);
       return;
     }
     case 'list': {
       const projects = controller.listProjects(db);
       heading('Projects');
       if (!projects.length) {
-        console.log('(none — create one with "fanforge project create <name>")');
+        console.log('(none — create one with "fanfable project create <name>")');
         return;
       }
       const active = globalState().lastProject;
@@ -393,7 +393,7 @@ async function cmdLore(args: Args): Promise<void> {
       `${C.green('extracted')} ${stats.entities} entities, ${stats.relations} relationships, ` +
         `${stats.facts} facts, ${stats.timeline} timeline entries`,
     );
-    console.log(C.dim('  review them with "fanforge lore show"'));
+    console.log(C.dim('  review them with "fanfable lore show"'));
     return;
   }
 
@@ -417,7 +417,7 @@ async function cmdLore(args: Args): Promise<void> {
 
   if (sub === 'enrich') {
     const name = args._[2];
-    if (!name) throw new Error('a name is required: fanforge lore enrich <name>');
+    if (!name) throw new Error('a name is required: fanfable lore enrich <name>');
     heading(`Re-reading the passages about ${name}`);
     const result = await loreDiag.enrichEntity(db, a.llm, project.id, name, {
       maxPassages: flagNumber(args, 'passages', 12),
@@ -548,7 +548,7 @@ async function cmdLore(args: Args): Promise<void> {
     const events = lore.listCanonEvents(db, project.id, flagNumber(args, 'limit', 50));
     heading('Canon events');
     if (!events.length) {
-      console.log('(no index yet — run "fanforge lore events --extract")');
+      console.log('(no index yet — run "fanfable lore events --extract")');
       return;
     }
     for (const e of events) {
@@ -614,14 +614,14 @@ async function cmdPlan(args: Args): Promise<void> {
     for (const w of warnings) console.log(`${C.yellow('warning:')} ${w}`);
     printOutline(outline);
     console.log(
-      `\n${C.yellow('This is a draft proposal.')} Review it, then run ${C.bold('fanforge plan approve')} to make it established.`,
+      `\n${C.yellow('This is a draft proposal.')} Review it, then run ${C.bold('fanfable plan approve')} to make it established.`,
     );
     return;
   }
 
   if (sub === 'show') {
     const outline = planner.approvedOutline(db, project.id) ?? planner.latestOutline(db, project.id);
-    if (!outline) throw new Error('no outline yet — run "fanforge plan draft"');
+    if (!outline) throw new Error('no outline yet — run "fanfable plan draft"');
     printOutline(outline);
     return;
   }
@@ -806,8 +806,8 @@ function printWriteResult(result: controller.WriteChapterResult): void {
     printIssues(result.issues);
   }
   console.log(
-    `\nReview it with ${C.bold(`fanforge write show ${result.chapter.number}`)} ` +
-      `then ${C.bold(`fanforge write approve ${result.chapter.number}`)}.`,
+    `\nReview it with ${C.bold(`fanfable write show ${result.chapter.number}`)} ` +
+      `then ${C.bold(`fanfable write approve ${result.chapter.number}`)}.`,
   );
 }
 
@@ -887,7 +887,7 @@ async function cmdContinuity(args: Args): Promise<void> {
     console.log(`model checks:   ${current.modelChecks ? 'yes' : 'no'}`);
     console.log(`check drafts:   ${current.onDraft ? 'yes' : 'no'}`);
     console.log(`report:         ${current.minSeverity} and above`);
-    console.log(`\n${C.dim('change it with: fanforge continuity --off | --on | --model on|off | --drafts on|off | --severity error|warning|note')}`);
+    console.log(`\n${C.dim('change it with: fanfable continuity --off | --on | --model on|off | --drafts on|off | --severity error|warning|note')}`);
     return;
   }
 
@@ -933,7 +933,7 @@ async function cmdGraph(args: Args): Promise<void> {
   }
 
   const name = flagString(args, 'name') || (sub === 'stats' ? '' : sub);
-  if (!name) throw new Error('a name is required: fanforge graph <name>');
+  if (!name) throw new Error('a name is required: fanfable graph <name>');
   const hops = flagNumber(args, 'hops', 1);
   const g = graph.loadGraph(db, project.id);
   const roots = graph.resolveRoots(g, [name]);
@@ -984,7 +984,7 @@ async function cmdConflicts(args: Args): Promise<void> {
       `\n${C.yellow(`[${c.kind}]`)} ${C.bold(c.subject)} — ${c.message}` +
         `\n   ${C.dim('established: ' + c.existingRef + ' · this chapter: ' + c.incomingRef)}` +
         (c.evidence ? `\n   ${C.dim(c.evidence)}` : '') +
-        `\n   ${C.dim('resolve with: fanforge conflicts resolve ' + c.id + ' --status accepted|resolved')}`,
+        `\n   ${C.dim('resolve with: fanfable conflicts resolve ' + c.id + ' --status accepted|resolved')}`,
     );
   }
 }

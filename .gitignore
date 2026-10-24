@@ -4,7 +4,7 @@ node_modules/
 *.db-shm
 *.db-journal
 .DS_Store
-fanforge.db
+fanfable.db
 .imports/
 # Local-only harness (never pushed): benchmark runs, ratings, corpora, scripts, tests
 testing/

@@ -1,4 +1,4 @@
-/* fanforge UI — application logic.
+/* fanfable UI — application logic.
    Plain ES modules-free JS, no build step. Views are functions that render
    into #content; state lives in one object at the top. */
 
