@@ -4,6 +4,8 @@
   <img src="fanfable/src/ui/fanfable.png" alt="FanFable logo" width="200" />
 </p>
 
+<br />
+
 FanFable is a local AI writing tool for creating fanfiction and alternate-universe stories based on books you provide. It aims to help AI understand a book's characters, relationships, events, and lore so it can generate new stories without constantly losing track of canon.
 
 Instead of relying on prompts alone, FanFable aims to build a connected understanding of the source material. This can help with story planning, continuity, and exploring new ideas while staying consistent with the original book.
