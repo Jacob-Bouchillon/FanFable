@@ -101,6 +101,8 @@ export interface RetrievalPackage {
     ppr?: { nodes: number; iterations: number; converged: boolean };
     /** True when dense top-K passages filled an empty PPR package. */
     pprFallback?: boolean;
+    /** Similarity-web edges in the loaded graph, per kind. */
+    web?: { aliasEdges: number; resemblanceEdges: number; cooccurrenceEdges: number };
     /** Recognition-filter counts, when dense-only seeds were checked. */
     recognition?: { checked: number; kept: number; dropped: number };
   };
@@ -379,6 +381,7 @@ export async function retrieve(
       ...(graphContext.stats.ppr ? { ppr: graphContext.stats.ppr } : {}),
       ...(graphContext.stats.pprFallback ? { pprFallback: true } : {}),
       ...(graphContext.stats.recognition ? { recognition: graphContext.stats.recognition } : {}),
+      ...(graphContext.stats.web ? { web: graphContext.stats.web } : {}),
     },
   };
 }

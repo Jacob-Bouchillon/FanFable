@@ -24,10 +24,96 @@
  * story time it holds for.
  */
 import { Db, fromJson, strList } from './db.ts';
-import { DEFAULT_EMBED_MODEL, cosine, embedTexts, readVectors, type EmbedFn } from './embeddings.ts';
+import { DEFAULT_EMBED_MODEL, cosine, embedTexts, readVectors, resolveEmbedConfig, type EmbedFn } from './embeddings.ts';
 import type { LlmClient } from './llm.ts';
 import { filterDenseSeeds } from './recognition.ts';
+import { looksAlike, nameRelation, sharedSpeakerScene, speakerChunksByEntity } from './lorebook.ts';
 import { truncate } from './text.ts';
+
+/* --------------------------------------------- similarity-web weights
+ *
+ * One block so the bake-off can tune them later. Alias edges join what the
+ * merge rules call one thing; resemblance joins what vectors agree on;
+ * co-occurrence joins what the book keeps putting in one window. All three
+ * are ranker infrastructure: PPR spreads along them, the text never shows
+ * them, and every one is weaker than a real relation (weight 1) except a
+ * confirmed alias.
+ */
+export const ALIAS_WEIGHT = 1.0;
+export const QUARANTINE_WEIGHT = 0.5;
+export const RESEMBLANCE_THRESHOLD = 0.75;
+export const RESEMBLANCE_TOPK = 3;
+export const COOCCURRENCE_MIN_WINDOWS = 2;
+export const COOCCURRENCE_WEIGHT_PER_WINDOW = 0.15;
+export const COOCCURRENCE_WEIGHT_CAP = 0.5;
+export const HUB_DF_FRACTION = 0.5;
+
+export interface CooccurrenceLink {
+  a: number;
+  b: number;
+  /** Windows mentioning both. */
+  windows: number;
+  weight: number;
+}
+
+/**
+ * Which entity pairs earn a co-occurrence edge, from window sets alone.
+ *
+ * Pairs sharing fewer than COOCCURRENCE_MIN_WINDOWS windows are noise;
+ * anything in more than HUB_DF_FRACTION of all windows is a score sink and
+ * disqualifies every pair it touches. Pairs come out in id order, so the
+ * same input always yields the same links.
+ */
+/**
+ * Per-kind counts of the similarity web in a loaded graph, for stats and
+ * diagnostics. The web is ranker infrastructure; these counts say how much
+ * of it a query had to spread along.
+ */
+export function countWebEdges(graph: Graph): {
+  aliasEdges: number;
+  resemblanceEdges: number;
+  cooccurrenceEdges: number;
+} {
+  let aliasEdges = 0;
+  let resemblanceEdges = 0;
+  let cooccurrenceEdges = 0;
+  for (const edge of graph.edges) {
+    if (edge.type === 'alias_of') aliasEdges++;
+    else if (edge.type === 'resembles') resemblanceEdges++;
+    else if (edge.type === 'appears_with') cooccurrenceEdges++;
+  }
+  return { aliasEdges, resemblanceEdges, cooccurrenceEdges };
+}
+
+export function cooccurrenceLinks(
+  entityWindows: Map<number, Set<number>>,
+  totalWindows: number,
+): CooccurrenceLink[] {
+  const out: CooccurrenceLink[] = [];
+  if (totalWindows <= 0) return out;
+  const ids = [...entityWindows.keys()]
+    .filter((id) => (entityWindows.get(id)?.size ?? 0) / totalWindows <= HUB_DF_FRACTION)
+    .sort((a, b) => a - b);
+  for (let i = 0; i < ids.length; i++) {
+    for (let j = i + 1; j < ids.length; j++) {
+      const a = ids[i]!;
+      const b = ids[j]!;
+      const sa = entityWindows.get(a)!;
+      const sb = entityWindows.get(b)!;
+      const [small, large] = sa.size <= sb.size ? [sa, sb] : [sb, sa];
+      let shared = 0;
+      for (const w of small) if (large.has(w)) shared++;
+      if (shared < COOCCURRENCE_MIN_WINDOWS) continue;
+      out.push({
+        a,
+        b,
+        windows: shared,
+        weight: Math.min(COOCCURRENCE_WEIGHT_CAP, COOCCURRENCE_WEIGHT_PER_WINDOW * shared),
+      });
+    }
+  }
+  return out;
+}
 
 export type GraphScope = 'canon' | 'story' | 'both';
 
@@ -507,6 +593,151 @@ export function loadGraph(db: Db, projectId: number, opts: GraphLoadOptions = {}
           extra: { weight: 1 },
         });
       }
+    }
+
+    // Alias web: pairs the merge rules would join stay linked, recomputed
+    // read-only — merge behavior itself is untouched. A same-name pair is
+    // certain (1.0); a containment the co-speaker veto blocked, or a mere
+    // lookalike, is probable (0.5). One edge per pair: PPR already spreads
+    // every edge both ways.
+    const aliasSpeakers = speakerChunksByEntity(db, projectId);
+    const aliasEntities = db.all<{ id: number; kind: string; name: string }>(
+      'SELECT id, kind, name FROM canon_entity WHERE project_id = ? ORDER BY id',
+      projectId,
+    );
+    for (let i = 0; i < aliasEntities.length; i++) {
+      for (let j = i + 1; j < aliasEntities.length; j++) {
+        const a = aliasEntities[i]!;
+        const b = aliasEntities[j]!;
+        // A person and a place can share a name; they are not the same thing.
+        if (a.kind !== b.kind) continue;
+        const relation = nameRelation(a.name, b.name);
+        let weight: number | null = null;
+        if (relation === 'same') weight = ALIAS_WEIGHT;
+        else if (relation === 'containment') {
+          weight = sharedSpeakerScene(aliasSpeakers, a.id, b.id) ? QUARANTINE_WEIGHT : ALIAS_WEIGHT;
+        } else if (looksAlike(a.name, b.name).alike) weight = QUARANTINE_WEIGHT;
+        if (weight === null) continue;
+        const [x, y] = a.id < b.id ? [a, b] : [b, a];
+        addEdge(graph, {
+          id: `canon:alias:${x.id}:${y.id}`,
+          from: canonEntityId(x.id),
+          to: canonEntityId(y.id),
+          type: 'alias_of',
+          scope: 'canon',
+          description: '',
+          evidence: '',
+          confidence: 1,
+          reviewStatus: 'accepted',
+          extra: { weight },
+        });
+      }
+    }
+
+    // Resemblance web: entities whose stored vectors agree get linked at
+    // their similarity. No vectors, no edges — a purely lexical graph loads
+    // exactly as before. At most RESEMBLANCE_TOPK edges per node, greedy in
+    // id order so the same input always yields the same edges.
+    const activeModel = resolveEmbedConfig(db, projectId, {}).model;
+    const entityVecs = new Map(
+      readVectors(db, projectId, activeModel)
+        .filter((v) => v.kind === 'entity' && v.vec.length > 0)
+        .map((v) => [v.ref, v.vec] as [string, number[]]),
+    );
+    for (const id of [...entityVecs.keys()]) {
+      if (!graph.nodes.has(id)) entityVecs.delete(id);
+    }
+    const resembleDegree = new Map<string, number>();
+    const resembledPairs = new Set<string>();
+    for (const id of [...entityVecs.keys()].sort()) {
+      const scored: { other: string; sim: number }[] = [];
+      for (const other of entityVecs.keys()) {
+        if (other === id) continue;
+        const sim = cosine(entityVecs.get(id)!, entityVecs.get(other)!);
+        if (sim >= RESEMBLANCE_THRESHOLD) scored.push({ other, sim });
+      }
+      scored.sort((a, b) => b.sim - a.sim || (a.other < b.other ? -1 : 1));
+      for (const { other, sim } of scored.slice(0, RESEMBLANCE_TOPK)) {
+        const key = id < other ? `${id}|${other}` : `${other}|${id}`;
+        if (resembledPairs.has(key)) continue;
+        if ((resembleDegree.get(id) ?? 0) >= RESEMBLANCE_TOPK) continue;
+        if ((resembleDegree.get(other) ?? 0) >= RESEMBLANCE_TOPK) continue;
+        resembledPairs.add(key);
+        resembleDegree.set(id, (resembleDegree.get(id) ?? 0) + 1);
+        resembleDegree.set(other, (resembleDegree.get(other) ?? 0) + 1);
+        const [x, y] = id < other ? [id, other] : [other, id];
+        const xn = graph.nodes.get(x)!.numericId;
+        const yn = graph.nodes.get(y)!.numericId;
+        const [nx, ny] = xn < yn ? [xn, yn] : [yn, xn];
+        addEdge(graph, {
+          id: `canon:resembles:${nx}:${ny}`,
+          from: x,
+          to: y,
+          type: 'resembles',
+          scope: 'canon',
+          description: '',
+          evidence: '',
+          confidence: 1,
+          reviewStatus: 'accepted',
+          extra: { weight: sim },
+        });
+      }
+    }
+
+    // Co-occurrence web: pairs mentioned together in at least
+    // COOCCURRENCE_MIN_WINDOWS windows of 8 consecutive passages. One
+    // shared window is noise; a ubiquitous entity is a score sink, so pairs
+    // involving anything above HUB_DF_FRACTION of windows get nothing.
+    const winRows = db.all<{ id: number; source_id: number; seq: number }>(
+      'SELECT id, source_id, seq FROM canon_chunk WHERE project_id = ? ORDER BY source_id, seq',
+      projectId,
+    );
+    const chunkWindow = new Map<number, number>();
+    {
+      let window = -1;
+      let count = 0;
+      let lastSource = -1;
+      for (const row of winRows) {
+        if (row.source_id !== lastSource || count >= 8) {
+          window++;
+          count = 0;
+          lastSource = row.source_id;
+        }
+        chunkWindow.set(row.id, window);
+        count++;
+      }
+    }
+    const totalWindows = chunkWindow.size ? Math.max(...chunkWindow.values()) + 1 : 0;
+    const entityWindows = new Map<number, Set<number>>();
+    for (const node of graph.nodes.values()) {
+      if (node.kind !== 'canon-entity' || node.scope !== 'canon') continue;
+      const windows = new Set<number>();
+      for (const ref of node.sourceRefs) {
+        if (typeof ref.chunk !== 'number') continue;
+        const w = chunkWindow.get(ref.chunk);
+        if (w !== undefined) windows.add(w);
+      }
+      const first = node.extra?.firstChunk;
+      if (typeof first === 'number') {
+        const w = chunkWindow.get(first);
+        if (w !== undefined) windows.add(w);
+      }
+      if (windows.size) entityWindows.set(node.numericId, windows);
+    }
+    for (const { a, b, weight } of cooccurrenceLinks(entityWindows, totalWindows)) {
+      const [x, y] = a < b ? [a, b] : [b, a];
+      addEdge(graph, {
+        id: `canon:appears-with:${x}:${y}`,
+        from: canonEntityId(x),
+        to: canonEntityId(y),
+        type: 'appears_with',
+        scope: 'canon',
+        description: '',
+        evidence: '',
+        confidence: 1,
+        reviewStatus: 'accepted',
+        extra: { weight },
+      });
     }
   }
 
@@ -1323,6 +1554,8 @@ export interface GraphContext {
     ppr?: { nodes: number; iterations: number; converged: boolean };
     /** True when PPR found nothing and dense top-K passages filled in. */
     pprFallback?: boolean;
+    /** Similarity-web edges in the loaded graph, per kind. */
+    web?: { aliasEdges: number; resemblanceEdges: number; cooccurrenceEdges: number };
     /** Recognition-filter counts, when dense-only seeds were checked. */
     recognition?: { checked: number; kept: number; dropped: number };
   };
@@ -1355,7 +1588,10 @@ export function resolveQuerySeeds(
     });
 
   // 1. A relation triple the query describes, with at least one endpoint named.
+  //    Web edges (alias/resemblance/co-occurrence) carry no claim and never
+  //    seed, even if a query word brushes their type name.
   for (const edge of graph.edges) {
+    if (edge.type === 'alias_of' || edge.type === 'resembles' || edge.type === 'appears_with') continue;
     const from = graph.nodes.get(edge.from);
     const to = graph.nodes.get(edge.to);
     if (!from || !to) continue;
@@ -1470,6 +1706,7 @@ export function buildGraphContext(
       passages: passages.length,
       words: finalText.split(/\s+/).length,
       seedVia: seed.via,
+      web: countWebEdges(graph),
     },
   };
 }
@@ -1707,6 +1944,7 @@ export async function buildPprGraphContext(
       ppr: { nodes: graph.nodes.size, iterations: ppr.iterations, converged: ppr.converged },
       ...(pprFallback ? { pprFallback: true } : {}),
       ...(recognition ? { recognition } : {}),
+      web: countWebEdges(graph),
     },
   };
 }
@@ -1818,7 +2056,9 @@ export function renderGraphContext(
   ]);
   // Mention edges are ranker infrastructure, not claims: they say where an
   // entity was seen, which the passages underneath already show.
-  const shown = edges.filter((e) => e.type !== 'mentions_in');
+  const shown = edges.filter(
+    (e) => e.type !== 'mentions_in' && e.type !== 'alias_of' && e.type !== 'resembles' && e.type !== 'appears_with',
+  );
   const relationEdges = shown.filter((e) => !NAVIGATIONAL.has(e.type));
   const navigational = shown.filter((e) => NAVIGATIONAL.has(e.type));
 

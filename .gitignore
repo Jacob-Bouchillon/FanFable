@@ -9,6 +9,9 @@ fanfable.db
 # Local-only harness (never pushed): benchmark runs, ratings, corpora, scripts, tests
 testing/
 
+# Local-only reference material (never pushed): upstream sources to read, not to ship
+RESOURCES/
+
 # Secrets and local environment
 .env
 .env.*

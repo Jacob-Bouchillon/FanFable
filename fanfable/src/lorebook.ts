@@ -1579,7 +1579,7 @@ function normalise(text: string): string {
  * not, so "Dursley" and "Dursleys" is handled separately and a name is never
  * singularised on its own ("James" must not become "Jame").
  */
-function canonicalName(name: string): string {
+export function canonicalName(name: string): string {
   return name
     .toLowerCase()
     .replace(/[’']s\b/g, '')
@@ -1589,7 +1589,7 @@ function canonicalName(name: string): string {
     .trim();
 }
 
-function nameTokens(name: string): string[] {
+export function nameTokens(name: string): string[] {
   return canonicalName(name).split(' ').filter(Boolean);
 }
 
@@ -1600,7 +1600,7 @@ function nameTokens(name: string): string[] {
  *  - containment:   every word of the shorter name is in the longer one
  *  - null:          not a variant by rule
  */
-function nameRelation(a: string, b: string): 'same' | 'containment' | null {
+export function nameRelation(a: string, b: string): 'same' | 'containment' | null {
   const ka = canonicalName(a);
   const kb = canonicalName(b);
   if (!ka || !kb) return null;
@@ -1619,7 +1619,7 @@ const SPEAKER_VERBS =
   'said|asked|replied|answered|whispered|shouted|cried|muttered|added|continued|repeated|snapped|murmured|yelled|called';
 
 /** The names used as dialogue speakers in a passage, lowercased. */
-function speakersIn(text: string): string[] {
+export function speakersIn(text: string): string[] {
   const out: string[] = [];
   const before = new RegExp(`(?:^|[.!?\\n]\\s*)([A-Z][a-z]+(?:\\s+[A-Z][a-z]+){0,2})\\s+(?:${SPEAKER_VERBS})\\b`, 'g');
   const after = new RegExp(`\\b(?:${SPEAKER_VERBS})\\s+([A-Z][a-z]+(?:\\s+[A-Z][a-z]+){0,2})`, 'g');
@@ -1639,7 +1639,7 @@ function speakersIn(text: string): string[] {
  * one looks like a shorter version of the other: that is the veto the alias
  * merge needs.
  */
-function speakerChunksByEntity(db: Db, projectId: number): Map<number, Set<number>> {
+export function speakerChunksByEntity(db: Db, projectId: number): Map<number, Set<number>> {
   const byEntity = new Map<number, Set<number>>();
   const entities = listEntities(db, projectId).map((e) => ({
     id: e.id,
@@ -1668,7 +1668,7 @@ function speakerChunksByEntity(db: Db, projectId: number): Map<number, Set<numbe
 }
 
 /** Was the same passage a scene two different people spoke in? */
-function sharedSpeakerScene(
+export function sharedSpeakerScene(
   speakers: Map<number, Set<number>>,
   a: number,
   b: number,
@@ -1682,7 +1682,7 @@ function sharedSpeakerScene(
 }
 
 /** A cheap "these two look like the same person" test for quarantine. */
-function looksAlike(a: string, b: string): { alike: boolean; reason: string } {
+export function looksAlike(a: string, b: string): { alike: boolean; reason: string } {
   const ta = nameTokens(a);
   const tb = nameTokens(b);
   if (!ta.length || !tb.length) return { alike: false, reason: '' };
