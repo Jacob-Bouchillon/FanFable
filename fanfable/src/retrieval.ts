@@ -27,6 +27,7 @@ import { Db } from './db.ts';
 import type { LlmClient } from './llm.ts';
 import * as lore from './lore.ts';
 import * as lorebook from './lorebook.ts';
+import * as embeddings from './embeddings.ts';
 import * as graph from './graph.ts';
 
 export interface RetrievalRequest {
@@ -58,6 +59,13 @@ export interface RetrievalRequest {
    * today's unmined behavior.
    */
   lazyExtract?: boolean;
+  /**
+   * Seed PPR with dense cosine matches alongside the lexical triple/event
+   * seeds. Defaults on for everything except the fast lookup path, which
+   * pays zero embedding work. Currently takes effect on the relational path
+   * only; lookup and vague behave exactly as before.
+   */
+  dense?: boolean;
 }
 
 /** What kind of question this is, and therefore which path answers it. */
@@ -91,6 +99,8 @@ export interface RetrievalPackage {
     lazyMined?: { windows: number; entities: number; relations: number };
     /** PageRank diagnostics, when the relational path ranked by PPR. */
     ppr?: { nodes: number; iterations: number; converged: boolean };
+    /** True when dense top-K passages filled an empty PPR package. */
+    pprFallback?: boolean;
   };
 }
 
@@ -230,15 +240,21 @@ export async function retrieve(
    * Build the graph side, the supporting passages and the budgeted text.
    * Called once, and again with a second hop if the coverage check asks for it.
    */
-  const assemble = (hops: number): {
+  // Dense config resolves from project settings (a DB read, no network);
+  // the single query embed happens inside, only when vectors are stored.
+  const denseEmbed =
+    relational && req.dense !== false
+      ? embeddings.resolveEmbedConfig(db, projectId, { fallbackBaseUrl: llm.settings.baseUrl })
+      : undefined;
+  const assemble = async (hops: number): Promise<{
     graphContext: graph.GraphContext;
     keptPassages: lore.Passage[];
     supporting: lore.Passage[];
     text: string;
-  } => {
+  }> => {
     const graphContext = includeGraph
       ? relational
-        ? graph.buildPprGraphContext(db, projectId, {
+        ? await graph.buildPprGraphContext(db, projectId, {
             query,
             focus: focus.length ? focus : graph.terms(query).slice(0, 3),
             hops,
@@ -247,6 +263,7 @@ export async function retrieve(
             // A two-hop walk needs room: the answer is often at the far end.
             maxNodes: hops > 1 ? 70 : 45,
             maxWords: Math.round(maxWords * 0.70),
+            ...(denseEmbed ? { embed: denseEmbed } : {}),
           })
         : graph.buildGraphContext(db, projectId, {
             query,
@@ -306,7 +323,7 @@ export async function retrieve(
     return { graphContext, keptPassages, supporting, text: parts.join('\n\n') };
   };
 
-  let assembled = assemble(req.hops ?? 1);
+  let assembled = await assemble(req.hops ?? 1);
 
   const coverage = (built: typeof assembled): RetrievalCoverage => {
     const requested = focus;
@@ -335,7 +352,7 @@ export async function retrieve(
   // The tail check: a name the package does not carry is the symptom of a walk
   // that stopped one hop too early. Walk once more before giving up.
   if (relational && includeGraph && cov.missing.length && (req.hops ?? 1) < 2) {
-    assembled = assemble(2);
+    assembled = await assemble(2);
     cov = coverage(assembled);
   }
 
@@ -357,6 +374,7 @@ export async function retrieve(
       coverage: cov,
       ...(lazyMined ? { lazyMined } : {}),
       ...(graphContext.stats.ppr ? { ppr: graphContext.stats.ppr } : {}),
+      ...(graphContext.stats.pprFallback ? { pprFallback: true } : {}),
     },
   };
 }

@@ -218,6 +218,30 @@ export const MIGRATIONS: Migration[] = [
     `,
   },
   {
+    version: 8,
+    name: 'embedding store',
+    // Dense seeds for PPR: one row per passage, entity and triple per model.
+    // ref is a chunk id for passages and a stable node id (canon:entity:12,
+    // canon:relation:34) for the rest. Rows are keyed by exact model string,
+    // so a model change backfills fresh rows instead of mixing dimensions.
+    sql: `
+      CREATE TABLE IF NOT EXISTS embedding (
+        id         INTEGER PRIMARY KEY,
+        project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        chunk_id   INTEGER REFERENCES canon_chunk(id) ON DELETE CASCADE,
+        kind       TEXT NOT NULL DEFAULT 'passage',
+        ref        TEXT NOT NULL DEFAULT '',
+        model      TEXT NOT NULL DEFAULT '',
+        dims       INTEGER NOT NULL DEFAULT 0,
+        vec        TEXT NOT NULL DEFAULT '[]',
+        updated_at TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS embedding_kind_ref_model
+        ON embedding(project_id, kind, ref, model);
+      CREATE INDEX IF NOT EXISTS embedding_chunk ON embedding(chunk_id);
+    `,
+  },
+  {
     version: 3,
     name: 'chapter references for story graph records',
     // Knowledge, motives, secrets and relationships have to be removable when

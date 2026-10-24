@@ -15,6 +15,7 @@ import { Db } from './db.ts';
 import * as controller from './controller.ts';
 import * as lore from './lore.ts';
 import * as lorebook from './lorebook.ts';
+import * as embeddings from './embeddings.ts';
 import * as graph from './graph.ts';
 import * as loreDiag from './lore-diagnostics.ts';
 import { listConflicts, resolveConflict } from './state-conflicts.ts';
@@ -351,6 +352,20 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
             full: body.full === true,
             onProgress: (m) => progress(m),
           });
+        });
+        json(res, 200, { jobId: id });
+        return;
+      }
+
+      if (path === '/api/book-lore/embed' && method === 'POST') {
+        const body = await readJson(req);
+        const { id } = startJob('embed-lore', async (progress) => {
+          const p = project();
+          const cfg = embeddings.resolveEmbedConfig(db, p.id, {
+            model: typeof body.model === 'string' ? body.model : undefined,
+            fallbackBaseUrl: llm().settings.baseUrl,
+          });
+          return embeddings.embedBackfill(db, p.id, cfg, (m) => progress(m));
         });
         json(res, 200, { jobId: id });
         return;

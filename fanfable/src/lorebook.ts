@@ -13,6 +13,7 @@
 import { Db, nowIso, strList, toJson } from './db.ts';
 import { asRecordArray, extractJson, salvageJsonArray, toStringArray } from './json.ts';
 import type { LlmClient } from './llm.ts';
+import { embedMissing, type EmbedFn } from './embeddings.ts';
 import { splitSentences, truncate } from './text.ts';
 
 /* ------------------------------------------------------------------ models */
@@ -252,6 +253,12 @@ export interface ExtractOptions {
   seed?: number;
   /** Mine everything, ignoring maxWindows/priorityFirst/randomFloor. */
   full?: boolean;
+  /**
+   * Embed newly mined rows when the embedder is reachable, else leave them
+   * NULL for the backfill. Opt-in only: extraction never makes network calls
+   * by default. Never fails the run.
+   */
+  embed?: { baseUrl: string; model?: string; embedFn?: EmbedFn; batchSize?: number; timeoutMs?: number };
   onProgress?: (message: string) => void;
   /** Structured window counts, for a progress monitor rather than the console. */
   onWindow?: (progress: ExtractWindowProgress) => void;
@@ -599,6 +606,13 @@ export async function extractLore(
   stats.quarantinedAliases = merged.quarantined;
   // Now that the entities and the events exist, marry the two.
   linkTimelineToEvents(db, projectId);
+  if (opts.embed) {
+    try {
+      await embedMissing(db, projectId, opts.embed);
+    } catch {
+      /* embedding never fails an extraction */
+    }
+  }
   stats.windows = runList.length;
   rememberExtractionReport(db, projectId, stats);
 

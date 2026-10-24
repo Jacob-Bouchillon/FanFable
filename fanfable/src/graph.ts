@@ -24,6 +24,7 @@
  * story time it holds for.
  */
 import { Db, fromJson, strList } from './db.ts';
+import { DEFAULT_EMBED_MODEL, cosine, embedTexts, readVectors, type EmbedFn } from './embeddings.ts';
 import { truncate } from './text.ts';
 
 export type GraphScope = 'canon' | 'story' | 'both';
@@ -1286,6 +1287,13 @@ export interface GraphContextOptions {
    * word happens to match a summary.
    */
   seedMode?: 'entity' | 'triple';
+  /**
+   * Dense PPR seeds (relational path only). When present and vectors are
+   * stored for the model, the query is embedded once and cosine top-K
+   * triples/entities/passages join the lexical seeds. Absent means purely
+   * lexical seeding, exactly as before.
+   */
+  embed?: { embedFn?: EmbedFn; model?: string; baseUrl?: string };
 }
 
 export interface GraphContext {
@@ -1304,6 +1312,8 @@ export interface GraphContext {
     seedVia?: 'triple' | 'event' | 'entity';
     /** PageRank diagnostics, when the context was ranked by PPR. */
     ppr?: { nodes: number; iterations: number; converged: boolean };
+    /** True when PPR found nothing and dense top-K passages filled in. */
+    pprFallback?: boolean;
   };
 }
 
@@ -1453,6 +1463,79 @@ export function buildGraphContext(
   };
 }
 
+export interface DenseSeed {
+  id: string;
+  w: number;
+}
+
+export interface DensePassage {
+  chunkId: number;
+  score: number;
+}
+
+/**
+ * Merge dense seeds into lexical ones. Lexical weight always wins a tie:
+ * what the query names outranks what it merely resembles.
+ */
+export function mergeSeedWeights(
+  lexical: Map<string, number>,
+  dense: DenseSeed[],
+): { merged: Map<string, number>; added: number } {
+  const merged = new Map(lexical);
+  let added = 0;
+  for (const { id, w } of dense) {
+    if (!merged.has(id)) {
+      merged.set(id, w);
+      added++;
+    }
+  }
+  return { merged, added };
+}
+
+/**
+ * Cosine top-K seeds from stored vectors: triples/entities at 0.8, passages
+ * at 0.3. A triple seeds both its endpoints, the way triple-seeding does.
+ * Returns nothing when no vectors are stored for the model or the query
+ * cannot be embedded — the caller then behaves exactly as lexical-only.
+ */
+export async function resolveDenseSeeds(
+  db: Db,
+  projectId: number,
+  graph: Graph,
+  query: string,
+  cfg: { embedFn?: EmbedFn; model?: string; baseUrl?: string },
+): Promise<{ seeds: DenseSeed[]; passages: DensePassage[] }> {
+  const none = { seeds: [] as DenseSeed[], passages: [] as DensePassage[] };
+  const model = cfg.model ?? DEFAULT_EMBED_MODEL;
+  const stored = readVectors(db, projectId, model);
+  if (!stored.length || !query.trim()) return none;
+  const embed = cfg.embedFn ?? ((texts: string[]) => embedTexts(texts, { baseUrl: cfg.baseUrl ?? 'http://127.0.0.1:11434', model }));
+  const qvec = (await embed([query]))?.[0];
+  if (!qvec) return none;
+
+  const scored = stored
+    .map((s) => ({ ...s, score: cosine(qvec, s.vec) }))
+    .filter((s) => s.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  const seeds: DenseSeed[] = [];
+  for (const hit of scored.filter((s) => s.kind !== 'passage').slice(0, 8)) {
+    if (hit.kind === 'entity') {
+      if (graph.nodes.has(hit.ref)) seeds.push({ id: hit.ref, w: 0.8 });
+      continue;
+    }
+    const edge = graph.edges.find((e) => e.id === hit.ref);
+    if (!edge) continue;
+    seeds.push({ id: edge.from, w: 0.8 }, { id: edge.to, w: 0.8 });
+  }
+  const passages: DensePassage[] = [];
+  for (const hit of scored.filter((s) => s.kind === 'passage').slice(0, 4)) {
+    const chunkId = Number(hit.ref);
+    if (Number.isFinite(chunkId)) passages.push({ chunkId, score: hit.score });
+  }
+  return { seeds, passages };
+}
+
 /**
  * Graph context ranked by personalised PageRank instead of the hop walk.
  *
@@ -1464,11 +1547,11 @@ export function buildGraphContext(
  * `stats.ppr`. When PPR finds nothing, the passages fall back to exactly
  * today's reference-backed list (today's FTS5 top-K covers the rest).
  */
-export function buildPprGraphContext(
+export async function buildPprGraphContext(
   db: Db,
   projectId: number,
   opts: GraphContextOptions = {},
-): GraphContext {
+): Promise<GraphContext> {
   const graph = loadGraph(db, projectId, { scope: opts.scope });
   const queryTerms = terms(opts.query ?? '');
   const focusNames = opts.focus ?? [];
@@ -1481,7 +1564,7 @@ export function buildPprGraphContext(
 
   // Same triple/event seeding the hop walk uses.
   const seed = resolveQuerySeeds(graph, opts.query ?? '', focusNames);
-  const weights = new Map<string, number>();
+  let weights = new Map<string, number>();
   for (const root of seed.roots) weights.set(root, 1);
   // The passages the seeds mention start with a little weight of their own,
   // so evidence near a seed outranks evidence several hops out.
@@ -1494,6 +1577,14 @@ export function buildPprGraphContext(
       if (!node || node.kind !== 'canon-passage') continue;
       if (!weights.has(other)) weights.set(other, 0.2);
     }
+  }
+  // Dense seeds: the query embedded once, cosine top-K over stored vectors.
+  // Lexical weight wins ties; the PPR call itself is untouched.
+  let densePassages: DensePassage[] = [];
+  if (opts.embed) {
+    const dense = await resolveDenseSeeds(db, projectId, graph, opts.query ?? '', opts.embed);
+    weights = mergeSeedWeights(weights, dense.seeds).merged;
+    densePassages = dense.passages;
   }
   const ppr = personalizedPageRank(graph, weights);
 
@@ -1540,6 +1631,16 @@ export function buildPprGraphContext(
       orderedChunkIds.push(chunkId);
     }
   }
+  // DPR-style fallback without embeddings-in-the-loop: when PPR and the
+  // walked references both come up empty but dense passages exist, the dense
+  // top-K fills the passage budget instead of an empty package.
+  let pprFallback = false;
+  if (orderedChunkIds.length === 0 && densePassages.length > 0) {
+    for (const { chunkId } of densePassages) {
+      if (!orderedChunkIds.includes(chunkId)) orderedChunkIds.push(chunkId);
+    }
+    pprFallback = true;
+  }
   const passages: GraphContext['passages'] = [];
   for (const chunkId of orderedChunkIds) {
     const row = db.get<{ id: number; locator: string; text: string }>(
@@ -1573,6 +1674,7 @@ export function buildPprGraphContext(
       words: pprText.split(/\s+/).length,
       seedVia: seed.via,
       ppr: { nodes: graph.nodes.size, iterations: ppr.iterations, converged: ppr.converged },
+      ...(pprFallback ? { pprFallback: true } : {}),
     },
   };
 }

@@ -21,6 +21,7 @@ import { clientFrom } from './llm.ts';
 import type { LlmSettings } from './llm.ts';
 import * as lore from './lore.ts';
 import * as lorebook from './lorebook.ts';
+import * as embeddings from './embeddings.ts';
 import * as graph from './graph.ts';
 import * as loreDiag from './lore-diagnostics.ts';
 import { listConflicts, resolveConflict } from './state-conflicts.ts';
@@ -129,6 +130,7 @@ ${C.bold('SOURCE MATERIAL')}
                            Extract the book's lore: people, places, rules, facts.
                            No budget flags mines everything; --max-windows caps it (top priority
                            first, seeded sample of the rest); --full ignores the budget.
+  lore embed [--model m]           Embed passages, entities and triples for dense retrieval
   lore merge                       Merge entries that are the same under two names
   lore diagnose                    Report what the index is probably missing
   lore enrich <name>              Re-read the passages about one character
@@ -434,6 +436,25 @@ async function cmdLore(args: Args): Promise<void> {
       );
     }
     console.log(C.dim('  review them with "fanfable lore show"'));
+    return;
+  }
+
+  if (sub === 'embed') {
+    heading('Embedding book lore');
+    const cfg = embeddings.resolveEmbedConfig(db, project.id, {
+      model: flagString(args, 'model') || undefined,
+      fallbackBaseUrl: a.llm.settings.baseUrl,
+    });
+    const stats = await embeddings.embedBackfill(
+      db,
+      project.id,
+      { ...cfg, batchSize: flagNumber(args, 'batch', 32) },
+      (m) => process.stdout.write(`  ${C.dim(m)}\n`),
+    );
+    console.log(
+      `${C.green('embedded')} ${stats.embedded} vectors for ${C.bold(stats.model)} ` +
+        `(${stats.skipped} already embedded, ${stats.dims} dims)`,
+    );
     return;
   }
 
