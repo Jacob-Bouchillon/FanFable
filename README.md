@@ -52,3 +52,7 @@ FanFable is still a work in progress, with plenty left to build and improve.
 I'm open to feedback, constructive criticism, advice, and contributions. I'm especially interested in hearing from people with experience in **LLM information extraction, retrieval systems, knowledge graphs, and long-document processing**.
 
 If you have useful research, resources, or ideas that could help with these areas, I'd love to hear from you.
+
+## License
+
+FanFable is licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later). See [LICENSE](LICENSE) for the full license text.
