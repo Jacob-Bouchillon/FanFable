@@ -1651,7 +1651,115 @@ export function markerFor(edgeType: string): string {
 }
 
 /**
- * Choose traversal roots from what the query actually asks about.
+ * Family composition: answer from the web instead of mining.
+ *
+ * Two banked ties imply a third through one middle person — Dudley son of
+ * Mrs Dursley plus Mrs Dursley aunt of Harry means Dudley cousin of Harry —
+ * with no new reading. Only the closed family table below composes; friend
+ * of a friend proves nothing. One hop only: composed answers never feed
+ * another composition, so a wrong row cannot cascade. Nothing is banked.
+ */
+type FamilyBase = 'child' | 'parent' | 'sibling' | 'spouse' | 'aunt-or-uncle' | 'cousin' | 'grandparent' | 'nephew-or-niece';
+
+const FAMILY_BASES: ReadonlyMap<string, FamilyBase> = new Map([
+  ['child of', 'child'], ['son of', 'child'], ['daughter of', 'child'],
+  ['parent of', 'parent'], ['mother of', 'parent'], ['father of', 'parent'],
+  ['sibling of', 'sibling'], ['brother of', 'sibling'], ['sister of', 'sibling'],
+  ['spouse of', 'spouse'], ['wife of', 'spouse'], ['husband of', 'spouse'], ['married to', 'spouse'], ['married', 'spouse'],
+  ['aunt of', 'aunt-or-uncle'], ['uncle of', 'aunt-or-uncle'],
+  ['nephew of', 'nephew-or-niece'], ['niece of', 'nephew-or-niece'],
+  ['cousin of', 'cousin'],
+  ['grandparent of', 'grandparent'], ['grandmother of', 'grandparent'], ['grandfather of', 'grandparent'],
+]);
+
+const INVERSE_BASE: Record<FamilyBase, FamilyBase> = {
+  child: 'parent', parent: 'child', sibling: 'sibling', spouse: 'spouse',
+  'aunt-or-uncle': 'nephew-or-niece', 'nephew-or-niece': 'aunt-or-uncle', cousin: 'cousin', grandparent: 'grandparent',
+};
+
+/** X-R1-Y plus Y-R2-Z implies X-RESULT-Z. Ungendered outputs only: the web
+ * never knows which gendered word the source would use. */
+const COMPOSE: ReadonlyMap<string, string> = new Map([
+  ['child+aunt-or-uncle', 'cousin of'],
+  ['child+parent', 'sibling of'],
+  ['child+spouse', 'parent of'],
+  ['parent+parent', 'grandparent of'],
+  ['parent+sibling', 'parent of'],
+  ['sibling+parent', 'relative of'],
+  ['sibling+child', 'child of'],
+  ['spouse+child', 'parent of'],
+  ['aunt-or-uncle+parent', 'relative of'],
+]);
+
+const INVERT_LABEL: ReadonlyMap<string, string> = new Map([
+  ['child of', 'parent of'], ['son of', 'parent of'], ['daughter of', 'parent of'],
+  ['parent of', 'child of'], ['mother of', 'child of'], ['father of', 'child of'],
+]);
+
+export interface ComposedPath {
+  /** The middle person the answer walks through. */
+  via: string;
+  /** The implied tie, X to Y. */
+  label: string;
+}
+
+/**
+ * A composed family path between two entities, if accepted rows imply one.
+ * Only rows nobody disputes count: accepted review, uncontested. Read-only.
+ */
+export function findComposedPath(db: Db, projectId: number, aId: number, bId: number): ComposedPath | null {
+  if (aId === bId) return null;
+  const rows = db.all<{ f: number; t: number; kind: string; fn: string; tn: string }>(
+    `SELECT r.from_entity AS f, r.to_entity AS t, r.kind AS kind, fe.name AS fn, te.name AS tn
+       FROM canon_relation r
+       JOIN canon_entity fe ON fe.id = r.from_entity
+       JOIN canon_entity te ON te.id = r.to_entity
+      WHERE r.project_id = ? AND r.review_status = 'accepted'
+        AND (r.from_entity = ? OR r.to_entity = ? OR r.from_entity = ? OR r.to_entity = ?)`,
+    projectId, aId, aId, bId, bId,
+  );
+  // Oriented edges out of each endpoint: base label as seen from X toward Y.
+  const oriented = (x: number, r: { f: number; t: number; kind: string }): { base: FamilyBase; mid: number; name: string } | null => {
+    const base = FAMILY_BASES.get(r.kind.trim().toLowerCase());
+    if (!base) return null;
+    if (r.f === x) return { base, mid: r.t, name: '' };
+    if (r.t === x) return { base: INVERSE_BASE[base], mid: r.f, name: '' };
+    return null;
+  };
+  const names = new Map<number, string>();
+  for (const r of rows) { names.set(r.f, r.fn); names.set(r.t, r.tn); }
+  // Edges out of X toward the middle, in X-to-middle reading.
+  const towardMid = (z: number, r: { f: number; t: number; kind: string }): { base: FamilyBase; mid: number } | null => {
+    const base = FAMILY_BASES.get(r.kind.trim().toLowerCase());
+    if (!base) return null;
+    if (r.t === z) return { base, mid: r.f }; // edge runs mid -> Z with base label
+    if (r.f === z) return { base: INVERSE_BASE[base], mid: r.t }; // edge runs Z -> mid; read backwards
+    return null;
+  };
+  const aOut = rows.map((r) => ({ r, o: oriented(aId, r) })).filter((x) => x.o && x.o.mid !== bId);
+  const zIn = rows.map((r) => ({ r, o: towardMid(bId, r) })).filter((x) => x.o && x.o.mid !== aId);
+  for (const a of aOut) {
+    for (const z of zIn) {
+      if (a.o!.mid !== z.o!.mid) continue;
+      const label = COMPOSE.get(`${a.o!.base}+${z.o!.base}`);
+      if (!label) continue;
+      return { via: names.get(a.o!.mid) ?? '?', label };
+    }
+  }
+  // Same search with the endpoints swapped, inverting the answer.
+  const bOut = rows.map((r) => ({ r, o: oriented(bId, r) })).filter((x) => x.o && x.o.mid !== aId);
+  const aIn = rows.map((r) => ({ r, o: towardMid(aId, r) })).filter((x) => x.o && x.o.mid !== bId);
+  for (const b of bOut) {
+    for (const a of aIn) {
+      if (b.o!.mid !== a.o!.mid) continue;
+      const label = COMPOSE.get(`${b.o!.base}+${a.o!.base}`);
+      if (!label) continue;
+      return { via: names.get(b.o!.mid) ?? '?', label: INVERT_LABEL.get(label) ?? label };
+    }
+  }
+  return null;
+}
+/**
  *
  * A multi-hop question names a relationship, not an entity: "who is Serena's
  * sister" is answered by the sibling edge, and starting from the word "sister"

@@ -102,6 +102,8 @@ export interface RetrievalPackage {
     truncated: boolean;
     route: RetrievalRoute;
     coverage: RetrievalCoverage;
+    /** A family tie the web already implies, so no mining was needed. */
+    composedPath?: { via: string; label: string };
     /** Windows mined on demand for this query, when the lazy path fired. */
     lazyMined?: { windows: number; entities: number; relations: number };
     /** PageRank diagnostics, when the relational path ranked by PPR. */
@@ -235,8 +237,17 @@ export async function retrieve(
 
   /* ------------------------------- lazy mining of unmined hits */
   let lazyMined: { windows: number; entities: number; relations: number } | undefined;
+  let composedPath: { via: string; label: string } | undefined;
   const lazyOn = req.lazyExtract ?? route !== 'lookup';
-  if (lazyOn && req.includeGraph !== false && passages.length) {
+  // A family tie the web already implies needs no fresh reading: two people
+  // joined by a composed path through accepted rows skip the mining the
+  // query would otherwise pay for. Nothing is banked; the graph answers.
+  if (lazyOn && relational && focus.length >= 2) {
+    const a = lorebook.findEntity(db, projectId, focus[0]!);
+    const b = lorebook.findEntity(db, projectId, focus[1]!);
+    if (a && b) composedPath = graph.findComposedPath(db, projectId, a.id, b.id) ?? undefined;
+  }
+  if (lazyOn && req.includeGraph !== false && passages.length && !composedPath) {
     const mini = await lorebook.mineUnminedHits(
       db,
       llm,
@@ -388,6 +399,7 @@ export async function retrieve(
       route,
       coverage: cov,
       ...(lazyMined ? { lazyMined } : {}),
+      ...(composedPath ? { composedPath } : {}),
       ...(graphContext.stats.ppr ? { ppr: graphContext.stats.ppr } : {}),
       ...(graphContext.stats.pprFallback ? { pprFallback: true } : {}),
       ...(graphContext.stats.recognition ? { recognition: graphContext.stats.recognition } : {}),

@@ -182,7 +182,7 @@ Reply with JSON only:
 
 Rules:
 - "from" and "to" must both be names from the KNOWN ENTITIES list. Do not invent a name, and do not use a name that is not listed, even if it appears in the passage.
-- Record only a lasting tie these passages state explicitly. A tie stays true pages later (family, lasting roles, friend or enemy). A moment happens once (met, gave, told, saw, wished, refused) and is never a tie, even when stated. Never infer one.
+- Record only a lasting tie these passages state explicitly. A tie stays true pages later (family, lasting roles, friend or enemy). A moment happens once (met, gave, told, saw, wished, refused) and is never a tie, even when stated: moments belong to events, and a moment label is dropped and counted. A noun tie must be spoken in its quote: sister, brother, father and their kin only bank when the proving sentence says the word. Never infer one.
 - Be thorough within lasting ties: list every lasting tie the passages state explicitly — most windows contain several. Do not stop after the first one or two, and do not pad the list with moments.
 - One relation per entry, with one kind. If two people have several relationships, write a separate entry for each.
 - The direction matters: "from" is the one who has the relationship and "to" is the one it is to. If Harry is Petunia's nephew, it is from="Harry", to="Petunia", kind="nephew of".
@@ -295,6 +295,15 @@ export interface VerificationStats {
   /** Claims whose quote names nobody in the claim (third roster person
    * instead); flagged in the counter and never written. */
   unrelated: number;
+  /** Claims whose label is a moment, not a tie (met, gave, told, saw,
+   * refused and their kin belong to events); counted and never written. */
+  moment: number;
+  /** Claims whose generic kinship word repeats a specific one already banked
+   * for the pair ("parent of" beside "father of"); counted and never written. */
+  redundant: number;
+  /** Claims whose noun tie the quote never speaks ("cousin of" proved by a
+   * sentence without the word); counted and never written. */
+  unsupported: number;
 }
 
 /**
@@ -754,7 +763,7 @@ function blankResult(): ExtractLoreResult {
     timeline: 0,
     passages: 0,
     windows: 0,
-    verification: { claimed: 0, verified: 0, repointed: 0, dropped: 0, unresolved: 0, unrelated: 0 },
+    verification: { claimed: 0, verified: 0, repointed: 0, dropped: 0, unresolved: 0, unrelated: 0, moment: 0, redundant: 0, unsupported: 0 },
     emptyWindows: [],
     quarantinedAliases: [],
     mergedAliases: [],
@@ -1504,6 +1513,96 @@ function applyRelations(
       : refsFor(chunk);
     const kinds = normaliseKinds(String(raw.kind ?? ''));
     for (const kind of kinds) {
+      // A moment is never a tie, however real its quote: met, gave, told,
+      // saw, refused and their kin belong to events. Counted, never written.
+      if (isMomentKind(kind)) {
+        stats.verification.moment++;
+        continue;
+      }
+      // A generic kinship word repeats a specific one: "parent of" beside
+      // "father of" says nothing new. The generic drops when the specific
+      // is banked; a specific arriving late replaces the banked generic.
+      // Unordered pair, like the merge below.
+      const lk = kind.toLowerCase();
+      const specifics = GENERIC_KINSHIP.get(lk);
+      if (specifics) {
+        const dup = db.get<{ id: number }>(
+          `SELECT id FROM canon_relation WHERE project_id = ? AND lower(kind) IN (${[...specifics].map(() => '?').join(',')})
+             AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?)) LIMIT 1`,
+          projectId,
+          ...[...specifics].map((s) => s.toLowerCase()),
+          fromId,
+          toId,
+          toId,
+          fromId,
+        );
+        if (dup) {
+          stats.verification.redundant++;
+          continue;
+        }
+      } else {
+        for (const [generic, kinds] of GENERIC_KINSHIP) {
+          if (!kinds.has(lk)) continue;
+          const stale = db.all<{ id: number }>(
+            'SELECT id FROM canon_relation WHERE project_id = ? AND lower(kind) = ? AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))',
+            projectId,
+            generic,
+            fromId,
+            toId,
+            toId,
+            fromId,
+          );
+          if (stale.length) {
+            for (const row of stale) db.run('DELETE FROM canon_relation WHERE id = ?', row.id);
+            stats.verification.redundant += stale.length;
+          }
+          break;
+        }
+      }
+      // A noun tie must be spoken: sister, brother, father and their kin
+      // only bank when the quote itself says the word. A true label on a
+      // silent quote ("cousin of" proved by "What's his name again?") is
+      // dropped and counted, never banked.
+      if (isUnsupportedKind(kind, span.quote)) {
+        stats.verification.unsupported++;
+        continue;
+      }
+      // The same claim in two words: one pair, one quote, one head verb
+      // ("trusts with life" beside "trusts with important task"). Merge into
+      // the earliest row instead of banking both; the longer telling wins,
+      // exactly like the same-label merge below.
+      const headWord = (k: string): string => {
+        const stop = new Set(['a', 'an', 'the', 'to', 'of', 'with', 'by', 'for', 'in', 'on', 'at']);
+        return k.toLowerCase().split(/[^a-z]+/).filter((w) => w && !stop.has(w))[0] ?? '';
+      };
+      const rivals = db.all<{ id: number; kind: string; description: string; evidence: string; source_refs: string }>(
+        `SELECT id, kind, description, evidence, source_refs FROM canon_relation
+          WHERE project_id = ? AND evidence = ? AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))
+          ORDER BY id`,
+        projectId,
+        span.quote,
+        fromId,
+        toId,
+        toId,
+        fromId,
+      );
+      const twin = rivals.find((r) => headWord(r.kind) === headWord(kind) && headWord(kind).length > 0);
+      if (twin) {
+        const description = String(raw.description ?? '').trim();
+        const sentence = description.length > twin.description.length ? description : twin.description;
+        const quote = span.quote.length > twin.evidence.length ? span.quote : twin.evidence;
+        const sourceRefs = earliestRefs(db, toJson(refs), twin.source_refs);
+        db.run(
+          'UPDATE canon_relation SET kind = ?, description = ?, evidence = ?, source_refs = ? WHERE id = ?',
+          twin.kind,
+          sentence,
+          quote,
+          sourceRefs,
+          twin.id,
+        );
+        accepted++;
+        continue;
+      }
       const existing = db.get<{ id: number; kind: string; description: string; evidence: string; source_refs: string; review_status: string }>(
         `SELECT id, kind, description, evidence, source_refs, review_status
          FROM canon_relation
@@ -2542,6 +2641,81 @@ export function linkTimelineToEvents(
   return { linked, participants: participantRows, unlinked };
 }
 
+
+/**
+ * Words that make a label a moment, not a tie.
+ *
+ * A tie stays true pages later. These verbs happen once and belong to
+ * events: the model narrating an interaction instead of stating what two
+ * people are to each other. Whole words only. Drawn from the bank's own
+ * filler labels plus the action bucket, never from any one book: meeting,
+ * giving, telling, seeing, wishing and refusing are moments everywhere.
+ */
+const MOMENT_WORDS = new Set(
+  ('met meet gave give told tell saw see heard hear wished wish refused refuse ' +
+    'offered offer asked ask asks winked winks wink annoyed annoy punished punish ' +
+    'target follower follow questioned question explained explain disagreed disagree ' +
+    'comforted comfort admired admire disappointed disappoint proud shook shake ' +
+    'dropped drop talking talk rumored rumor signalled signaled signal watched watch ' +
+    'knows knew know known observed observe seen')
+    .split(' '),
+);
+
+/** A generic kinship word drops when the same pair holds the specific one:
+ * "parent of" says nothing once "father of" is banked. Universal sets only:
+ * every generic maps to the specific words that entail it. */
+const GENERIC_KINSHIP: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ['parent of', new Set(['father of', 'mother of'])],
+  ['sibling of', new Set(['brother of', 'sister of'])],
+  ['child of', new Set(['son of', 'daughter of'])],
+]);
+
+/** True when a relation kind is named by a noun the quote must speak aloud.
+ * Exported for the trials counter so the gate and the measuring stick never
+ * disagree. Whole words, case-insensitive. */
+export function isMomentKind(kind: string): boolean {
+  const words = (kind ?? '').toLowerCase().split(/[^a-z]+/).filter(Boolean);
+  return words.some((w) => MOMENT_WORDS.has(w));
+}
+
+/**
+ * Kin words that share one meaning. A noun tie banks only when the quote
+ * itself says the word or one of its kin: "sister of" needs sister, sibling
+ * or brother in the proving sentence, not merely nearby. Verb phrases and
+ * unlisted words skip this check — the moment gate already handles verbs.
+ */
+const KIN_GROUPS: ReadonlyArray<ReadonlySet<string>> = [
+  new Set(['sibling', 'brother', 'sister']),
+  new Set(['parent', 'mother', 'father']),
+  new Set(['child', 'son', 'daughter']),
+  new Set(['spouse', 'wife', 'husband', 'married', 'marriage']),
+  new Set(['grandmother', 'grandfather', 'grandson', 'granddaughter']),
+  new Set(['relative', 'relation', 'relationship', 'family', 'kin', 'uncle', 'aunt', 'cousin', 'nephew', 'niece']),
+  new Set(['friend', 'friends', 'friendly']),
+  new Set(['enemy', 'enemies', 'foe']),
+  new Set(['ally', 'allies']),
+  new Set(['teacher', 'student', 'mentor', 'master', 'servant', 'guardian', 'commander', 'captain']),
+];
+
+/** The kin groups a label touches, if any. Empty means no noun to check. */
+function kinGroupsOf(kind: string): ReadonlySet<string>[] {
+  const words = new Set((kind ?? '').toLowerCase().split(/[^a-z]+/).filter(Boolean));
+  return KIN_GROUPS.filter((g) => [...g].some((w) => words.has(w)));
+}
+
+/**
+ * True when the quote fails to speak the tie's noun: the label names a kin
+ * group no word of the quote belongs to. "Cousin of" proved by "What's his
+ * name again?" is exactly this — true from knowledge, silent in the sentence.
+ */
+export function isUnsupportedKind(kind: string, quote: string): boolean {
+  const groups = kinGroupsOf(kind);
+  if (!groups.length) return false;
+  const want = new Set<string>();
+  for (const g of groups) for (const w of g) want.add(w);
+  const quoteWords = new Set((quote ?? '').toLowerCase().split(/[^a-z]+/).filter(Boolean));
+  return ![...want].some((w) => quoteWords.has(w));
+}
 
 /**
  * Split a relation kind into single kinds.
