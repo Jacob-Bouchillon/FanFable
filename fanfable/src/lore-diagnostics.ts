@@ -21,6 +21,7 @@ import { Db, nowIso, strList, toJson } from './db.ts';
 import { extractJson } from './json.ts';
 import type { LlmClient } from './llm.ts';
 import * as lorebook from './lorebook.ts';
+import { preferThin, readHandoff } from './chain-handoff.ts';
 import { truncate } from './text.ts';
 
 /* ------------------------------------------------------------- diagnostics */
@@ -28,6 +29,7 @@ import { truncate } from './text.ts';
 export type GapKind =
   | 'isolated-entity'
   | 'thin-entity'
+  | 'thin-thread'
   | 'contradictory-relation'
   | 'missing-relation'
   | 'unsupported-claim'
@@ -333,7 +335,54 @@ export function diagnose(db: Db, projectId: number, opts: { limit?: number } = {
     }
   }
 
-  return gaps.slice(0, limit);
+  // 4. Thin threads: a verified tie standing on one window alone. The claim
+  // is proven but uncorroborated — one re-read either firms it or breaks it.
+  // Appended last so existing gaps keep their slots; read-only like the rest.
+  {
+    const support = lorebook.relationCorroboration(db, projectId);
+    const pairSizes = new Map<string, number>();
+    for (const r of relations) {
+      const key = [r.from_entity, r.to_entity].sort((a, b) => a - b).join(':');
+      pairSizes.set(key, (pairSizes.get(key) ?? 0) + 1);
+    }
+    const locatorOf = new Map(passages.map((p) => [p.id, p.locator] as [number, string]));
+    const chunkOf = (refs: string): number | undefined => {
+      try {
+        const arr = JSON.parse(refs || '[]') as { chunk?: unknown }[];
+        for (const ref of arr) {
+          const id = Number(ref?.chunk);
+          if (Number.isFinite(id) && id > 0) return id;
+        }
+      } catch {
+        /* unplaceable stays unplaceable */
+      }
+      return undefined;
+    };
+    for (const r of relations) {
+      if (!r.evidence.trim()) continue;
+      if ((support.get(r.id) ?? 1) !== 1) continue;
+      const key = [r.from_entity, r.to_entity].sort((a, b) => a - b).join(':');
+      if ((pairSizes.get(key) ?? 0) !== 1) continue;
+      const pair = `${names.get(r.from_entity) ?? '?'} / ${names.get(r.to_entity) ?? '?'}`;
+      const chunkId = chunkOf(r.source_refs);
+      gaps.push({
+        kind: 'thin-thread',
+        severity: 'note',
+        subject: pair,
+        message: `${pair} is recorded as "${r.kind}" from a single window: "${truncate(r.description || r.kind, 120)}".`,
+        evidence: r.evidence || 'no quote recorded',
+        chunkId,
+        locator: chunkId !== undefined ? locatorOf.get(chunkId) : undefined,
+        suggestion: 'Re-read the proving passage; one more window behind this tie firms it or breaks it.',
+      });
+    }
+  }
+
+  // Slots: known gaps keep their order and priority under the limit; up to
+  // three thin threads ride beyond it so a busy bank never hides them all.
+  const capped = gaps.slice(0, limit);
+  const thin = gaps.slice(limit).filter((g) => g.kind === 'thin-thread').slice(0, 3);
+  return [...capped, ...thin];
 }
 
 /** The sentence a match sits in. */
@@ -372,7 +421,17 @@ export async function enrichEntity(
   llm: LlmClient,
   projectId: number,
   name: string,
-  opts: { sourceId?: number; maxPassages?: number; onProgress?: (m: string) => void } = {},
+  opts: {
+    sourceId?: number;
+    maxPassages?: number;
+    onProgress?: (m: string) => void;
+    /**
+     * Path to a chain handoff file. When given and readable, passages
+     * sitting in the subject's thin windows go first (same cap applies).
+     * Absent or unreadable means today's order, exactly as before.
+     */
+    handoffPath?: string;
+  } = {},
 ): Promise<{ relations: number; facts: number; knowledge: number; passages: number }> {
   const entity = lorebook.findEntity(db, projectId, name);
   if (!entity) throw new Error(`"${name}" is not in the lore index`);
@@ -393,9 +452,22 @@ export async function enrichEntity(
     text: string;
     source_title: string;
   }>(sql, ...params);
-  const passages = all
-    .filter((p) => names.some((n) => p.text.toLowerCase().includes(n.toLowerCase())))
-    .slice(0, opts.maxPassages ?? 12);
+  const matched = all.filter((p) =>
+    names.some((n) => p.text.toLowerCase().includes(n.toLowerCase())),
+  );
+  // Handoff order is advisory only: thin windows first, the rest behind in
+  // their old order, still capped below. A missing or bad file changes nothing.
+  let ordered = matched;
+  if (opts.handoffPath) {
+    try {
+      const handoff = readHandoff(opts.handoffPath);
+      const thin = handoff.thin.find((t) => t.name.toLowerCase() === entity.name.toLowerCase());
+      if (thin) ordered = preferThin(matched, thin.windows);
+    } catch {
+      ordered = matched;
+    }
+  }
+  const passages = ordered.slice(0, opts.maxPassages ?? 12);
   if (!passages.length) return { relations: 0, facts: 0, knowledge: 0, passages: 0 };
 
   const existing = db.all<{ from_entity: number; to_entity: number; kind: string }>(

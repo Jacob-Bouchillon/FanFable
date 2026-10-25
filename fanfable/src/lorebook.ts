@@ -14,6 +14,7 @@ import { Db, nowIso, strList, toJson } from './db.ts';
 import { asRecordArray, extractJson, salvageJsonArray, toStringArray } from './json.ts';
 import type { LlmClient } from './llm.ts';
 import { embedMissing, type EmbedFn } from './embeddings.ts';
+import { CORROBORATION_CAP, tripleKey } from './edge-rank.ts';
 import { STOPWORDS, splitSentences, tokenize, truncate } from './text.ts';
 
 /* ------------------------------------------------------------------ models */
@@ -158,6 +159,8 @@ Reply with JSON only:
 
 Rules:
 - Only record what these passages support. Never fill gaps with general knowledge.
+- Record people by the proper name the passages give. A description is never a new person: "the Potters' son" points at a named Potter when one is known, otherwise it is skipped. A thing or place is never a character.
+- One person per entry. Never bank "A and B" as a single person: "Lily and James Potter" is two entries, not one. A family group ("the Potters") is never a character.
 - chunk_index is the number shown in front of each passage. Use it for every entry.
 - evidence must be a short phrase copied from the passage, not your own words.
 - If the passages contain no new people, places or facts, return empty arrays.
@@ -179,8 +182,8 @@ Reply with JSON only:
 
 Rules:
 - "from" and "to" must both be names from the KNOWN ENTITIES list. Do not invent a name, and do not use a name that is not listed, even if it appears in the passage.
-- Only record a relationship these passages state explicitly. Never infer one.
-- Be thorough: list every relationship the passages state explicitly — most windows contain several. Do not stop after the first one or two.
+- Record only a lasting tie these passages state explicitly. A tie stays true pages later (family, lasting roles, friend or enemy). A moment happens once (met, gave, told, saw, wished, refused) and is never a tie, even when stated. Never infer one.
+- Be thorough within lasting ties: list every lasting tie the passages state explicitly — most windows contain several. Do not stop after the first one or two, and do not pad the list with moments.
 - One relation per entry, with one kind. If two people have several relationships, write a separate entry for each.
 - The direction matters: "from" is the one who has the relationship and "to" is the one it is to. If Harry is Petunia's nephew, it is from="Harry", to="Petunia", kind="nephew of".
 - chunk_index is the number shown in front of each passage.
@@ -289,6 +292,9 @@ export interface VerificationStats {
   dropped: number;
   /** Relations naming an entity that does not exist; never written. */
   unresolved: number;
+  /** Claims whose quote names nobody in the claim (third roster person
+   * instead); flagged in the counter and never written. */
+  unrelated: number;
 }
 
 /**
@@ -748,7 +754,7 @@ function blankResult(): ExtractLoreResult {
     timeline: 0,
     passages: 0,
     windows: 0,
-    verification: { claimed: 0, verified: 0, repointed: 0, dropped: 0, unresolved: 0 },
+    verification: { claimed: 0, verified: 0, repointed: 0, dropped: 0, unresolved: 0, unrelated: 0 },
     emptyWindows: [],
     quarantinedAliases: [],
     mergedAliases: [],
@@ -1029,25 +1035,63 @@ function opposingClaims(a: string, b: string): boolean {
   return false;
 }
 
-/** One relation per pair: keep the most detailed description. */
+/** Place order for a relation: first referenced chunk's seq, or null. */
+function refsSeq(db: Db, sourceRefs: string): number | null {
+  const chunkId = firstChunkOf(sourceRefs);
+  if (chunkId === undefined) return null;
+  return db.get<{ seq: number }>('SELECT seq FROM canon_chunk WHERE id = ?', chunkId)?.seq ?? null;
+}
+
+/** The earlier of two places; a known place beats an unknown one. */
+function earliestRefs(db: Db, a: string, b: string): string {
+  const sa = refsSeq(db, a);
+  const sb = refsSeq(db, b);
+  if (sa === null) return sb === null ? a : b;
+  if (sb === null) return a;
+  return sa <= sb ? a : b;
+}
+
+/**
+ * One relation per pair and label.
+ *
+ * The model can name the same tie from either side (A→B and B→A), so the pair
+ * is unordered and the label is lower-cased. Surviving rows keep the longer
+ * sentence and quote, the earliest place, and needs_review if either side had
+ * it. Different labels on the same pair stay separate.
+ */
 function dedupeRelations(db: Db, projectId: number): void {
-  const rows = db.all<{ id: number; from_entity: number; to_entity: number; kind: string; description: string }>(
-    'SELECT id, from_entity, to_entity, kind, description FROM canon_relation WHERE project_id = ? ORDER BY id',
+  type Row = { id: number; from_entity: number; to_entity: number; kind: string; description: string; evidence: string; source_refs: string; review_status: string };
+  const rows = db.all<Row>(
+    'SELECT id, from_entity, to_entity, kind, description, evidence, source_refs, review_status FROM canon_relation WHERE project_id = ? ORDER BY id',
     projectId,
   );
-  const seen = new Map<string, (typeof rows)[number]>();
+  const pairOf = (row: Row) => (row.from_entity < row.to_entity ? `${row.from_entity}:${row.to_entity}` : `${row.to_entity}:${row.from_entity}`);
+  const merged = new Map<string, Row>();
   for (const row of rows) {
-    // The same pair can hold several relationships, so the kind is part of the key.
-    const key = `${row.from_entity}:${row.to_entity}:${row.kind}`;
-    const first = seen.get(key);
+    // The same pair can hold several relationships, so the label is part of the key.
+    const key = `${pairOf(row)}:${row.kind.toLowerCase()}`;
+    const first = merged.get(key);
     if (!first) {
-      seen.set(key, row);
+      merged.set(key, row);
       continue;
     }
-    if (row.description.length > first.description.length) {
-      db.run('UPDATE canon_relation SET kind = ?, description = ? WHERE id = ?', row.kind, row.description, first.id);
-    }
+    const description = row.description.length > first.description.length ? row.description : first.description;
+    const evidence = row.evidence.length > first.evidence.length ? row.evidence : first.evidence;
+    const sourceRefs = earliestRefs(db, first.source_refs, row.source_refs);
+    const review = first.review_status === 'needs_review' || row.review_status === 'needs_review' ? 'needs_review' : first.review_status;
+    db.run(
+      'UPDATE canon_relation SET description = ?, evidence = ?, source_refs = ?, review_status = ? WHERE id = ?',
+      description,
+      evidence,
+      sourceRefs,
+      review,
+      first.id,
+    );
     db.run('DELETE FROM canon_relation WHERE id = ?', row.id);
+    first.description = description;
+    first.evidence = evidence;
+    first.source_refs = sourceRefs;
+    first.review_status = review;
   }
 }
 
@@ -1249,6 +1293,15 @@ function applyEntities(
     const name = String(raw.name ?? '').trim();
     if (!name) continue;
     const kind = normaliseKind(String(raw.kind ?? 'character'));
+    // A description, a conjunction, or a group is never a new character.
+    // Skipped here, relations naming it fall into the existing unresolved
+    // path and are counted there.
+    if (
+      kind === 'character' &&
+      (isDescriptiveCharacterName(name) || isConjoinedCharacterName(name) || isGroupCharacterName(name))
+    ) {
+      continue;
+    }
     const chunk = chunkAt(window, raw.chunk_index);
     const span = spanFor(raw.evidence, chunk, neighboursOf(chunk?.id), gate, stats.verification);
     if (span.status === 'dropped') continue;
@@ -1357,6 +1410,60 @@ function applyFacts(
   return accepted;
 }
 
+const PROOF_TITLES = new Set(['mr', 'mrs', 'ms', 'miss', 'dr', 'professor', 'prof', 'aunt', 'uncle', 'madam', 'sir', 'dame', 'lady', 'lord']);
+const PROOF_FILLER = new Set(['and', 'the', 'she', 'his', 'her', 'you', 'our', 'for', 'are', 'was', 'were', 'has', 'have', 'had', 'that', 'this', 'with', 'from', 'they', 'them', 'its', 'our']);
+
+function proofTokens(text: string, minLen: number): Set<string> {
+  return new Set(
+    normalise(String(text ?? ''))
+      .split(' ')
+      .filter((w) => w.length >= minLen && !PROOF_TITLES.has(w) && !PROOF_FILLER.has(w)),
+  );
+}
+
+/** Roster names with aliases for one project: id -> token set. */
+function rosterTokens(db: Db, projectId: number): Map<number, Set<string>> {
+  const out = new Map<number, Set<string>>();
+  for (const row of db.all<{ id: number; name: string; aliases: string }>(
+    'SELECT id, name, aliases FROM canon_entity WHERE project_id = ?',
+    projectId,
+  )) {
+    const toks = proofTokens(row.name, 3);
+    for (const a of strList(row.aliases)) for (const t of proofTokens(a, 3)) toks.add(t);
+    out.set(row.id, toks);
+  }
+  return out;
+}
+
+/**
+ * Proof relevance (soft cap: demote, never delete).
+ *
+ * A proving quote passes when it names at least one endpoint of its claim,
+ * or when it names nobody at all (pronoun and scene-color quotes stay).
+ * It fails only when it names a *third* roster person absent from the claim —
+ * a quote about Neville attached to a Seamus-to-Ron claim. Same-subject
+ * fiction, unjudged meaning: the row is still written, flagged for review.
+ */
+function proofRelevance(
+  roster: Map<number, Set<string>>,
+  fromId: number,
+  toId: number,
+  quote: string,
+): boolean {
+  const words = proofTokens(quote, 3);
+  if (!words.size) return true;
+  const endpoints = new Set<string>();
+  for (const id of [fromId, toId]) for (const t of roster.get(id) ?? []) endpoints.add(t);
+  if ([...endpoints].some((t) => words.has(t))) return true;
+  for (const [id, toks] of roster) {
+    if (id === fromId || id === toId) continue;
+    for (const t of toks) {
+      if (t.length >= 4 && words.has(t)) return false;
+    }
+  }
+  return true;
+}
+
 /** Write the relation section. Returns how many claims were accepted. */
 function applyRelations(
   db: Db,
@@ -1369,6 +1476,8 @@ function applyRelations(
   gate: boolean,
 ): number {
   let accepted = 0;
+  // Fresh per call: entities created earlier in the same run are visible.
+  const roster = rosterTokens(db, projectId);
   for (const raw of raws) {
     const fromId = resolveEntity(db, projectId, entityIdByName, String(raw.from ?? ''));
     const toId = resolveEntity(db, projectId, entityIdByName, String(raw.to ?? ''));
@@ -1381,35 +1490,55 @@ function applyRelations(
     const chunk = chunkAt(window, raw.chunk_index);
     const span = spanFor(raw.evidence, chunk, neighboursOf(chunk?.id), gate, stats.verification);
     if (span.status === 'dropped') continue;
+    // Hard gate (gated path only): a quote about neither endpoint names a
+    // third roster person instead. Never written — an unprovable tie is
+    // worse than a missing one. The pre-gate path keeps its lenient flag.
+    const relevant = proofRelevance(roster, fromId, toId, span.quote);
+    const review = relevant ? 'accepted' : 'needs_review';
+    if (!relevant && gate) {
+      stats.verification.unrelated++;
+      continue;
+    }
     const refs = span.chunkId !== null
       ? [{ source: span.source, locator: span.locator, chunk: span.chunkId }]
       : refsFor(chunk);
     const kinds = normaliseKinds(String(raw.kind ?? ''));
     for (const kind of kinds) {
-      const existing = db.get<{ id: number; kind: string; description: string; evidence: string }>(
-        'SELECT id, kind, description, evidence FROM canon_relation WHERE project_id = ? AND from_entity = ? AND to_entity = ? AND kind = ?',
+      const existing = db.get<{ id: number; kind: string; description: string; evidence: string; source_refs: string; review_status: string }>(
+        `SELECT id, kind, description, evidence, source_refs, review_status
+         FROM canon_relation
+         WHERE project_id = ? AND lower(kind) = ?
+           AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))
+         ORDER BY id LIMIT 1`,
         projectId,
+        kind.toLowerCase(),
         fromId,
         toId,
-        kind,
+        toId,
+        fromId,
       );
       if (existing) {
-        // One relation per pair and kind: keep the richer description rather
-        // than accumulating near-duplicates across extraction runs.
+        // One relation per pair and label, whichever side named it: merge
+        // rather than bank the same tie twice in opposite directions.
         const description = String(raw.description ?? '').trim();
+        const sentence = description.length > existing.description.length ? description : existing.description;
+        const quote = span.quote.length > existing.evidence.length ? span.quote : existing.evidence;
+        const sourceRefs = earliestRefs(db, toJson(refs), existing.source_refs);
+        const mergedReview = review === 'needs_review' || existing.review_status === 'needs_review' ? 'needs_review' : existing.review_status;
         db.run(
-          'UPDATE canon_relation SET kind = ?, description = ?, evidence = ? WHERE id = ?',
-          existing.kind || kind,
-          description.length > existing.description.length ? description : existing.description,
-          span.quote || existing.evidence,
+          'UPDATE canon_relation SET description = ?, evidence = ?, source_refs = ?, review_status = ? WHERE id = ?',
+          sentence,
+          quote,
+          sourceRefs,
+          mergedReview,
           existing.id,
         );
         accepted++;
         continue;
       }
       db.run(
-        `INSERT INTO canon_relation (project_id, from_entity, to_entity, kind, description, evidence, source_refs, modality, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO canon_relation (project_id, from_entity, to_entity, kind, description, evidence, source_refs, modality, review_status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         projectId,
         fromId,
         toId,
@@ -1418,6 +1547,7 @@ function applyRelations(
         span.quote,
         toJson(refs),
         normaliseModality(raw.modality),
+        review,
         nowIso(),
       );
       stats.relations++;
@@ -1729,6 +1859,52 @@ export function nameRelation(a: string, b: string): 'same' | 'containment' | nul
     if (short.length && short.every((t) => long.includes(t))) return 'containment';
   }
   return null;
+}
+
+/**
+ * A character name that is a description, not a proper name.
+ *
+ * "The Potters' son" describes a person instead of naming one. Banking it
+ * as a new entity splits one person into two and invents relations like
+ * "Harry Potter is the brother of The Potters' son". Proper names pass;
+ * determiner + possessive + kinship phrases ("the ...'s son/daughter/child")
+ * do not. "The Bloody Baron" passes: no possessive, no kinship ending.
+ */
+export function isDescriptiveCharacterName(raw: string): boolean {
+  const lower = String(raw ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+  if (!/^(the|a|an)\s+.+/.test(lower)) return false;
+  if (!lower.includes("'s") && !lower.includes("s'")) return false;
+  const last = lower.split(' ').pop() ?? '';
+  return (
+    'sibling brother sister mother father son daughter parent child aunt uncle cousin nephew niece husband wife spouse grandmother grandfather grandson granddaughter boy girl man woman family kin'.split(
+      ' ',
+    ).includes(last)
+  );
+}
+
+/**
+ * A character name joining two people with "and".
+ *
+ * "Lily and James Potter" is two entries, never one entity. Banking it as
+ * one person invents ties no one holds. No proper person name contains
+ * " and ", so anything matching is a conjunction to split, not a name.
+ */
+export function isConjoinedCharacterName(raw: string): boolean {
+  return /\band\b/i.test(String(raw ?? '').trim());
+}
+
+/**
+ * A family group banked as a character.
+ *
+ * "the Potters" names a household, not a person. Proper people are not
+ * "the" plus a plural. "The Bloody Baron" passes: singular ending, no
+ * plural. Groups belong to factions, never to characters.
+ */
+export function isGroupCharacterName(raw: string): boolean {
+  const lower = String(raw ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+  if (!/^(the|a|an)\s+.+/.test(lower)) return false;
+  if (lower.includes("'s") || lower.includes("s'")) return false;
+  return /s$/.test(lower);
 }
 
 const SPEAKER_VERBS =
@@ -2185,6 +2361,35 @@ export async function judgeQuarantine(
 
 /* ------------------------------------------------- timeline ↔ event join */
 
+/**
+ * Independent-window support behind every relation row.
+ *
+ * Rows asserting one triple from different passages corroborate each other;
+ * the count caps at CORROBORATION_CAP, so support nudges display order and
+ * never overrides proof. Read-only, computed from existing references.
+ */
+export function relationCorroboration(db: Db, projectId: number): Map<number, number> {
+  const rows = db.all<{ id: number; from_entity: number; to_entity: number; kind: string; source_refs: string }>(
+    'SELECT id, from_entity, to_entity, kind, source_refs FROM canon_relation WHERE project_id = ? ORDER BY id',
+    projectId,
+  );
+  const chunks = new Map<string, Set<number>>();
+  const chunkOf = new Map<number, number>();
+  for (const row of rows) {
+    const key = tripleKey(row.from_entity, row.to_entity, row.kind);
+    const chunk = firstChunkOf(row.source_refs) ?? -1;
+    chunkOf.set(row.id, chunk);
+    if (!chunks.has(key)) chunks.set(key, new Set());
+    chunks.get(key)!.add(chunk);
+  }
+  const out = new Map<number, number>();
+  for (const row of rows) {
+    const key = tripleKey(row.from_entity, row.to_entity, row.kind);
+    out.set(row.id, Math.min(chunks.get(key)!.size, CORROBORATION_CAP));
+  }
+  return out;
+}
+
 function firstChunkOf(sourceRefs: string): number | undefined {
   try {
     const refs = JSON.parse(sourceRefs || '[]') as { chunk?: unknown }[];
@@ -2518,6 +2723,94 @@ export function listRelations(db: Db, projectId: number): CanonRelation[] {
     modality: r.modality ?? 'asserted',
     conflictStatus: r.conflict_status ?? 'none',
   }));
+}
+
+/** One tie in a pair's story, with its story position when known. */
+export interface StatusRow extends CanonRelation {
+  /** canon_chunk.seq of the proving passage, or null when unplaceable. */
+  seq: number | null;
+  /** The passage locator (chapter + page) when known. */
+  locator: string | null;
+}
+
+/** A pair's relationship over the story: what it is now, what it was. */
+export interface PairStatus {
+  current: StatusRow | null;
+  history: StatusRow[];
+}
+
+/**
+ * Read-time relationship status: append-only rows in, current-vs-history out.
+ *
+ * Every differing label the extraction banked stays banked; this lines them up
+ * by story order (the proving passage's chunk seq, falling back to row order
+ * for unplaceable rows) and calls the latest plain-stated row current. Denials
+ * and maybes never become status. Same-window rivals keep whatever contested
+ * flag the marking pass gave them; far-apart changes simply order as history.
+ * With atSeq, the line stops there (unplaceable rows are excluded: a status
+ * "at chapter 3" cannot rest on a claim going nowhere).
+ */
+export function pairHistory(
+  db: Db,
+  projectId: number,
+  aId: number,
+  bId: number,
+  atSeq?: number,
+): PairStatus {
+  const rows = db.all<{
+    id: number;
+    from_entity: number;
+    to_entity: number;
+    kind: string;
+    description: string;
+    evidence: string;
+    from_name: string;
+    to_name: string;
+    modality: string | null;
+    conflict_status: string | null;
+    source_refs: string;
+  }>(
+    `SELECT r.id, r.from_entity, r.to_entity, r.kind, r.description, r.evidence,
+            a.name AS from_name, b.name AS to_name, r.modality, r.conflict_status,
+            r.source_refs
+     FROM canon_relation r
+     JOIN canon_entity a ON a.id = r.from_entity
+     JOIN canon_entity b ON b.id = r.to_entity
+     WHERE r.project_id = ?
+       AND ((r.from_entity = ? AND r.to_entity = ?) OR (r.from_entity = ? AND r.to_entity = ?))
+     ORDER BY r.id`,
+    projectId, aId, bId, bId, aId,
+  );
+  const seqByChunk = new Map(
+    db
+      .all<{ id: number; seq: number; locator: string }>('SELECT id, seq, locator FROM canon_chunk WHERE project_id = ?', projectId)
+      .map((c) => [c.id, c] as [number, { seq: number; locator: string }]),
+  );
+  const placed: StatusRow[] = rows.map((r) => {
+    const chunkId = firstChunkOf(r.source_refs);
+    const chunk = chunkId !== undefined ? seqByChunk.get(chunkId) : undefined;
+    const seq = chunk ? chunk.seq : null;
+    return {
+      id: r.id,
+      fromId: r.from_entity,
+      fromName: r.from_name,
+      toId: r.to_entity,
+      toName: r.to_name,
+      kind: r.kind,
+      description: r.description,
+      evidence: r.evidence,
+      modality: r.modality ?? 'asserted',
+      conflictStatus: r.conflict_status ?? 'none',
+      seq,
+      locator: chunk ? chunk.locator : null,
+    };
+  });
+  const visible = atSeq === undefined ? placed : placed.filter((r) => r.seq !== null && r.seq <= atSeq);
+  visible.sort((x, y) => (x.seq ?? Number.POSITIVE_INFINITY) - (y.seq ?? Number.POSITIVE_INFINITY) || x.id - y.id);
+  const asserted = visible.filter((r) => r.modality === 'asserted');
+  const current = asserted.length ? asserted[asserted.length - 1]! : null;
+  const history = current ? visible.filter((r) => r.id !== current.id) : visible;
+  return { current, history };
 }
 
 export function listFacts(db: Db, projectId: number, topic?: string): CanonFact[] {

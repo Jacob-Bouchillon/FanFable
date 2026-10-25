@@ -135,10 +135,11 @@ ${C.bold('SOURCE MATERIAL')}
   lore embed [--model m]           Embed passages, entities and triples for dense retrieval
   lore trails --query "..." [--out f]  Draw how each top passage connects to the query
                            [--web] show the association layer too (default off)
+  lore ties --from A --to B [--at n]  What two people are to each other now, and before
   lore merge                       Merge entries that are the same under two names
   lore judge-aliases [--max n]     Rule on quarantined nickname pairs (one model call)
   lore diagnose                    Report what the index is probably missing
-  lore enrich <name>              Re-read the passages about one character
+  lore enrich <name> [--handoff f] Re-read the passages about one character
   lore correct relation <id>       Correct a relation by hand
   lore remove relation <id>       Remove a relation you do not believe
   lore show [--kind k]            Show the extracted lore
@@ -615,6 +616,45 @@ async function cmdLore(args: Args): Promise<void> {
     return;
   }
 
+  if (sub === 'ties') {
+    const fromName = flagString(args, 'from');
+    const toName = flagString(args, 'to');
+    if (!fromName || !toName) throw new Error('names required: lore ties --from "Harry Potter" --to "Ron"');
+    const from = lorebook.findEntity(db, project.id, fromName);
+    if (!from) throw new Error(`no one called "${fromName}" (the --from side)`);
+    const to = lorebook.findEntity(db, project.id, toName);
+    if (!to) throw new Error(`no one called "${toName}" (the --to side)`);
+    const atRaw = flagNumber(args, 'at', NaN);
+    const atSeq = Number.isFinite(atRaw) ? atRaw : undefined;
+    const { current, history } = lorebook.pairHistory(db, project.id, from.id, to.id, atSeq);
+    const corroborated = lorebook.relationCorroboration(db, project.id);
+    heading(
+      `Ties: ${from.name} ↔ ${to.name}` + (atSeq !== undefined ? C.dim(` (at passage ${atSeq})`) : ''),
+    );
+    if (!current && !history.length) {
+      console.log(C.dim('(no ties banked between them)'));
+      return;
+    }
+    const show = (r: (typeof history)[number]): void => {
+      const badge = r.conflictStatus !== 'none' ? C.dim(` [${r.conflictStatus}]`) : '';
+      const support = (corroborated.get(r.id) ?? 1) > 1 ? C.dim(` [×${corroborated.get(r.id)} windows]`) : '';
+      const where = r.locator ? C.dim(` [${r.locator}]`) : r.seq !== null ? C.dim(` (passage ${r.seq})`) : C.dim(' (unplaced)');
+      console.log(`\n${C.bold(`${r.fromName} → ${r.toName}: ${r.kind}`)}${badge}${support}${where}`);
+      if (r.description) console.log(`  ${r.description}`);
+      if (r.evidence) console.log(`  ${C.dim(`"${r.evidence}"`)}`);
+      if (r.modality !== 'asserted') console.log(`  ${C.dim(`framed as: ${r.modality}`)}`);
+    };
+    if (current) {
+      console.log(C.green('Current:'));
+      show(current);
+    }
+    if (history.length) {
+      console.log(C.dim(`${current ? '\nBefore:' : 'Only:'}`));
+      for (const r of history) show(r);
+    }
+    return;
+  }
+
   if (sub === 'diagnose') {
     heading('Lore diagnostics');
     const gaps = loreDiag.diagnose(db, project.id, { limit: flagNumber(args, 'limit', 25) });
@@ -637,8 +677,18 @@ async function cmdLore(args: Args): Promise<void> {
     const name = args._[2];
     if (!name) throw new Error('a name is required: fanfable lore enrich <name>');
     heading(`Re-reading the passages about ${name}`);
+    // Handoff by default: an explicit --handoff path wins, else a handoff.json
+    // sitting next to the database is used when present. Absent means plain order.
+    const explicitHandoff = flagString(args, 'handoff') || undefined;
+    let handoffPath = explicitHandoff;
+    if (!handoffPath) {
+      const conventional = join(dirname(resolve(flagString(args, 'db') || defaultDbPath())), 'handoff.json');
+      if (existsSync(conventional)) handoffPath = conventional;
+    }
+    if (handoffPath) process.stdout.write(`  ${C.dim(`handoff: ${handoffPath}`)}\n`);
     const result = await loreDiag.enrichEntity(db, a.llm, project.id, name, {
       maxPassages: flagNumber(args, 'passages', 12),
+      handoffPath,
       onProgress: (m) => process.stdout.write(`  ${C.dim(m)}\n`),
     });
     console.log(
