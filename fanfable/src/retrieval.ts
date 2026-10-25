@@ -112,6 +112,7 @@ export interface RetrievalPackage {
     web?: { aliasEdges: number; resemblanceEdges: number; cooccurrenceEdges: number };
     /** Recognition-filter counts, when dense-only seeds were checked. */
     recognition?: { checked: number; kept: number; dropped: number };
+    corroborated?: { passages: number; maxSeeds: number };
   };
 }
 
@@ -390,6 +391,7 @@ export async function retrieve(
       ...(graphContext.stats.ppr ? { ppr: graphContext.stats.ppr } : {}),
       ...(graphContext.stats.pprFallback ? { pprFallback: true } : {}),
       ...(graphContext.stats.recognition ? { recognition: graphContext.stats.recognition } : {}),
+      ...(graphContext.stats.corroborated ? { corroborated: graphContext.stats.corroborated } : {}),
       ...(graphContext.stats.web ? { web: graphContext.stats.web } : {}),
     },
   };

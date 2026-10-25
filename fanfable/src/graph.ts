@@ -1587,6 +1587,8 @@ export interface GraphContext {
     web?: { aliasEdges: number; resemblanceEdges: number; cooccurrenceEdges: number };
     /** Recognition-filter counts, when dense-only seeds were checked. */
     recognition?: { checked: number; kept: number; dropped: number };
+    /** Convergence audit: corroborated passages and the deepest agreement. */
+    corroborated?: { passages: number; maxSeeds: number };
   };
 }
 
@@ -2020,6 +2022,32 @@ export function buildPassageTrails(
   return out;
 }
 
+export interface CorroborationCandidate {
+  chunkId: number;
+  score: number;
+  /** Distinct seed roots reaching this passage. */
+  seeds: number;
+}
+
+/**
+ * Order PPR passage candidates: score first, chunk id to break ties, then
+ * one adjacent float pass where a corroborated (>=2 seeds) passage rises
+ * above a single-seed neighbor. Each passage moves at most one slot, so PPR
+ * order stays primary and the pass is fully deterministic.
+ */
+export function orderCorroborated(candidates: CorroborationCandidate[]): CorroborationCandidate[] {
+  const ordered = [...candidates].sort((a, b) => b.score - a.score || a.chunkId - b.chunkId);
+  for (let i = 1; i < ordered.length; i++) {
+    const prev = ordered[i - 1]!;
+    const curr = ordered[i]!;
+    if (curr.seeds >= 2 && prev.seeds < 2) {
+      ordered[i - 1] = curr;
+      ordered[i] = prev;
+    }
+  }
+  return ordered;
+}
+
 export async function buildPprGraphContext(
   db: Db,
   projectId: number,
@@ -2095,16 +2123,58 @@ export async function buildPprGraphContext(
   const nodeIds = new Set(ranked.map((n) => n.id));
   const edges = result.edges.filter((e) => nodeIds.has(e.from) && nodeIds.has(e.to));
 
+  // Convergence audit: one walk per seed root (skipped when there is
+  // nothing to converge), counting the distinct seeds reaching each
+  // passage. No model calls — small in-memory graphs, microseconds each.
+  const reach = new Map<string, number>();
+  if (seed.roots.length > 1) {
+    for (const root of seed.roots) {
+      const one = traverse(graph, {
+        roots: [root],
+        hops: opts.hops ?? 1,
+        scope: opts.scope,
+        edgeTypes: opts.edgeTypes,
+        beforeOrder,
+        temporal: true,
+        maxNodes: opts.maxNodes ?? 40,
+      });
+      for (const [id, node] of one.nodes) {
+        if (node.kind === 'canon-passage') reach.set(id, (reach.get(id) ?? 0) + 1);
+      }
+    }
+  }
   // Passages in PPR order first; the reference-backed ones from the walked
   // nodes after. When PPR finds nothing, this is exactly today's list.
+  // Corroborated passages (2+ seeds) float one slot above single-seed
+  // neighbors of adjacent PPR rank; everything else keeps PPR order.
   const seenChunks = new Set<number>();
   const orderedChunkIds: number[] = [];
+  const pprCandidates: CorroborationCandidate[] = [];
   for (const { id, score } of ppr.ranked.slice(0, 12)) {
     if (score <= 0) continue;
     const chunkId = graph.nodes.get(id)?.numericId;
-    if (typeof chunkId !== 'number' || seenChunks.has(chunkId)) continue;
-    seenChunks.add(chunkId);
-    orderedChunkIds.push(chunkId);
+    if (typeof chunkId !== 'number' || pprCandidates.some((c) => c.chunkId === chunkId)) continue;
+    pprCandidates.push({ chunkId, score, seeds: reach.get(id) ?? 0 });
+  }
+  let corroborated: { passages: number; maxSeeds: number } | undefined;
+  if (seed.roots.length > 1) {
+    let maxSeeds = 0;
+    for (const c of pprCandidates) maxSeeds = Math.max(maxSeeds, c.seeds);
+    const floated = orderCorroborated(pprCandidates);
+    let met = 0;
+    for (const c of floated) {
+      if (seenChunks.has(c.chunkId)) continue;
+      seenChunks.add(c.chunkId);
+      orderedChunkIds.push(c.chunkId);
+      if (c.seeds >= 2) met++;
+    }
+    corroborated = { passages: met, maxSeeds };
+  } else {
+    for (const c of pprCandidates) {
+      if (seenChunks.has(c.chunkId)) continue;
+      seenChunks.add(c.chunkId);
+      orderedChunkIds.push(c.chunkId);
+    }
   }
   for (const node of ranked) {
     for (const ref of node.sourceRefs) {
@@ -2174,6 +2244,7 @@ export async function buildPprGraphContext(
       ppr: { nodes: graph.nodes.size, iterations: ppr.iterations, converged: ppr.converged },
       ...(pprFallback ? { pprFallback: true } : {}),
       ...(recognition ? { recognition } : {}),
+      ...(corroborated ? { corroborated } : {}),
       web: countWebEdges(graph),
     },
   };

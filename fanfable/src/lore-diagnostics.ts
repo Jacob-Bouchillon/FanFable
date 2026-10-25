@@ -539,3 +539,26 @@ export function removeRelation(db: Db, projectId: number, id: number): boolean {
   db.run('DELETE FROM canon_relation WHERE id = ? AND project_id = ?', id, projectId);
   return true;
 }
+
+/** Past quarantine rulings, newest first — the audit log for judge-aliases. */
+export function quarantineReport(
+  db: Db,
+  projectId: number,
+): { name: string; candidate: string; reason: string; status: string; ruling: string; ruledAt: string }[] {
+  try {
+    return db.all<{
+      name: string;
+      candidate: string;
+      reason: string;
+      status: string;
+      ruling: string;
+      ruledAt: string;
+    }>(
+      'SELECT name, candidate, reason, status, ruling, ruled_at AS ruledAt FROM quarantine_alias WHERE project_id = ? ORDER BY id DESC',
+      projectId,
+    );
+  } catch {
+    // A database from before the quarantine table simply has no rulings.
+    return [];
+  }
+}

@@ -136,6 +136,7 @@ ${C.bold('SOURCE MATERIAL')}
   lore trails --query "..." [--out f]  Draw how each top passage connects to the query
                            [--web] show the association layer too (default off)
   lore merge                       Merge entries that are the same under two names
+  lore judge-aliases [--max n]     Rule on quarantined nickname pairs (one model call)
   lore diagnose                    Report what the index is probably missing
   lore enrich <name>              Re-read the passages about one character
   lore correct relation <id>       Correct a relation by hand
@@ -693,6 +694,25 @@ async function cmdLore(args: Args): Promise<void> {
       return;
     }
     throw new Error('remove what? "relation" or "entity"');
+  }
+
+  if (sub === 'judge-aliases') {
+    heading('Judging quarantined aliases');
+    const maxPairs = Math.max(1, flagNumber(args, 'max', 20));
+    const { rulings, checked, pending } = await lorebook.judgeQuarantine(a.llm, db, project.id, { maxPairs });
+    if (!rulings.length) {
+      console.log(
+        C.dim(pending ? `no rulings recorded; ${pending} pair(s) stay pending.` : 'nothing to judge: no pending pairs.'),
+      );
+      return;
+    }
+    for (const r of rulings) {
+      const mark = r.verdict === 'merged' ? C.green('merged') : r.verdict === 'ruled' ? C.yellow('different') : C.dim(r.verdict);
+      console.log(`${mark} ${C.bold(r.name)} / ${C.bold(r.candidate)} — ${r.reason}${r.quote ? ` — "${truncate(r.quote, 120)}"` : ''}`);
+    }
+    const merged = rulings.filter((r) => r.verdict === 'merged').length;
+    console.log(C.dim(`${checked} pair(s) judged, ${merged} merged.`));
+    return;
   }
 
   if (sub === 'merge') {

@@ -621,6 +621,7 @@ export async function extractLore(
   const merged = mergeCanonEntities(db, projectId);
   stats.mergedAliases = merged.merged;
   stats.quarantinedAliases = merged.quarantined;
+  persistQuarantine(db, projectId, merged.quarantined);
   // Now that the entities and the events exist, marry the two.
   linkTimelineToEvents(db, projectId);
   if (opts.embed) {
@@ -700,6 +701,7 @@ export async function ensureWindowsForChunks(
   const merged = mergeCanonEntities(db, projectId);
   stats.mergedAliases = merged.merged;
   stats.quarantinedAliases = merged.quarantined;
+  persistQuarantine(db, projectId, merged.quarantined);
   linkTimelineToEvents(db, projectId);
   stats.windows = targets.length;
   return stats;
@@ -1824,6 +1826,89 @@ export function looksAlike(a: string, b: string): { alike: boolean; reason: stri
  *  - anything that merely looks similar goes to the quarantine list, which is
  *    returned and never merged. A wrong merge invents a person.
  */
+/**
+ * Fold one entity into another: aliases, relations, facts, then delete.
+ *
+ * Shared by the rule-based merge and the quarantine judge. The judge may
+ * only confirm into this path, never invent around it.
+ */
+export function mergeEntityPair(db: Db, projectId: number, keep: CanonEntity, drop: CanonEntity): void {
+  db.transaction(() => {
+    const aliases = [...keep.aliases, drop.name, ...drop.aliases].filter(
+      (al, i, arr) =>
+        al.toLowerCase() !== keep.name.toLowerCase() &&
+        arr.findIndex((x) => x.toLowerCase() === al.toLowerCase()) === i,
+    );
+    db.run(
+      'UPDATE canon_entity SET aliases = ?, summary = ?, role = ?, status = ?, mentions = mentions + ?, updated_at = ? WHERE id = ?',
+      toJson(aliases),
+      keep.summary || drop.summary,
+      keep.role || drop.role,
+      keep.status || drop.status,
+      drop.mentions,
+      nowIso(),
+      keep.id,
+    );
+    // Move relations over, and drop the ones that would now be duplicates.
+    const rels = db.all<{ id: number; from_entity: number; to_entity: number; kind: string; description: string; evidence: string }>(
+      'SELECT id, from_entity, to_entity, kind, description, evidence FROM canon_relation WHERE project_id = ? AND (from_entity = ? OR to_entity = ?)',
+      projectId,
+      drop.id,
+      drop.id,
+    );
+    for (const r of rels) {
+      const from = r.from_entity === drop.id ? keep.id : r.from_entity;
+      const to = r.to_entity === drop.id ? keep.id : r.to_entity;
+      if (from === to) {
+        db.run('DELETE FROM canon_relation WHERE id = ?', r.id);
+        continue;
+      }
+      const existing = db.get<{ id: number }>(
+        'SELECT id FROM canon_relation WHERE project_id = ? AND from_entity = ? AND to_entity = ? AND kind = ?',
+        projectId,
+        from,
+        to,
+        r.kind,
+      );
+      if (existing) {
+        db.run('DELETE FROM canon_relation WHERE id = ?', r.id);
+      } else {
+        db.run('UPDATE canon_relation SET from_entity = ?, to_entity = ? WHERE id = ?', from, to, r.id);
+      }
+    }
+    db.run('UPDATE canon_fact SET subject = ? WHERE project_id = ? AND subject = ?', keep.name, projectId, drop.name);
+    db.run('DELETE FROM canon_entity WHERE id = ?', drop.id);
+  });
+}
+
+/**
+ * Persist quarantine pairs for later judgment. Idempotent: reruns add only
+ * genuinely new pairs. Never touches merge behavior.
+ */
+export function persistQuarantine(
+  db: Db,
+  projectId: number,
+  quarantined: QuarantinedAlias[],
+): { written: number; skipped: number } {
+  let written = 0;
+  let skipped = 0;
+  const now = nowIso();
+  for (const q of quarantined) {
+    const r = db.run(
+      `INSERT OR IGNORE INTO quarantine_alias (project_id, name, candidate, reason, status, created_at)
+       VALUES (?, ?, ?, ?, 'pending', ?)`,
+      projectId,
+      q.name,
+      q.candidate,
+      q.reason,
+      now,
+    );
+    if (r.changes) written++;
+    else skipped++;
+  }
+  return { written, skipped };
+}
+
 export function mergeCanonEntities(
   db: Db,
   projectId: number,
@@ -1859,52 +1944,7 @@ export function mergeCanonEntities(
     if (!pair) break;
 
     const { keep, drop } = pair;
-    db.transaction(() => {
-      const aliases = [...keep.aliases, drop.name, ...drop.aliases].filter(
-        (al, i, arr) =>
-          al.toLowerCase() !== keep.name.toLowerCase() &&
-          arr.findIndex((x) => x.toLowerCase() === al.toLowerCase()) === i,
-      );
-      db.run(
-        'UPDATE canon_entity SET aliases = ?, summary = ?, role = ?, status = ?, mentions = mentions + ?, updated_at = ? WHERE id = ?',
-        toJson(aliases),
-        keep.summary || drop.summary,
-        keep.role || drop.role,
-        keep.status || drop.status,
-        drop.mentions,
-        nowIso(),
-        keep.id,
-      );
-      // Move relations over, and drop the ones that would now be duplicates.
-      const rels = db.all<{ id: number; from_entity: number; to_entity: number; kind: string; description: string; evidence: string }>(
-        'SELECT id, from_entity, to_entity, kind, description, evidence FROM canon_relation WHERE project_id = ? AND (from_entity = ? OR to_entity = ?)',
-        projectId,
-        drop.id,
-        drop.id,
-      );
-      for (const r of rels) {
-        const from = r.from_entity === drop.id ? keep.id : r.from_entity;
-        const to = r.to_entity === drop.id ? keep.id : r.to_entity;
-        if (from === to) {
-          db.run('DELETE FROM canon_relation WHERE id = ?', r.id);
-          continue;
-        }
-        const existing = db.get<{ id: number }>(
-          'SELECT id FROM canon_relation WHERE project_id = ? AND from_entity = ? AND to_entity = ? AND kind = ?',
-          projectId,
-          from,
-          to,
-          r.kind,
-        );
-        if (existing) {
-          db.run('DELETE FROM canon_relation WHERE id = ?', r.id);
-        } else {
-          db.run('UPDATE canon_relation SET from_entity = ?, to_entity = ? WHERE id = ?', from, to, r.id);
-        }
-      }
-      db.run('UPDATE canon_fact SET subject = ? WHERE project_id = ? AND subject = ?', keep.name, projectId, drop.name);
-      db.run('DELETE FROM canon_entity WHERE id = ?', drop.id);
-    });
+    mergeEntityPair(db, projectId, keep, drop);
     merged.push(`${drop.name} -> ${keep.name}`);
   }
 
@@ -1942,6 +1982,205 @@ export function mergeCanonEntities(
 
 function quarantineKey(a: string, b: string): string {
   return [canonicalName(a), canonicalName(b)].sort().join(' :: ');
+}
+
+export interface QuarantineRuling {
+  name: string;
+  candidate: string;
+  /** Terminal verdict: merged, ruled different, or skipped with a reason. */
+  verdict: 'merged' | 'ruled' | 'skipped' | 'pending';
+  reason: string;
+  quote: string;
+}
+
+const JUDGE_SYSTEM =
+  'For each pair answer same:true/false with the exact quote proving sameness. ' +
+  'No quote, no merge. Reply JSON only: {rulings:[{name, candidate, same, quote}]}.';
+
+/** Evidence an entity brings to its quarantine hearing: quote + passages. */
+function entityDossier(db: Db, projectId: number, entity: CanonEntity): { evidence: string; chunks: ChunkRow[] } {
+  const chunks: ChunkRow[] = [];
+  for (const ref of entity.sourceRefs) {
+    if (chunks.length >= 2) break;
+    if (typeof ref.chunk !== 'number') continue;
+    const row = db.get<ChunkRow>(
+      `SELECT c.id, c.seq, c.heading, c.locator, c.text, s.title AS source_title, s.path, c.source_id
+       FROM canon_chunk c JOIN canon_source s ON s.id = c.source_id
+       WHERE c.id = ? AND c.project_id = ?`,
+      ref.chunk,
+      projectId,
+    );
+    if (row) chunks.push(row);
+  }
+  return { evidence: entity.evidence, chunks };
+}
+
+/**
+ * Does the quote appear in either entity's evidence or passages?
+ *
+ * verifySpan is the only checker for passages; a normalized substring hit in
+ * recorded evidence counts the same way. Anything else is unproven.
+ */
+function quoteSupported(
+  quote: string,
+  a: { evidence: string; chunks: ChunkRow[] },
+  b: { evidence: string; chunks: ChunkRow[] },
+): boolean {
+  const needle = normalise(quote);
+  if (!needle) return false;
+  for (const entity of [a, b]) {
+    if (entity.evidence && normalise(entity.evidence).includes(needle)) return true;
+    for (const chunk of entity.chunks) {
+      const others = entity.chunks.filter((c) => c.id !== chunk.id);
+      if (verifySpan(quote, chunk, others).status !== 'dropped') return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Rule on quarantined nickname pairs, one model call for the batch.
+ *
+ * same:true merges ONLY with a verifying quote and no co-speaker veto — the
+ * veto overrules the model, always. Application reuses mergeEntityPair, so a
+ * confirmed pair merges exactly like a rule-based one. Anything uncertain
+ * stays pending for a later run; judged outcomes are terminal.
+ */
+export async function judgeQuarantine(
+  llm: LlmClient,
+  db: Db,
+  projectId: number,
+  opts: { maxPairs?: number } = {},
+): Promise<{ rulings: QuarantineRuling[]; checked: number; pending: number }> {
+  const maxPairs = Math.max(1, opts.maxPairs ?? 20);
+  const pending = db.all<{ name: string; candidate: string; reason: string }>(
+    'SELECT name, candidate, reason FROM quarantine_alias WHERE project_id = ? AND status = ? ORDER BY id LIMIT ?',
+    projectId,
+    'pending',
+    maxPairs,
+  );
+  const rulings: QuarantineRuling[] = [];
+  const remaining = (): number =>
+    db.get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM quarantine_alias WHERE project_id = ? AND status = 'pending'",
+      projectId,
+    )?.n ?? 0;
+  if (!pending.length) return { rulings, checked: 0, pending: 0 };
+
+  const settle = (
+    name: string,
+    candidate: string,
+    verdict: QuarantineRuling['verdict'],
+    reason: string,
+    quote = '',
+  ): void => {
+    db.run(
+      'UPDATE quarantine_alias SET status = ?, ruling = ?, ruled_at = ? WHERE project_id = ? AND name = ? AND candidate = ?',
+      verdict === 'pending' ? 'pending' : verdict,
+      verdict === 'pending' ? '' : reason,
+      verdict === 'pending' ? '' : nowIso(),
+      projectId,
+      name,
+      candidate,
+    );
+    rulings.push({ name, candidate, verdict, reason, quote });
+  };
+
+  // Resolve both names to live entities first: renames and deletions since
+  // quarantining end the question without spending a model call.
+  const live = new Map<string, CanonEntity[]>();
+  for (const row of listEntities(db, projectId)) {
+    live.set(row.name, [...(live.get(row.name) ?? []), row]);
+  }
+  const speakers = speakerChunksByEntity(db, projectId);
+  const judged: { name: string; candidate: string; dossier: string }[] = [];
+  const skippedEarly: { name: string; candidate: string; reason: string }[] = [];
+  for (const pair of pending) {
+    const a = live.get(pair.name) ?? [];
+    const b = live.get(pair.candidate) ?? [];
+    if (a.length !== 1 || b.length !== 1) {
+      skippedEarly.push({ ...pair, reason: 'ambiguous-names' });
+      continue;
+    }
+    if (a[0]!.kind !== b[0]!.kind) {
+      skippedEarly.push({ ...pair, reason: 'kind-changed' });
+      continue;
+    }
+    const da = entityDossier(db, projectId, a[0]!);
+    const dbb = entityDossier(db, projectId, b[0]!);
+    const lines = [
+      `Pair: ${pair.name} / ${pair.candidate} (${pair.reason})`,
+      `${pair.name}: ${da.evidence || '(no recorded evidence)'}`,
+      ...da.chunks.map((q, i) => `  passage ${i + 1} (${q.locator}): ${truncate(q.text, 600)}`),
+      `${pair.candidate}: ${dbb.evidence || '(no recorded evidence)'}`,
+      ...dbb.chunks.map((q, i) => `  passage ${i + 1} (${q.locator}): ${truncate(q.text, 600)}`),
+    ];
+    judged.push({ name: pair.name, candidate: pair.candidate, dossier: lines.join('\n') });
+  }
+  for (const s of skippedEarly) {
+    settle(s.name, s.candidate, 'skipped', s.reason);
+  }
+  if (!judged.length) return { rulings, checked: 0, pending: remaining() };
+
+  let verdicts = new Map<string, { same: boolean; quote: string }>();
+  try {
+    const res = await llm.chat({
+      system: JUDGE_SYSTEM,
+      messages: [
+        {
+          role: 'user',
+          content: judged.map((j) => j.dossier).join('\n\n---\n\n'),
+        },
+      ],
+      temperature: 0.0,
+      maxTokens: 2000,
+    });
+    const parsed = extractJson<{ rulings?: unknown }>(res.text);
+    if (Array.isArray(parsed?.rulings)) {
+      for (const raw of parsed.rulings) {
+        const item = raw as { name?: unknown; candidate?: unknown; same?: unknown; quote?: unknown };
+        if (typeof item?.name !== 'string' || typeof item?.candidate !== 'string') continue;
+        if (typeof item.same !== 'boolean') continue;
+        verdicts.set(`${item.name}::${item.candidate}`, {
+          same: item.same,
+          quote: typeof item.quote === 'string' ? item.quote : '',
+        });
+      }
+    }
+  } catch {
+    return { rulings, checked: 0, pending: remaining() };
+  }
+  if (!verdicts.size) return { rulings, checked: judged.length, pending: remaining() };
+
+  for (const j of judged) {
+    const verdict = verdicts.get(`${j.name}::${j.candidate}`);
+    if (!verdict) continue; // Unanswered pairs stay pending: fail-open per pair.
+    const a = live.get(j.name)![0]!;
+    const b = live.get(j.candidate)![0]!;
+    if (!verdict.same) {
+      settle(j.name, j.candidate, 'ruled', 'different');
+      continue;
+    }
+    if (!quoteSupported(verdict.quote, entityDossier(db, projectId, a), entityDossier(db, projectId, b))) {
+      settle(j.name, j.candidate, 'skipped', 'unproven', verdict.quote);
+      continue;
+    }
+    if (sharedSpeakerScene(speakers, a.id, b.id)) {
+      settle(j.name, j.candidate, 'skipped', 'vetoed', verdict.quote);
+      continue;
+    }
+    const keep = a.name.length >= b.name.length ? a : b;
+    const drop = keep === a ? b : a;
+    mergeEntityPair(db, projectId, keep, drop);
+    settle(j.name, j.candidate, 'merged', `${drop.name} -> ${keep.name}`, verdict.quote);
+    // Later pairs in this batch re-resolve: refresh the live map.
+    live.set(
+      keep.name,
+      listEntities(db, projectId).filter((e) => e.name === keep.name),
+    );
+    live.set(drop.name, []);
+  }
+  return { rulings, checked: judged.length, pending: remaining() };
 }
 
 /* ------------------------------------------------- timeline ↔ event join */

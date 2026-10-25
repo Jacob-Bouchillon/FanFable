@@ -256,6 +256,27 @@ export const MIGRATIONS: Migration[] = [
     ],
   },
   {
+    version: 10,
+    name: 'quarantine alias rulings',
+    // Nickname pairs the merge rules would not decide on their own wait
+    // here for a batched model ruling. Old databases migrate empty.
+    sql: `
+      CREATE TABLE IF NOT EXISTS quarantine_alias (
+        id         INTEGER PRIMARY KEY,
+        project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        name       TEXT NOT NULL DEFAULT '',
+        candidate  TEXT NOT NULL DEFAULT '',
+        reason     TEXT NOT NULL DEFAULT '',
+        status     TEXT NOT NULL DEFAULT 'pending',
+        ruling     TEXT NOT NULL DEFAULT '',
+        ruled_at   TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS quarantine_alias_pair
+        ON quarantine_alias(project_id, name, candidate);
+    `,
+  },
+  {
     version: 3,
     name: 'chapter references for story graph records',
     // Knowledge, motives, secrets and relationships have to be removable when
