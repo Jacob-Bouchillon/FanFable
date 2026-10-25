@@ -550,6 +550,13 @@ async function cmdLore(args: Args): Promise<void> {
       console.log(C.dim(`  ${stats.emptyWindows.length} window(s) produced nothing:`));
       for (const w of stats.emptyWindows) console.log(C.dim(`    #${w.index} ${w.locator}: ${w.reason}`));
     }
+    if (stats.contested && (stats.contested.facts || stats.contested.relations)) {
+      console.log(
+        C.dim(
+          `  contested: ${stats.contested.facts} fact(s), ${stats.contested.relations} relation(s) flagged rivals (see "fanfable lore diagnose")`,
+        ),
+      );
+    }
     if (stats.quarantinedAliases.length) {
       console.log(
         C.dim(`  ${stats.quarantinedAliases.length} near-duplicate name(s) left for review; see "fanfable lore merge"`),

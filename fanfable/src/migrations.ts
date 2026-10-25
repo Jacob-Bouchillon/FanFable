@@ -242,6 +242,20 @@ export const MIGRATIONS: Migration[] = [
     `,
   },
   {
+    version: 9,
+    name: 'claim modality and conflict status',
+    // Denials and doubts are claims too: modality records how the passage
+    // framed it (asserted|denied|possible|suspected), and conflict_status
+    // marks rival claims neither side resolves (none|contested|superseded).
+    // Existing rows read as asserted/none — no backfill.
+    columns: [
+      ['canon_fact', 'modality', "TEXT NOT NULL DEFAULT 'asserted'"],
+      ['canon_fact', 'conflict_status', "TEXT NOT NULL DEFAULT 'none'"],
+      ['canon_relation', 'modality', "TEXT NOT NULL DEFAULT 'asserted'"],
+      ['canon_relation', 'conflict_status', "TEXT NOT NULL DEFAULT 'none'"],
+    ],
+  },
+  {
     version: 3,
     name: 'chapter references for story graph records',
     // Knowledge, motives, secrets and relationships have to be removable when

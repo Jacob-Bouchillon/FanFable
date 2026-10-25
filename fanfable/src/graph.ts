@@ -1590,6 +1590,64 @@ export interface GraphContext {
   };
 }
 
+export type RelationBucket = 'family' | 'role' | 'spatial' | 'action' | 'other';
+
+const FAMILY_WORDS = new Set(
+  'sibling brother sister parent mother father son daughter child children spouse husband wife married marry cousin aunt uncle nephew niece grandfather grandmother grandson granddaughter family kin twin widow widower betrothed'.split(
+    ' ',
+  ),
+);
+const ROLE_WORDS = new Set(
+  'lord lady master servant member leader king queen prince princess captain commander teacher student mentor heir knight guard soldier apprentice minister mayor chief boss owner founder head officer leads serves works'.split(
+    ' ',
+  ),
+);
+const SPATIAL_WORDS = new Set(
+  'near pointing at in on inside outside above below behind beside across through into under over location lives'.split(
+    ' ',
+  ),
+);
+const ACTION_WORDS = new Set(
+  'cause causes caused hunt hunts hunted break breaks broke broken breaking kill kills killed give gave takes took knows knew met meet'.split(
+    ' ',
+  ),
+);
+
+/**
+ * The coarse bucket a relation kind belongs to, by keyword. Whole words
+ * only: 'at' must not fire inside 'great'.
+ */
+export function relationBucket(kind: string): RelationBucket {
+  const words = (kind ?? '').toLowerCase().split(/[^a-z]+/).filter(Boolean);
+  if (words.some((w) => FAMILY_WORDS.has(w))) return 'family';
+  if (words.some((w) => ROLE_WORDS.has(w))) return 'role';
+  if (words.some((w) => SPATIAL_WORDS.has(w))) return 'spatial';
+  if (words.some((w) => ACTION_WORDS.has(w))) return 'action';
+  return 'other';
+}
+
+const BUCKET_RANK: Record<RelationBucket, number> = { family: 0, role: 1, spatial: 2, action: 3, other: 4 };
+
+/**
+ * Stored edge types mapped onto the controlled vocabulary. Relation kinds
+ * map to their coarse bucket; the web and mention kinds map 1:1. Nothing is
+ * renamed in storage — this is a lens for ranking, not a migration.
+ */
+export function markerFor(edgeType: string): string {
+  switch (edgeType) {
+    case 'alias_of':
+      return 'ALIAS';
+    case 'mentions_in':
+      return 'MENTIONED_IN';
+    case 'resembles':
+      return 'SEMANTICALLY_SIMILAR';
+    case 'appears_with':
+      return 'REPEATED_CO_OCCURRENCE';
+    default:
+      return relationBucket(edgeType).toUpperCase();
+  }
+}
+
 /**
  * Choose traversal roots from what the query actually asks about.
  *
@@ -1619,6 +1677,11 @@ export function resolveQuerySeeds(
   // 1. A relation triple the query describes, with at least one endpoint named.
   //    Web edges (alias/resemblance/co-occurrence) carry no claim and never
   //    seed, even if a query word brushes their type name.
+  //    Family and role ties outrank spatial and action ones: when a query
+  //    matches both "X's sister near Y" and "X walks near Y", the kinship is
+  //    the answer and the whereabouts are trivia. Stable sort, so ties keep
+  //    database order exactly as before.
+  const tripleHits: { edge: (typeof graph.edges)[number]; rank: number; at: number }[] = [];
   for (const edge of graph.edges) {
     if (edge.type === 'alias_of' || edge.type === 'resembles' || edge.type === 'appears_with') continue;
     const from = graph.nodes.get(edge.from);
@@ -1629,6 +1692,10 @@ export function resolveQuerySeeds(
     const label = `${edge.type} ${edge.description}`.toLowerCase();
     if (!queryTerms.some((t) => label.includes(t))) continue;
     if (!namesInText(from) && !namesInText(to)) continue;
+    tripleHits.push({ edge, rank: BUCKET_RANK[relationBucket(edge.type)], at: tripleHits.length });
+  }
+  tripleHits.sort((a, b) => a.rank - b.rank || a.at - b.at);
+  for (const { edge } of tripleHits) {
     roots.add(edge.from);
     roots.add(edge.to);
   }

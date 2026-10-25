@@ -14,7 +14,7 @@ import { Db, nowIso, strList, toJson } from './db.ts';
 import { asRecordArray, extractJson, salvageJsonArray, toStringArray } from './json.ts';
 import type { LlmClient } from './llm.ts';
 import { embedMissing, type EmbedFn } from './embeddings.ts';
-import { splitSentences, truncate } from './text.ts';
+import { STOPWORDS, splitSentences, tokenize, truncate } from './text.ts';
 
 /* ------------------------------------------------------------------ models */
 
@@ -44,6 +44,8 @@ export interface CanonRelation {
   kind: string;
   description: string;
   evidence: string;
+  modality: string;
+  conflictStatus: string;
 }
 
 export interface CanonFact {
@@ -55,6 +57,8 @@ export interface CanonFact {
   subject: string;
   evidence: string;
   sourceRefs: { source: string; locator: string; chunk?: number }[];
+  modality: string;
+  conflictStatus: string;
 }
 
 export interface CanonTimelineEntry {
@@ -88,12 +92,14 @@ Reply with JSON only:
   ],
   "relations": [
     {"from":"name","to":"name","kind":"one short phrase, such as 'sibling of'",
-     "description":"one sentence","chunk_index":0,"evidence":"a short exact quote"}
+     "description":"one sentence","chunk_index":0,"evidence":"a short exact quote",
+     "modality":"asserted|denied|possible|suspected — only include when not asserted"}
   ],
   "facts": [
     {"topic":"the subject of the fact","statement":"what the book establishes",
      "kind":"rule|fact|background","certainty":"confirmed|inferred","subject":"name it concerns",
-     "chunk_index":0,"evidence":"a short exact quote"}
+     "chunk_index":0,"evidence":"a short exact quote",
+     "modality":"asserted|denied|possible|suspected — only include when not asserted"}
   ],
   "timeline": [
     {"title":"what happens","summary":"one or two sentences","when":"when it happens, in the book's words",
@@ -111,6 +117,7 @@ Rules:
   the one it is to. If Harry is Petunia's nephew, it is from="Harry Potter",
   to="Aunt Petunia", kind="nephew of".
 - If the passages contain no new people or facts, return empty arrays.
+- If the passage denies, doubts, or frames something as merely possible, record the claim normally but set modality to denied/possible/suspected with the denying quote as evidence; never store a denial as a plain fact.
 - No prose outside the JSON.`;
 
 /*
@@ -144,7 +151,8 @@ Reply with JSON only:
   "facts": [
     {"topic":"the subject of the fact","statement":"what the book establishes",
      "kind":"rule|fact|background","certainty":"confirmed|inferred","subject":"name it concerns",
-     "chunk_index":0,"evidence":"a short exact quote"}
+     "chunk_index":0,"evidence":"a short exact quote",
+     "modality":"asserted|denied|possible|suspected — only include when not asserted"}
   ]
 }
 
@@ -153,6 +161,7 @@ Rules:
 - chunk_index is the number shown in front of each passage. Use it for every entry.
 - evidence must be a short phrase copied from the passage, not your own words.
 - If the passages contain no new people, places or facts, return empty arrays.
+- If the passage denies, doubts, or frames something as merely possible, record the claim normally but set modality to denied/possible/suspected with the denying quote as evidence; never store a denial as a plain fact.
 - No prose outside the JSON.`;
 
 export const EXTRACT_RELATIONS_SYSTEM = `You read passages from a book and record relationships between the known entities listed below.
@@ -163,7 +172,8 @@ Reply with JSON only:
     {"from":"a name from the list, exactly as written",
      "to":"another name from the list, exactly as written",
      "kind":"one short phrase, such as 'sibling of'",
-     "description":"one sentence","chunk_index":0,"evidence":"a short exact quote"}
+     "description":"one sentence","chunk_index":0,"evidence":"a short exact quote",
+     "modality":"asserted|denied|possible|suspected — only include when not asserted"}
   ]
 }
 
@@ -176,6 +186,7 @@ Rules:
 - chunk_index is the number shown in front of each passage.
 - evidence must be a short phrase copied from the passage, not your own words.
 - If the passages state no new relationship, return an empty array.
+- If the passage denies, doubts, or frames something as merely possible, record the claim normally but set modality to denied/possible/suspected with the denying quote as evidence; never store a denial as a plain fact.
 - No prose outside the JSON.`;
 
 export const EXTRACT_EVENTS_SYSTEM = `You read passages from a book and record what happens in them, in order.
@@ -197,6 +208,7 @@ Rules:
 - chunk_index is the number shown in front of each passage.
 - evidence must be a short phrase copied from the passage, not your own words.
 - If the passages narrate no event, return an empty array.
+- If the passage denies, doubts, or frames something as merely possible, record the claim normally but set modality to denied/possible/suspected with the denying quote as evidence; never store a denial as a plain fact.
 - No prose outside the JSON.`;
 
 export interface ExtractWindowProgress {
@@ -313,6 +325,8 @@ export interface ExtractLoreResult {
   mergedAliases: string[];
   /** Budget selection, when a budget applied. Absent means everything ran. */
   selection?: { selected: number; total: number; skipped: number };
+  /** Rival-claim rows flagged contested by this run. */
+  contested?: { facts: number; relations: number };
 }
 
 export interface ChunkRow {
@@ -602,6 +616,8 @@ export async function extractLore(
 
   // Fold any duplicates left by earlier runs into one row per pair.
   dedupeRelations(db, projectId);
+  const contested = markContestedClaims(db, projectId);
+  if (contested.facts || contested.relations) stats.contested = contested;
   const merged = mergeCanonEntities(db, projectId);
   stats.mergedAliases = merged.merged;
   stats.quarantinedAliases = merged.quarantined;
@@ -679,6 +695,8 @@ export async function ensureWindowsForChunks(
   });
 
   dedupeRelations(db, projectId);
+  const contested = markContestedClaims(db, projectId);
+  if (contested.facts || contested.relations) stats.contested = contested;
   const merged = mergeCanonEntities(db, projectId);
   stats.mergedAliases = merged.merged;
   stats.quarantinedAliases = merged.quarantined;
@@ -888,6 +906,7 @@ function rememberExtractionReport(db: Db, projectId: number, stats: ExtractLoreR
         emptyWindows: stats.emptyWindows,
         quarantinedAliases: stats.quarantinedAliases.length,
         mergedAliases: stats.mergedAliases.length,
+        contested: stats.contested ?? { facts: 0, relations: 0 },
       }),
     );
   } catch {
@@ -906,6 +925,7 @@ export function lastExtractionReport(
   emptyWindows: EmptyWindowReport[];
   quarantinedAliases: number;
   mergedAliases: number;
+  contested: { facts: number; relations: number };
 } | undefined {
   const row = db.get<{ value: string }>('SELECT value FROM schema_meta WHERE key = ?', `lore-extraction:${projectId}`);
   if (!row) return undefined;
@@ -914,6 +934,97 @@ export function lastExtractionReport(
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Flag rival claims neither side resolves.
+ *
+ * Deterministic marking only: same-subject facts (or same-pair relations)
+ * whose normalized texts contain opposing markers — a negation against an
+ * affirmation, died/dead against alive, before against after — are both set
+ * to contested. Nothing is deleted, nothing is auto-resolved, and model
+ * judgment stays out of it. Only rows still marked none move.
+ */
+export function markContestedClaims(db: Db, projectId: number): { facts: number; relations: number } {
+  const counts = { facts: 0, relations: 0 };
+  const flag = (table: string, ids: number[]): number => {
+    let n = 0;
+    for (const id of ids) {
+      const r = db.run(
+        `UPDATE ${table} SET conflict_status = 'contested' WHERE id = ? AND project_id = ? AND conflict_status = 'none'`,
+        id,
+        projectId,
+      );
+      n += r.changes;
+    }
+    return n;
+  };
+
+  const facts = db.all<{ id: number; subject: string; statement: string }>(
+    'SELECT id, subject, statement FROM canon_fact WHERE project_id = ?',
+    projectId,
+  );
+  const bySubject = new Map<string, typeof facts>();
+  for (const f of facts) {
+    const key = f.subject.trim().toLowerCase() || '(no subject)';
+    bySubject.set(key, [...(bySubject.get(key) ?? []), f]);
+  }
+  for (const group of bySubject.values()) {
+    for (let i = 0; i < group.length; i++) {
+      for (let j = i + 1; j < group.length; j++) {
+        if (opposingClaims(group[i]!.statement, group[j]!.statement)) {
+          counts.facts += flag('canon_fact', [group[i]!.id, group[j]!.id]);
+        }
+      }
+    }
+  }
+
+  const relations = db.all<{ id: number; from_entity: number; to_entity: number; description: string }>(
+    'SELECT id, from_entity, to_entity, description FROM canon_relation WHERE project_id = ?',
+    projectId,
+  );
+  const byPair = new Map<string, typeof relations>();
+  for (const r of relations) {
+    const key = [r.from_entity, r.to_entity].sort((a, b) => a - b).join(':');
+    byPair.set(key, [...(byPair.get(key) ?? []), r]);
+  }
+  for (const group of byPair.values()) {
+    for (let i = 0; i < group.length; i++) {
+      for (let j = i + 1; j < group.length; j++) {
+        if (opposingClaims(group[i]!.description, group[j]!.description)) {
+          counts.relations += flag('canon_relation', [group[i]!.id, group[j]!.id]);
+        }
+      }
+    }
+  }
+  return counts;
+}
+
+const NEGATION_RE = /\b(not|never|no|n't|cannot|can't|didn't|doesn't|don't|isn't|wasn't|weren't|hasn't|haven't|hadn't|won't|wouldn't|couldn't|shouldn't|neither|nor|nothing|none|without)\b/;
+const DIED_RE = /\b(died|dead|death)\b/;
+const ALIVE_RE = /\b(alive|living|survived|survive|survives)\b/;
+const BEFORE_RE = /\bbefore\b/;
+const AFTER_RE = /\bafter\b/;
+
+function hasMarker(text: string, re: RegExp): boolean {
+  return re.test(` ${text.toLowerCase().replace(/[^a-z0-9' ]+/g, ' ')} `);
+}
+
+/** Do two same-subject texts state opposite things by a fixed marker set? */
+function opposingClaims(a: string, b: string): boolean {
+  if (!a.trim() || !b.trim()) return false;
+  // Rival claims talk about the same thing: without a shared content word
+  // the markers below would fire on any two unrelated statements.
+  const wa = new Set(tokenize(a));
+  let shared = 0;
+  for (const w of tokenize(b)) if (wa.has(w)) shared++;
+  if (shared < 1) return false;
+  if (hasMarker(a, NEGATION_RE) !== hasMarker(b, NEGATION_RE)) return true;
+  if (hasMarker(a, DIED_RE) && hasMarker(b, ALIVE_RE)) return true;
+  if (hasMarker(a, ALIVE_RE) && hasMarker(b, DIED_RE)) return true;
+  if (hasMarker(a, BEFORE_RE) && hasMarker(b, AFTER_RE)) return true;
+  if (hasMarker(a, AFTER_RE) && hasMarker(b, BEFORE_RE)) return true;
+  return false;
 }
 
 /** One relation per pair: keep the most detailed description. */
@@ -1225,8 +1336,8 @@ function applyFacts(
       ? [{ source: span.source, locator: span.locator, chunk: span.chunkId }]
       : refsFor(chunk);
     db.run(
-      `INSERT INTO canon_fact (project_id, topic, statement, kind, certainty, subject, evidence, source_refs, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO canon_fact (project_id, topic, statement, kind, certainty, subject, evidence, source_refs, modality, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       projectId,
       String(raw.topic ?? '').trim(),
       statement,
@@ -1235,6 +1346,7 @@ function applyFacts(
       String(raw.subject ?? '').trim(),
       span.quote,
       toJson(refs),
+      normaliseModality(raw.modality),
       nowIso(),
     );
     stats.facts++;
@@ -1294,8 +1406,8 @@ function applyRelations(
         continue;
       }
       db.run(
-        `INSERT INTO canon_relation (project_id, from_entity, to_entity, kind, description, evidence, source_refs, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO canon_relation (project_id, from_entity, to_entity, kind, description, evidence, source_refs, modality, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         projectId,
         fromId,
         toId,
@@ -1303,6 +1415,7 @@ function applyRelations(
         String(raw.description ?? '').trim(),
         span.quote,
         toJson(refs),
+        normaliseModality(raw.modality),
         nowIso(),
       );
       stats.relations++;
@@ -2019,6 +2132,19 @@ function normaliseKind(kind: string): EntityKind {
   return 'character';
 }
 
+export type ClaimModality = 'asserted' | 'denied' | 'possible' | 'suspected';
+
+/**
+ * The model's modality word, defensively: anything outside the four known
+ * framings reads as asserted. A denial stored as a plain fact would be
+ * worse than a wrong label, so unknown values fall back, never through.
+ */
+export function normaliseModality(raw: unknown): ClaimModality {
+  const word = String(raw ?? '').trim().toLowerCase();
+  if (word === 'denied' || word === 'possible' || word === 'suspected') return word;
+  return 'asserted';
+}
+
 function key(name: string): string {
   return name.trim().toLowerCase();
 }
@@ -2130,9 +2256,11 @@ export function listRelations(db: Db, projectId: number): CanonRelation[] {
     evidence: string;
     from_name: string;
     to_name: string;
+    modality: string | null;
+    conflict_status: string | null;
   }>(
     `SELECT r.id, r.from_entity, r.to_entity, r.kind, r.description, r.evidence,
-            a.name AS from_name, b.name AS to_name
+            a.name AS from_name, b.name AS to_name, r.modality, r.conflict_status
      FROM canon_relation r
      JOIN canon_entity a ON a.id = r.from_entity
      JOIN canon_entity b ON b.id = r.to_entity
@@ -2148,6 +2276,8 @@ export function listRelations(db: Db, projectId: number): CanonRelation[] {
     kind: r.kind,
     description: r.description,
     evidence: r.evidence,
+    modality: r.modality ?? 'asserted',
+    conflictStatus: r.conflict_status ?? 'none',
   }));
 }
 
@@ -2168,6 +2298,8 @@ export function listFacts(db: Db, projectId: number, topic?: string): CanonFact[
     subject: string;
     evidence: string;
     source_refs: string;
+    modality: string | null;
+    conflict_status: string | null;
   }>(sql, ...params);
   return rows.map((r) => ({
     id: r.id,
@@ -2178,6 +2310,8 @@ export function listFacts(db: Db, projectId: number, topic?: string): CanonFact[
     subject: r.subject,
     evidence: r.evidence,
     sourceRefs: JSON.parse(r.source_refs || '[]') as { source: string; locator: string }[],
+    modality: r.modality ?? 'asserted',
+    conflictStatus: r.conflict_status ?? 'none',
   }));
 }
 

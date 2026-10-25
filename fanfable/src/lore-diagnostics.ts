@@ -31,6 +31,7 @@ export type GapKind =
   | 'contradictory-relation'
   | 'missing-relation'
   | 'unsupported-claim'
+  | 'contested-claim'
   | 'extraction-quality';
 
 export interface LoreGap {
@@ -184,6 +185,44 @@ export function diagnose(db: Db, projectId: number, opts: { limit?: number } = {
 
   const names = new Map<number, string>();
   for (const e of entities) names.set(e.id, e.name);
+
+  // 0c. Rival claims the marker flagged: both rows stay, the author judges.
+  const contestedFacts = db.all<{ id: number; subject: string; statement: string; evidence: string }>(
+    "SELECT id, subject, statement, evidence FROM canon_fact WHERE project_id = ? AND conflict_status = 'contested' ORDER BY id LIMIT 10",
+    projectId,
+  );
+  for (const row of contestedFacts) {
+    gaps.push({
+      kind: 'contested-claim',
+      severity: 'warning',
+      subject: row.subject || row.statement,
+      message: `Two passages disagree about ${row.subject || 'this'}: "${truncate(row.statement, 120)}".`,
+      evidence: row.evidence || 'no quote recorded',
+      suggestion: 'Check the source passages; neither claim was removed.',
+    });
+  }
+  const contestedRelations = db.all<{
+    id: number;
+    from_entity: number;
+    to_entity: number;
+    kind: string;
+    description: string;
+    evidence: string;
+  }>(
+    "SELECT id, from_entity, to_entity, kind, description, evidence FROM canon_relation WHERE project_id = ? AND conflict_status = 'contested' ORDER BY id LIMIT 10",
+    projectId,
+  );
+  for (const row of contestedRelations) {
+    const pair = `${names.get(row.from_entity) ?? '?'} / ${names.get(row.to_entity) ?? '?'}`;
+    gaps.push({
+      kind: 'contested-claim',
+      severity: 'warning',
+      subject: pair,
+      message: `${pair} is recorded as "${row.kind}" with a rival claim: "${truncate(row.description, 120)}".`,
+      evidence: row.evidence || 'no quote recorded',
+      suggestion: 'Check the source passages; neither claim was removed.',
+    });
+  }
 
   // 1. Entities that are mentioned often but have no relations at all.
   for (const e of entities) {
