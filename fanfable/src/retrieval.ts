@@ -104,6 +104,8 @@ export interface RetrievalPackage {
     coverage: RetrievalCoverage;
     /** A family tie the web already implies, so no mining was needed. */
     composedPath?: { via: string; label: string };
+    /** Two named people with no tie and no composed path: strangers. */
+    strangers?: { a: string; b: string };
     /** Windows mined on demand for this query, when the lazy path fired. */
     lazyMined?: { windows: number; entities: number; relations: number };
     /** PageRank diagnostics, when the relational path ranked by PPR. */
@@ -238,14 +240,26 @@ export async function retrieve(
   /* ------------------------------- lazy mining of unmined hits */
   let lazyMined: { windows: number; entities: number; relations: number } | undefined;
   let composedPath: { via: string; label: string } | undefined;
+  let strangers: { a: string; b: string } | undefined;
   const lazyOn = req.lazyExtract ?? route !== 'lookup';
   // A family tie the web already implies needs no fresh reading: two people
   // joined by a composed path through accepted rows skip the mining the
   // query would otherwise pay for. Nothing is banked; the graph answers.
+  // No banked stranger rows ever: N squared pairs, none quotable. Strangers
+  // are an answer ("no recorded connection"), computed here, never stored.
   if (lazyOn && relational && focus.length >= 2) {
     const a = lorebook.findEntity(db, projectId, focus[0]!);
     const b = lorebook.findEntity(db, projectId, focus[1]!);
-    if (a && b) composedPath = graph.findComposedPath(db, projectId, a.id, b.id) ?? undefined;
+    if (a && b) {
+      composedPath = graph.findComposedPath(db, projectId, a.id, b.id) ?? undefined;
+      if (!composedPath) {
+        const direct = db.get<{ id: number }>(
+          `SELECT id FROM canon_relation WHERE project_id = ? AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?)) LIMIT 1`,
+          projectId, a.id, b.id, b.id, a.id,
+        );
+        if (!direct) strangers = { a: a.name, b: b.name };
+      }
+    }
   }
   if (lazyOn && req.includeGraph !== false && passages.length && !composedPath) {
     const mini = await lorebook.mineUnminedHits(
@@ -400,6 +414,7 @@ export async function retrieve(
       coverage: cov,
       ...(lazyMined ? { lazyMined } : {}),
       ...(composedPath ? { composedPath } : {}),
+      ...(strangers ? { strangers } : {}),
       ...(graphContext.stats.ppr ? { ppr: graphContext.stats.ppr } : {}),
       ...(graphContext.stats.pprFallback ? { pprFallback: true } : {}),
       ...(graphContext.stats.recognition ? { recognition: graphContext.stats.recognition } : {}),

@@ -1473,6 +1473,101 @@ function proofRelevance(
   return true;
 }
 
+/**
+ * The bank's own endpoint rule, reusable outside extraction: a quote passes
+ * when it names an endpoint or nobody at all, and fails only when it names
+ * a third roster person. The relabeling pass judges by exactly this rule.
+ */
+export function quoteNamesEndpoint(
+  db: Db,
+  projectId: number,
+  fromId: number,
+  toId: number,
+  quote: string,
+): boolean {
+  return proofRelevance(rosterTokens(db, projectId), fromId, toId, quote);
+}
+
+/**
+ * Bank a happening as an event. Moments fail as ties but truly happened, so
+ * the occurrence is kept where happenings live: the event index, both
+ * people attached, the same proving quote. Deterministic, no model.
+ * Reruns collide on title-plus-chunk and add nothing.
+ */
+function bankMomentEvent(
+  db: Db,
+  projectId: number,
+  fromId: number,
+  toId: number,
+  kind: string,
+  description: string,
+  span: { quote: string; chunkId: number | null; source: string; locator: string },
+  chunk: ChunkRow | undefined,
+): void {
+  const names = new Map<number, string>();
+  for (const row of db.all<{ id: number; name: string }>(
+    'SELECT id, name FROM canon_entity WHERE project_id = ? AND id IN (?, ?)',
+    projectId,
+    fromId,
+    toId,
+  )) {
+    names.set(row.id, row.name);
+  }
+  const fromName = names.get(fromId) ?? '';
+  const toName = names.get(toId) ?? '';
+  if (!fromName || !toName) return;
+  let sourceId: number | null = null;
+  let chunkId: number | null = null;
+  let locator = span.locator;
+  let seq = chunk?.seq ?? 0;
+  if (span.chunkId !== null) {
+    const row = db.get<{ id: number; source_id: number; locator: string; seq: number }>(
+      'SELECT id, source_id, locator, seq FROM canon_chunk WHERE id = ?',
+      span.chunkId,
+    );
+    if (row) {
+      chunkId = row.id;
+      sourceId = row.source_id;
+      locator = row.locator;
+      seq = row.seq;
+    }
+  } else if (chunk) {
+    const row = db.get<{ id: number; source_id: number }>(
+      'SELECT id, source_id FROM canon_chunk WHERE project_id = ? AND seq = ? LIMIT 1',
+      projectId,
+      chunk.seq,
+    );
+    if (row) {
+      chunkId = row.id;
+      sourceId = row.source_id;
+    }
+    locator = chunk.locator;
+  }
+  const title = `${fromName} ${kind} ${toName}`;
+  const dup = db.get<{ id: number }>(
+    'SELECT id FROM canon_event WHERE project_id = ? AND title = ? AND (chunk_id IS ? OR chunk_id = ?)',
+    projectId,
+    title,
+    chunkId,
+    chunkId ?? -1,
+  );
+  if (dup) return;
+  db.run(
+    `INSERT INTO canon_event (project_id, source_id, chunk_id, locator, title, summary, participants, location, time_label, kind, quote, seq, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, '', '', 'event', ?, ?, ?)`,
+    projectId,
+    sourceId,
+    chunkId,
+    locator,
+    title,
+    description,
+    toJson([fromName, toName]),
+    span.quote,
+    seq,
+    nowIso(),
+  );
+}
+
 /** Write the relation section. Returns how many claims were accepted. */
 function applyRelations(
   db: Db,
@@ -1513,16 +1608,26 @@ function applyRelations(
       : refsFor(chunk);
     const kinds = normaliseKinds(String(raw.kind ?? ''));
     for (const kind of kinds) {
-      // A moment is never a tie, however real its quote: met, gave, told,
-      // saw, refused and their kin belong to events. Counted, never written.
+      // Moments are not ties, flagged or otherwise: what happened belongs to
+      // events. The happening banks as an event with both people attached;
+      // the tie question parks as a note. Counted throughout, never lost.
+      // Silent nouns keep a flagged tie row: the label IS relationship-
+      // shaped, only its quote is silent. The judge or a human decides.
+      let flagged: 'unsupported' | null = null;
       if (isMomentKind(kind)) {
         stats.verification.moment++;
+        bankMomentEvent(db, projectId, fromId, toId, kind, String(raw.description ?? '').trim(), span, chunk);
+        persistTieNote(db, projectId, fromId, toId, kind, 'moment', span.quote, toJson(refs));
         continue;
       }
+      if (isUnsupportedKind(kind, span.quote)) {
+        stats.verification.unsupported++;
+        persistTieNote(db, projectId, fromId, toId, kind, 'unsupported', span.quote, toJson(refs));
+        flagged = 'unsupported';
+      }
       // A generic kinship word repeats a specific one: "parent of" beside
-      // "father of" says nothing new. The generic drops when the specific
-      // is banked; a specific arriving late replaces the banked generic.
-      // Unordered pair, like the merge below.
+      // "father of" says nothing new. Pure dedupe, not a meaning judgment:
+      // the generic drops, the specific stands, the counter ticks.
       const lk = kind.toLowerCase();
       const specifics = GENERIC_KINSHIP.get(lk);
       if (specifics) {
@@ -1559,14 +1664,7 @@ function applyRelations(
           break;
         }
       }
-      // A noun tie must be spoken: sister, brother, father and their kin
-      // only bank when the quote itself says the word. A true label on a
-      // silent quote ("cousin of" proved by "What's his name again?") is
-      // dropped and counted, never banked.
-      if (isUnsupportedKind(kind, span.quote)) {
-        stats.verification.unsupported++;
-        continue;
-      }
+      const rowReview = flagged ? 'needs_review' : review;
       // The same claim in two words: one pair, one quote, one head verb
       // ("trusts with life" beside "trusts with important task"). Merge into
       // the earliest row instead of banking both; the longer telling wins,
@@ -1575,8 +1673,8 @@ function applyRelations(
         const stop = new Set(['a', 'an', 'the', 'to', 'of', 'with', 'by', 'for', 'in', 'on', 'at']);
         return k.toLowerCase().split(/[^a-z]+/).filter((w) => w && !stop.has(w))[0] ?? '';
       };
-      const rivals = db.all<{ id: number; kind: string; description: string; evidence: string; source_refs: string }>(
-        `SELECT id, kind, description, evidence, source_refs FROM canon_relation
+      const rivals = db.all<{ id: number; kind: string; description: string; evidence: string; source_refs: string; review_status: string }>(
+        `SELECT id, kind, description, evidence, source_refs, review_status FROM canon_relation
           WHERE project_id = ? AND evidence = ? AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))
           ORDER BY id`,
         projectId,
@@ -1592,12 +1690,14 @@ function applyRelations(
         const sentence = description.length > twin.description.length ? description : twin.description;
         const quote = span.quote.length > twin.evidence.length ? span.quote : twin.evidence;
         const sourceRefs = earliestRefs(db, toJson(refs), twin.source_refs);
+        const twinReview = rowReview === 'needs_review' || twin.review_status === 'needs_review' ? 'needs_review' : twin.review_status;
         db.run(
-          'UPDATE canon_relation SET kind = ?, description = ?, evidence = ?, source_refs = ? WHERE id = ?',
+          'UPDATE canon_relation SET kind = ?, description = ?, evidence = ?, source_refs = ?, review_status = ? WHERE id = ?',
           twin.kind,
           sentence,
           quote,
           sourceRefs,
+          twinReview,
           twin.id,
         );
         accepted++;
@@ -1623,7 +1723,7 @@ function applyRelations(
         const sentence = description.length > existing.description.length ? description : existing.description;
         const quote = span.quote.length > existing.evidence.length ? span.quote : existing.evidence;
         const sourceRefs = earliestRefs(db, toJson(refs), existing.source_refs);
-        const mergedReview = review === 'needs_review' || existing.review_status === 'needs_review' ? 'needs_review' : existing.review_status;
+        const mergedReview = rowReview === 'needs_review' || existing.review_status === 'needs_review' ? 'needs_review' : existing.review_status;
         db.run(
           'UPDATE canon_relation SET description = ?, evidence = ?, source_refs = ?, review_status = ? WHERE id = ?',
           sentence,
@@ -1646,7 +1746,7 @@ function applyRelations(
         span.quote,
         toJson(refs),
         normaliseModality(raw.modality),
-        review,
+        rowReview,
         nowIso(),
       );
       stats.relations++;
@@ -2072,6 +2172,45 @@ export function sharedSpeakerScene(
   return false;
 }
 
+/** Closed vocabulary for the notes relabeling pass. Universal kin and role
+ * words only — never book-specific. Per-book growth happens solely through
+ * the human review queue, never by model invention. */
+export const CLOSED_TIE_LABELS = [
+  'sister of', 'brother of', 'sibling of', 'mother of', 'father of', 'parent of',
+  'son of', 'daughter of', 'child of', 'husband of', 'wife of', 'spouse of',
+  'married to', 'uncle of', 'aunt of', 'nephew of', 'niece of', 'cousin of',
+  'relative of', 'friend of', 'enemy of', 'ally of', 'teacher of', 'student of',
+  'mentor of', 'leader of', 'member of',
+];
+
+/** Park a dropped tie for the batched relabeling pass. Reruns collide on
+ * the pair-plus-label index and add nothing. */
+function persistTieNote(
+  db: Db,
+  projectId: number,
+  fromId: number,
+  toId: number,
+  attemptedKind: string,
+  reason: 'moment' | 'unsupported' | 'evaluation',
+  evidence: string,
+  sourceRefs: string,
+  ruling = '',
+): void {
+  db.run(
+    `INSERT OR IGNORE INTO canon_tie_note (project_id, from_entity, to_entity, attempted_kind, reason, evidence, source_refs, status, ruling, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+    projectId,
+    fromId,
+    toId,
+    attemptedKind,
+    reason,
+    evidence,
+    sourceRefs,
+    ruling,
+    nowIso(),
+  );
+}
+
 /** A cheap "these two look like the same person" test for quarantine. */
 export function looksAlike(a: string, b: string): { alike: boolean; reason: string } {
   const ta = nameTokens(a);
@@ -2458,6 +2597,312 @@ export async function judgeQuarantine(
   return { rulings, checked: judged.length, pending: remaining() };
 }
 
+/* ------------------------------------------------- tie-note relabeling */
+
+export interface TieNoteResolution {
+  resolved: number;
+  confirmed: number;
+  unproven: number;
+  checked: number;
+  pending: number;
+}
+
+/**
+ * One closed-vocabulary pass over parked tie notes.
+ *
+ * Each pending note (a moment label or a quote-silent noun) is re-asked once
+ * with its proving passage: name one label from the closed universal list,
+ * or unresolvable, with an exact quote. Anything banked re-enters through
+ * the same gates (moment, support, endpoint naming) — the pass can only
+ * promote what the rules would have kept. Malformed answers stay pending:
+ * fail-open per note, exactly like the quarantine judge.
+ */
+export async function resolveTieNotes(
+  db: Db,
+  llm: LlmClient,
+  projectId: number,
+  opts: { maxNotes?: number; onProgress?: (message: string) => void } = {},
+): Promise<TieNoteResolution> {
+  const maxNotes = Math.max(1, opts.maxNotes ?? 25);
+  const remaining = (): number =>
+    db.get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM canon_tie_note WHERE project_id = ? AND status = 'pending'",
+      projectId,
+    )?.n ?? 0;
+  const notes = db.all<{
+    id: number;
+    from_entity: number;
+    to_entity: number;
+    attempted_kind: string;
+    reason: string;
+    evidence: string;
+    source_refs: string;
+    from_name: string;
+    to_name: string;
+  }>(
+    `SELECT n.id, n.from_entity, n.to_entity, n.attempted_kind, n.reason, n.evidence,
+            n.source_refs, fe.name AS from_name, te.name AS to_name
+       FROM canon_tie_note n
+       JOIN canon_entity fe ON fe.id = n.from_entity
+       JOIN canon_entity te ON te.id = n.to_entity
+      WHERE n.project_id = ? AND n.status = 'pending' ORDER BY n.id LIMIT ?`,
+    projectId,
+    maxNotes,
+  );
+  let resolved = 0;
+  let confirmed = 0;
+  let unproven = 0;
+  const norm = (s: string): string =>
+    s.replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/\s+/g, ' ').trim();
+  const settle = (id: number, status: 'resolved' | 'confirmed-drop', ruling: string): void => {
+    db.run(
+      "UPDATE canon_tie_note SET status = ?, ruling = ?, ruled_at = ? WHERE id = ? AND project_id = ?",
+      status,
+      ruling,
+      nowIso(),
+      id,
+      projectId,
+    );
+  };
+  for (const note of notes) {
+    opts.onProgress?.(`note ${note.from_name} / ${note.to_name} (${note.attempted_kind})`);
+    let chunkId: number | null = null;
+    try {
+      const refs = JSON.parse(note.source_refs || '[]') as { chunk?: unknown }[];
+      for (const ref of refs) {
+        const n = Number(ref?.chunk);
+        if (Number.isFinite(n) && n > 0) {
+          chunkId = n;
+          break;
+        }
+      }
+    } catch {
+      chunkId = null;
+    }
+    const chunk = chunkId
+      ? db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', chunkId)
+      : null;
+    if (!chunk?.text) {
+      unproven++;
+      continue;
+    }
+    const passage = chunk.text.slice(0, 1500);
+    // What the pair did together rides along: actions are context for the
+    // tie decision. Both names in the recorded participants, newest first.
+    const like = (s: string): string => s.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+    const doings = db.all<{ title: string; summary: string }>(
+      `SELECT title, summary FROM canon_event WHERE project_id = ? AND participants LIKE ? ESCAPE '\\' AND participants LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT 5`,
+      projectId,
+      `%${like(note.from_name)}%`,
+      `%${like(note.to_name)}%`,
+    );
+    const context = doings.length
+      ? `WHAT THEY DID TOGETHER:\n${doings.map((d) => `- ${d.title}${d.summary ? `: ${d.summary.slice(0, 140)}` : ''}`).join('\n')}\n\n`
+      : '';
+    let label = '';
+    let quote = '';
+    try {
+      const res = await llm.chat({
+        system:
+          'You relabel one claimed tie using only the passage. Reply with JSON only: {"label": "exactly one of the allowed labels, or unresolvable", "quote": "an exact phrase from the passage"}. Start with {. No other words.',
+        messages: [{
+          role: 'user',
+          content:
+            `PAIR: ${note.from_name} / ${note.to_name}\nOLD LABEL: ${note.attempted_kind}\n` +
+            `ALLOWED: ${CLOSED_TIE_LABELS.join(', ')}\n\n${context}PASSAGE:\n${passage}`,
+        }],
+        temperature: 0.1,
+        maxTokens: 300,
+      });
+      const raw = (res.text ?? '').replace(/```json|```/g, '');
+      const parsed = JSON.parse(raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1)) as {
+        label?: unknown;
+        quote?: unknown;
+      };
+      label = String(parsed.label ?? '').trim().toLowerCase();
+      quote = norm(String(parsed.quote ?? ''));
+    } catch {
+      unproven++;
+      continue;
+    }
+    if (!label || label === 'unresolvable') {
+      // No tie here after all: clear the flagged attempt so it stops
+      // showing up badged, and close the note. Accepted rows are never
+      // touched — only flagged ones of the attempted label.
+      db.run(
+        `DELETE FROM canon_relation WHERE project_id = ? AND lower(kind) = ? AND review_status = 'needs_review'
+          AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))`,
+        projectId,
+        note.attempted_kind.toLowerCase(),
+        note.from_entity,
+        note.to_entity,
+        note.to_entity,
+        note.from_entity,
+      );
+      settle(note.id, 'confirmed-drop', label || 'unresolvable');
+      confirmed++;
+      continue;
+    }
+    if (!CLOSED_TIE_LABELS.includes(label) || isMomentKind(label)) {
+      unproven++;
+      continue;
+    }
+    if (quote.length <= 10 || !norm(passage).includes(quote) || isUnsupportedKind(label, quote)) {
+      unproven++;
+      continue;
+    }
+    if (!quoteNamesEndpoint(db, projectId, note.from_entity, note.to_entity, quote)) {
+      unproven++;
+      continue;
+    }
+    const dup = db.get<{ id: number }>(
+      'SELECT id FROM canon_relation WHERE project_id = ? AND lower(kind) = ? AND review_status = ? AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))',
+      projectId,
+      label,
+      'accepted',
+      note.from_entity,
+      note.to_entity,
+      note.to_entity,
+      note.from_entity,
+    );
+    if (!dup) {
+      // The relabeled tie supersedes the flagged attempt: remove flagged rows
+      // of the old label so the pair is not counted twice, then bank clean.
+      db.run(
+        `DELETE FROM canon_relation WHERE project_id = ? AND lower(kind) = ? AND review_status = 'needs_review'
+          AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))`,
+        projectId,
+        note.attempted_kind.toLowerCase(),
+        note.from_entity,
+        note.to_entity,
+        note.to_entity,
+        note.from_entity,
+      );
+      db.run(
+        `INSERT OR IGNORE INTO canon_relation (project_id, from_entity, to_entity, kind, description, evidence, source_refs, modality, review_status, created_at)
+          VALUES (?, ?, ?, ?, '', ?, ?, 'asserted', 'accepted', ?)`,
+        projectId,
+        note.from_entity,
+        note.to_entity,
+        label,
+        quote,
+        note.source_refs,
+        nowIso(),
+      );
+    }
+    settle(note.id, 'resolved', label);
+    resolved++;
+  }
+  return { resolved, confirmed, unproven, checked: notes.length, pending: remaining() };
+}
+
+export interface TieEvaluation {
+  kept: number;
+  parked: number;
+  unproven: number;
+  checked: number;
+}
+
+/**
+ * Evaluate banked ties with understanding, not conditions.
+ *
+ * Lexical gates are cheap and blind: they drop what matches a word list and
+ * wave through everything else, including wrong pairs on true quotes. This
+ * pass asks the model one question per banked tie: does this sentence show
+ * these two ARE this to each other, lastingly? Keep leaves the row; drop
+ * removes it and parks a note for the relabeling pass, so a mislabeled but
+ * real connection still gets its second chance. Malformed answers leave the
+ * row untouched: fail-open, like every other batch judge here.
+ */
+export async function evaluateTies(
+  db: Db,
+  llm: LlmClient,
+  projectId: number,
+  opts: { maxTies?: number; afterId?: number; onProgress?: (message: string) => void } = {},
+): Promise<TieEvaluation> {
+  const maxTies = Math.max(1, opts.maxTies ?? 50);
+  const afterId = Math.max(0, opts.afterId ?? 0);
+  const rows = db.all<{
+    id: number;
+    from_entity: number;
+    to_entity: number;
+    kind: string;
+    description: string;
+    evidence: string;
+    source_refs: string;
+    from_name: string;
+    to_name: string;
+  }>(
+    `SELECT r.id, r.from_entity, r.to_entity, r.kind, r.description, r.evidence,
+            r.source_refs, fe.name AS from_name, te.name AS to_name
+       FROM canon_relation r
+       JOIN canon_entity fe ON fe.id = r.from_entity
+       JOIN canon_entity te ON te.id = r.to_entity
+      WHERE r.project_id = ? AND r.id > ? ORDER BY r.id LIMIT ?`,
+    projectId,
+    afterId,
+    maxTies,
+  );
+  let kept = 0;
+  let parked = 0;
+  let unproven = 0;
+  const like = (s: string): string => s.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+  for (const row of rows) {
+    opts.onProgress?.(`${row.from_name} / ${row.to_name} (${row.kind})`);
+    const doings = db.all<{ title: string; summary: string }>(
+      `SELECT title, summary FROM canon_event WHERE project_id = ? AND participants LIKE ? ESCAPE '\\' AND participants LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT 5`,
+      projectId,
+      `%${like(row.from_name)}%`,
+      `%${like(row.to_name)}%`,
+    );
+    const context = doings.length
+      ? `WHAT THEY DID TOGETHER:\n${doings.map((d) => `- ${d.title}${d.summary ? `: ${d.summary.slice(0, 140)}` : ''}`).join('\n')}\n\n`
+      : '';
+    let verdict = '';
+    let reason = '';
+    try {
+      const res = await llm.chat({
+        system:
+          'You judge one banked tie. Reply with JSON only: {"verdict": "keep" or "drop", "reason": "one short phrase"}. Start with {. No other words.',
+        messages: [{
+          role: 'user',
+          content:
+            `PAIR: ${row.from_name} / ${row.to_name}\nLABEL: ${row.kind}\n` +
+            `SENTENCE: ${row.description || row.kind}\nQUOTE: ${row.evidence}\n${context}` +
+            `Does the quote show these two ARE this to each other, lastingly? A feeling about a third person, a wrong pair, or a momentary interaction means drop.`,
+        }],
+        temperature: 0.1,
+        maxTokens: 200,
+      });
+      const raw = (res.text ?? '').replace(/```json|```/g, '');
+      const parsed = JSON.parse(raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1)) as { verdict?: unknown; reason?: unknown };
+      verdict = String(parsed.verdict ?? '').trim().toLowerCase();
+      reason = String(parsed.reason ?? '').trim().slice(0, 140);
+    } catch {
+      unproven++;
+      continue;
+    }
+    if (verdict !== 'keep' && verdict !== 'drop') {
+      unproven++;
+      continue;
+    }
+    if (verdict === 'keep') {
+      kept++;
+      continue;
+    }
+    // Flag, don't delete: the row stays visible with its badge until a human
+    // or the relabeling pass rules. The parked note carries the case.
+    db.run(
+      "UPDATE canon_relation SET review_status = 'needs_review' WHERE id = ? AND project_id = ?",
+      row.id,
+      projectId,
+    );
+    persistTieNote(db, projectId, row.from_entity, row.to_entity, row.kind, 'evaluation', row.evidence, row.source_refs, reason || 'drop');
+    parked++;
+  }
+  return { kept, parked, unproven, checked: rows.length };
+}
+
 /* ------------------------------------------------- timeline ↔ event join */
 
 /**
@@ -2657,7 +3102,7 @@ const MOMENT_WORDS = new Set(
     'target follower follow questioned question explained explain disagreed disagree ' +
     'comforted comfort admired admire disappointed disappoint proud shook shake ' +
     'dropped drop talking talk rumored rumor signalled signaled signal watched watch ' +
-    'knows knew know known observed observe seen')
+    'knows knew know known observed observe seen afraid frightened feared fear fears scared')
     .split(' '),
 );
 

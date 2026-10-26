@@ -1683,6 +1683,7 @@ const COMPOSE: ReadonlyMap<string, string> = new Map([
   ['child+aunt-or-uncle', 'cousin of'],
   ['child+parent', 'sibling of'],
   ['child+spouse', 'parent of'],
+  ['child+sibling', 'relative of'],
   ['parent+parent', 'grandparent of'],
   ['parent+sibling', 'parent of'],
   ['sibling+parent', 'relative of'],

@@ -140,6 +140,9 @@ ${C.bold('SOURCE MATERIAL')}
   lore judge-aliases [--max n]     Rule on quarantined nickname pairs (one model call)
   lore diagnose                    Report what the index is probably missing
   lore enrich <name> [--handoff f] Re-read the passages about one character
+  lore notes [--resolve] [--max n] Parked tie failures; resolve them with one closed-vocabulary pass
+  lore evaluate [--max n]        Judge each banked tie with understanding; failures park as notes
+  lore status [--watch [secs]]     How much of the book is read, banked, and waiting
   lore correct relation <id>       Correct a relation by hand
   lore remove relation <id>       Remove a relation you do not believe
   lore show [--kind k]            Show the extracted lore
@@ -695,6 +698,99 @@ async function cmdLore(args: Args): Promise<void> {
       `${C.green('added')} ${result.relations} relations, ${result.facts} facts ` +
         `from ${result.passages} passages (new entries are marked as needing review)`,
     );
+    return;
+  }
+
+  if (sub === 'notes') {
+    if (args.flags.resolve === true) {
+      heading('Resolving parked tie notes');
+      const result = await lorebook.resolveTieNotes(db, a.llm, project.id, {
+        maxNotes: flagNumber(args, 'max', 25),
+        onProgress: (m) => process.stdout.write(`  ${C.dim(m)}\n`),
+      });
+      console.log(
+        `${C.green('resolved')} ${result.resolved} ties, ${result.confirmed} confirmed drops, ` +
+          `${result.unproven} left pending (${result.pending} still waiting)`,
+      );
+      return;
+    }
+    const rows = db.all<{ reason: string; status: string; n: number }>(
+      `SELECT reason, status, COUNT(*) AS n FROM canon_tie_note WHERE project_id = ? GROUP BY reason, status ORDER BY reason, status`,
+      project.id,
+    );
+    if (!rows.length) {
+      console.log(C.dim('(no parked tie notes)'));
+      return;
+    }
+    heading('Parked tie notes');
+    for (const r of rows) console.log(`  ${r.n} ${r.reason} / ${r.status}`);
+    console.log(C.dim('run "fanfable lore notes --resolve" for one closed-vocabulary pass over the pending ones'));
+    return;
+  }
+
+  if (sub === 'evaluate') {
+    heading('Evaluating banked ties');
+    const result = await lorebook.evaluateTies(db, a.llm, project.id, {
+      maxTies: flagNumber(args, 'max', 50),
+      onProgress: (m) => process.stdout.write(`  ${C.dim(m)}\n`),
+    });
+    console.log(
+      `${C.green('kept')} ${result.kept} ties, parked ${result.parked} for relabeling, ` +
+        `${result.unproven} left untouched (${result.checked} judged)`,
+    );
+    return;
+  }
+
+  if (sub === 'status') {
+    const watchSecs = args.flags.watch === true ? 5 : Math.max(1, Number(args.flags.watch) || 0);
+    const showStatus = (): number => {
+      const total = db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_chunk WHERE project_id = ?', project.id)?.n ?? 0;
+      const mined = db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_chunk WHERE project_id = ? AND lore_mined = 1', project.id)?.n ?? 0;
+      const counts = db.get<{ entities: number; relations: number; facts: number; timeline: number }>(
+        `SELECT (SELECT COUNT(*) FROM canon_entity WHERE project_id = ?) AS entities,
+                (SELECT COUNT(*) FROM canon_relation WHERE project_id = ?) AS relations,
+                (SELECT COUNT(*) FROM canon_fact WHERE project_id = ?) AS facts,
+                (SELECT COUNT(*) FROM canon_timeline WHERE project_id = ?) AS timeline`,
+        project.id, project.id, project.id, project.id,
+      )!;
+      const notes = db.all<{ status: string; n: number }>(
+        `SELECT status, COUNT(*) AS n FROM canon_tie_note WHERE project_id = ? GROUP BY status`,
+        project.id,
+      );
+      const pct = total ? Math.round((mined / total) * 100) : 0;
+      const filled = Math.round(pct / 5);
+      heading(`Lore status: ${project.name}`);
+      console.log(`  mined [${'#'.repeat(filled)}${'-'.repeat(20 - filled)}] ${pct}% (${mined}/${total} passages)`);
+      console.log(`  bank: ${counts.entities} people, ${counts.relations} ties, ${counts.facts} facts, ${counts.timeline} events`);
+      if (notes.length) {
+        console.log(`  notes: ${notes.map((r) => `${r.n} ${r.status}`).join(', ')}`);
+      } else {
+        console.log(`  notes: ${C.dim('none parked')}`);
+      }
+      const last = lorebook.lastExtractionReport(db, project.id);
+      if (last) {
+        const v = last.verification;
+        console.log(`  last run: ${v.verified} verified, ${v.repointed} repointed, ${v.dropped} dropped` +
+          (v.moment ? `, ${v.moment} moments` : '') +
+          (v.unsupported ? `, ${v.unsupported} unsupported` : '') +
+          (v.redundant ? `, ${v.redundant} redundant` : ''));
+      }
+      return pct;
+    };
+    if (watchSecs > 0) {
+      for (;;) {
+        console.clear();
+        const pct = showStatus();
+        if (pct >= 100) {
+          console.log(C.green('  fully read'));
+          break;
+        }
+        console.log(C.dim(`  refreshing every ${watchSecs}s (Ctrl-C to stop)`));
+        await new Promise((r) => setTimeout(r, watchSecs * 1000));
+      }
+      return;
+    }
+    showStatus();
     return;
   }
 

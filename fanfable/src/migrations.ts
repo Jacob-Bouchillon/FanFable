@@ -277,6 +277,31 @@ export const MIGRATIONS: Migration[] = [
     `,
   },
   {
+    version: 11,
+    name: 'parked tie notes for relabeling',
+    // Moment labels and quote-silent nouns drop out of the bank but wait
+    // here — pair, attempted label, reason, proving quote — for one batched
+    // closed-vocabulary relabeling pass. Old databases migrate empty.
+    sql: `
+      CREATE TABLE IF NOT EXISTS canon_tie_note (
+        id         INTEGER PRIMARY KEY,
+        project_id INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        from_entity INTEGER NOT NULL REFERENCES canon_entity(id) ON DELETE CASCADE,
+        to_entity   INTEGER NOT NULL REFERENCES canon_entity(id) ON DELETE CASCADE,
+        attempted_kind TEXT NOT NULL DEFAULT '',
+        reason     TEXT NOT NULL DEFAULT '',
+        evidence   TEXT NOT NULL DEFAULT '',
+        source_refs TEXT NOT NULL DEFAULT '[]',
+        status     TEXT NOT NULL DEFAULT 'pending',
+        ruling     TEXT NOT NULL DEFAULT '',
+        ruled_at   TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS canon_tie_note_pair
+        ON canon_tie_note(project_id, from_entity, to_entity, attempted_kind);
+    `,
+  },
+  {
     version: 3,
     name: 'chapter references for story graph records',
     // Knowledge, motives, secrets and relationships have to be removable when
