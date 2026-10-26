@@ -26,7 +26,7 @@ a run listed with its command or artifact. Where judgment appears, it is labeled
   See `verify-2026-10-26.md`.
 - **Suite:** 276/276 green, `tsc` clean for `fanfable/src` at commit time.
 
-## 2. Close-the-loop (wired, UNVERIFIED — no tests, no tsc per instruction)
+## 2. Close-the-loop (wired, VERIFIED 2026-10-26: suite 276/276, tsc clean for fanfable/)
 
 Inline gap-driven re-read at the end of `extractLore`: gap entities
 (0 ties, or 1 tie with mentions > 3) → tight gate (same-sentence name+cue,
@@ -35,7 +35,8 @@ never throws, audit lines appended. See `close-the-loop.md` for the full
 measurement record (cue hit rates 124/122/75→66→14, cost table, emission vs
 coverage verdict). The Tarkin pinned re-read (seq 664–671 reset + mined:
 6 entities, 4 relations, aide banked accepted with exact quote) is the
-behavioral evidence; the wired loop itself has no green run. Do not cite.
+behavioral evidence; the wired loop itself now has a green run (276/276,
+2026-10-26) and may be cited.
 
 ## 3. Contamination probe (qwen2.5:7b, the incumbent)
 

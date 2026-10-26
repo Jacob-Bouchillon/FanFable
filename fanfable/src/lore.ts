@@ -10,7 +10,7 @@ import { statSync } from 'node:fs';
 import { Db, nowIso, strList } from './db.ts';
 import { asRecordArray, extractJson, salvageJsonArray, toStringArray } from './json.ts';
 import type { LlmClient } from './llm.ts';
-import { chunkText, titleFromPath, truncate, wordCount, STOPWORDS } from './text.ts';
+import { chunkText, titleFromPath, trimFrontBackMatter, truncate, wordCount, STOPWORDS } from './text.ts';
 import { importFile, readTextFile, type ImportedText } from './importer.ts';
 import * as lorebook from './lorebook.ts';
 
@@ -50,7 +50,7 @@ export function importSource(
   projectId: number,
   filePath: string,
   opts: { title?: string; author?: string; maxWords?: number; overwrite?: boolean } = {},
-): { source: SourceInfo; chunks: number; replaced: boolean } {
+): { source: SourceInfo; chunks: number; replaced: boolean; trimmed?: { headPages: number; tailPages: number } } {
   return storeSource(db, projectId, filePath, readTextFile(filePath), opts);
 }
 
@@ -60,7 +60,7 @@ export async function importSourceAsync(
   projectId: number,
   filePath: string,
   opts: { title?: string; author?: string; maxWords?: number; overwrite?: boolean } = {},
-): Promise<{ source: SourceInfo; chunks: number; replaced: boolean }> {
+): Promise<{ source: SourceInfo; chunks: number; replaced: boolean; trimmed?: { headPages: number; tailPages: number } }> {
   const imported = await importFile(filePath);
   return storeSource(db, projectId, filePath, imported, opts);
 }
@@ -71,7 +71,7 @@ function storeSource(
   filePath: string,
   imported: ImportedText,
   opts: { title?: string; author?: string; maxWords?: number; overwrite?: boolean },
-): { source: SourceInfo; chunks: number; replaced: boolean } {
+): { source: SourceInfo; chunks: number; replaced: boolean; trimmed?: { headPages: number; tailPages: number } } {
   const raw = imported.text;
   const sha = createHash('sha256').update(raw).digest('hex');
   const title = opts.title ?? imported.title ?? titleFromPath(filePath);
@@ -102,7 +102,10 @@ function storeSource(
 
   let sourceId = 0;
   let replaced = false;
-  const chunks = chunkText(raw, { maxWords: opts.maxWords ?? 220 });
+  // Front/back matter (copyright, ads, other-book excerpts) never becomes
+  // passages: the trim blanks those pages, keeping page numbers stable.
+  const trimmed = trimFrontBackMatter(raw);
+  const chunks = chunkText(trimmed.text, { maxWords: opts.maxWords ?? 220 });
   const byteSize = statSync(filePath).size;
   const importedAt = nowIso();
   db.transaction(() => {
@@ -159,6 +162,10 @@ function storeSource(
     },
     chunks: chunks.length,
     replaced,
+    trimmed:
+      trimmed.headPages || trimmed.tailPages
+        ? { headPages: trimmed.headPages, tailPages: trimmed.tailPages }
+        : undefined,
   };
 }
 
@@ -343,6 +350,12 @@ Rules:
   entity name when the claim comes from the extracted index, e.g. [Lore: Ilsa Marrow].
 - If the material does not contain the answer, say exactly what is missing. Do not invent canon details.
 - Clearly separate CONFIRMED (directly supported) from INFERRED (a reasoned guess).
+- A tie between two named people is CONFIRMED only when the lore index banks it
+  between those two names, or when you quote a passage that names both people AND
+  states the tie in so many words. A quote that names one side, or states no tie,
+  never confirms one: say the tie is not established.
+- Never state that one person is another person. Alias and identity claims need
+  an explicit quote; a shared title, shared scenes, or a summary sentence are not proof.
 - Quote short key phrases from the source when they matter.
 - Keep the answer focused and organised with short sections.`;
 
@@ -400,7 +413,7 @@ export async function answerLoreQuestion(
           'Answer with citations. State clearly when evidence is missing.',
       },
     ],
-    temperature: 0.3,
+    temperature: 0.1,
   });
   return {
     answer: res.text.trim(),

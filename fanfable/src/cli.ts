@@ -336,7 +336,7 @@ async function cmdImport(args: Args): Promise<void> {
       `${C.green('imported')} ${res.source.title} ${C.dim(
         `(${res.source.format}, ${res.chunks} passages${
           res.source.pageCount ? `, ${res.source.pageCount} pages` : ''
-        }${res.replaced ? ', replaced previous import' : ''})`,
+        }${res.trimmed ? `, front/back matter skipped (${res.trimmed.headPages}+${res.trimmed.tailPages} pages)` : ''}${res.replaced ? ', replaced previous import' : ''})`,
       )}`,
     );
   }

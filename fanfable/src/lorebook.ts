@@ -37,6 +37,7 @@ export interface CanonEntity {
   evidence: string;
   sourceRefs: { source: string; locator: string; chunk?: number }[];
   mentions: number;
+  reviewStatus: string;
 }
 
 export interface CanonRelation {
@@ -189,7 +190,8 @@ Reply with JSON only:
 Rules:
 - "from" and "to" must both be names from the KNOWN ENTITIES list. Do not invent a name, and do not use a name that is not listed, even if it appears in the passage.
 - Record only a lasting tie these passages state explicitly. A tie stays true pages later (family, lasting roles, friend or enemy). A moment happens once (met, gave, told, saw, wished, refused) and is never a tie, even when stated: moments belong to events, and a moment label is dropped and counted. A noun tie must be spoken in its quote: sister, brother, father and their kin only bank when the proving sentence says the word. Never infer one.
-- Be thorough within lasting ties: list every lasting tie the passages state explicitly — most windows contain several. Do not stop after the first one or two, and do not pad the list with moments.
+- Be exhaustive, not representative: list EVERY lasting tie the passages state explicitly — most windows contain several, and a long list is good while a missed tie is bad. Do not stop after the first few entries, and do not pad the list with moments. When in doubt whether a stated tie is lasting, include it with its quote and let the gates decide.
+- evidence must be a phrase copied VERBATIM from the passage, long enough to state the tie on its own (a name plus the tie word), not your own words and not a two-word fragment.
 - One relation per entry, with one kind. If two people have several relationships, write a separate entry for each.
 - The direction matters: "from" is the one who has the relationship and "to" is the one it is to. If Harry is Petunia's nephew, it is from="Harry", to="Petunia", kind="nephew of".
 - chunk_index is the number shown in front of each passage.
@@ -643,6 +645,15 @@ export async function extractLore(
   stats.mergedAliases = merged.merged;
   stats.quarantinedAliases = merged.quarantined;
   persistQuarantine(db, projectId, merged.quarantined);
+  // Identity-claim sweep over entity summaries: flags only, merges stay
+  // human-gated. Dynamic import avoids the lorebook<->rule-checker cycle
+  // (same precedent as the deferred diagnostics import).
+  const identityHits = (await import('./rule-checker.ts')).checkEntities(db, projectId);
+  if (identityHits.length) {
+    opts.onProgress?.(
+      `identity sweep: ${identityHits.length} summar${identityHits.length === 1 ? 'y' : 'ies'} flagged for review`,
+    );
+  }
   // Now that the entities and the events exist, marry the two.
   linkTimelineToEvents(db, projectId);
   if (opts.embed) {
@@ -825,6 +836,15 @@ export async function ensureWindowsForChunks(
   stats.mergedAliases = merged.merged;
   stats.quarantinedAliases = merged.quarantined;
   persistQuarantine(db, projectId, merged.quarantined);
+  // Identity-claim sweep over entity summaries: flags only, merges stay
+  // human-gated. Dynamic import avoids the lorebook<->rule-checker cycle
+  // (same precedent as the deferred diagnostics import).
+  const identityHits = (await import('./rule-checker.ts')).checkEntities(db, projectId);
+  if (identityHits.length) {
+    opts.onProgress?.(
+      `identity sweep: ${identityHits.length} summar${identityHits.length === 1 ? 'y' : 'ies'} flagged for review`,
+    );
+  }
   linkTimelineToEvents(db, projectId);
   stats.windows = targets.length;
   writeAuditNote(projectId, 'mine', [
@@ -2076,12 +2096,12 @@ async function extractWindowSplit(
   const answers: string[] = [];
   let failed = false;
 
-  const ask = async (system: string, maxTok: number): Promise<string | null> => {
+  const ask = async (system: string, maxTok: number, temp = 0.1): Promise<string | null> => {
     try {
       const res = await llm.chat({
         system,
         messages: [{ role: 'user', content: passages }],
-        temperature: 0.1,
+        temperature: temp,
         maxTokens: maxTok,
       });
       answers.push(res.text);
@@ -2110,7 +2130,7 @@ async function extractWindowSplit(
   const names = windowEntityNames(db, projectId, window);
   if (names.length) {
     const system = `${EXTRACT_RELATIONS_SYSTEM}\n\nKNOWN ENTITIES:\n${names.map((n) => `- ${n}`).join('\n')}`;
-    const second = await ask(system, Math.min(1200, maxTokens));
+    const second = await ask(system, Math.min(3000, maxTokens), 0);
     if (second !== null) {
       const relations = parseSection(second, 'relations');
       parsedClaims += relations.length;
@@ -3640,6 +3660,7 @@ export function listEntities(db: Db, projectId: number, kind?: EntityKind): Cano
     evidence: string;
     source_refs: string;
     mentions: number;
+    review_status: string | null;
   }>(sql, ...params);
   return rows.map((r) => ({
     id: r.id,
@@ -3654,6 +3675,7 @@ export function listEntities(db: Db, projectId: number, kind?: EntityKind): Cano
     evidence: r.evidence,
     sourceRefs: JSON.parse(r.source_refs || '[]') as { source: string; locator: string }[],
     mentions: r.mentions,
+    reviewStatus: r.review_status ?? 'accepted',
   }));
 }
 
@@ -4031,11 +4053,13 @@ export function searchLore(db: Db, projectId: number, query: string, limit = 10)
   const words = q.split(/[^a-z0-9']+/).filter((w) => w.length > 2);
 
   const entities = listEntities(db, projectId).filter((e) => {
+    if (e.reviewStatus !== 'accepted' && e.reviewStatus !== 'user_confirmed') return false;
     const hay = `${e.name} ${e.aliases.join(' ')} ${e.summary} ${e.role}`.toLowerCase();
     return words.some((w) => hay.includes(w));
   });
 
   const rels = listRelations(db, projectId).filter((r) => {
+    if (r.reviewStatus !== 'accepted' && r.reviewStatus !== 'user_confirmed') return false;
     const hay = `${r.fromName} ${r.toName} ${r.kind} ${r.description}`.toLowerCase();
     return words.some((w) => hay.includes(w));
   });

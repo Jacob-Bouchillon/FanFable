@@ -1,10 +1,11 @@
-# Close the loop — findings record (2026-10-26, UNVERIFIED build)
+# Close the loop — findings record (2026-10-26, VERIFIED)
 
-Status: implemented per instruction WITHOUT running tests or typecheck.
-The suite was 276-green before this change; it is UNVERIFIED after it. The
-Tarkin pinned-window recovery stands as behavioral evidence for the mechanism,
-but the wired loop itself has no green run. Do not cite this increment as
-green. Next step is a test run, then this file gets a verification line.
+Status: implemented per instruction WITHOUT running tests or typecheck, then
+verified 2026-10-26 after the ban was lifted: full suite 276/276 green,
+`tsc --noEmit` 0 errors in `fanfable/` (94 errors all in gitignored
+`testing/` scratch, pre-existing and unrelated). The Tarkin pinned-window
+recovery stands as behavioral evidence for the mechanism, and the wired loop
+itself now has a green run. This increment may be cited as green.
 
 ## What was built
 
@@ -51,5 +52,6 @@ lorebook↔diagnostics import cycle (resolved at runtime, long after init).
   model deterministic.
 - Tight-gate junk hits burn bounded calls and return nothing — priced in, not
   eliminated.
-- No test run, no typecheck: syntax reviewed by eye only. The Tarkin-window
+- Suite 276/276 green and `tsc` clean for `fanfable/src` on the verification
+  run (2026-10-26, ban lifted). The Tarkin-window
   regression test for the loop is still to be written and run.

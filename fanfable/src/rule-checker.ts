@@ -164,3 +164,140 @@ export function quarantinePredicate(opts: {
   const match = strip(opts.a) === strip(opts.b) || strip(opts.a).startsWith(strip(opts.b)) || strip(opts.b).startsWith(strip(opts.a));
   return match && !opts.sharedScene && !opts.coSpeakerVeto && opts.corroboration < 2;
 }
+
+/* ------------------------------------------------- entity identity claims */
+
+/**
+ * A summary (or role) that says one row IS another row.
+ *
+ * Entity intake verifies the evidence quote but stores the summary verbatim,
+ * so a claim like "X, also known as Y" banks whenever its attached quote
+ * verifies — the gate checks the receipt, not what the summary says with it.
+ * This rule mirrors the relations-side both-endpoints principle: an identity
+ * claim needs a span-verified quote naming both names. Otherwise the row is
+ * flagged needs_review (invisible to status, ranking, graph, and the answer
+ * index) and the pair joins the quarantine list for human judgment.
+ * Flags only: never edits text, never merges, never deletes.
+ */
+const IDENTITY_CLAIM_RES: RegExp[] = [
+  /also known as\s+([^.,;()]+)/i,
+  /\baka\b\s+([^.,;()]+)/i,
+  /better known as\s+([^.,;()]+)/i,
+  /\bis also\s+([^.,;()]+)/i,
+  /\(\s*([^()]*?)\s*\)/,
+];
+
+/**
+ * Bare copula ("X is Y") without an "also known as"-style marker.
+ * Guarded: Y must read as a bare name, not name-plus-role ("Darth
+ * Sidious's apprentice" is a relation phrasing, not an identity claim).
+ * Generic English relational words only — never book terms.
+ */
+const COPULA_RE = /\b(?:is|was)\s+((?:the\s+)?[A-Z][\w']*(?:\s+[A-Z][\w']*)*)/;
+const RELATION_WORD_AFTER_NAME = new Set([
+  'apprentice', 'master', 'ally', 'friend', 'aide', 'mentor', 'servant',
+  'enemy', 'rival', 'heir', 'successor', 'padawan', 'colleague', 'peer',
+  'partner', 'opponent', 'teacher', 'student', 'agent',
+]);
+
+function identTokens(s: string): string[] {
+  return s.toLowerCase().replace(/[^a-z0-9']+/g, ' ').replace(/\s+/g, ' ').trim().split(' ').filter(Boolean);
+}
+
+/** True when needle appears as a contiguous word-run inside hay. */
+function containsRun(hay: string[], needle: string[]): boolean {
+  if (!needle.length) return false;
+  outer: for (let i = 0; i + needle.length <= hay.length; i++) {
+    for (let j = 0; j < needle.length; j++) {
+      if (hay[i + j] !== needle[j]) continue outer;
+    }
+    return true;
+  }
+  return false;
+}
+
+/** Run all entity identity rules and flag unproven claims. Never writes facts. */
+export function checkEntities(db: Db, projectId: number, opts: { ids?: number[] } = {}): RuleHit[] {
+  const filter = opts.ids && opts.ids.length ? ` AND id IN (${opts.ids.map(() => '?').join(',')})` : '';
+  const params: unknown[] = opts.ids && opts.ids.length ? [projectId, ...opts.ids] : [projectId];
+  const rows = db.all<{
+    id: number; kind: string; name: string; aliases: string; summary: string;
+    role: string; evidence: string; review_status: string;
+  }>(
+    `SELECT id, kind, name, aliases, summary, role, evidence, review_status
+       FROM canon_entity WHERE project_id = ?${filter} ORDER BY id`,
+    ...params,
+  );
+  if (!rows.length) return [];
+  const ownNames = new Map<number, string[]>();
+  for (const r of rows) {
+    let aliases: string[] = [];
+    try { aliases = JSON.parse(r.aliases || '[]') as string[]; } catch { aliases = []; }
+    ownNames.set(r.id, [r.name, ...aliases]);
+  }
+  const hits: RuleHit[] = [];
+  const flag = (id: number, rule: string, reason: string): void => {
+    if (hits.some((h) => h.id === id && h.rule === rule)) return;
+    hits.push({ id, rule, reason });
+  };
+  const claimed: { id: number; otherId: number; otherName: string; span: string }[] = [];
+  for (const r of rows) {
+    if (r.review_status === 'user_confirmed' || r.review_status === 'rejected') continue;
+    const text = `${r.summary || ''}\n${r.role || ''}`;
+    const mine = ownNames.get(r.id)!.map((n) => identTokens(n)).filter((t) => t.length);
+    const spans: string[] = [];
+    for (const re of IDENTITY_CLAIM_RES) {
+      for (const m of text.matchAll(new RegExp(re.source, re.flags + 'g'))) {
+        const span = (m[1] ?? '').trim();
+        if (span) spans.push(span);
+      }
+    }
+    // Bare copula with no trailing role noun: "X is Darth Y" claims identity,
+    // "X is Darth Y's apprentice" states a relation and is not one.
+    for (const m of text.matchAll(new RegExp(COPULA_RE.source, COPULA_RE.flags + 'g'))) {
+      const span = (m[1] ?? '').replace(/^the\s+/i, '').trim();
+      if (!span) continue;
+      const after = text.slice((m.index ?? 0) + m[0].length).trim().split(/[\s.,;()]+/).filter(Boolean)[0]?.toLowerCase() ?? '';
+      if (RELATION_WORD_AFTER_NAME.has(after) || RELATION_WORD_AFTER_NAME.has(after.replace(/'s$/, ''))) continue;
+      spans.push(span);
+    }
+    for (const span of spans) {
+      const spanToks = identTokens(span);
+      if (!spanToks.length) continue;
+      // A span restating this row's own name is not a claim about another row.
+      if (mine.some((t) => containsRun(spanToks, t) || containsRun(t, spanToks))) continue;
+      for (const o of rows) {
+        if (o.id === r.id) continue;
+        const otherNames = ownNames.get(o.id)!;
+        const match = otherNames.some((n) => {
+          const t = identTokens(n);
+          return t.length > 0 && (containsRun(spanToks, t) || containsRun(t, spanToks));
+        });
+        if (!match) continue;
+        // Proven only by a quote naming both sides — the both-endpoints rule.
+        const evToks = identTokens(r.evidence || '');
+        const sideNamed = (names: string[]): boolean =>
+          names.some((n) => containsRun(evToks, identTokens(n)));
+        if (sideNamed(ownNames.get(r.id)!) && sideNamed(otherNames)) continue;
+        flag(r.id, 'summary-identity-unproven', `summary claims "${span.trim().slice(0, 80)}" naming ${o.name} without a both-endpoints quote`);
+        claimed.push({ id: r.id, otherId: o.id, otherName: o.name, span: span.trim().slice(0, 120) });
+        break;
+      }
+    }
+  }
+  const now = new Date().toISOString();
+  for (const h of hits) {
+    if (h.rule !== 'summary-identity-unproven') continue;
+    db.run(`UPDATE canon_entity SET review_status = 'needs_review', updated_at = ? WHERE id = ? AND project_id = ? AND review_status = 'accepted'`, now, h.id, projectId);
+  }
+  for (const c of claimed) {
+    const claimer = rows.find((r) => r.id === c.id);
+    if (!claimer) continue;
+    db.run(
+      `INSERT OR IGNORE INTO quarantine_alias (project_id, name, candidate, reason, status, created_at)
+       VALUES (?, ?, ?, ?, 'pending', ?)`,
+      projectId, claimer.name, c.otherName, `summary-identity: claims "${c.span}"`, now,
+    );
+  }
+  return hits;
+}

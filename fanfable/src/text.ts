@@ -75,6 +75,156 @@ export function findHeadings(text: string): { heading: string; start: number }[]
 }
 
 /**
+ * Front/back-matter trim, derived from the file's own contents page.
+ *
+ * Novels ship with non-novel pages: copyright, dedication, contents, and —
+ * at the back — author bios, ads for other books, excerpts of other books,
+ * timelines. Imported verbatim, those pages become quotable "canon": the
+ * gates verify quotes against the file, not against the novel, so ad copy
+ * banks as evidence. This trim blanks those pages before chunking, keeping
+ * page numbers stable (blanked, never deleted).
+ *
+ * Universal and conservative: everything comes from a detected contents
+ * list (a run of `N: Title` lines in the first 200 lines). The novel body
+ * runs from its first chapter/prologue heading to its last; back matter
+ * starts at the first trailing contents entry (author bio, excerpt,
+ * timeline) seen after the body ends. No list of books, authors, or
+ * publishers anywhere: books without a detectable contents list import
+ * exactly as before.
+ */
+export interface MatterTrim {
+  text: string;
+  headPages: number;
+  tailPages: number;
+}
+
+export function trimFrontBackMatter(text: string): MatterTrim {
+  const noop = { text, headPages: 0, tailPages: 0 };
+  if (!text.includes('\f')) return noop;
+  const lines = text.split('\n');
+  const zone = lines.slice(0, 200);
+  // The contents list is the FIRST dense run of `N: Title` lines: chapters
+  // of the story itself can fall inside the scan window in short inputs, so
+  // a later sparse run must not move the block. Groups split on gaps wider
+  // than a contents page turn.
+  const hits: number[] = [];
+  zone.forEach((ln, i) => {
+    if (/^(\d{1,3}):\s+(\S.*)$/.exec(ln.trim())) hits.push(i);
+  });
+  const groups: number[][] = [];
+  for (const h of hits) {
+    const last = groups[groups.length - 1];
+    if (last && h - last[last.length - 1]! <= 8) last.push(h);
+    else groups.push([h]);
+  }
+  const run = groups.find((g) => g.length >= 3);
+  if (!run) return noop;
+  const numbered: string[] = [];
+  for (const i of run) {
+    const m = /^(\d{1,3}):\s+(\S.*)$/.exec(zone[i].trim());
+    if (m) numbered.push(`${m[1]}: ${m[2]}`.toLowerCase());
+  }
+  const zoneEnd = run[run.length - 1]!;
+  // Trailing contents entries: the author bio, excerpts, timelines listed
+  // after the last numbered chapter. Prologue/epilogue/part lines belong to
+  // the body, not the back matter.
+  const backEntries: string[] = [];
+  let backEnd = zoneEnd;
+  for (let i = zoneEnd + 1; i < Math.min(zone.length, zoneEnd + 60); i++) {
+    const t = zone[i].trim();
+    if (!t) {
+      if (backEntries.length) {
+        backEnd = i;
+        break;
+      }
+      continue;
+    }
+    if (/^\d{1,3}:\s+\S/.test(t)) continue;
+    if (/^(prologue|epilogue|part\s+.+)$/i.test(t)) continue;
+    backEntries.push(t.toLowerCase());
+  }
+  if (!backEntries.length) backEnd = zoneEnd;
+  const bodyTitles = new Set<string>(numbered);
+  zone.forEach((ln) => {
+    const t = ln.trim();
+    if (/^(prologue|epilogue)$/i.test(t)) bodyTitles.add(t.toLowerCase());
+  });
+  // The search for the body starts after the contents block itself, not
+  // after the last numbered line seen: in short inputs a story chapter can
+  // fall inside the 200-line scan window, and must not move the start line.
+  const contentEnd = backEnd;
+  const pages = text.split('\f');
+  // Map global line index -> page number (1-based).
+  const linePage: number[] = new Array(lines.length);
+  let pg = 1;
+  for (let i = 0; i < lines.length; i++) {
+    linePage[i] = pg;
+    if (lines[i].includes('\f')) pg++;
+  }
+  const zoneEndPage = linePage[contentEnd] ?? 1;
+  const shaped = (t: string): boolean => t.length > 0 && t.length <= 120;
+  let bodyStartPage = -1;
+  let bodyEndPage = -1;
+  pages.forEach((pageText, idx) => {
+    const p = idx + 1;
+    if (p <= zoneEndPage) return;
+    for (const raw of pageText.split('\n')) {
+      const t = raw.trim();
+      if (!shaped(t)) continue;
+      if (bodyTitles.has(t.toLowerCase())) {
+        if (bodyStartPage < 0) bodyStartPage = p;
+        bodyEndPage = p;
+      }
+    }
+  });
+  if (bodyStartPage < 0 || bodyEndPage < 0) return noop;
+  let cutPage = -1;
+  for (let p = bodyEndPage + 1; p <= pages.length; p++) {
+    const pageText = pages[p - 1];
+    const hit = pageText.split('\n').some((raw) => {
+      const t = raw.trim();
+      return shaped(t) && backEntries.includes(t.toLowerCase());
+    });
+    if (hit) {
+      cutPage = p;
+      break;
+    }
+  }
+  const out = pages.slice();
+  let head = 0;
+  let tail = 0;
+  // Head trim stops at the last blank page, and never eats a page that
+  // carries contents-listed chapter material: a non-empty run immediately
+  // before the body (opening crawl, epigraph, part title) belongs to the
+  // novel. Back-matter entries are deliberately NOT a veto here — the walk
+  // only runs over pre-body pages, where a matching line (title-page
+  // epigraph, dedication quote) is front matter quoting the novel, not
+  // back matter. The tail cut handles back matter separately.
+  const pageHasContentsMaterial = (pageText: string): boolean =>
+    pageText.split('\n').some((raw) => {
+      const t = raw.trim();
+      return /^\d{1,3}:\s+\S/.test(t) || /^(prologue|epilogue|part\s+.+)$/i.test(t);
+    });
+  let keepFrom = bodyStartPage;
+  for (let p = bodyStartPage - 1; p >= 1; p--) {
+    if (pages[p - 1].trim() === '' || pageHasContentsMaterial(pages[p - 1])) break;
+    keepFrom = p;
+  }
+  for (let p = 1; p < keepFrom; p++) {
+    if (out[p - 1].trim() !== '') head++;
+    out[p - 1] = '';
+  }
+  if (cutPage > 0) {
+    for (let p = cutPage; p <= pages.length; p++) {
+      if (out[p - 1].trim() !== '') tail++;
+      out[p - 1] = '';
+    }
+  }
+  if (!head && !tail) return noop;
+  return { text: out.join('\f'), headPages: head, tailPages: tail };
+}
+
+/**
  * Chunk source text into passage-sized units.
  *
  * Paragraphs (blank-line separated) are the atomic unit: consecutive
