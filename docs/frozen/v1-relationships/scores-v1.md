@@ -20,7 +20,7 @@ Probe cost: ~476s wall for 20 asks (~24s/pair, concurrency 1).
 
 ## Known failures (3) — each with mechanism + planned fix
 
-- #3 Tarkin aide **recall miss, confirmed 2026-10-26** — true per text, model didn't emit this run (unresolved 3). Mechanism: recall, not gate. Enrich re-read 6 Tarkin passages (relations:0, facts:2): aide tie still not emitted → confirmed-miss, windows recorded in enrich run, no gate loosened to force it.
+- #3 Tarkin aide **recovered 2026-10-26 by pinned re-read** — was recall miss (6-passage enrich: 0 relations). Resetting seq 664–671 to unread and mining that single window banked `aide of` accepted with the exact verifying quote. Emission failure, not gate, not coverage — the words were in already-mined chunks. Narrow scope fixed what broad windows missed.
 - #10 Jabba partner **recall miss, confirmed 2026-10-26** — true per text (partnership), neither bank nor probe mining nor targeted 6-passage enrich (relations:0, facts:1) emitted it. Zero Jabba ties banked. Mechanism: recall, not gate or ranking. Recorded as confirmed-miss; re-read on a wider window set is the honest next try, not a gate change.
 - #7 `encourager of` **open verb** — behavior banked as tie. Mechanism: open vocabulary, no kin group. Fix: #7 closed role-noun gate (park unlisted kinds).
 - #8 `responsibility to` **paraphrase-directionless** — new label, no arrow. Mechanism: open vocabulary + undirected reading. Fix: #7 gate + directed status (already built; caller opt-in outstanding).

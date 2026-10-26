@@ -653,15 +653,111 @@ export async function extractLore(
     }
   }
   stats.windows = runList.length;
+  // Close the loop inline: re-read thin spots in the same run, never a
+  // second pass afterward. Same unchanged extractor paths, tight-gated and
+  // capped; never throws the extraction.
+  const loopLines = await closeTheLoop(db, llm, projectId, stats, {
+    maxEntities: 5,
+    maxPassages: 4,
+    onProgress: opts.onProgress,
+  });
   rememberExtractionReport(db, projectId, stats);
   writeAuditNote(projectId, 'extract', [
     `windows visited: ${stats.windows}`,
     `ties banked: ${stats.relations}`,
     `quotes verified: ${stats.verification.verified}, repointed: ${stats.verification.repointed}, dropped: ${stats.verification.dropped}`,
     `empty windows: ${stats.emptyWindows.length}`,
+    ...loopLines,
   ], db);
 
   return stats;
+}
+
+/**
+ * Inline gap-driven re-read: the loop closed inside the extract run.
+ *
+ * After the budgeted windows are mined, entities with no ties (or one tie
+ * despite many mentions) are checked against already-mined passages for a
+ * same-sentence name-plus-cue hit — the tight gate. At most maxEntities such
+ * entities are re-read with the existing enrich path (one call per 4
+ * passages), bank-iff-verified, in the same concurrency-1 process. No new
+ * machinery, no prompt rewording, no gate loosening. Never throws.
+ */
+const LOOP_CUES: RegExp[] = [
+  /\b(?:his|her|their) (?:son|daughter)\b/i, /\b(?:son|daughter) of\b/i,
+  /\b(?:brother|sister|sibling) of\b/i, /\b(?:mother|father) of\b/i,
+  /\b(?:uncle|aunt) of\b/i, /\b(?:cousin|nephew|niece) of\b/i,
+  /\b(?:wife|husband|spouse) of\b/i, /\bmarried to\b/i, /\bapprentice\b/i,
+  /\baide\b/i, /\bassistant\b/i, /\bmaster of\b/i, /\bmentor\b/i, /\bpartner\b/i,
+];
+
+async function closeTheLoop(
+  db: Db,
+  llm: LlmClient,
+  projectId: number,
+  stats: ExtractLoreResult,
+  opts: { maxEntities: number; maxPassages: number; onProgress?: (message: string) => void },
+): Promise<string[]> {
+  const lines: string[] = [];
+  try {
+    const tieCount = new Map<number, number>();
+    for (const r of db.all<{ e: number }>(
+      `SELECT from_entity AS e FROM canon_relation WHERE project_id = ? UNION ALL SELECT to_entity AS e FROM canon_relation WHERE project_id = ?`,
+      projectId, projectId,
+    )) tieCount.set(r.e, (tieCount.get(r.e) ?? 0) + 1);
+    const entities = db.all<{ id: number; name: string; mentions: number }>(
+      'SELECT id, name, mentions FROM canon_entity WHERE project_id = ? ORDER BY mentions DESC',
+      projectId,
+    );
+    const gaps = entities.filter((e) => {
+      const ties = tieCount.get(e.id) ?? 0;
+      return ties === 0 || (ties === 1 && e.mentions > 3);
+    });
+    if (!gaps.length) return ['loop: no gap entities'];
+    const chunks = db.all<{ id: number; text: string; mined: number }>(
+      'SELECT id, text, lore_mined AS mined FROM canon_chunk WHERE project_id = ?',
+      projectId,
+    );
+    const tight: { id: number; name: string }[] = [];
+    for (const e of gaps) {
+      const needle = e.name.toLowerCase();
+      const minedOnes = chunks.filter((c) => c.mined && c.text.toLowerCase().includes(needle));
+      if (!minedOnes.length) continue;
+      const hit = minedOnes.some((c) =>
+        c.text.split(/(?<=[.!?])\s+/).some((s) => s.toLowerCase().includes(needle) && LOOP_CUES.some((re) => re.test(s))),
+      );
+      if (hit) tight.push(e);
+      if (tight.length >= Math.max(1, opts.maxEntities)) break;
+    }
+    if (!tight.length) return [`loop: ${gaps.length} gap entities, 0 tight-gated, 0 extra calls`];
+    // Deferred import: lore-diagnostics reads lorebook at module load, so a
+    // top-level import would cycle. Resolved here at runtime, long after init.
+    const { enrichEntity } = await import('./lore-diagnostics.ts');
+    let calls = 0;
+    for (const e of tight) {
+      try {
+        const r = await enrichEntity(db, llm, projectId, e.name, {
+          maxPassages: Math.max(1, opts.maxPassages),
+          onProgress: opts.onProgress,
+        });
+        calls++;
+        stats.relations += r.relations;
+        stats.facts += r.facts;
+        lines.push(`loop: re-read ${e.name}: +${r.relations} ties, +${r.facts} facts from ${r.passages} passages`);
+      } catch (err) {
+        lines.push(`loop: re-read ${e.name} failed (${err instanceof Error ? err.message : String(err)}), bank untouched`);
+      }
+    }
+    try {
+      dedupeRelations(db, projectId);
+    } catch {
+      /* dedupe is a nicety: never fail the loop over it */
+    }
+    lines.unshift(`loop: ${tight.length} tight-gated entities, ${calls} extra calls`);
+  } catch (err) {
+    lines.push(`loop: skipped (${err instanceof Error ? err.message : String(err)})`);
+  }
+  return lines;
 }
 
 export interface LazyMineOptions {
