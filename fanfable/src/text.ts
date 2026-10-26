@@ -125,25 +125,36 @@ export function trimFrontBackMatter(text: string): MatterTrim {
     if (m) numbered.push(`${m[1]}: ${m[2]}`.toLowerCase());
   }
   const zoneEnd = run[run.length - 1]!;
+  const runTitles = new Set<string>(numbered);
   // Trailing contents entries: the author bio, excerpts, timelines listed
-  // after the last numbered chapter. Prologue/epilogue/part lines belong to
-  // the body, not the back matter.
+  // after the last numbered chapter. The scan stops where the body begins:
+  // a body heading (prologue/epilogue/part line, or a repeated chapter
+  // number from the run) or a page turn (form feeds mid-line mean the
+  // contents spread is over) ends the block. Prologue/epilogue/part lines
+  // encountered before any back entry belong to the contents structure
+  // itself and are skipped, not treated as back matter.
   const backEntries: string[] = [];
   let backEnd = zoneEnd;
   for (let i = zoneEnd + 1; i < Math.min(zone.length, zoneEnd + 60); i++) {
-    const t = zone[i].trim();
+    const raw = zone[i];
+    const t = raw.trim();
     if (!t) {
-      if (backEntries.length) {
-        backEnd = i;
-        break;
-      }
+      if (backEntries.length) break;
       continue;
     }
-    if (/^\d{1,3}:\s+\S/.test(t)) continue;
-    if (/^(prologue|epilogue|part\s+.+)$/i.test(t)) continue;
+    if (raw.includes('\f') && backEntries.length) break;
+    const nm = /^(\d{1,3}):\s+(\S.*)$/.exec(t);
+    if (nm) {
+      if (runTitles.has(`${nm[1]}: ${nm[2]}`.toLowerCase())) break;
+      continue;
+    }
+    if (/^(prologue|epilogue|part\s+.+)$/i.test(t)) {
+      if (backEntries.length) break;
+      continue;
+    }
     backEntries.push(t.toLowerCase());
+    backEnd = i;
   }
-  if (!backEntries.length) backEnd = zoneEnd;
   const bodyTitles = new Set<string>(numbered);
   zone.forEach((ln) => {
     const t = ln.trim();
@@ -152,16 +163,22 @@ export function trimFrontBackMatter(text: string): MatterTrim {
   // The search for the body starts after the contents block itself, not
   // after the last numbered line seen: in short inputs a story chapter can
   // fall inside the 200-line scan window, and must not move the start line.
+  // The page is counted in form feeds before the block's end: a line can
+  // hold several (blank pages leave back-to-back feeds), and the line a
+  // feed sits on belongs to the page before it.
   const contentEnd = backEnd;
   const pages = text.split('\f');
-  // Map global line index -> page number (1-based).
-  const linePage: number[] = new Array(lines.length);
-  let pg = 1;
-  for (let i = 0; i < lines.length; i++) {
-    linePage[i] = pg;
-    if (lines[i].includes('\f')) pg++;
+  // The block's end is located by its own text in the page array (first
+  // occurrence wins — the contents precedes everything else), which stays
+  // exact no matter how form feeds bunch up on a line.
+  const anchor = lines[contentEnd].trim();
+  let zoneEndPage = 1;
+  for (let p = 0; p < pages.length; p++) {
+    if (pages[p].split('\n').some((raw) => raw.trim() === anchor)) {
+      zoneEndPage = p + 1;
+      break;
+    }
   }
-  const zoneEndPage = linePage[contentEnd] ?? 1;
   const shaped = (t: string): boolean => t.length > 0 && t.length <= 120;
   let bodyStartPage = -1;
   let bodyEndPage = -1;
@@ -295,21 +312,23 @@ export function chunkText(
   for (const line of lines) {
     const lineEnd = offset + line.length;
     if (line.includes('\f')) {
-      // Page break: the text before it belongs to the current page.
-      const before = line.split('\f')[0];
-      if (before.trim()) {
-        if (!buffer.length) bufStart = offset;
-        buffer.push(before.trim());
-        bufEnd = offset + before.length;
-      }
-      flush();
-      page++;
-      const after = line.slice(line.indexOf('\f') + 1);
-      if (after.trim()) {
-        bufStart = offset + line.indexOf('\f') + 1;
-        buffer.push(after.trim());
-        bufEnd = lineEnd;
-      }
+      // A line can hold several page breaks (blank pages leave back-to-back
+      // form feeds with no newline between them); every one advances the
+      // page, or later pages inherit earlier pages' numbers.
+      let segStart = offset;
+      const parts = line.split('\f');
+      parts.forEach((part, k) => {
+        if (k > 0) {
+          flush();
+          page++;
+        }
+        if (part.trim()) {
+          if (!buffer.length) bufStart = segStart;
+          buffer.push(part.trim());
+          bufEnd = segStart + part.length;
+        }
+        segStart += part.length + 1;
+      });
     } else if (line.trim()) {
       if (!buffer.length) bufStart = offset;
       buffer.push(line.trim());
