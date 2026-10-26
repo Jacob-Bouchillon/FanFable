@@ -1642,9 +1642,9 @@ function proofRelevance(
 }
 
 /**
- * The bank's own endpoint rule, reusable outside extraction: a quote passes
- * when it names an endpoint or nobody at all, and fails only when it names
- * a third roster person. The relabeling pass judges by exactly this rule.
+ * The bank's own endpoint rule, reused by the relabel pass: a quote banks
+ * a tie only when it names at least one endpoint. A nobody-named quote
+ * stays pending no matter how suggestive the scene.
  */
 export function quoteNamesEndpoint(
   db: Db,
@@ -1653,7 +1653,10 @@ export function quoteNamesEndpoint(
   toId: number,
   quote: string,
 ): boolean {
-  return proofRelevance(rosterTokens(db, projectId), fromId, toId, quote);
+  const roster = rosterTokens(db, projectId);
+  const words = proofTokens(quote, 3);
+  if (!words.size) return false;
+  return [fromId, toId].some((id) => [...(roster.get(id) ?? [])].some((t) => words.has(t)));
 }
 
 /** True when the quote names a recognizable form of both endpoints. */
@@ -1824,7 +1827,14 @@ function applyRelations(
       }
     }
     const misattached = thirdParty && !bothNamed;
-    const review = relevant && !misattached ? 'accepted' : 'needs_review';
+    // A quote naming neither endpoint proves nothing about the pair, even
+    // with no third party in it ("Thus are lasting partnerships solidified"
+    // for a Plagueis → Damask tie). Pending, never accepted: pronoun and
+    // scene color can be re-proved, but they must not bank.
+    const anyNamed = [fromId, toId].some((id) =>
+      [...(roster.get(id) ?? [])].some((t) => proofTokens(span.quote, 3).has(t)),
+    );
+    const review = relevant && !misattached && anyNamed ? 'accepted' : 'needs_review';
     if (!relevant && gate) {
       stats.verification.unrelated++;
       continue;
@@ -1832,6 +1842,17 @@ function applyRelations(
     const refs = span.chunkId !== null
       ? [{ source: span.source, locator: span.locator, chunk: span.chunkId }]
       : refsFor(chunk);
+    // Endpoint silence leaves a case file, not just a parked row: without a
+    // note the relabel pass would never reconsider the tie. Only for closed
+    // kinds — open vocabulary gets its own note below, and the unique index
+    // keeps one note per pair+kind.
+    if (relevant && !misattached && !anyNamed) {
+      const firstKind = normaliseKinds(String(raw.kind ?? ''))[0] ?? 'related to';
+      if (isClosedRoleKind(firstKind)) {
+        stats.verification.unsupported++;
+        persistTieNote(db, projectId, fromId, toId, firstKind, 'unsupported', span.quote, toJson(refs));
+      }
+    }
     const kinds = normaliseKinds(String(raw.kind ?? ''));
     for (const kind of kinds) {
       // Moments are not ties, flagged or otherwise: what happened belongs to
@@ -2961,7 +2982,7 @@ export async function resolveTieNotes(
           role: 'user',
           content:
             `PAIR: ${note.from_name} / ${note.to_name}\nOLD LABEL: ${note.attempted_kind}\n` +
-            `ALLOWED: ${CLOSED_TIE_LABELS.join(', ')}\n\n${context}PASSAGE:\n${passage}`,
+            `ALLOWED: ${CLOSED_ROLE_KINDS.join(', ')}\n\n${context}PASSAGE:\n${passage}`,
         }],
         temperature: 0.1,
         maxTokens: 300,
@@ -2995,7 +3016,7 @@ export async function resolveTieNotes(
       confirmed++;
       continue;
     }
-    if (!CLOSED_TIE_LABELS.includes(label) || isMomentKind(label)) {
+    if (!CLOSED_ROLE_KINDS.includes(label) || isMomentKind(label)) {
       unproven++;
       continue;
     }
@@ -3122,18 +3143,60 @@ export async function evaluateTies(
     const context = doings.length
       ? `WHAT THEY DID TOGETHER:\n${doings.map((d) => `- ${d.title}${d.summary ? `: ${d.summary.slice(0, 140)}` : ''}`).join('\n')}\n\n`
       : '';
+    // The full dossier for the pair: every banked claim about these two
+    // (rival labels included), both entity files, open identity questions,
+    // and the passage the quote came from — not just the quote in isolation.
+    // A judge shown one row and one line guesses; a judge shown the file rules.
+    const pairRows = db.all<{ kind: string; evidence: string; review_status: string }>(
+      `SELECT kind, evidence, review_status FROM canon_relation WHERE project_id = ? AND id != ?
+       AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?)) ORDER BY id LIMIT 8`,
+      projectId, row.id, row.from_entity, row.to_entity, row.to_entity, row.from_entity,
+    );
+    const dossierPair = pairRows.length
+      ? `OTHER BANKED CLAIMS FOR THIS PAIR:\n${pairRows.map((o) => `- ${o.kind} [${o.review_status}]: "${truncate(o.evidence, 160)}"`).join('\n')}\n\n`
+      : '';
+    const dossierEnts = db.all<{ name: string; summary: string; aliases: string }>(
+      'SELECT name, summary, aliases FROM canon_entity WHERE project_id = ? AND id IN (?, ?)',
+      projectId, row.from_entity, row.to_entity,
+    );
+    const dossierFiles = dossierEnts.length
+      ? `ENTITY FILES:\n${dossierEnts.map((e) => {
+        let aliases: string[] = [];
+        try { aliases = JSON.parse(e.aliases || '[]') as string[]; } catch { aliases = []; }
+        const also = aliases.length ? ` (also filed as: ${aliases.join(', ')})` : '';
+        return `- ${e.name}${also}: ${truncate(e.summary || '(no summary)', 200)}`;
+      }).join('\n')}\n\n`
+      : '';
+    const dossierQuar = db.all<{ name: string; candidate: string; reason: string }>(
+      `SELECT name, candidate, reason FROM quarantine_alias WHERE project_id = ? AND status = 'pending'
+       AND (name IN (?, ?) OR candidate IN (?, ?)) LIMIT 5`,
+      projectId, row.from_name, row.to_name, row.from_name, row.to_name,
+    );
+    const dossierIdentity = dossierQuar.length
+      ? `OPEN IDENTITY QUESTIONS (unresolved — do not assume either way):\n${dossierQuar.map((q) => `- ${q.name} ~ ${q.candidate} (${q.reason})`).join('\n')}\n\n`
+      : '';
+    let dossierPassage = '';
+    try {
+      const refs = JSON.parse(row.source_refs || '[]') as { chunk?: unknown }[];
+      const ref = refs.find((x) => Number.isFinite(Number(x?.chunk)) && Number(x?.chunk) > 0);
+      const chunkId = ref ? Number((ref as { chunk: number }).chunk) : NaN;
+      if (Number.isFinite(chunkId)) {
+        const ch = db.get<{ text: string; locator: string }>('SELECT text, locator FROM canon_chunk WHERE id = ?', chunkId);
+        if (ch?.text) dossierPassage = `PASSAGE (the quote's home; the tie must be statable from it):\n${truncate(ch.text, 900)}\n\n`;
+      }
+    } catch { /* refs unparseable: judge works from the quote alone */ }
     let verdict = '';
     let reason = '';
     try {
       const res = await llm.chat({
         system:
-          'You judge one banked tie. Reply with JSON only: {"verdict": "keep" or "drop", "reason": "one short phrase"}. Start with {. No other words.',
+          'You judge one banked tie against its whole file. Reply with JSON only: {"verdict": "keep" or "drop", "reason": "one short phrase"}. Start with {. No other words.',
         messages: [{
           role: 'user',
           content:
             `PAIR: ${row.from_name} / ${row.to_name}\nLABEL: ${row.kind}\n` +
-            `SENTENCE: ${row.description || row.kind}\nQUOTE: ${row.evidence}\n${context}` +
-            `Does the quote show these two ARE this to each other, lastingly? A feeling about a third person, a wrong pair, or a momentary interaction means drop.`,
+            `SENTENCE: ${row.description || row.kind}\nQUOTE: ${row.evidence}\n${dossierPair}${dossierFiles}${dossierIdentity}${dossierPassage}${context}` +
+            `Does the file show these two ARE this to each other, lastingly? A feeling about a third person, a wrong pair, a momentary interaction, an open identity question, or a passage that never states the tie means drop. Conflicting labels for the same pair: keep at most the one the passage states.`,
         }],
         temperature: 0.1,
         maxTokens: 200,
@@ -3520,14 +3583,30 @@ function kinGroupsOf(kind: string): ReadonlySet<string>[] {
  * True when the quote fails to speak the tie's noun: the label names a kin
  * group no word of the quote belongs to. "Cousin of" proved by "What's his
  * name again?" is exactly this — true from knowledge, silent in the sentence.
+ *
+ * Closed role nouns outside the kin groups ("apprentice", "aide", "partner",
+ * "operative", "member", "leader", "assistant") get the same treatment with
+ * plain plural tolerance: an "apprentice of" proved by a quote that never
+ * says the word banks nothing. Open vocabulary is not this rule's job.
  */
+const KIND_FILLER = new Set(['of', 'to', 'with', 'for', 'a', 'the', 'an', 'in', 'on', 'as']);
+
 export function isUnsupportedKind(kind: string, quote: string): boolean {
   const groups = kinGroupsOf(kind);
-  if (!groups.length) return false;
-  const want = new Set<string>();
-  for (const g of groups) for (const w of g) want.add(w);
   const quoteWords = new Set((quote ?? '').toLowerCase().split(/[^a-z]+/).filter(Boolean));
-  return ![...want].some((w) => quoteWords.has(w));
+  if (groups.length) {
+    const want = new Set<string>();
+    for (const g of groups) for (const w of g) want.add(w);
+    return ![...want].some((w) => quoteWords.has(w));
+  }
+  if (!isClosedRoleKind(kind)) return false;
+  const want: string[] = [];
+  for (const w of (kind ?? '').toLowerCase().split(/[^a-z]+/).filter(Boolean)) {
+    if (KIND_FILLER.has(w)) continue;
+    want.push(w, `${w}s`, `${w}es`);
+  }
+  if (!want.length) return false;
+  return !want.some((w) => quoteWords.has(w));
 }
 
 /**
