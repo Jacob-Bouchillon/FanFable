@@ -373,6 +373,113 @@ export function formatPassages(passages: Passage[]): string {
  *
  * `search` is optional; when omitted the researcher performs its own retrieval.
  */
+/* --------------------------------------------- answer-tie guard (universal) */
+
+/**
+ * Code enforcement behind the LORE_SYSTEM tie rule. The prompt alone is
+ * advisory: the model can still write CONFIRMED for a pair the bank never
+ * held. This guard runs after the model returns and only affects questions
+ * shaped like "status of A to B" (the frozen probe shape and the ask CLI).
+ * No names, kinds, or books appear here: A and B come from the question,
+ * aliases come from the entity rows, and passage text is only tested for
+ * naming both sides in one passage.
+ */
+function parseStatusPair(question: string): { a: string; b: string } | null {
+  const noScope = question.replace(/\s+as\s+of\s+.*$/i, '').trim();
+  const m = noScope.match(/status\s+of\s+(.+?)\s+to\s+(.+?)\s*$/i);
+  if (!m) return null;
+  const a = m[1].trim().replace(/^["'“”]+|["'“”]+$/g, '');
+  const b = m[2].trim().replace(/^["'“”]+|["'“”]+$/g, '');
+  if (!a || !b) return null;
+  return { a, b };
+}
+
+function entityVariantsFor(
+  entities: { id: number; name: string; aliases: string[] }[],
+  query: string,
+): { ids: number[]; variants: string[] } {
+  const q = query.toLowerCase();
+  const matched = entities.filter(
+    (e) => e.name.toLowerCase() === q || e.aliases.some((al) => al.toLowerCase() === q),
+  );
+  const pool = matched.length ? matched : [];
+  const ids = pool.map((e) => e.id);
+  const variants = [q];
+  for (const e of pool) {
+    variants.push(e.name.toLowerCase());
+    for (const al of e.aliases) variants.push(al.toLowerCase());
+  }
+  return { ids, variants: [...new Set(variants)].filter((v) => v.length > 0) };
+}
+
+function bankHoldsAcceptedTie(db: Db, projectId: number, idsA: number[], idsB: number[]): boolean {
+  if (!idsA.length || !idsB.length) return false;
+  const row = db.get<{ n: number }>(
+    `SELECT COUNT(*) AS n FROM canon_relation WHERE project_id = ? AND review_status IN ('accepted','user_confirmed')
+     AND ((from_entity IN (${idsA.map(() => '?').join(',')}) AND to_entity IN (${idsB.map(() => '?').join(',')}))
+       OR (from_entity IN (${idsB.map(() => '?').join(',')}) AND to_entity IN (${idsA.map(() => '?').join(',')})))`,
+    projectId,
+    ...idsA,
+    ...idsB,
+    ...idsB,
+    ...idsA,
+  );
+  return (row?.n ?? 0) > 0;
+}
+
+function passageNamesBoth(passages: Passage[], variantsA: string[], variantsB: string[]): boolean {
+  return passages.some((pg) => {
+    const text = (pg.text ?? '').toLowerCase();
+    if (!text) return false;
+    const hitsA = variantsA.some((v) => v.length > 2 && text.includes(v));
+    const hitsB = variantsB.some((v) => v.length > 2 && text.includes(v));
+    return hitsA && hitsB;
+  });
+}
+
+/**
+ * Downgrade an unsupported CONFIRMED tie to an explicit abstain. Returns the
+ * original answer when the question is not a status-of pair, when the bank
+ * holds an accepted tie, when one passage names both sides, or when the
+ * draft never claims CONFIRMED. Otherwise the tie is not established: the
+ * original draft is kept below for audit, never silently dropped.
+ */
+function enforceStatusTieGuard(
+  db: Db,
+  projectId: number,
+  question: string,
+  draft: string,
+  passages: Passage[],
+): string {
+  const pair = parseStatusPair(question);
+  if (!pair) return draft;
+  if (!/\bconfirmed\b/i.test(draft)) return draft;
+  let entities: { id: number; name: string; aliases: string[] }[] = [];
+  try {
+    entities = lorebook
+      .listEntities(db, projectId)
+      .map((e) => ({ id: e.id, name: e.name, aliases: e.aliases ?? [] }));
+  } catch {
+    return draft;
+  }
+  const sideA = entityVariantsFor(entities, pair.a);
+  const sideB = entityVariantsFor(entities, pair.b);
+  // Same-row identity: a tie to self is never confirmed.
+  if (sideA.ids.length && sideA.ids.some((id) => sideB.ids.includes(id))) {
+    // Fall through to the abstain below.
+  } else if (bankHoldsAcceptedTie(db, projectId, sideA.ids, sideB.ids)) {
+    return draft;
+  } else if (passageNamesBoth(passages, sideA.variants, sideB.variants)) {
+    return draft;
+  }
+  return (
+    `### Status of ${pair.a} to ${pair.b}\n\n` +
+    `Tie not established. The lore index banks no tie between ${pair.a} and ${pair.b}, ` +
+    `and no single retrieved passage names both and states the tie. Nothing here is confirmed.\n\n` +
+    `---\nOriginal draft (uncorrected, kept for audit):\n${draft}`
+  );
+}
+
 export async function answerLoreQuestion(
   db: Db,
   llm: LlmClient,
@@ -415,8 +522,9 @@ export async function answerLoreQuestion(
     ],
     temperature: 0.1,
   });
+  const guarded = enforceStatusTieGuard(db, projectId, question, res.text.trim(), passages);
   return {
-    answer: res.text.trim(),
+    answer: guarded,
     passages,
     grounded: passages.length > 0 || indexText.length > 0,
   };
