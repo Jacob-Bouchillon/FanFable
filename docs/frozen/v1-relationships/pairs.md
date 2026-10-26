@@ -1,6 +1,11 @@
 # Frozen pairs v1 — Plagueis probe (20)
 
-Source: `RESOURCES/Novels/Darth Plagueis - James Luceno.pdf` (local-only, not tracked).
+Source: `RESOURCES/Novels/Darth Plagueis - James Luceno.pdf` (local-only, not tracked;
+sha256 `5655977b…`, 528 PDF pages, 2012 Lucasfilm Ltd. text; third-party PDF rebuild —
+producer tag is a Python PDF library, not the publisher's own file. No ISBN in the text layer.)
+All locators (`p. N`) are print pages as extracted from THIS file. A different printing may
+paginate or word passages differently — which is why every verdict here rests on quotes
+verified in this file, never on an oracle's citations.
 Extractive build: 12-window selective extract, seed 42, then capped probe mining.
 Each row: pair class + expected behavior. Full verdicts in `scores-v1.md`.
 
