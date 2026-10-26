@@ -8,13 +8,16 @@ export type Row = Record<string, unknown>;
 
 export class Db {
   readonly raw: DatabaseSync;
+  readonly path: string;
   private depth = 0;
 
   constructor(path: string) {
+    this.path = path;
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.raw = new DatabaseSync(path);
     this.raw.exec('PRAGMA journal_mode = WAL');
     this.raw.exec('PRAGMA busy_timeout = 5000');
+    this.raw.exec('PRAGMA foreign_keys = ON');
     runMigrations(this.raw);
     // Keep enum-ish columns tidy when the model invents its own wording.
     this.raw.exec(

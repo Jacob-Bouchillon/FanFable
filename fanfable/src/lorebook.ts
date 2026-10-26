@@ -11,10 +11,13 @@
  * than in a wall of retrieved text.
  */
 import { Db, nowIso, strList, toJson } from './db.ts';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { asRecordArray, extractJson, salvageJsonArray, toStringArray } from './json.ts';
 import type { LlmClient } from './llm.ts';
 import { embedMissing, type EmbedFn } from './embeddings.ts';
-import { CORROBORATION_CAP, tripleKey } from './edge-rank.ts';
+import { CORROBORATION_CAP, tripleKey, rankRows } from './edge-rank.ts';
 import { STOPWORDS, splitSentences, tokenize, truncate } from './text.ts';
 
 /* ------------------------------------------------------------------ models */
@@ -47,6 +50,9 @@ export interface CanonRelation {
   evidence: string;
   modality: string;
   conflictStatus: string;
+  ledgerState: string;
+  scope: string;
+  reviewStatus: string;
 }
 
 export interface CanonFact {
@@ -648,6 +654,12 @@ export async function extractLore(
   }
   stats.windows = runList.length;
   rememberExtractionReport(db, projectId, stats);
+  writeAuditNote(projectId, 'extract', [
+    `windows visited: ${stats.windows}`,
+    `ties banked: ${stats.relations}`,
+    `quotes verified: ${stats.verification.verified}, repointed: ${stats.verification.repointed}, dropped: ${stats.verification.dropped}`,
+    `empty windows: ${stats.emptyWindows.length}`,
+  ], db);
 
   return stats;
 }
@@ -719,6 +731,11 @@ export async function ensureWindowsForChunks(
   persistQuarantine(db, projectId, merged.quarantined);
   linkTimelineToEvents(db, projectId);
   stats.windows = targets.length;
+  writeAuditNote(projectId, 'mine', [
+    `windows visited: ${stats.windows}`,
+    `ties banked: ${stats.relations}`,
+    `quotes verified: ${stats.verification.verified}, repointed: ${stats.verification.repointed}, dropped: ${stats.verification.dropped}`,
+  ], db);
   return stats;
 }
 
@@ -862,6 +879,7 @@ async function runWindowBatch(
     const group = entries.slice(start, start + batch.concurrency);
     await Promise.all(
       group.map(async ({ window, index }) => {
+        const emptyBefore = stats.emptyWindows.length;
         try {
           if (batch.singlePrompt) {
             await extractWindowLegacy(db, llm, projectId, window, entityIdByName, stats, ctx.neighboursOf, batch.maxTokens);
@@ -887,7 +905,10 @@ async function runWindowBatch(
             detail: err instanceof Error ? err.message : String(err),
           });
         }
-        for (const c of window) db.run('UPDATE canon_chunk SET lore_mined = 1 WHERE id = ?', c.id);
+        const failed = stats.emptyWindows.slice(emptyBefore).some((e) => e.index === index && e.reason !== 'empty-answer');
+        if (!failed) {
+          for (const c of window) db.run('UPDATE canon_chunk SET lore_mined = 1 WHERE id = ?', c.id);
+        }
         done++;
         batch.onProgress?.(
           `read ${done}/${entries.length} windows (${done * batch.windowSize} of ${batch.totalChunks} passages)`,
@@ -928,6 +949,37 @@ function rememberExtractionReport(db: Db, projectId: number, stats: ExtractLoreR
     );
   } catch {
     /* diagnostics are a nicety: never fail an extraction over them */
+  }
+}
+
+/**
+ * Audit notes by default: every run emits windows visited, ties banked,
+ * quotes repointed/dropped, rules fired as text alongside DB writes.
+ * DB stays authoritative; the note is the paper trail. Never throws.
+ * Code paths are bit-deterministic; LLM text excluded from comparison.
+ */
+export function writeAuditNote(projectId: number, op: string, lines: string[], db?: Db): string | undefined {
+  try {
+    // Alongside the DB when its path is known (temp DBs stay in tmp, real
+    // DBs keep notes next to them); :memory: and pathless callers fall back
+    // to a tmpdir home so suite runs never pollute the repo dir.
+    let dir: string;
+    const p = db?.path;
+    if (p && p !== ':memory:') {
+      dir = join(dirname(p), '.audits');
+    } else if (!db) {
+      dir = join(tmpdir(), '.audits-fanfable');
+    } else {
+      dir = join(tmpdir(), '.audits-fanfable');
+    }
+    mkdirSync(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const safeOp = op.replace(/[^a-z0-9-_]+/gi, '-').slice(0, 40) || 'op';
+    const path = join(dir, `${projectId}-${safeOp}-${stamp}.md`);
+    writeFileSync(path, `# Audit ${op} project ${projectId} at ${new Date().toISOString()}\n\n${lines.map((l) => `- ${l}`).join('\n')}\n`);
+    return path;
+  } catch {
+    return undefined;
   }
 }
 
@@ -1488,6 +1540,46 @@ export function quoteNamesEndpoint(
   return proofRelevance(rosterTokens(db, projectId), fromId, toId, quote);
 }
 
+/** True when the quote names a recognizable form of both endpoints. */
+export function quoteNamesBothEndpoints(
+  db: Db,
+  projectId: number,
+  fromId: number,
+  toId: number,
+  quote: string,
+): boolean {
+  const roster = rosterTokens(db, projectId);
+  const words = proofTokens(quote, 3);
+  if (!words.size) return false;
+  return [fromId, toId].every((id) =>
+    [...(roster.get(id) ?? [])].some((t) => words.has(t)),
+  );
+}
+
+/**
+ * True when the quote names a third roster person beyond the pair — the
+ * Kim-assistant shape: the quote proves Pax Teem + Aks Moe, not Pax Teem +
+ * Kim. Single-endpoint-plus-outsider must not bank as accepted.
+ */
+export function quoteNamesThirdParty(
+  db: Db,
+  projectId: number,
+  fromId: number,
+  toId: number,
+  quote: string,
+): boolean {
+  const roster = rosterTokens(db, projectId);
+  const words = proofTokens(quote, 3);
+  if (!words.size) return false;
+  for (const [id, toks] of roster) {
+    if (id === fromId || id === toId) continue;
+    for (const t of toks) {
+      if (words.has(t)) return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Bank a happening as an event. Moments fail as ties but truly happened, so
  * the occurrence is kept where happenings live: the event index, both
@@ -1598,7 +1690,25 @@ function applyRelations(
     // third roster person instead. Never written — an unprovable tie is
     // worse than a missing one. The pre-gate path keeps its lenient flag.
     const relevant = proofRelevance(roster, fromId, toId, span.quote);
-    const review = relevant ? 'accepted' : 'needs_review';
+    // Misattached proof: the quote names a third roster person without
+    // naming both endpoints (Pax Teem + Aks Moe proving Pax Teem + Kim).
+    // Never accepted — at best pending until a both-endpoints quote arrives.
+    const bothNamed = [fromId, toId].every((id) =>
+      [...(roster.get(id) ?? [])].some((t) => proofTokens(span.quote, 3).has(t)),
+    );
+    let thirdParty = false;
+    if (!bothNamed) {
+      const words = proofTokens(span.quote, 3);
+      for (const [id, toks] of roster) {
+        if (id === fromId || id === toId) continue;
+        for (const t of toks) {
+          if (words.has(t)) { thirdParty = true; break; }
+        }
+        if (thirdParty) break;
+      }
+    }
+    const misattached = thirdParty && !bothNamed;
+    const review = relevant && !misattached ? 'accepted' : 'needs_review';
     if (!relevant && gate) {
       stats.verification.unrelated++;
       continue;
@@ -1613,7 +1723,7 @@ function applyRelations(
       // the tie question parks as a note. Counted throughout, never lost.
       // Silent nouns keep a flagged tie row: the label IS relationship-
       // shaped, only its quote is silent. The judge or a human decides.
-      let flagged: 'unsupported' | null = null;
+      let flagged: 'unsupported' | 'open-vocab' | null = null;
       if (isMomentKind(kind)) {
         stats.verification.moment++;
         bankMomentEvent(db, projectId, fromId, toId, kind, String(raw.description ?? '').trim(), span, chunk);
@@ -1624,6 +1734,15 @@ function applyRelations(
         stats.verification.unsupported++;
         persistTieNote(db, projectId, fromId, toId, kind, 'unsupported', span.quote, toJson(refs));
         flagged = 'unsupported';
+      }
+      // Open vocabulary parks: the kind is no closed role noun (kinship,
+      // titled role, human-gated peer/colleague), so it can never bank
+      // accepted. It stays pending with reason open-vocab-kind — the
+      // encourager/acknowledger class — invisible to status until cleared.
+      if (!flagged && !isClosedRoleKind(kind)) {
+        stats.verification.unsupported++;
+        persistTieNote(db, projectId, fromId, toId, kind, 'open-vocab', span.quote, toJson(refs));
+        flagged = 'open-vocab';
       }
       // A generic kinship word repeats a specific one: "parent of" beside
       // "father of" says nothing new. Pure dedupe, not a meaning judgment:
@@ -2180,8 +2299,23 @@ export const CLOSED_TIE_LABELS = [
   'son of', 'daughter of', 'child of', 'husband of', 'wife of', 'spouse of',
   'married to', 'uncle of', 'aunt of', 'nephew of', 'niece of', 'cousin of',
   'relative of', 'friend of', 'enemy of', 'ally of', 'teacher of', 'student of',
-  'mentor of', 'leader of', 'member of',
+  'mentor of', 'leader of', 'member of', 'peer of', 'colleague of',
 ];
+
+/** Closed role-noun list for bankable tie kinds: universal kin + titled roles +
+ * the human-gated peer/colleague set. Seeded from kinds banked as accepted on
+ * the frozen sheet's correct answers. Anything outside it parks as
+ * needs_review with reason open-vocab-kind — never banks accepted. */
+export const CLOSED_ROLE_KINDS = [
+  ...CLOSED_TIE_LABELS,
+  'aide of', 'apprentice of', 'assistant of', 'master of', 'operative for',
+  'partner', 'partner with',
+];
+
+/** True when the kind resolves to the closed role-noun list. */
+export function isClosedRoleKind(kind: string): boolean {
+  return CLOSED_ROLE_KINDS.includes((kind ?? '').trim().toLowerCase());
+}
 
 /** Park a dropped tie for the batched relabeling pass. Reruns collide on
  * the pair-plus-label index and add nothing. */
@@ -2191,7 +2325,7 @@ function persistTieNote(
   fromId: number,
   toId: number,
   attemptedKind: string,
-  reason: 'moment' | 'unsupported' | 'evaluation',
+  reason: 'moment' | 'unsupported' | 'open-vocab' | 'evaluation',
   evidence: string,
   sourceRefs: string,
   ruling = '',
@@ -2621,9 +2755,10 @@ export async function resolveTieNotes(
   db: Db,
   llm: LlmClient,
   projectId: number,
-  opts: { maxNotes?: number; onProgress?: (message: string) => void } = {},
+  opts: { maxNotes?: number; afterId?: number; onProgress?: (message: string) => void } = {},
 ): Promise<TieNoteResolution> {
   const maxNotes = Math.max(1, opts.maxNotes ?? 25);
+  const afterId = Math.max(0, opts.afterId ?? 0);
   const remaining = (): number =>
     db.get<{ n: number }>(
       "SELECT COUNT(*) AS n FROM canon_tie_note WHERE project_id = ? AND status = 'pending'",
@@ -2645,8 +2780,9 @@ export async function resolveTieNotes(
        FROM canon_tie_note n
        JOIN canon_entity fe ON fe.id = n.from_entity
        JOIN canon_entity te ON te.id = n.to_entity
-      WHERE n.project_id = ? AND n.status = 'pending' ORDER BY n.id LIMIT ?`,
+      WHERE n.project_id = ? AND n.status = 'pending' AND n.id > ? ORDER BY n.id LIMIT ?`,
     projectId,
+    afterId,
     maxNotes,
   );
   let resolved = 0;
@@ -2768,6 +2904,8 @@ export async function resolveTieNotes(
     if (!dup) {
       // The relabeled tie supersedes the flagged attempt: remove flagged rows
       // of the old label so the pair is not counted twice, then bank clean.
+      // Never resolve without a row: a colliding needs_review row leaves the
+      // note pending for a human rather than marking success with no bank.
       db.run(
         `DELETE FROM canon_relation WHERE project_id = ? AND lower(kind) = ? AND review_status = 'needs_review'
           AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))`,
@@ -2778,7 +2916,7 @@ export async function resolveTieNotes(
         note.to_entity,
         note.from_entity,
       );
-      db.run(
+      const added = db.run(
         `INSERT OR IGNORE INTO canon_relation (project_id, from_entity, to_entity, kind, description, evidence, source_refs, modality, review_status, created_at)
           VALUES (?, ?, ?, ?, '', ?, ?, 'asserted', 'accepted', ?)`,
         projectId,
@@ -2789,11 +2927,21 @@ export async function resolveTieNotes(
         note.source_refs,
         nowIso(),
       );
+      if (added.changes === 0) {
+        unproven++;
+        continue;
+      }
     }
     settle(note.id, 'resolved', label);
     resolved++;
   }
-  return { resolved, confirmed, unproven, checked: notes.length, pending: remaining() };
+  const out = { resolved, confirmed, unproven, checked: notes.length, pending: remaining() };
+  writeAuditNote(projectId, 'relabel', [
+    `notes checked: ${out.checked}`,
+    `resolved: ${out.resolved}, confirmed drops: ${out.confirmed}, left pending: ${out.unproven}`,
+    `still waiting: ${out.pending}`,
+  ], db);
+  return out;
 }
 
 export interface TieEvaluation {
@@ -2838,7 +2986,7 @@ export async function evaluateTies(
        FROM canon_relation r
        JOIN canon_entity fe ON fe.id = r.from_entity
        JOIN canon_entity te ON te.id = r.to_entity
-      WHERE r.project_id = ? AND r.id > ? ORDER BY r.id LIMIT ?`,
+      WHERE r.project_id = ? AND r.id > ? AND r.review_status != 'user_confirmed' ORDER BY r.id LIMIT ?`,
     projectId,
     afterId,
     maxTies,
@@ -2900,7 +3048,12 @@ export async function evaluateTies(
     persistTieNote(db, projectId, row.from_entity, row.to_entity, row.kind, 'evaluation', row.evidence, row.source_refs, reason || 'drop');
     parked++;
   }
-  return { kept, parked, unproven, checked: rows.length };
+  const out = { kept, parked, unproven, checked: rows.length };
+  writeAuditNote(projectId, 'evaluate', [
+    `ties checked: ${out.checked}`,
+    `kept: ${out.kept}, parked: ${out.parked}, untouched: ${out.unproven}`,
+  ], db);
+  return out;
 }
 
 /* ------------------------------------------------- timeline ↔ event join */
@@ -2932,6 +3085,103 @@ export function relationCorroboration(db: Db, projectId: number): Map<number, nu
     out.set(row.id, Math.min(chunks.get(key)!.size, CORROBORATION_CAP));
   }
   return out;
+}
+
+export interface TriplePosting {
+  tripleKey: string;
+  fromId: number;
+  toId: number;
+  kind: string;
+  chunkId: number;
+  locator: string;
+  seq: number | null;
+}
+
+/**
+ * Triple-to-passage index from existing pointers, no new table.
+ *
+ * Every banked relation already carries its proving chunk in source_refs;
+ * this inverts those pointers into per-triple postings with locators that
+ * resolve. Unplaced rows (no chunk) produce no posting and stay invisible
+ * to ranking. Read-only, deterministic by triple then chunk.
+ * Code paths are bit-deterministic; LLM text excluded from comparison.
+ */
+export function triplePassages(db: Db, projectId: number): TriplePosting[] {
+  const rows = db.all<{ from_entity: number; to_entity: number; kind: string; source_refs: string }>(
+    'SELECT from_entity, to_entity, kind, source_refs FROM canon_relation WHERE project_id = ? ORDER BY id',
+    projectId,
+  );
+  const locByChunk = new Map(
+    db.all<{ id: number; locator: string; seq: number }>('SELECT id, locator, seq FROM canon_chunk WHERE project_id = ?', projectId)
+      .map((c) => [c.id, c] as [number, { locator: string; seq: number }]),
+  );
+  const out: TriplePosting[] = [];
+  const seen = new Set<string>();
+  for (const r of rows) {
+    const key = tripleKey(r.from_entity, r.to_entity, r.kind);
+    const chunkId = firstChunkOf(r.source_refs);
+    if (chunkId === undefined) continue;
+    const dedupe = `${key}:${chunkId}`;
+    if (seen.has(dedupe)) continue;
+    seen.add(dedupe);
+    const loc = locByChunk.get(chunkId);
+    out.push({
+      tripleKey: key,
+      fromId: r.from_entity,
+      toId: r.to_entity,
+      kind: r.kind,
+      chunkId,
+      locator: loc?.locator ?? '',
+      seq: loc?.seq ?? null,
+    });
+  }
+  out.sort((a, b) => (a.tripleKey < b.tripleKey ? -1 : a.tripleKey > b.tripleKey ? 1 : a.chunkId - b.chunkId));
+  return out;
+}
+
+/**
+ * Frozen ordering for the tie view: verified-first (unverified invisible by
+ * default), then corroboration desc (capped), density 1/claims desc, id asc.
+ * Scope is project_id before ordering; atSeq narrows to story position when
+ * given. Deterministic by construction.
+ */
+export function rankedRelations(
+  db: Db,
+  projectId: number,
+  opts: { atSeq?: number; includeUnverified?: boolean; includeFlagged?: boolean; limit?: number } = {},
+): CanonRelation[] {
+  const all = listRelations(db, projectId);
+  const cleared = opts.includeFlagged ? all : all.filter((r) => r.reviewStatus === 'accepted' || r.reviewStatus === 'user_confirmed');
+  const verified = opts.includeUnverified ? cleared : cleared.filter((r) => r.evidence.trim().length > 0);
+  const refs = new Map<number, string>();
+  for (const row of db.all<{ id: number; source_refs: string }>(
+    'SELECT id, source_refs FROM canon_relation WHERE project_id = ? ORDER BY id',
+    projectId,
+  )) refs.set(row.id, row.source_refs);
+  const idChunk = new Map<number, number>();
+  const chunkCounts = new Map<number, number>();
+  for (const r of verified) {
+    const chunk = firstChunkOf(refs.get(r.id) ?? '[]') ?? -1;
+    idChunk.set(r.id, chunk);
+    chunkCounts.set(chunk, (chunkCounts.get(chunk) ?? 0) + 1);
+  }
+  const seqByChunk = new Map(
+    db.all<{ id: number; seq: number }>('SELECT id, seq FROM canon_chunk WHERE project_id = ?', projectId).map((c) => [c.id, c.seq] as [number, number]),
+  );
+  const scoped = opts.atSeq === undefined
+    ? verified
+    : verified.filter((r) => {
+        const seq = seqByChunk.get(idChunk.get(r.id) ?? -1);
+        return seq !== undefined && seq <= opts.atSeq!;
+      });
+  const ordered = rankRows(
+    scoped.map((r) => ({ id: r.id, a: r.fromId, b: r.toId, kind: r.kind, evidence: r.evidence, chunkSeq: null })),
+    chunkCounts,
+    (row) => idChunk.get(row.id) ?? -1,
+  );
+  const order = new Map(ordered.map((o, i) => [o.id, i] as [number, number]));
+  const out = scoped.slice().sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
+  return typeof opts.limit === 'number' ? out.slice(0, Math.max(0, opts.limit)) : out;
 }
 
 function firstChunkOf(sourceRefs: string): number | undefined {
@@ -3102,7 +3352,8 @@ const MOMENT_WORDS = new Set(
     'target follower follow questioned question explained explain disagreed disagree ' +
     'comforted comfort admired admire disappointed disappoint proud shook shake ' +
     'dropped drop talking talk rumored rumor signalled signaled signal watched watch ' +
-    'knows knew know known observed observe seen afraid frightened feared fear fears scared')
+    'knows knew know known observed observe seen afraid frightened feared fear fears scared ' +
+    'killed kill kills killing murdered murder murders murdering assassinated assassinate assassinates assassinating')
     .split(' '),
 );
 
@@ -3140,6 +3391,7 @@ const KIN_GROUPS: ReadonlyArray<ReadonlySet<string>> = [
   new Set(['enemy', 'enemies', 'foe']),
   new Set(['ally', 'allies']),
   new Set(['teacher', 'student', 'mentor', 'master', 'servant', 'guardian', 'commander', 'captain']),
+  new Set(['peer', 'peers', 'colleague', 'colleagues', 'coworker', 'coworkers', 'co-worker']),
 ];
 
 /** The kin groups a label touches, if any. Empty means no noun to check. */
@@ -3321,9 +3573,13 @@ export function listRelations(db: Db, projectId: number): CanonRelation[] {
     to_name: string;
     modality: string | null;
     conflict_status: string | null;
+    ledger_state: string | null;
+    scope: string | null;
+    review_status: string | null;
   }>(
     `SELECT r.id, r.from_entity, r.to_entity, r.kind, r.description, r.evidence,
-            a.name AS from_name, b.name AS to_name, r.modality, r.conflict_status
+            a.name AS from_name, b.name AS to_name, r.modality, r.conflict_status,
+            r.ledger_state, r.scope, r.review_status
      FROM canon_relation r
      JOIN canon_entity a ON a.id = r.from_entity
      JOIN canon_entity b ON b.id = r.to_entity
@@ -3341,6 +3597,9 @@ export function listRelations(db: Db, projectId: number): CanonRelation[] {
     evidence: r.evidence,
     modality: r.modality ?? 'asserted',
     conflictStatus: r.conflict_status ?? 'none',
+    ledgerState: r.ledger_state ?? 'verified',
+    scope: r.scope ?? '',
+    reviewStatus: r.review_status ?? 'accepted',
   }));
 }
 
@@ -3387,11 +3646,14 @@ export function pairHistory(
     to_name: string;
     modality: string | null;
     conflict_status: string | null;
+    ledger_state: string | null;
+    scope: string | null;
+    review_status: string | null;
     source_refs: string;
   }>(
     `SELECT r.id, r.from_entity, r.to_entity, r.kind, r.description, r.evidence,
             a.name AS from_name, b.name AS to_name, r.modality, r.conflict_status,
-            r.source_refs
+            r.ledger_state, r.scope, r.review_status, r.source_refs
      FROM canon_relation r
      JOIN canon_entity a ON a.id = r.from_entity
      JOIN canon_entity b ON b.id = r.to_entity
@@ -3420,16 +3682,52 @@ export function pairHistory(
       evidence: r.evidence,
       modality: r.modality ?? 'asserted',
       conflictStatus: r.conflict_status ?? 'none',
+      ledgerState: r.ledger_state ?? 'verified',
+      scope: r.scope ?? '',
+      reviewStatus: r.review_status ?? 'accepted',
       seq,
       locator: chunk ? chunk.locator : null,
     };
   });
-  const visible = atSeq === undefined ? placed : placed.filter((r) => r.seq !== null && r.seq <= atSeq);
+  // Flagged rows are invisible to status until cleared: pending review reads
+  // as no current, not as a guess. Human-confirmed rows stay visible.
+  const cleared = placed.filter((r) => r.reviewStatus === 'accepted' || r.reviewStatus === 'user_confirmed');
+  const visible = atSeq === undefined ? cleared : cleared.filter((r) => r.seq !== null && r.seq <= atSeq);
   visible.sort((x, y) => (x.seq ?? Number.POSITIVE_INFINITY) - (y.seq ?? Number.POSITIVE_INFINITY) || x.id - y.id);
   const asserted = visible.filter((r) => r.modality === 'asserted');
   const current = asserted.length ? asserted[asserted.length - 1]! : null;
   const history = current ? visible.filter((r) => r.id !== current.id) : visible;
   return { current, history };
+}
+
+/**
+ * Directed status: A→B and B→A hold separate currents.
+ *
+ * The undirected pairHistory stays for history views; this is the answering
+ * path, where a reversed arrow must become impossible, not just unlikely.
+ * Each direction filters to its own arrow, orders by story position, and
+ * names the latest asserted row current. Flagged rows stay invisible per
+ * direction. Deterministic by construction.
+ */
+export function directedPairStatus(
+  db: Db,
+  projectId: number,
+  aId: number,
+  bId: number,
+  atSeq?: number,
+): { forward: PairStatus; reverse: PairStatus } {
+  const one = (from: number, to: number): PairStatus => {
+    const { current, history } = pairHistory(db, projectId, from, to, atSeq);
+    // pairHistory reads both arrows; narrow to the requested one.
+    const fwd = [current, ...history].filter(Boolean).filter(
+      (r) => r!.fromId === from && r!.toId === to,
+    ) as StatusRow[];
+    fwd.sort((x, y) => (x.seq ?? Number.POSITIVE_INFINITY) - (y.seq ?? Number.POSITIVE_INFINITY) || x.id - y.id);
+    const asserted = fwd.filter((r) => r.modality === 'asserted');
+    const cur = asserted.length ? asserted[asserted.length - 1]! : null;
+    return { current: cur, history: cur ? fwd.filter((r) => r.id !== cur.id) : fwd };
+  };
+  return { forward: one(aId, bId), reverse: one(bId, aId) };
 }
 
 export function listFacts(db: Db, projectId: number, topic?: string): CanonFact[] {

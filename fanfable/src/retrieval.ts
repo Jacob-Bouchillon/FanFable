@@ -247,29 +247,47 @@ export async function retrieve(
   // query would otherwise pay for. Nothing is banked; the graph answers.
   // No banked stranger rows ever: N squared pairs, none quotable. Strangers
   // are an answer ("no recorded connection"), computed here, never stored.
-  if (lazyOn && relational && focus.length >= 2) {
+  // Conditional mining: cheap bank check first, pay for mining only when
+  // unmined evidence is in scope. Nothing unmined among the FTS hits keeps
+  // the old skip (verdict from bank, no LLM). Unmined hits mine first, then
+  // the verdict is recomputed so it never freezes stale.
+  const computeVerdict = (): void => {
+    composedPath = undefined;
+    strangers = undefined;
+    if (!(lazyOn && relational && focus.length >= 2)) return;
     const a = lorebook.findEntity(db, projectId, focus[0]!);
     const b = lorebook.findEntity(db, projectId, focus[1]!);
-    if (a && b) {
-      composedPath = graph.findComposedPath(db, projectId, a.id, b.id) ?? undefined;
-      if (!composedPath) {
-        const direct = db.get<{ id: number }>(
-          `SELECT id FROM canon_relation WHERE project_id = ? AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?)) LIMIT 1`,
-          projectId, a.id, b.id, b.id, a.id,
-        );
-        if (!direct) strangers = { a: a.name, b: b.name };
-      }
+    if (!a || !b) return;
+    composedPath = graph.findComposedPath(db, projectId, a.id, b.id) ?? undefined;
+    if (!composedPath) {
+      const direct = db.get<{ id: number }>(
+        `SELECT id FROM canon_relation WHERE project_id = ? AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?)) LIMIT 1`,
+        projectId, a.id, b.id, b.id, a.id,
+      );
+      if (!direct) strangers = { a: a.name, b: b.name };
     }
-  }
-  if (lazyOn && req.includeGraph !== false && passages.length && !composedPath) {
-    const mini = await lorebook.mineUnminedHits(
-      db,
-      llm,
-      projectId,
-      passages.map((p) => p.chunkId),
-    );
-    if (mini) {
-      lazyMined = { windows: mini.windows, entities: mini.entities, relations: mini.relations };
+  };
+  computeVerdict();
+  if (lazyOn && req.includeGraph !== false && passages.length) {
+    const chunkIds = passages.map((p) => p.chunkId);
+    const unmined = chunkIds.length
+      ? db.all<{ id: number }>(
+          `SELECT id FROM canon_chunk WHERE project_id = ? AND lore_mined = 0 AND id IN (${chunkIds.map(() => '?').join(',')})`,
+          projectId,
+          ...chunkIds,
+        )
+      : [];
+    if (unmined.length) {
+      const mini = await lorebook.mineUnminedHits(
+        db,
+        llm,
+        projectId,
+        chunkIds,
+      );
+      if (mini) {
+        lazyMined = { windows: mini.windows, entities: mini.entities, relations: mini.relations };
+      }
+      computeVerdict();
     }
   }
 

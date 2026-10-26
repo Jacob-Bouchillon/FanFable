@@ -34,6 +34,7 @@ export type GapKind =
   | 'missing-relation'
   | 'unsupported-claim'
   | 'contested-claim'
+  | 'alias-quarantine'
   | 'extraction-quality';
 
 export interface LoreGap {
@@ -74,11 +75,11 @@ const RELATION_CUES: { re: RegExp; kind: string }[] = [
 
 /** The kinds that describe the same relationship, so a near-match is a hit. */
 const RELATED_KINDS: Record<string, string[]> = {
-  'child of': ['son of', 'daughter of', 'mother of', 'father of', 'parent of', 'sibling of', 'child'],
+  'child of': ['son of', 'daughter of', 'mother of', 'father of', 'parent of', 'child'],
   'sibling of': ['brother of', 'sister of', 'sibling of', 'brother', 'sister'],
   'relative of': ['uncle of', 'aunt of', 'cousin of', 'nephew of', 'niece of', 'relative of'],
   'married to': ['wife of', 'husband of', 'spouse of', 'married to', 'wife', 'husband'],
-  'leads': ['headmaster of', 'headmistress of', 'leads', 'works for'],
+  'leads': ['headmaster of', 'headmistress of', 'leads'],
   'student of': ['student of', 'studies at', 'attends'],
   'member of': ['member of', 'belongs to', 'part of', 'works for'],
   'friend of': ['friend of', 'friends with', 'best friend of'],
@@ -177,7 +178,7 @@ export function diagnose(db: Db, projectId: number, opts: { limit?: number } = {
     description: string;
     evidence: string;
     source_refs: string;
-  }>('SELECT * FROM canon_relation WHERE project_id = ?', projectId);
+  }>('SELECT * FROM canon_relation WHERE project_id = ? ORDER BY id', projectId);
 
   const byEntity = new Map<number, typeof relations>();
   for (const r of relations) {
@@ -314,8 +315,7 @@ export function diagnose(db: Db, projectId: number, opts: { limit?: number } = {
         for (const other of others) {
           const key = [entity.id, other.id].sort((a, b) => a - b).join(':');
           const kinds = relationIndex.get(key);
-          if (!kinds) continue;
-          if ([...kinds].some((k) => sameRelation(k, cue.kind))) continue;
+          if (kinds && [...kinds].some((k) => sameRelation(k, cue.kind))) continue;
           const dedupe = `${key}:${cue.kind}`;
           if (seenGaps.has(dedupe)) continue;
           seenGaps.add(dedupe);
@@ -323,7 +323,9 @@ export function diagnose(db: Db, projectId: number, opts: { limit?: number } = {
             kind: 'missing-relation',
             severity: 'note',
             subject: `${entity.name} / ${other.name}`,
-            message: `The source says "${cue.kind}" between ${entity.name} and ${other.name}, but the graph records only ${[...kinds].join(', ')}.`,
+            message: kinds
+              ? `The source says "${cue.kind}" between ${entity.name} and ${other.name}, but the graph records only ${[...kinds].join(', ')}.`
+              : `The source says "${cue.kind}" between ${entity.name} and ${other.name}, but the graph records no tie between them.`,
             evidence: truncate(sentence.trim(), 200),
             chunkId: passage.id,
             locator: passage.locator,
@@ -333,6 +335,27 @@ export function diagnose(db: Db, projectId: number, opts: { limit?: number } = {
         }
       }
     }
+  }
+
+  // 3b. Alias quarantine residents blocking merges: a pending near-duplicate
+  // keeps relations split across two names. Surface with the recorded reason.
+  try {
+    const quarantined = db.all<{ name: string; candidate: string; reason: string }>(
+      `SELECT name, candidate, reason FROM quarantine_alias WHERE project_id = ? AND status = 'pending' ORDER BY name, candidate LIMIT 10`,
+      projectId,
+    );
+    for (const q of quarantined) {
+      gaps.push({
+        kind: 'alias-quarantine',
+        severity: 'note',
+        subject: `${q.name} / ${q.candidate}`,
+        message: `"${q.name}" may be "${q.candidate}" — merge blocked pending review.`,
+        evidence: q.reason || 'near-duplicate names await review',
+        suggestion: 'Run "fanfable lore merge" to resolve, then re-run extraction to reunite split ties.',
+      });
+    }
+  } catch {
+    /* old DBs without the quarantine table simply have no blockers */
   }
 
   // 4. Thin threads: a verified tie standing on one window alone. The claim

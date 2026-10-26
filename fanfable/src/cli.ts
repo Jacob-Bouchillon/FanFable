@@ -629,16 +629,16 @@ async function cmdLore(args: Args): Promise<void> {
     if (!to) throw new Error(`no one called "${toName}" (the --to side)`);
     const atRaw = flagNumber(args, 'at', NaN);
     const atSeq = Number.isFinite(atRaw) ? atRaw : undefined;
-    const { current, history } = lorebook.pairHistory(db, project.id, from.id, to.id, atSeq);
+    const directed = lorebook.directedPairStatus(db, project.id, from.id, to.id, atSeq);
     const corroborated = lorebook.relationCorroboration(db, project.id);
     heading(
       `Ties: ${from.name} ↔ ${to.name}` + (atSeq !== undefined ? C.dim(` (at passage ${atSeq})`) : ''),
     );
-    if (!current && !history.length) {
+    if (!directed.forward.current && !directed.forward.history.length && !directed.reverse.current && !directed.reverse.history.length) {
       console.log(C.dim('(no ties banked between them)'));
       return;
     }
-    const show = (r: (typeof history)[number]): void => {
+    const show = (r: lorebook.StatusRow): void => {
       const badge = r.conflictStatus !== 'none' ? C.dim(` [${r.conflictStatus}]`) : '';
       const support = (corroborated.get(r.id) ?? 1) > 1 ? C.dim(` [×${corroborated.get(r.id)} windows]`) : '';
       const where = r.locator ? C.dim(` [${r.locator}]`) : r.seq !== null ? C.dim(` (passage ${r.seq})`) : C.dim(' (unplaced)');
@@ -647,13 +647,18 @@ async function cmdLore(args: Args): Promise<void> {
       if (r.evidence) console.log(`  ${C.dim(`"${r.evidence}"`)}`);
       if (r.modality !== 'asserted') console.log(`  ${C.dim(`framed as: ${r.modality}`)}`);
     };
-    if (current) {
-      console.log(C.green('Current:'));
-      show(current);
+    if (directed.forward.current) {
+      console.log(C.green(`Current ${from.name} → ${to.name}:`));
+      show(directed.forward.current);
     }
-    if (history.length) {
-      console.log(C.dim(`${current ? '\nBefore:' : 'Only:'}`));
-      for (const r of history) show(r);
+    if (directed.forward.history.length) {
+      console.log(C.dim(`${directed.forward.current ? '\nBefore:' : 'Only:'}`));
+      for (const r of directed.forward.history) show(r);
+    }
+    if (directed.reverse.current || directed.reverse.history.length) {
+      console.log(C.dim(`\nReverse ${to.name} → ${from.name}:`));
+      if (directed.reverse.current) show(directed.reverse.current);
+      for (const r of directed.reverse.history) show(r);
     }
     return;
   }
@@ -742,7 +747,8 @@ async function cmdLore(args: Args): Promise<void> {
   }
 
   if (sub === 'status') {
-    const watchSecs = args.flags.watch === true ? 5 : Math.max(1, Number(args.flags.watch) || 0);
+    const watchFlag = args.flags.watch;
+    const watchSecs = watchFlag === true ? 5 : watchFlag !== undefined ? Math.max(1, Number(watchFlag) || 5) : 0;
     const showStatus = (): number => {
       const total = db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_chunk WHERE project_id = ?', project.id)?.n ?? 0;
       const mined = db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_chunk WHERE project_id = ? AND lore_mined = 1', project.id)?.n ?? 0;
@@ -778,11 +784,15 @@ async function cmdLore(args: Args): Promise<void> {
       return pct;
     };
     if (watchSecs > 0) {
-      for (;;) {
-        console.clear();
+      for (let i = 0; i < 3600; i++) {
+        if (i > 0) console.clear();
         const pct = showStatus();
         if (pct >= 100) {
           console.log(C.green('  fully read'));
+          break;
+        }
+        if (pct <= 0 && (db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_chunk WHERE project_id = ?', project.id)?.n ?? 0) === 0) {
+          console.log(C.dim('  nothing imported yet'));
           break;
         }
         console.log(C.dim(`  refreshing every ${watchSecs}s (Ctrl-C to stop)`));

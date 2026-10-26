@@ -302,6 +302,22 @@ export const MIGRATIONS: Migration[] = [
     `,
   },
   {
+    version: 12,
+    name: 'ledger states for courtroom v0',
+    // Rival scopes coexist: same pair+kind may recur under different scope.
+    // Existing rows read as verified with empty scope. Additive only.
+    columns: [
+      ['canon_relation', 'ledger_state', "TEXT NOT NULL DEFAULT 'verified'"],
+      ['canon_relation', 'scope', "TEXT NOT NULL DEFAULT ''"],
+      ['canon_relation', 'superseding_chapter', 'INTEGER REFERENCES chapter(id) ON DELETE SET NULL'],
+    ],
+    sql: `
+      DROP INDEX IF EXISTS canon_relation_pair_kind;
+      CREATE UNIQUE INDEX IF NOT EXISTS canon_relation_pair_kind_scope
+        ON canon_relation(project_id, from_entity, to_entity, kind, scope);
+    `,
+  },
+  {
     version: 3,
     name: 'chapter references for story graph records',
     // Knowledge, motives, secrets and relationships have to be removable when

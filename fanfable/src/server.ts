@@ -10,7 +10,7 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
-import { join, extname, basename } from 'node:path';
+import { join, extname, basename, normalize, resolve, sep } from 'node:path';
 import { Db } from './db.ts';
 import * as controller from './controller.ts';
 import * as lore from './lore.ts';
@@ -89,11 +89,22 @@ function json(res: ServerResponse, code: number, body: unknown): void {
   res.end(text);
 }
 
-function readBody(req: IncomingMessage): Promise<string> {
-  return new Promise((resolve) => {
+function readBody(req: IncomingMessage, maxBytes = 2 * 1024 * 1024): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let size = 0;
     let data = '';
-    req.on('data', (c) => (data += c));
+    req.on('data', (c: string | Buffer) => {
+      const chunk = typeof c === 'string' ? c : c.toString('utf-8');
+      size += Buffer.byteLength(chunk);
+      if (size > maxBytes) {
+        reject(Object.assign(new Error('request body too large'), { statusCode: 413 }));
+        req.destroy();
+        return;
+      }
+      data += chunk;
+    });
     req.on('end', () => resolve(data));
+    req.on('error', (e) => reject(e));
   });
 }
 
@@ -103,7 +114,7 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
   try {
     return JSON.parse(raw) as Record<string, unknown>;
   } catch {
-    return {};
+    throw Object.assign(new Error('malformed JSON body'), { statusCode: 400 });
   }
 }
 
@@ -161,7 +172,13 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
         return;
       }
       if (method === 'GET' && path.startsWith('/ui/')) {
-        serveStatic(res, join(UI_DIR, path.slice(4)));
+        const reqPath = normalize(decodeURIComponent(path.slice(4))).replace(/^(\.\.[\\/])+/, '');
+        const file = resolve(UI_DIR, reqPath);
+        if (file !== UI_DIR && !file.startsWith(UI_DIR + sep)) {
+          json(res, 403, { error: 'forbidden' });
+          return;
+        }
+        serveStatic(res, file);
         return;
       }
 
@@ -262,6 +279,16 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
         if (!files.length) {
           json(res, 400, { error: 'no files' });
           return;
+        }
+        if (files.length > 10) {
+          json(res, 413, { error: 'too many files (max 10)' });
+          return;
+        }
+        for (const f of files) {
+          if (typeof f.contentBase64 !== 'string' || f.contentBase64.length > 15 * 1024 * 1024) {
+            json(res, 413, { error: `file too large: ${f.name ?? 'unnamed'}` });
+            return;
+          }
         }
         const { id } = startJob('import', async (progress) => {
           const p = project();
@@ -432,8 +459,9 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
           return;
         }
         const p = project();
+        const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit') ?? 200) || 200));
         json(res, 200, {
-          conflicts: listConflicts(db, p.id, { openOnly: url.searchParams.get('all') !== '1' }),
+          conflicts: listConflicts(db, p.id, { openOnly: url.searchParams.get('all') !== '1' }).slice(0, limit),
         });
         return;
       }
@@ -828,7 +856,8 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
           return;
         }
         const p = project();
-        json(res, 200, { issues: continuity.listIssues(db, p.id, { openOnly: url.searchParams.get('all') !== '1' }) });
+        const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit') ?? 200) || 200));
+        json(res, 200, { issues: continuity.listIssues(db, p.id, { openOnly: url.searchParams.get('all') !== '1' }).slice(0, limit) });
         return;
       }
 
@@ -888,7 +917,10 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
 
       json(res, 404, { error: 'not found' });
     } catch (err) {
-      json(res, 500, { error: err instanceof Error ? err.message : String(err) });
+      const code = typeof (err as { statusCode?: unknown }).statusCode === 'number'
+        ? (err as { statusCode: number }).statusCode
+        : 500;
+      json(res, code, { error: err instanceof Error ? err.message : String(err) });
     }
   });
 

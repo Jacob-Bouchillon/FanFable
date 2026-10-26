@@ -310,8 +310,24 @@ export async function assembleContext(
 
   // The connected context: what this scene touches, and how it all hangs
   // together. The graph says what is related; the passages behind it say
-  // whether to believe it.
-  const connectedText = retrieved.graph.text;
+  // whether to believe it. Verdicts computed after mining ride along so the
+  // writer sees them: composed family ties, explicit strangers, gaps.
+  let connectedText = retrieved.graph.text;
+  const verdicts: string[] = [];
+  if (retrieved.stats.composedPath) {
+    verdicts.push(
+      `Family tie implied: ${loreNames.slice(0, 2).join(' / ')} via ${retrieved.stats.composedPath.via} (${retrieved.stats.composedPath.label}).`,
+    );
+  }
+  if (retrieved.stats.strangers) {
+    verdicts.push(
+      `No recorded connection between ${retrieved.stats.strangers.a} and ${retrieved.stats.strangers.b} in the extracted lore.`,
+    );
+  }
+  if (retrieved.stats.coverage?.missing?.length || retrieved.stats.truncated) {
+    verdicts.push(`Coverage incomplete: missing ${retrieved.stats.coverage.missing.join(', ') || 'none listed'}. Do not invent the missing link.`);
+  }
+  if (verdicts.length) connectedText = connectedText ? `${connectedText}\n\n${verdicts.join('\n')}` : verdicts.join('\n');
 
   const prev = listChapters(db, projectId).filter((c) => c.number < opts.chapterNumber);
   const last = prev[prev.length - 1];
@@ -657,14 +673,17 @@ export async function writeChapter(
   const contextLlm = opts.contextLlm ?? llm;
 
   // Create the chapter row first so context requests can be attributed to it.
+  // If the model fails, a newly created placeholder is removed so numbering never skips.
+  const hadExisting = existing.some((c) => c.number === chapterNumber);
   const placeholder = saveChapter(db, projectId, chapterNumber, {
     title: chapterOutline?.title ?? `Chapter ${chapterNumber}`,
-    body: '',
-    status: 'draft',
+    ...(hadExisting ? {} : { body: '', status: 'draft' }),
     outlineId: outline.id,
   });
 
-  const result = await writer.writeChapter(
+  let result: Awaited<ReturnType<typeof writer.writeChapter>>;
+  try {
+    result = await writer.writeChapter(
     llm,
     {
       chapterNumber,
@@ -687,6 +706,12 @@ export async function writeChapter(
     },
     limits,
   );
+  } catch (err) {
+    if (!hadExisting) {
+      db.run('DELETE FROM chapter WHERE project_id = ? AND number = ?', projectId, chapterNumber);
+    }
+    throw err;
+  }
 
   const chapter = saveChapter(db, projectId, chapterNumber, {
     title: chapterOutline?.title ?? `Chapter ${chapterNumber}`,
@@ -733,9 +758,11 @@ export async function approveChapter(
   // The conflict is recorded; nothing established is overwritten quietly.
   const conflicts = detectConflicts(db, projectId, chapter.id, extraction);
 
-  memory.clearChapterExtraction(db, projectId, chapter.id);
-  memory.applyStateExtraction(db, projectId, chapter.id, extraction, { source: 'au' });
-  if (conflicts.length) saveConflicts(db, projectId, chapter.id, conflicts);
+  db.transaction(() => {
+    memory.clearChapterExtraction(db, projectId, chapter.id);
+    memory.applyStateExtraction(db, projectId, chapter.id, extraction, { source: 'au' });
+    if (conflicts.length) saveConflicts(db, projectId, chapter.id, conflicts);
+  });
 
   if (extraction.summary) {
     db.run('UPDATE chapter SET summary = ?, approved_at = ?, updated_at = ?, status = ? WHERE id = ?',

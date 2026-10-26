@@ -149,9 +149,12 @@ CREATE TABLE IF NOT EXISTS canon_relation (
   review_status TEXT NOT NULL DEFAULT 'accepted',
   valid_from_event_id INTEGER REFERENCES canon_event(id) ON DELETE SET NULL,
   valid_to_event_id   INTEGER REFERENCES canon_event(id) ON DELETE SET NULL,
+  ledger_state  TEXT NOT NULL DEFAULT 'verified',
+  scope         TEXT NOT NULL DEFAULT '',
+  superseding_chapter INTEGER REFERENCES chapter(id) ON DELETE SET NULL,
   created_at    TEXT NOT NULL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS canon_relation_pair_kind ON canon_relation(project_id, from_entity, to_entity, kind);
+CREATE UNIQUE INDEX IF NOT EXISTS canon_relation_pair_kind_scope ON canon_relation(project_id, from_entity, to_entity, kind, scope);
 
 -- Statements the source supports: world rules, definitions, background facts.
 CREATE TABLE IF NOT EXISTS canon_fact (

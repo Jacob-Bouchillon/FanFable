@@ -293,6 +293,8 @@ export function loadGraph(db: Db, projectId: number, opts: GraphLoadOptions = {}
       valid_to_event_id: number | null;
     }>('SELECT * FROM canon_relation WHERE project_id = ? ORDER BY id', projectId);
     for (const r of relations) {
+      const rs = r.review_status ?? 'accepted';
+      if (rs !== 'accepted' && rs !== 'user_confirmed') continue;
       addEdge(graph, {
         id: `canon:relation:${r.id}`,
         from: canonEntityId(r.from_entity),
@@ -302,7 +304,7 @@ export function loadGraph(db: Db, projectId: number, opts: GraphLoadOptions = {}
         description: r.description,
         evidence: r.evidence,
         confidence: r.confidence ?? 1,
-        reviewStatus: r.review_status ?? 'accepted',
+        reviewStatus: rs,
         sourceRefs: refs(r.source_refs),
         extra: {},
       });
@@ -1716,7 +1718,8 @@ export function findComposedPath(db: Db, projectId: number, aId: number, bId: nu
        JOIN canon_entity fe ON fe.id = r.from_entity
        JOIN canon_entity te ON te.id = r.to_entity
       WHERE r.project_id = ? AND r.review_status = 'accepted'
-        AND (r.from_entity = ? OR r.to_entity = ? OR r.from_entity = ? OR r.to_entity = ?)`,
+        AND (r.from_entity = ? OR r.to_entity = ? OR r.from_entity = ? OR r.to_entity = ?)
+      ORDER BY r.id`,
     projectId, aId, aId, bId, bId,
   );
   // Oriented edges out of each endpoint: base label as seen from X toward Y.
@@ -1739,12 +1742,13 @@ export function findComposedPath(db: Db, projectId: number, aId: number, bId: nu
   };
   const aOut = rows.map((r) => ({ r, o: oriented(aId, r) })).filter((x) => x.o && x.o.mid !== bId);
   const zIn = rows.map((r) => ({ r, o: towardMid(bId, r) })).filter((x) => x.o && x.o.mid !== aId);
+  const hits: { via: string; label: string }[] = [];
   for (const a of aOut) {
     for (const z of zIn) {
       if (a.o!.mid !== z.o!.mid) continue;
       const label = COMPOSE.get(`${a.o!.base}+${z.o!.base}`);
       if (!label) continue;
-      return { via: names.get(a.o!.mid) ?? '?', label };
+      hits.push({ via: names.get(a.o!.mid) ?? '?', label });
     }
   }
   // Same search with the endpoints swapped, inverting the answer.
@@ -1755,10 +1759,12 @@ export function findComposedPath(db: Db, projectId: number, aId: number, bId: nu
       if (b.o!.mid !== a.o!.mid) continue;
       const label = COMPOSE.get(`${b.o!.base}+${a.o!.base}`);
       if (!label) continue;
-      return { via: names.get(b.o!.mid) ?? '?', label: INVERT_LABEL.get(label) ?? label };
+      hits.push({ via: names.get(b.o!.mid) ?? '?', label: INVERT_LABEL.get(label) ?? label });
     }
   }
-  return null;
+  if (!hits.length) return null;
+  hits.sort((x, y) => (x.via < y.via ? -1 : x.via > y.via ? 1 : x.label < y.label ? -1 : x.label > y.label ? 1 : 0));
+  return hits[0]!;
 }
 /**
  *

@@ -100,29 +100,30 @@ function storeSource(
     };
   }
 
-  let sourceId: number;
+  let sourceId = 0;
   let replaced = false;
-  if (existing) {
-    replaced = true;
-    db.run('DELETE FROM canon_source WHERE id = ?', existing.id);
-  }
-  const res = db.run(
-    `INSERT INTO canon_source (project_id, path, title, author, format, sha256, byte_size, page_count, imported_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    projectId,
-    filePath,
-    title,
-    opts.author ?? imported.author,
-    imported.format,
-    sha,
-    statSync(filePath).size,
-    imported.pageCount,
-    nowIso(),
-  );
-  sourceId = res.lastInsertRowid;
-
   const chunks = chunkText(raw, { maxWords: opts.maxWords ?? 220 });
+  const byteSize = statSync(filePath).size;
+  const importedAt = nowIso();
   db.transaction(() => {
+    if (existing) {
+      replaced = true;
+      db.run('DELETE FROM canon_source WHERE id = ?', existing.id);
+    }
+    const res = db.run(
+      `INSERT INTO canon_source (project_id, path, title, author, format, sha256, byte_size, page_count, imported_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      projectId,
+      filePath,
+      title,
+      opts.author ?? imported.author,
+      imported.format,
+      sha,
+      byteSize,
+      imported.pageCount,
+      importedAt,
+    );
+    sourceId = res.lastInsertRowid;
     for (const c of chunks) {
       const page = c.pageStart ? (c.pageEnd > c.pageStart ? `p. ${c.pageStart}-${c.pageEnd}` : `p. ${c.pageStart}`) : '';
       const locator = c.heading ? (page ? `${c.heading} (${page})` : c.heading) : page || `passage ${c.seq + 1}`;
@@ -152,9 +153,9 @@ function storeSource(
       author: opts.author ?? imported.author,
       format: imported.format,
       sha256: sha,
-      byteSize: statSync(filePath).size,
+      byteSize,
       pageCount: imported.pageCount,
-      importedAt: nowIso(),
+      importedAt,
     },
     chunks: chunks.length,
     replaced,
