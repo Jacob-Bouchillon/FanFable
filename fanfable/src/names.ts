@@ -4,10 +4,12 @@
  * One canonicalizer, one token matcher, two explicit policies:
  *
  *   LINK     — soft lookup for retrieval, graph scoring, extraction windows,
- *             the answer guard, and lore search. Whole-token matches; a token
- *             one edit away matches when it is long enough.
+ *             and lore search. Whole-token matches; a token one edit away
+ *             matches when it is long enough.
  *   IDENTITY — exact/alias lookup for `findEntity` and merge decisions. It
  *             intentionally stays exact and is not changed by this module.
+ *   PROOF    — exact endpoint matching for the answer guard. Whole-token
+ *             equality only; no edit distance, no substring, no partial.
  *
  * No book-specific strings; names come from the caller.
  */
@@ -157,4 +159,24 @@ export function nameMentioned(
 ): boolean {
   const hayCanonical = canonicalName(text);
   return nameMentionedFromTokens(name, hayCanonical, new Set(hayCanonical.split(' ').filter(Boolean)), opts);
+}
+
+/**
+ * A name mention in free text using the PROOF policy.
+ *
+ * Exact whole-token equality after canonicalization, plus an exact multi-word
+ * phrase. A proof that one passage names an endpoint must not accept a typo,
+ * a substring, or a single token of a multi-word name; those remain in the
+ * LINK policy above for retrieval and ranking only.
+ */
+export function nameMentionedExact(name: string, text: string): boolean {
+  const canonical = canonicalName(name);
+  if (!canonical) return false;
+  const meaningful = canonical.split(' ').filter(Boolean);
+  if (!meaningful.length) return false;
+  const hayCanonical = canonicalName(text);
+  const hayTokens = new Set(hayCanonical.split(' ').filter(Boolean));
+  if (meaningful.length === 1) return hayTokens.has(meaningful[0]!);
+  if (phraseInText(hayCanonical, canonical)) return true;
+  return meaningful.every((token) => hayTokens.has(token));
 }

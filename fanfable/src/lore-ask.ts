@@ -6,7 +6,7 @@
 import { Db } from './db.ts';
 import { extractJson, toStringArray } from './json.ts';
 import type { LlmClient } from './llm.ts';
-import { nameMentioned } from './names.ts';
+import { nameMentionedExact } from './names.ts';
 import * as lorebook from './lorebook.ts';
 import { expandQuery, searchCanon } from './lore-search.ts';
 import type { Passage } from './lore.ts';
@@ -84,8 +84,8 @@ function entityVariantsFor(
 export function passageNamesBoth(passages: Passage[], variantsA: string[], variantsB: string[]): boolean {
   return passages.some((pg) => {
     if (!pg.text) return false;
-    const hitsA = variantsA.some((v) => nameMentioned(v, pg.text));
-    const hitsB = variantsB.some((v) => nameMentioned(v, pg.text));
+    const hitsA = variantsA.some((v) => nameMentionedExact(v, pg.text));
+    const hitsB = variantsB.some((v) => nameMentionedExact(v, pg.text));
     return hitsA && hitsB;
   });
 }
