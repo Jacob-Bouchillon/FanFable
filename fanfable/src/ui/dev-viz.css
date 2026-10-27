@@ -73,6 +73,29 @@
 .dv-check { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text-muted); cursor: pointer; }
 .dv-check input { accent-color: var(--accent); }
 
+.dv-focus-line { display: flex; align-items: center; gap: var(--s2); min-height: 28px; font-size: 12.5px; color: var(--text-muted); }
+.dv-focus-line b { color: var(--text); font-weight: 600; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dv-link-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: 12px;
+  text-decoration: underline;
+  cursor: pointer;
+  padding: 0;
+}
+.dv-link-btn[hidden] { display: none; }
+.dv-graph-counts {
+  margin: 0 0 var(--s2);
+  font-size: 12px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.dv-graph-counts b { color: var(--text); }
+.dv-graph-cap { color: var(--warning); font-weight: 650; }
+
 .dv-banner {
   display: flex;
   flex-direction: column;
@@ -144,11 +167,18 @@
 .dv-edge.keeper { stroke: var(--text-muted); opacity: .42; stroke-width: 1.2; }
 .dv-edge.parked { stroke: var(--warning); opacity: .22; stroke-width: 1; stroke-dasharray: 4 4; }
 .dv-edge.coverage { stroke: var(--text-faint); opacity: .16; stroke-width: .9; stroke-dasharray: 2 5; }
+.dv-edge.is-cross { opacity: .11; }
+
+@media (prefers-reduced-motion: reduce) {
+  .dv-node { transition: none; }
+}
 .dv-edge.is-hover { opacity: .95; stroke-width: 2.4; }
 
-.dv-node { cursor: pointer; }
+.dv-node { cursor: pointer; transition: transform .18s ease; transform-origin: 0 0; }
+.dv-layer-ring { fill: none; stroke: var(--border); stroke-width: 1; opacity: .45; vector-effect: non-scaling-stroke; pointer-events: none; }
 .dv-node circle { stroke: var(--bg-raised); stroke-width: 1.2; vector-effect: non-scaling-stroke; }
 .dv-node[data-kind="character"] circle { fill: var(--accent); }
+.dv-node[data-kind="species"] circle { fill: #8b5cf6; }
 .dv-node[data-kind="location"] circle { fill: var(--note); }
 .dv-node[data-kind="faction"] circle { fill: var(--warning); }
 .dv-node[data-kind="item"] circle { fill: var(--ok); }
@@ -156,7 +186,10 @@
 .dv-node[data-kind="rule"] circle { fill: var(--text-faint); }
 .dv-node.is-parked circle { opacity: .55; }
 .dv-node.is-thin circle { stroke: var(--warning); stroke-dasharray: 2 2; }
+.dv-node.is-expanded circle { stroke: var(--accent); stroke-width: 2.2; stroke-dasharray: 2 2; }
 .dv-node.is-match circle, .dv-node.is-selected circle { stroke: var(--text); stroke-width: 2.5; }
+.dv-node:focus-visible { outline: none; }
+.dv-node:focus-visible circle { stroke: var(--text); stroke-width: 2.5; }
 .dv-node-label {
   display: none;
   font-size: 11px;
@@ -167,6 +200,17 @@
   stroke-linejoin: round;
   pointer-events: none;
 }
+.dv-node-badge {
+  font-size: 9.5px;
+  fill: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  paint-order: stroke;
+  stroke: var(--bg-raised);
+  stroke-width: 2px;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+.dv-node-badge.is-expanded { fill: var(--accent); font-weight: 650; }
 .dv-node:hover .dv-node-label,
 .dv-node.show-label .dv-node-label,
 .dv-node.is-selected .dv-node-label { display: block; }
@@ -184,6 +228,7 @@
 .dv-key { display: inline-flex; align-items: center; gap: 5px; }
 .dv-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
 .dv-dot-character { background: var(--accent); }
+.dv-dot-species { background: #8b5cf6; }
 .dv-dot-location { background: var(--note); }
 .dv-dot-faction { background: var(--warning); }
 .dv-dot-item { background: var(--ok); }
@@ -224,6 +269,7 @@
 .dv-card-head { display: flex; align-items: center; justify-content: space-between; gap: var(--s2); margin-bottom: var(--s1); }
 .dv-kind { font-size: 10.5px; text-transform: uppercase; letter-spacing: .07em; font-weight: 650; color: var(--text-faint); }
 .dv-kind-character { color: var(--accent); }
+.dv-kind-species { color: #8b5cf6; }
 .dv-kind-location { color: var(--note); }
 .dv-kind-faction { color: var(--warning); }
 .dv-kind-item { color: var(--ok); }

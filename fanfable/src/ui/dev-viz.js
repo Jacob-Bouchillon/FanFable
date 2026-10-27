@@ -41,6 +41,11 @@
     graphSearch: '',
     graphKind: 'all',
     graphStatus: 'all',
+    graphFocus: null,
+    graphExpanded: new Set(),
+    graphShown: new Set(),
+    graphNodeEls: new Map(),
+    graphLabelCtx: null,
     indexQuery: '',
     indexKind: 'all',
     indexStatus: 'all',
@@ -54,9 +59,10 @@
   };
 
   const VIEWS = ['graph', 'index', 'timeline', 'reader', 'ask'];
-  const KIND_ORDER = ['character', 'location', 'faction', 'item', 'creature', 'rule'];
+  const KIND_ORDER = ['character', 'species', 'location', 'faction', 'item', 'creature', 'rule'];
   const KIND_LABEL = {
     character: 'character',
+    species: 'species',
     location: 'location',
     faction: 'faction',
     item: 'item',
@@ -171,12 +177,6 @@
     h = Math.imul(h ^ (h >>> 16), 0x45d9f3b) >>> 0;
     h = Math.imul(h ^ (h >>> 16), 0x45d9f3b) >>> 0;
     h ^= h >>> 16;
-    return h >>> 0;
-  }
-
-  function kindHash(kind, seed) {
-    let h = seed | 0;
-    for (const ch of String(kind)) h = Math.imul(h ^ ch.charCodeAt(0), 0x45d9f3b) >>> 0;
     return h >>> 0;
   }
 
@@ -451,23 +451,36 @@
             <option value="thin" ${state.graphStatus === 'thin' ? 'selected' : ''}>thin names</option>
           </select>
         </label>
-        <button class="btn btn-sm" id="dv-graph-reset">Reset view</button>
+        <div class="dv-field">
+          <span class="dv-field-label">Focus</span>
+          <span class="dv-focus-line">
+            <b id="dv-graph-focus-name">worlds</b>
+            <button type="button" class="dv-link-btn" id="dv-graph-clear" ${state.graphFocus === null ? 'hidden' : ''}>Clear</button>
+          </span>
+        </div>
+        <button class="btn btn-sm" id="dv-graph-expand-all">Expand all shown</button>
+        <button class="btn btn-sm" id="dv-graph-reset">Reset</button>
+        <button class="btn btn-sm" id="dv-graph-reset-view">Reset view</button>
       </div>
+      <div class="dv-graph-counts" id="dv-graph-counts" aria-live="polite">loading graph…</div>
       <div class="dv-graph-wrap">
-        <svg id="dv-graph" viewBox="0 0 1400 1100" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Bank graph">
+        <svg class="dv-graph" id="dv-graph" viewBox="0 0 1400 1100" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Bank graph">
           <g id="dv-graph-viewport">
+            <g id="dv-graph-rings"></g>
             <g id="dv-graph-edges"></g>
             <g id="dv-graph-nodes"></g>
           </g>
         </svg>
-        <div class="dv-graph-hint">drag to pan · wheel to zoom · click a name for its bank card</div>
+        <div class="dv-graph-hint">drag to pan · wheel to zoom · click a name for its bank card · double-click a name to expand</div>
       </div>
       <div class="dv-legend" id="dv-graph-legend"></div>
     `;
 
     $('#dv-graph-search').addEventListener('input', (ev) => {
       state.graphSearch = ev.target.value;
-      drawGraph();
+      const focus = focusFromSearch();
+      if (focus !== null && focus !== state.graphFocus) setGraphFocus(focus);
+      else drawGraph();
     });
     $('#dv-graph-kind').addEventListener('change', (ev) => {
       state.graphKind = ev.target.value;
@@ -477,9 +490,16 @@
       state.graphStatus = ev.target.value;
       drawGraph();
     });
-    $('#dv-graph-reset').addEventListener('click', () => {
+    $('#dv-graph-clear').addEventListener('click', () => setGraphFocus(null));
+    $('#dv-graph-expand-all').addEventListener('click', () => {
+      for (const id of state.graphShown) state.graphExpanded.add(id);
+      drawGraph();
+    });
+    $('#dv-graph-reset').addEventListener('click', () => setGraphFocus(null));
+    $('#dv-graph-reset-view').addEventListener('click', () => {
       state.graphTransform = { x: 0, y: 0, k: 1 };
       applyGraphTransform();
+      updateGraphLabels();
     });
 
     wireGraphPanZoom($('#dv-graph'));
@@ -506,34 +526,255 @@
     return true;
   }
 
+  const GRAPH_SHOW_CAP = 200;
+  const GRAPH_LAYER_GAP = 50;
+
+  let graphClickTimer = null;
+
+  function graphDegree(node) {
+    return (node.keeperTies || 0) + (node.parkedTies || 0) + (node.coverageTies || 0);
+  }
+
+  function degreeThenId(a, b, byId) {
+    return graphDegree(byId.get(b)) - graphDegree(byId.get(a)) || a - b;
+  }
+
+  function rootOrder(a, b) {
+    return (
+      graphDegree(b) - graphDegree(a) ||
+      (b.mentions || 0) - (a.mentions || 0) ||
+      a.id - b.id
+    );
+  }
+
+  function visibleGraph() {
+    const nodes = state.summary.nodes.filter(graphNodeVisible);
+    const ids = new Set(nodes.map((n) => n.id));
+    const edges = state.summary.edges.filter(
+      (e) => graphEdgeVisible(e) && ids.has(e.fromId) && ids.has(e.toId),
+    );
+    return { nodes, edges, ids };
+  }
+
+  function buildAdjacency(edges) {
+    const adj = new Map();
+    for (const edge of edges) {
+      for (const [from, to] of [[edge.fromId, edge.toId], [edge.toId, edge.fromId]]) {
+        const list = adj.get(from) ?? [];
+        list.push({ id: to, edge });
+        adj.set(from, list);
+      }
+    }
+    return adj;
+  }
+
+  function focusFromSearch() {
+    const query = state.graphSearch.trim().toLowerCase();
+    if (!query) return null;
+    const visible = state.summary.nodes.filter(graphNodeVisible);
+    const exact = visible.filter(
+      (n) =>
+        n.name.toLowerCase() === query ||
+        n.aliases.some((alias) => alias.toLowerCase() === query),
+    );
+    const pool = exact.length ? exact : visible.filter((n) => nodeMatches(n, query));
+    return pool.length === 1 ? pool[0].id : null;
+  }
+
+  function chooseRoots(visible, focusId) {
+    if (focusId !== null && visible.ids.has(focusId)) return [focusId];
+    const worlds = visible.nodes.filter((n) => n.kind === 'location' && graphDegree(n) > 0);
+    const tied = worlds.length ? worlds : visible.nodes.filter((n) => graphDegree(n) > 0);
+    const pool = tied.length ? tied : visible.nodes;
+    return pool.slice().sort(rootOrder).slice(0, 12).map((n) => n.id);
+  }
+
+  function computeShown(roots, expanded, adj, byId, cap) {
+    const shown = new Set(roots);
+    const generation = new Map(roots.map((id) => [id, 0]));
+    const parentOf = new Map();
+    const queue = [...roots];
+    let capHit = false;
+    for (let qi = 0; qi < queue.length; qi++) {
+      const id = queue[qi];
+      if (!expanded.has(id)) continue;
+      const neighbours = (adj.get(id) ?? [])
+        .map((item) => item.id)
+        .filter((other) => !shown.has(other))
+        .sort((a, b) => degreeThenId(a, b, byId));
+      for (const other of neighbours) {
+        if (shown.size >= cap) {
+          capHit = true;
+          break;
+        }
+        shown.add(other);
+        generation.set(other, (generation.get(id) ?? 0) + 1);
+        parentOf.set(other, id);
+        queue.push(other);
+      }
+    }
+    return { shown, generation, parentOf, capHit };
+  }
+
+  function setGraphFocus(id) {
+    const visible = visibleGraph();
+    state.graphFocus = id !== null && visible.ids.has(id) ? id : null;
+    state.graphExpanded = new Set();
+    state.graphTransform = { x: 0, y: 0, k: 1 };
+    applyGraphTransform();
+    drawGraph();
+  }
+
+  function layoutLayers(roots, model, byId, seed) {
+    const positions = new Map();
+    const sectors = new Map();
+    const angleOf = new Map();
+    if (!roots.length) return { positions, radii: [], maxLayer: 0 };
+
+    const start = ((hash32(roots.length, seed) % 360) * Math.PI) / 180;
+    const width = (Math.PI * 2) / roots.length;
+    roots.forEach((id, index) => {
+      const a = start + index * width;
+      const b = a + width;
+      sectors.set(id, [a, b]);
+      angleOf.set(id, (a + b) / 2);
+    });
+
+    const children = new Map();
+    for (const [id, parent] of model.parentOf) {
+      if (!model.shown.has(id)) continue;
+      const list = children.get(parent) ?? [];
+      list.push(id);
+      children.set(parent, list);
+    }
+    const queue = [...roots];
+    for (let qi = 0; qi < queue.length; qi++) {
+      const parent = queue[qi];
+      const kids = (children.get(parent) ?? []).sort((a, b) => degreeThenId(a, b, byId));
+      if (!kids.length) continue;
+      const sector = sectors.get(parent) ?? [0, Math.PI * 2];
+      const sub = (sector[1] - sector[0]) / kids.length;
+      kids.forEach((id, index) => {
+        const a = sector[0] + index * sub;
+        const b = a + sub;
+        sectors.set(id, [a, b]);
+        angleOf.set(id, (a + b) / 2);
+        queue.push(id);
+      });
+    }
+
+    const counts = new Map();
+    let maxLayer = 0;
+    for (const id of model.shown) {
+      const layer = model.generation.get(id) ?? 0;
+      counts.set(layer, (counts.get(layer) ?? 0) + 1);
+      maxLayer = Math.max(maxLayer, layer);
+    }
+    const radii = [];
+    for (let layer = 0; layer <= maxLayer; layer++) {
+      const natural = ((counts.get(layer) ?? 0) * 38) / (Math.PI * 2);
+      let radius = layer === 0
+        ? Math.max(150, natural)
+        : Math.max(radii[layer - 1] + 130, 150 + layer * 130, natural);
+      if (layer === 1) {
+        for (const root of roots) {
+          const k = (children.get(root) ?? []).length;
+          if (!k) continue;
+          const sector = sectors.get(root) ?? [0, Math.PI * 2];
+          const angular = sector[1] - sector[0];
+          if (angular <= 0) continue;
+          radius = Math.max(radius, GRAPH_LAYER_GAP / (2 * Math.sin(angular / (2 * k))));
+        }
+      }
+      radii[layer] = radius;
+    }
+
+    for (const id of model.shown) {
+      const layer = model.generation.get(id) ?? 0;
+      const angle = angleOf.get(id) ?? 0;
+      const radius = radii[layer] ?? 150;
+      positions.set(id, {
+        x: 700 + Math.cos(angle) * radius,
+        y: 550 + Math.sin(angle) * radius,
+      });
+    }
+    return { positions, radii, maxLayer };
+  }
+
+  function toggleExpanded(id) {
+    if (state.graphExpanded.has(id)) state.graphExpanded.delete(id);
+    else state.graphExpanded.add(id);
+    drawGraph();
+  }
+
   function drawGraph() {
+    const ringsGroup = $('#dv-graph-rings');
     const edgesGroup = $('#dv-graph-edges');
     const nodesGroup = $('#dv-graph-nodes');
     const legend = $('#dv-graph-legend');
-    if (!edgesGroup || !nodesGroup) return;
+    const counts = $('#dv-graph-counts');
+    if (!ringsGroup || !edgesGroup || !nodesGroup) return;
 
-    const visibleNodes = state.summary.nodes.filter(graphNodeVisible);
-    const ids = new Set(visibleNodes.map((n) => n.id));
-    const visibleEdges = state.summary.edges.filter(
-      (e) => graphEdgeVisible(e) && ids.has(e.fromId) && ids.has(e.toId),
-    );
-    const layout = buildLayout(visibleNodes, state.seed);
+    const visible = visibleGraph();
+    if (state.graphFocus !== null && !visible.ids.has(state.graphFocus)) {
+      state.graphFocus = null;
+      state.graphExpanded = new Set();
+    }
+    const roots = chooseRoots(visible, state.graphFocus);
+    if (!roots.length) {
+      ringsGroup.replaceChildren();
+      edgesGroup.replaceChildren();
+      nodesGroup.replaceChildren();
+      state.graphShown = new Set();
+      state.graphPositions = new Map();
+      state.graphEdgeEls = new Map();
+      state.graphNodeEls = new Map();
+      state.graphLabelCtx = null;
+      if (counts) counts.innerHTML = 'showing <b>0</b> of <b>0</b> · layers 0 · expanded 0';
+      legend.innerHTML = '<span class="dv-muted">No rows match this filter and reveal fence.</span>';
+      updateGraphFocusLine(null);
+      return;
+    }
+
+    const byId = new Map(visible.nodes.map((n) => [n.id, n]));
+    const adj = buildAdjacency(visible.edges);
+    const model = computeShown(roots, state.graphExpanded, adj, byId, GRAPH_SHOW_CAP);
+    state.graphShown = model.shown;
+    const layout = layoutLayers(roots, model, byId, state.seed);
     state.graphPositions = layout.positions;
+
+    ringsGroup.replaceChildren();
+    for (let layer = 0; layer <= layout.maxLayer; layer++) {
+      ringsGroup.appendChild(
+        svgEl('circle', {
+          class: 'dv-layer-ring',
+          cx: '700',
+          cy: '550',
+          r: (layout.radii[layer] ?? 150).toFixed(2),
+        }),
+      );
+    }
+
+    const chosenNodes = [...model.shown].map((id) => state.nodeById.get(id)).filter(Boolean);
+    const chosenEdges = visible.edges.filter(
+      (e) => model.shown.has(e.fromId) && model.shown.has(e.toId),
+    );
+    const selectedIds = new Set(chosenNodes.map((n) => n.id));
     state.graphEdgeEls = new Map();
 
     edgesGroup.replaceChildren();
-    nodesGroup.replaceChildren();
-
-    for (const edge of visibleEdges) {
+    for (const edge of chosenEdges) {
       const a = layout.positions.get(edge.fromId);
       const b = layout.positions.get(edge.toId);
       if (!a || !b) continue;
+      const ga = model.generation.get(edge.fromId) ?? 0;
+      const gb = model.generation.get(edge.toId) ?? 0;
       const line = svgEl('line', {
         x1: a.x.toFixed(2),
         y1: a.y.toFixed(2),
         x2: b.x.toFixed(2),
         y2: b.y.toFixed(2),
-        class: `dv-edge ${edgeClass(edge)}`,
+        class: `dv-edge ${edgeClass(edge)}${ga > 0 || gb > 0 ? ' is-cross' : ''}`,
         'data-edge-id': String(edge.id),
       });
       line.addEventListener('pointerenter', (ev) => showTooltip(ev, edgeTooltipHtml(edge)));
@@ -545,57 +786,189 @@
 
     const query = state.graphSearch.trim().toLowerCase();
     const matches = query
-      ? new Set(visibleNodes.filter((n) => nodeMatches(n, query)).map((n) => n.id))
+      ? new Set(chosenNodes.filter((n) => nodeMatches(n, query)).map((n) => n.id))
       : new Set();
 
-    for (const node of visibleNodes) {
+    if ([...state.graphNodeEls.values()].some((group) => group.parentNode !== nodesGroup)) {
+      state.graphNodeEls = new Map();
+    }
+    const previous = state.graphNodeEls;
+    const next = new Map();
+    for (const node of chosenNodes) {
       const p = layout.positions.get(node.id);
       if (!p) continue;
+      const expanded = state.graphExpanded.has(node.id);
+      const hiddenNeighbours = (adj.get(node.id) ?? []).filter(
+        (item) => !model.shown.has(item.id),
+      ).length;
       const r = nodeRadius(node);
-      const group = svgEl('g', {
-        class: 'dv-node',
-        'data-node-id': String(node.id),
-        'data-kind': node.kind,
-        transform: `translate(${p.x.toFixed(2)} ${p.y.toFixed(2)})`,
-        role: 'button',
-        'aria-label': node.name,
-      });
-      if (node.thin) group.classList.add('is-thin');
-      if (node.keeperTies === 0 && node.parkedTies > 0) group.classList.add('is-parked');
-      if (matches.has(node.id)) group.classList.add('is-match', 'show-label');
-      if (state.selectedNode === node.id) group.classList.add('is-selected');
+      let group = previous.get(node.id);
+      if (!group) {
+        group = svgEl('g', {
+          class: 'dv-node',
+          'data-node-id': String(node.id),
+          'data-kind': node.kind,
+          role: 'button',
+          tabindex: '0',
+        });
+        group.append(svgEl('circle', { r: r.toFixed(2) }));
+        const label = svgEl('text', {
+          class: 'dv-node-label',
+          x: (r + 4).toFixed(2),
+          y: '3',
+        });
+        label.textContent = node.name;
+        group.append(label);
+        group.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          if (ev.detail > 1) return;
+          if (graphClickTimer) clearTimeout(graphClickTimer);
+          graphClickTimer = setTimeout(() => {
+            graphClickTimer = null;
+            openNode(node.id);
+          }, 220);
+        });
+        group.addEventListener('dblclick', (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          if (graphClickTimer) {
+            clearTimeout(graphClickTimer);
+            graphClickTimer = null;
+          }
+          closeDrawer();
+          toggleExpanded(node.id);
+        });
+        group.addEventListener('keydown', (ev) => {
+          if (ev.key !== 'Enter') return;
+          ev.preventDefault();
+          if (ev.shiftKey) toggleExpanded(node.id);
+          else openNode(node.id);
+        });
+        group.addEventListener('pointerenter', () => {
+          for (const edgeId of state.adj.get(node.id) ?? []) {
+            state.graphEdgeEls.get(edgeId)?.classList.add('is-hover');
+          }
+        });
+        group.addEventListener('pointerleave', () => {
+          for (const edgeId of state.adj.get(node.id) ?? []) {
+            state.graphEdgeEls.get(edgeId)?.classList.remove('is-hover');
+          }
+        });
+        nodesGroup.appendChild(group);
+      }
 
-      const circle = svgEl('circle', { r: r.toFixed(2) });
-      const label = svgEl('text', {
-        class: 'dv-node-label',
-        x: (r + 4).toFixed(2),
-        y: '3',
-      });
-      label.textContent = node.name;
-      group.append(circle, label);
+      const classes = ['dv-node'];
+      if (expanded) classes.push('is-expanded');
+      if (node.thin) classes.push('is-thin');
+      if (node.keeperTies === 0 && node.parkedTies > 0) classes.push('is-parked');
+      if (matches.has(node.id)) classes.push('is-match');
+      if (state.selectedNode === node.id) classes.push('is-selected');
+      group.setAttribute('class', classes.join(' '));
+      group.setAttribute('data-kind', node.kind);
+      group.setAttribute('aria-label', node.name);
+      group.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+      group.setAttribute('transform', `translate(${p.x.toFixed(2)} ${p.y.toFixed(2)})`);
+      group.style.transform = `translate(${p.x.toFixed(2)}px, ${p.y.toFixed(2)}px)`;
+      group.style.transformOrigin = '0 0';
 
-      group.addEventListener('click', (ev) => {
-        ev.stopPropagation();
-        openNode(node.id);
-      });
-      group.addEventListener('pointerenter', () => {
-        for (const edgeId of state.adj.get(node.id) ?? []) {
-          state.graphEdgeEls.get(edgeId)?.classList.add('is-hover');
+      const badgeText = expanded
+        ? hiddenNeighbours
+          ? `−${hiddenNeighbours}`
+          : '−'
+        : hiddenNeighbours
+          ? `+${hiddenNeighbours}`
+          : '';
+      let badge = group.querySelector('.dv-node-badge');
+      if (badgeText) {
+        if (!badge) {
+          badge = svgEl('text', { class: 'dv-node-badge', 'text-anchor': 'end' });
+          group.append(badge);
         }
-      });
-      group.addEventListener('pointerleave', () => {
-        for (const edgeId of state.adj.get(node.id) ?? []) {
-          state.graphEdgeEls.get(edgeId)?.classList.remove('is-hover');
-        }
-      });
+        badge.setAttribute('class', `dv-node-badge${expanded ? ' is-expanded' : ''}`);
+        badge.setAttribute('x', (-(r + 4)).toFixed(2));
+        badge.setAttribute('y', '3');
+        badge.textContent = badgeText;
+      } else if (badge) {
+        badge.remove();
+      }
 
-      nodesGroup.appendChild(group);
+      next.set(node.id, group);
     }
+    for (const [id, group] of previous) {
+      if (!next.has(id)) group.remove();
+    }
+    state.graphNodeEls = next;
 
-    if (!visibleNodes.length) {
-      legend.innerHTML = '<span class="dv-muted">No rows match this filter and reveal fence.</span>';
-    } else {
-      legend.innerHTML = graphLegend(visibleNodes, visibleEdges);
+    const order = [...model.shown].sort(
+      (a, b) =>
+        (model.generation.get(a) ?? 0) - (model.generation.get(b) ?? 0) ||
+        degreeThenId(a, b, byId),
+    );
+    state.graphLabelCtx = {
+      order,
+      generation: model.generation,
+      positions: layout.positions,
+      matches,
+      count: chosenNodes.length,
+    };
+    updateGraphLabels();
+
+    const expandedShown = order.filter((id) => state.graphExpanded.has(id)).length;
+    const layers = layout.maxLayer + 1;
+    if (counts) {
+      counts.innerHTML =
+        `showing <b>${fmt(chosenNodes.length)}</b> of <b>${fmt(visible.nodes.length)}</b> · layers ${layers} · expanded ${fmt(expandedShown)}` +
+        (model.capHit ? ' · <span class="dv-graph-cap">cap reached — collapse something</span>' : '');
+    }
+    updateGraphFocusLine(state.graphFocus === null ? null : state.nodeById.get(state.graphFocus) ?? null);
+
+    legend.innerHTML = graphLegend(chosenNodes, chosenEdges);
+  }
+
+  function updateGraphFocusLine(node) {
+    const name = $('#dv-graph-focus-name');
+    if (name) name.textContent = node ? node.name : 'worlds';
+    const clear = $('#dv-graph-clear');
+    if (clear) clear.hidden = state.graphFocus === null;
+  }
+
+  function updateGraphLabels() {
+    const ctx = state.graphLabelCtx;
+    if (!ctx) return;
+    const dense = ctx.count <= 60 || state.graphTransform.k >= 0.9;
+    for (const id of ctx.order) {
+      state.graphNodeEls.get(id)?.classList.remove('show-label');
+    }
+    const boxes = [];
+    for (const id of ctx.order) {
+      const group = state.graphNodeEls.get(id);
+      if (!group) continue;
+      const generation = ctx.generation.get(id) ?? 0;
+      if (!(generation <= 1 || dense || ctx.matches.has(id))) continue;
+      group.classList.add('show-label');
+      const label = group.querySelector('.dv-node-label');
+      const p = ctx.positions.get(id);
+      let b = null;
+      try {
+        b = label?.getBBox() ?? null;
+      } catch {
+        b = null;
+      }
+      if (!p || !b || b.width <= 0) {
+        group.classList.remove('show-label');
+        continue;
+      }
+      const box = {
+        x0: Math.floor(p.x + b.x - 1),
+        y0: Math.floor(p.y + b.y - 1),
+        x1: Math.ceil(p.x + b.x + b.width + 1),
+        y1: Math.ceil(p.y + b.y + b.height + 1),
+      };
+      if (boxes.some((o) => box.x0 < o.x1 && box.x1 > o.x0 && box.y0 < o.y1 && box.y1 > o.y0)) {
+        group.classList.remove('show-label');
+        continue;
+      }
+      boxes.push(box);
     }
   }
 
@@ -625,46 +998,6 @@
       <span class="dv-key"><i class="dv-line dv-line-coverage"></i>appears_with coverage ${fmt(coverage)} <span class="dv-muted">(never a relationship)</span></span>
       <span class="dv-key"><i class="dv-ring"></i>thin name ${fmt(thin)}</span>
     `;
-  }
-
-  function buildLayout(nodes, seed) {
-    const byKind = new Map();
-    for (const node of nodes) {
-      const list = byKind.get(node.kind) ?? [];
-      list.push(node);
-      byKind.set(node.kind, list);
-    }
-
-    const positions = new Map();
-    const cx = 700;
-    const cy = 550;
-    let radius = 92;
-    let ringIndex = 0;
-    const extraKinds = [...byKind.keys()].filter((k) => !KIND_ORDER.includes(k)).sort();
-    for (const kind of [...KIND_ORDER, ...extraKinds]) {
-      const list = (byKind.get(kind) ?? []).slice().sort(
-        (a, b) => (b.mentions || 0) - (a.mentions || 0) || a.id - b.id,
-      );
-      let index = 0;
-      while (index < list.length) {
-        const capacity = Math.max(6, Math.floor((2 * Math.PI * radius) / 22));
-        const slice = list.slice(index, index + capacity);
-        const offset = (kindHash(kind, seed) + ringIndex * 41) % 360 * Math.PI / 180;
-        for (let i = 0; i < slice.length; i++) {
-          const node = slice[i];
-          const angle = offset + (i / slice.length) * Math.PI * 2;
-          const jitter = ((hash32(node.id + ringIndex * 31, seed) % 100) / 100 - 0.5) * 5;
-          positions.set(node.id, {
-            x: cx + Math.cos(angle) * (radius + jitter),
-            y: cy + Math.sin(angle) * (radius + jitter),
-          });
-        }
-        index += capacity;
-        radius += 38;
-        ringIndex++;
-      }
-    }
-    return { positions, maxRadius: radius };
   }
 
   function circularLayout(ids, cx, cy, radius, seed) {
@@ -713,6 +1046,7 @@
       t.y = local.y - graphY * nextK;
       t.k = nextK;
       applyGraphTransform();
+      updateGraphLabels();
     }, { passive: false });
 
     svg.addEventListener('pointerdown', (ev) => {
@@ -1458,6 +1792,7 @@
         <div class="dv-drawer-line"><span>first banked passage</span> ${esc(node.locator || 'unplaced')}${node.firstSeq === null ? '' : ` <span class="dv-muted">(passage ${fmt(node.firstSeq)})</span>`}</div>
         <p class="dv-drawer-summary">${esc(node.summary || '—')}</p>
         <div class="dv-drawer-actions">
+          <button class="btn btn-sm" id="dv-drawer-focus">Focus here</button>
           <button class="btn btn-sm" id="dv-drawer-graph">Show in graph</button>
           <button class="btn btn-sm" id="dv-drawer-index">Find in index</button>
         </div>
@@ -1466,9 +1801,13 @@
       </div>
     `;
     drawer.hidden = false;
+    $('#dv-drawer-focus')?.addEventListener('click', () => {
+      setGraphFocus(node.id);
+      setView('graph');
+    });
     $('#dv-drawer-graph')?.addEventListener('click', () => {
       state.graphSearch = node.name;
-      closeDrawer();
+      setGraphFocus(node.id);
       setView('graph');
     });
     $('#dv-drawer-index')?.addEventListener('click', () => {
