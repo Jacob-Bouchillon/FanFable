@@ -36,7 +36,8 @@ export type GapKind =
   | 'unsupported-claim'
   | 'contested-claim'
   | 'alias-quarantine'
-  | 'extraction-quality';
+  | 'extraction-quality'
+  | 'tie-hint';
 
 export interface LoreGap {
   kind: GapKind;
@@ -95,6 +96,20 @@ interface EntityRow {
 export function diagnose(db: Db, projectId: number, opts: { limit?: number } = {}): LoreGap[] {
   const gaps: LoreGap[] = [];
   const limit = opts.limit ?? 25;
+
+  // Hints are independent of the entity bank: report them even when no
+  // entities have been extracted yet.
+  const pendingHints = lorebook.countTieHints(db, projectId, 'pending');
+  if (pendingHints) {
+    gaps.push({
+      kind: 'tie-hint',
+      severity: 'note',
+      subject: 'unresolved-endpoint hints',
+      message: `${pendingHints} unresolved-endpoint hints waiting`,
+      evidence: '',
+      suggestion: '',
+    });
+  }
 
   const entities = db.all<EntityRow>(
     'SELECT id, kind, name, aliases, summary, role, status, mentions FROM canon_entity WHERE project_id = ? ORDER BY mentions DESC, name',

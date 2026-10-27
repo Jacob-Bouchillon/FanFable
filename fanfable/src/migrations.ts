@@ -318,6 +318,31 @@ export const MIGRATIONS: Migration[] = [
     `,
   },
   {
+    version: 13,
+    name: 'unresolved-endpoint tie hints',
+    // Relations whose endpoints the bank does not know are kept as hints
+    // instead of being dropped. Additive only; nothing here creates an entity
+    // or promotes a tie.
+    sql: `
+      CREATE TABLE IF NOT EXISTS canon_tie_hint (
+        id          INTEGER PRIMARY KEY,
+        project_id  INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        from_name   TEXT NOT NULL,
+        to_name     TEXT NOT NULL,
+        kind        TEXT NOT NULL,
+        evidence    TEXT NOT NULL DEFAULT '',
+        source_refs TEXT NOT NULL DEFAULT '[]',
+        status      TEXT NOT NULL DEFAULT 'pending',
+        note        TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS canon_tie_hint_pair
+        ON canon_tie_hint(project_id, from_name, to_name, kind);
+      CREATE INDEX IF NOT EXISTS canon_tie_hint_status
+        ON canon_tie_hint(project_id, status);
+    `,
+  },
+  {
     version: 3,
     name: 'chapter references for story graph records',
     // Knowledge, motives, secrets and relationships have to be removable when

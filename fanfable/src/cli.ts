@@ -136,6 +136,9 @@ ${C.bold('SOURCE MATERIAL')}
   lore embed [--model m]           Embed passages, entities and triples for dense retrieval
   lore trails --query "..." [--out f]  Draw how each top passage connects to the query
                            [--web] show the association layer too (default off)
+  lore hints [--limit n]           List ties whose endpoints are not in the bank
+  lore link-facts [--dry-run] [--limit n]  Attach fact subjects to entities
+  lore capacity [--dry-run] [--limit n]  Park unproven entities, funnel proven nouns
   lore ties --from A --to B [--at n]  What two people are to each other now, and before
   lore merge                       Merge entries that are the same under two names
   lore judge-aliases [--max n]     Rule on quarantined nickname pairs (one model call)
@@ -438,7 +441,8 @@ async function cmdLore(args: Args): Promise<void> {
       console.log(
         C.dim(
           `  quotes: ${v.verified} verified, ${v.repointed} repointed, ${v.dropped} dropped` +
-            (v.unresolved ? `, ${v.unresolved} relations named an unknown entity` : ''),
+            (v.unresolved ? `, ${v.unresolved} relations named an unknown entity` : '') +
+            (v.hinted ? `, ${v.hinted} hints kept` : ''),
         ),
       );
     }
@@ -620,6 +624,51 @@ async function cmdLore(args: Args): Promise<void> {
         `  ${C.dim(`dropped: ${Object.entries(d).filter(([, n]) => (n as number) > 0).map(([k, n]) => `${n} ${k}`).join(', ')}`)}`,
       );
     }
+    return;
+  }
+
+  if (sub === 'capacity') {
+    const dryRun = args.flags['dry-run'] === true;
+    const limit = args.flags.limit === undefined
+      ? undefined
+      : Math.max(0, Math.floor(flagNumber(args, 'limit', 0)));
+    const ids = limit === undefined
+      ? db.all<{ id: number }>('SELECT id FROM canon_entity WHERE project_id = ? ORDER BY id', project.id)
+      : db.all<{ id: number }>('SELECT id FROM canon_entity WHERE project_id = ? ORDER BY id LIMIT ?', project.id, limit);
+    const result = lorebook.checkEntityCapacity(db, project.id, ids.map((row) => row.id), { write: !dryRun });
+    heading(dryRun ? 'Entity capacity (dry run)' : 'Entity capacity');
+    console.log(
+      `scanned ${result.scanned}, parked ${result.parked}, funneled ${result.funneled}, skipped ${result.skipped}, skippedReferenced ${result.skippedReferenced}`,
+    );
+    return;
+  }
+
+  if (sub === 'link-facts') {
+    const dryRun = args.flags['dry-run'] === true;
+    const limit = args.flags.limit === undefined
+      ? undefined
+      : Math.max(0, Math.floor(flagNumber(args, 'limit', 0)));
+    const result = lorebook.linkFactSubjects(db, project.id, { dryRun, limit });
+    heading(dryRun ? 'Fact subject links (dry run)' : 'Fact subject links');
+    console.log(
+      `scanned ${result.scanned}, linked ${result.linked}, ambiguous ${result.ambiguous}, unmatched ${result.unmatched}`,
+    );
+    return;
+  }
+
+  if (sub === 'hints') {
+    const limit = Math.max(1, Math.floor(flagNumber(args, 'limit', 50)));
+    const pending = lorebook.countTieHints(db, project.id, 'pending');
+    const hints = lorebook.listTieHints(db, project.id, { status: 'pending', limit });
+    heading('Unresolved-endpoint hints');
+    if (!hints.length) {
+      console.log(C.dim('(none)'));
+    } else {
+      for (const h of hints) {
+        console.log(`  #${h.id} ${C.bold(h.fromName)} -> ${C.bold(h.toName)}: ${h.kind} ${C.dim(h.locator || 'unplaced')}`);
+      }
+    }
+    console.log(C.dim(`${pending} pending`));
     return;
   }
 
@@ -815,7 +864,7 @@ async function cmdLore(args: Args): Promise<void> {
         `${stats.relations} relationships, ${stats.facts} facts, ${stats.timeline} timeline entries`,
     );
     const kindFlag = flagString(args, 'kind');
-    const kind = (['character', 'location', 'item', 'rule', 'faction', 'creature'] as const).find(
+    const kind = (['character', 'species', 'location', 'item', 'rule', 'faction', 'creature'] as const).find(
       (k) => k === kindFlag,
     );
     const entities = lorebook.listEntities(db, project.id, kind);

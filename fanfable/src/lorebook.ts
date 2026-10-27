@@ -26,12 +26,14 @@ import {
   MOMENT_WORDS,
   PROOF_FILLER,
   PROOF_TITLES,
+  STOPWORDS,
 } from './vocab.ts';
 import { SEARCH_CANDIDATE_POOL } from './search-policy.ts';
 import {
   canonicalName,
   linkTokenMatch,
   linkTokensMatch,
+  nameMentionedExact,
   nameMentionedFromTokens,
   nameRelation,
   nameTokens,
@@ -43,7 +45,7 @@ export { canonicalName, nameRelation, nameTokens } from './names.ts';
 
 /* ------------------------------------------------------------------ models */
 
-export type EntityKind = 'character' | 'location' | 'item' | 'rule' | 'faction' | 'creature';
+export type EntityKind = 'character' | 'species' | 'location' | 'item' | 'rule' | 'faction' | 'creature';
 
 export interface CanonEntity {
   id: number;
@@ -109,7 +111,7 @@ export const EXTRACT_SYSTEM = `You read passages from a book and record what the
 Reply with JSON only:
 {
   "entities": [
-    {"kind":"character|location|item|rule|faction|creature",
+    {"kind":"character|species|faction|location|item|rule|creature",
      "name":"the name as the book gives it",
      "aliases":["other names or titles"],
      "summary":"one or two sentences on who or what this is",
@@ -135,6 +137,24 @@ Reply with JSON only:
      "participants":["names"],"location":"where","chunk_index":0,"evidence":"a short exact quote"}
   ]
 }
+
+Entity kinds (choose exactly one):
+- character — one named individual.
+- species — a people or kind with members (a species, race, folk, lineage or bloodline).
+- faction — an organisation, order, house, company, government, army or cult.
+- location — a place, region, world, or building used as a setting.
+- item — a named object, weapon, ship, artefact or substance.
+- rule — a law, magic or system rule, custom or prophecy.
+- creature — a non-people animal or monster: a named beast, or a kind of beast the book treats as wildlife.
+
+Entity funnels:
+- Common nouns are not entities. An unadorned common noun (a bat, a chair, a tree) never becomes an entity. Record what the passage says as a fact instead: subject = the named person or place it appeared with, topic = the noun, statement = exactly what the passage says, evidence = a verbatim quote. Never drop the information.
+- One-scene props are not entities. A named thing that appears once and holds no role or tie stays a fact about the scene. It earns a row only when a later passage makes it matter.
+- People get one species row. A people or kind with members gets one species entry; its individual members stay character and tie to it. An individual never gets a species row.
+- Organisations are faction. A company, order, cult, senate, army or security force is faction, never character and never creature.
+- Occupations are not entities. A job, rank or title (senator, captain, apprentice) is the person's role or attribute, never its own entity.
+- Named individuals are character. A properly named person is character even when they appear once; proper names are not props.
+- Resolve ambiguity by role. A creature or item is decided by whether the book treats it as alive; a faction or species by whether it is an organisation (faction) or a people (species). If it is still unclear, keep it a fact instead of an entity.
 
 Rules:
 - Only record what these passages support. Never fill gaps with general knowledge.
@@ -162,12 +182,12 @@ Rules:
  * and the plan's three-call split otherwise leaves them without a home.
  */
 
-export const EXTRACT_ENTITIES_SYSTEM = `You read passages from a book and record the people, places, things, groups, creatures and rules they establish, and the facts the passages state.
+export const EXTRACT_ENTITIES_SYSTEM = `You read passages from a book and record the people, peoples, places, things, groups, creatures and rules they establish, and the facts the passages state.
 
 Reply with JSON only:
 {
   "entities": [
-    {"kind":"character|location|item|rule|faction|creature",
+    {"kind":"character|species|faction|location|item|rule|creature",
      "name":"the name as the book gives it",
      "aliases":["other names or titles used here"],
      "summary":"one or two sentences on who or what this is",
@@ -184,6 +204,24 @@ Reply with JSON only:
      "modality":"asserted|denied|possible|suspected — only include when not asserted"}
   ]
 }
+
+Entity kinds (choose exactly one):
+- character — one named individual.
+- species — a people or kind with members (a species, race, folk, lineage or bloodline).
+- faction — an organisation, order, house, company, government, army or cult.
+- location — a place, region, world, or building used as a setting.
+- item — a named object, weapon, ship, artefact or substance.
+- rule — a law, magic or system rule, custom or prophecy.
+- creature — a non-people animal or monster: a named beast, or a kind of beast the book treats as wildlife.
+
+Entity funnels:
+- Common nouns are not entities. An unadorned common noun (a bat, a chair, a tree) never becomes an entity. Record what the passage says as a fact instead: subject = the named person or place it appeared with, topic = the noun, statement = exactly what the passage says, evidence = a verbatim quote. Never drop the information.
+- One-scene props are not entities. A named thing that appears once and holds no role or tie stays a fact about the scene. It earns a row only when a later passage makes it matter.
+- People get one species row. A people or kind with members gets one species entry; its individual members stay character and tie to it. An individual never gets a species row.
+- Organisations are faction. A company, order, cult, senate, army or security force is faction, never character and never creature.
+- Occupations are not entities. A job, rank or title (senator, captain, apprentice) is the person's role or attribute, never its own entity.
+- Named individuals are character. A properly named person is character even when they appear once; proper names are not props.
+- Resolve ambiguity by role. A creature or item is decided by whether the book treats it as alive; a faction or species by whether it is an organisation (faction) or a people (species). If it is still unclear, keep it a fact instead of an entity.
 
 Rules:
 - Only record what these passages support. Never fill gaps with general knowledge.
@@ -333,6 +371,8 @@ export interface VerificationStats {
   /** Claims whose noun tie the quote never speaks ("cousin of" proved by a
    * sentence without the word); counted and never written. */
   unsupported: number;
+  /** Unresolved-endpoint claims kept in canon_tie_hint instead of dropped. */
+  hinted: number;
 }
 
 /**
@@ -588,6 +628,7 @@ export async function extractLore(
   const chunks = loadOrderedChunks(db, projectId, opts.sourceId);
   const stats = blankResult();
   if (!chunks.length) return stats;
+  const runStartedAt = nowIso();
 
   // Passages that have already been mined are skipped, so re-running the
   // extraction over a long book is cheap.
@@ -684,6 +725,17 @@ export async function extractLore(
     maxPassages: 4,
     onProgress: opts.onProgress,
   });
+  // Capacity sweep over only the entities this run created or touched.
+  const touched = new Set(entityIdByName.values());
+  for (const row of db.all<{ id: number }>(
+    'SELECT id FROM canon_entity WHERE project_id = ? AND (created_at >= ? OR updated_at >= ?)',
+    projectId,
+    runStartedAt,
+    runStartedAt,
+  )) {
+    touched.add(row.id);
+  }
+  checkEntityCapacity(db, projectId, touched, { write: true });
   rememberExtractionReport(db, projectId, stats);
   writeAuditNote(projectId, 'extract', [
     `windows visited: ${stats.windows}`,
@@ -908,7 +960,7 @@ function blankResult(): ExtractLoreResult {
     timeline: 0,
     passages: 0,
     windows: 0,
-    verification: { claimed: 0, verified: 0, repointed: 0, dropped: 0, unresolved: 0, unrelated: 0, moment: 0, redundant: 0, unsupported: 0 },
+    verification: { claimed: 0, verified: 0, repointed: 0, dropped: 0, unresolved: 0, unrelated: 0, moment: 0, redundant: 0, unsupported: 0, hinted: 0 },
     emptyWindows: [],
     quarantinedAliases: [],
     mergedAliases: [],
@@ -1609,12 +1661,20 @@ function applyFacts(
     const chunk = chunkAt(window, raw.chunk_index);
     const span = spanFor(raw.evidence, chunk, neighboursOf(chunk?.id), gate, stats.verification);
     if (span.status === 'dropped') continue;
-    const dup = db.get<{ id: number }>(
-      'SELECT id FROM canon_fact WHERE project_id = ? AND statement = ?',
+    const subject = String(raw.subject ?? '').trim();
+    const subjectLink = subject ? resolveSubjectEntity(db, projectId, subject) : { missing: true as const };
+    const subjectEntityId = 'id' in subjectLink ? subjectLink.id : null;
+    const dup = db.get<{ id: number; subject_entity_id: number | null }>(
+      'SELECT id, subject_entity_id FROM canon_fact WHERE project_id = ? AND statement = ?',
       projectId,
       statement,
     );
     if (dup) {
+      // A duplicate statement is an update opportunity, never a second row.
+      // Only fill a missing link; an existing link is never overwritten.
+      if (subjectEntityId !== null && dup.subject_entity_id === null) {
+        db.run('UPDATE canon_fact SET subject_entity_id = ? WHERE id = ?', subjectEntityId, dup.id);
+      }
       accepted++;
       continue;
     }
@@ -1622,16 +1682,17 @@ function applyFacts(
       ? [{ source: span.source, locator: span.locator, chunk: span.chunkId }]
       : refsFor(chunk);
     db.run(
-      `INSERT INTO canon_fact (project_id, topic, statement, kind, certainty, subject, evidence, source_refs, modality, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO canon_fact (project_id, topic, statement, kind, certainty, subject, evidence, source_refs, subject_entity_id, modality, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       projectId,
       String(raw.topic ?? '').trim(),
       statement,
       String(raw.kind ?? 'fact').trim(),
       String(raw.certainty ?? 'confirmed').trim(),
-      String(raw.subject ?? '').trim(),
+      subject,
       span.quote,
       toJson(refs),
+      subjectEntityId,
       normaliseModality(raw.modality),
       nowIso(),
     );
@@ -2755,12 +2816,41 @@ function applyRelations(
   // Fresh per call: entities created earlier in the same run are visible.
   const roster = rosterTokens(db, projectId);
   for (const raw of raws) {
-    const fromId = resolveEntity(db, projectId, entityIdByName, String(raw.from ?? ''));
-    const toId = resolveEntity(db, projectId, entityIdByName, String(raw.to ?? ''));
+    const fromName = String(raw.from ?? '').trim();
+    const toName = String(raw.to ?? '').trim();
+    const fromId = resolveEntity(db, projectId, entityIdByName, fromName);
+    const toId = resolveEntity(db, projectId, entityIdByName, toName);
     if (!fromId || !toId || fromId === toId) {
-      // A relation naming someone who does not exist is not a claim about the
-      // source; it is a name the relations call was told not to use.
+      // A relation naming someone the bank has never seen is a recall hole,
+      // not noise: keep the names, kind and quote as a hint. No entity is
+      // created and nothing is promoted to a relation.
       if (gate) stats.verification.unresolved++;
+      if (!fromId || !toId) {
+        const chunk = chunkAt(window, raw.chunk_index);
+        let quote = '';
+        let refs: { source: string; locator: string; chunk?: number }[] = [];
+        if (chunk) {
+          const hintSpan = gate
+            ? verifySpan(raw.evidence, chunk, neighboursOf(chunk.id))
+            : { ...verifyQuote(raw.evidence, chunk, neighboursOf(chunk.id)), status: 'verified' as const };
+          if (hintSpan.quote.trim()) {
+            quote = hintSpan.quote;
+            refs = hintSpan.chunkId !== null
+              ? [{ source: hintSpan.source, locator: hintSpan.locator, chunk: hintSpan.chunkId }]
+              : refsFor(chunk);
+          }
+        } else {
+          quote = String(raw.evidence ?? '').trim();
+        }
+        const rawKind = String(raw.kind ?? '').trim();
+        let captured = false;
+        if (quote && rawKind && /[a-z]/i.test(rawKind)) {
+          for (const kind of normaliseKinds(rawKind)) {
+            if (captureTieHint(db, projectId, { fromName, toName, kind, quote, refs })) captured = true;
+          }
+        }
+        if (captured) stats.verification.hinted++;
+      }
       continue;
     }
     const chunk = chunkAt(window, raw.chunk_index);
@@ -3401,6 +3491,141 @@ function persistTieNote(
   );
 }
 
+export interface TieHint {
+  id: number;
+  projectId: number;
+  fromName: string;
+  toName: string;
+  kind: string;
+  evidence: string;
+  sourceRefs: { source: string; locator: string; chunk?: number }[];
+  status: string;
+  note: string;
+  createdAt: string;
+  locator: string;
+}
+
+/** A hint name must look like a name, not a sentence or a stopword list. */
+function isHintName(name: string): boolean {
+  const clean = name.trim();
+  if (!clean || !/[a-z]/i.test(clean)) return false;
+  if (clean.split(/\s+/).filter(Boolean).length > 6) return false;
+  const words = normalise(clean).split(' ').filter(Boolean);
+  return words.length > 0 && !words.every((word) => STOPWORDS.has(word));
+}
+
+/** A hint kind is a short, non-empty phrase. */
+function isHintKind(kind: string): boolean {
+  const clean = kind.trim();
+  return clean.length > 1 && clean.length <= 40 && /[a-z]/i.test(clean) && !clean.includes('...');
+}
+
+/**
+ * Keep a tie whose endpoints are not in the bank as a hint, never a relation.
+ *
+ * The row carries the original names, the attempted kind, the verbatim quote
+ * and its refs. A duplicate key keeps the longer quote; it never creates an
+ * entity and never promotes anything.
+ */
+export function captureTieHint(
+  db: Db,
+  projectId: number,
+  hint: {
+    fromName: string;
+    toName: string;
+    kind: string;
+    quote: string;
+    refs: { source: string; locator: string; chunk?: number }[];
+  },
+): boolean {
+  const fromName = hint.fromName.trim();
+  const toName = hint.toName.trim();
+  const kind = hint.kind.trim();
+  const quote = hint.quote.trim();
+  if (!isHintName(fromName) || !isHintName(toName)) return false;
+  if (fromName.toLowerCase() === toName.toLowerCase()) return false;
+  if (!isHintKind(kind) || !quote) return false;
+  const refs = Array.isArray(hint.refs) ? hint.refs : [];
+  const inserted = db.run(
+    `INSERT OR IGNORE INTO canon_tie_hint
+       (project_id, from_name, to_name, kind, evidence, source_refs, status, note, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'pending', '', ?)`,
+    projectId,
+    fromName,
+    toName,
+    kind,
+    quote,
+    toJson(refs),
+    nowIso(),
+  );
+  if (inserted.changes > 0) return true;
+  const updated = db.run(
+    `UPDATE canon_tie_hint SET evidence = ?, source_refs = ?
+      WHERE project_id = ? AND from_name = ? AND to_name = ? AND kind = ? AND length(?) > length(evidence)`,
+    quote,
+    toJson(refs),
+    projectId,
+    fromName,
+    toName,
+    kind,
+    quote,
+  );
+  return updated.changes > 0;
+}
+
+/** Pending hints, read-only, newest last. */
+export function listTieHints(
+  db: Db,
+  projectId: number,
+  opts: { status?: string; limit?: number } = {},
+): TieHint[] {
+  const status = opts.status ?? 'pending';
+  const limit = Math.max(1, Math.floor(opts.limit ?? 50));
+  const rows = db.all<{
+    id: number;
+    project_id: number;
+    from_name: string;
+    to_name: string;
+    kind: string;
+    evidence: string;
+    source_refs: string;
+    status: string;
+    note: string;
+    created_at: string;
+  }>(
+    `SELECT id, project_id, from_name, to_name, kind, evidence, source_refs, status, note, created_at
+       FROM canon_tie_hint WHERE project_id = ? AND status = ? ORDER BY id LIMIT ?`,
+    projectId,
+    status,
+    limit,
+  );
+  return rows.map((row) => {
+    const refs = fromJson<{ source?: unknown; locator?: unknown; chunk?: unknown }[]>(row.source_refs, []);
+    const first = refs.find((ref) => ref && ref.locator !== undefined);
+    return {
+      id: row.id,
+      projectId: row.project_id,
+      fromName: row.from_name,
+      toName: row.to_name,
+      kind: row.kind,
+      evidence: row.evidence,
+      sourceRefs: refs as TieHint['sourceRefs'],
+      status: row.status,
+      note: row.note,
+      createdAt: row.created_at,
+      locator: String(first?.locator ?? ''),
+    };
+  });
+}
+
+export function countTieHints(db: Db, projectId: number, status = 'pending'): number {
+  return db.get<{ n: number }>(
+    'SELECT COUNT(*) AS n FROM canon_tie_hint WHERE project_id = ? AND status = ?',
+    projectId,
+    status,
+  )?.n ?? 0;
+}
+
 /** A cheap "these two look like the same person" test for quarantine. */
 export function looksAlike(a: string, b: string): { alike: boolean; reason: string } {
   const ta = nameTokens(a);
@@ -3431,12 +3656,34 @@ export function looksAlike(a: string, b: string): { alike: boolean; reason: stri
  *    returned and never merged. A wrong merge invents a person.
  */
 /**
- * Fold one entity into another: aliases, relations, facts, then delete.
+ * Fold one entity into another: aliases, relations, facts, tie notes, then
+ * delete.
  *
  * Shared by the rule-based merge and the quarantine judge. The judge may
  * only confirm into this path, never invent around it.
+ *
+ * Tie notes are audit records, so a merge carries them to the survivor rather
+ * than letting the entity delete cascade them away. An exact key collision
+ * keeps the resolved note and copies its ruling over a pending duplicate.
  */
-export function mergeEntityPair(db: Db, projectId: number, keep: CanonEntity, drop: CanonEntity): void {
+export interface MergeTieNoteCounts {
+  /** Notes re-pointed to the survivor. */
+  moved: number;
+  /** Incoming notes deleted because the same key already existed. */
+  collapsed: number;
+  /** Pending notes whose two endpoints both collapsed to the survivor. */
+  droppedSelf: number;
+  /** Resolved self-notes kept for audit, re-pointed to the survivor. */
+  keptSelf: number;
+}
+
+export function mergeEntityPair(
+  db: Db,
+  projectId: number,
+  keep: CanonEntity,
+  drop: CanonEntity,
+): MergeTieNoteCounts {
+  const noteCounts: MergeTieNoteCounts = { moved: 0, collapsed: 0, droppedSelf: 0, keptSelf: 0 };
   db.transaction(() => {
     const aliases = [...keep.aliases, drop.name, ...drop.aliases].filter(
       (al, i, arr) =>
@@ -3487,8 +3734,62 @@ export function mergeEntityPair(db: Db, projectId: number, keep: CanonEntity, dr
       }
     }
     db.run('UPDATE canon_fact SET subject = ? WHERE project_id = ? AND subject = ?', keep.name, projectId, drop.name);
+    // Carry tie notes to the survivor before the entity delete. The FK is
+    // ON DELETE CASCADE, so leaving them attached would destroy audit rows.
+    const notes = db.all<{
+      id: number;
+      from_entity: number;
+      to_entity: number;
+      attempted_kind: string;
+      status: string;
+      ruling: string;
+      ruled_at: string;
+    }>(
+      'SELECT id, from_entity, to_entity, attempted_kind, status, ruling, ruled_at FROM canon_tie_note WHERE project_id = ? AND (from_entity = ? OR to_entity = ?) ORDER BY id',
+      projectId,
+      drop.id,
+      drop.id,
+    );
+    for (const note of notes) {
+      const from = note.from_entity === drop.id ? keep.id : note.from_entity;
+      const to = note.to_entity === drop.id ? keep.id : note.to_entity;
+      const existing = db.get<{ id: number; status: string }>(
+        'SELECT id, status FROM canon_tie_note WHERE project_id = ? AND from_entity = ? AND to_entity = ? AND attempted_kind = ? AND id <> ?',
+        projectId,
+        from,
+        to,
+        note.attempted_kind,
+        note.id,
+      );
+      if (existing) {
+        if (note.status === 'resolved' && existing.status !== 'resolved') {
+          db.run(
+            "UPDATE canon_tie_note SET status = 'resolved', ruling = ?, ruled_at = ? WHERE id = ?",
+            note.ruling,
+            note.ruled_at,
+            existing.id,
+          );
+        }
+        db.run('DELETE FROM canon_tie_note WHERE id = ?', note.id);
+        noteCounts.collapsed++;
+        continue;
+      }
+      if (from === to) {
+        if (note.status === 'resolved') {
+          db.run('UPDATE canon_tie_note SET from_entity = ?, to_entity = ? WHERE id = ?', from, to, note.id);
+          noteCounts.keptSelf++;
+        } else {
+          db.run('DELETE FROM canon_tie_note WHERE id = ?', note.id);
+          noteCounts.droppedSelf++;
+        }
+        continue;
+      }
+      db.run('UPDATE canon_tie_note SET from_entity = ?, to_entity = ? WHERE id = ?', from, to, note.id);
+      noteCounts.moved++;
+    }
     db.run('DELETE FROM canon_entity WHERE id = ?', drop.id);
   });
+  return noteCounts;
 }
 
 /**
@@ -4546,12 +4847,27 @@ export function normaliseKinds(kind: string): string[] {
   return useful;
 }
 
-function normaliseKind(kind: string): EntityKind {
+/**
+ * The model's kind word, defensively. Species words are a people; animal and
+ * beast words are a creature; anything unrecognised keeps the historical
+ * character fallback so old and stray values behave exactly as before.
+ */
+export function normaliseKind(kind: string): EntityKind {
   const k = kind.toLowerCase();
   if (k.includes('loc') || k.includes('place')) return 'location';
   if (k.includes('item') || k.includes('object') || k.includes('thing')) return 'item';
   if (k.includes('rule') || k.includes('law') || k.includes('magic') || k.includes('lore')) return 'rule';
   if (k.includes('faction') || k.includes('group') || k.includes('family')) return 'faction';
+  if (
+    k.includes('species') ||
+    k.includes('race') ||
+    k.includes('people') ||
+    k.includes('folk') ||
+    k.includes('lineage') ||
+    k.includes('bloodline')
+  ) {
+    return 'species';
+  }
   if (k.includes('creature') || k.includes('animal') || k.includes('beast')) return 'creature';
   return 'character';
 }
@@ -4614,20 +4930,377 @@ function resolveEntity(
  * single-token name that matches exactly one entity as a whole word resolves
  * to it. Zero or several matches stay unresolved — never guess a person.
  */
-function resolveShortName(db: Db, projectId: number, clean: string): number | undefined {
-  if (/\s/.test(clean)) return undefined;
+function shortNameHits(db: Db, projectId: number, clean: string): number[] {
+  if (/\s/.test(clean)) return [];
   const needle = clean.toLowerCase();
-  if (needle.length < 3) return undefined;
+  if (needle.length < 3) return [];
   const rows = db.all<{ id: number; name: string; aliases: string }>(
     'SELECT id, name, aliases FROM canon_entity WHERE project_id = ?',
     projectId,
   );
-  const hits = rows.filter((r) =>
-    [r.name, ...strList(r.aliases)].some((v) =>
-      v.toLowerCase().split(/[^a-z0-9']+/).includes(needle),
-    ),
+  return rows
+    .filter((r) =>
+      [r.name, ...strList(r.aliases)].some((v) =>
+        v.toLowerCase().split(/[^a-z0-9']+/).includes(needle),
+      ),
+    )
+    .map((r) => r.id);
+}
+
+function resolveShortName(db: Db, projectId: number, clean: string): number | undefined {
+  const hits = shortNameHits(db, projectId, clean);
+  return hits.length === 1 ? hits[0] : undefined;
+}
+
+export type SubjectEntityResolution =
+  | { id: number }
+  | { ambiguous: number }
+  | { missing: true };
+
+/**
+ * Resolve a fact subject to an entity for canon_fact.subject_entity_id.
+ *
+ * Exact canonical name first, then exact canonical alias, then the existing
+ * unique short-name rule. No edit-distance or substring matching: a fact
+ * attached to the wrong person is worse than an unattached fact.
+ */
+export function resolveSubjectEntity(
+  db: Db,
+  projectId: number,
+  subject: string,
+): SubjectEntityResolution {
+  const canonical = canonicalName(subject ?? '');
+  if (!canonical) return { missing: true };
+  const rows = db.all<{ id: number; name: string; aliases: string }>(
+    'SELECT id, name, aliases FROM canon_entity WHERE project_id = ?',
+    projectId,
   );
-  return hits.length === 1 ? hits[0]!.id : undefined;
+  const nameHits = rows.filter((r) => canonicalName(r.name) === canonical).map((r) => r.id);
+  if (nameHits.length) {
+    return nameHits.length === 1 ? { id: nameHits[0]! } : { ambiguous: nameHits.length };
+  }
+  const aliasHits = rows
+    .filter((r) => strList(r.aliases).some((alias) => canonicalName(alias) === canonical))
+    .map((r) => r.id);
+  if (aliasHits.length) {
+    return aliasHits.length === 1 ? { id: aliasHits[0]! } : { ambiguous: aliasHits.length };
+  }
+  const shortHits = shortNameHits(db, projectId, canonical);
+  if (shortHits.length) {
+    return shortHits.length === 1 ? { id: shortHits[0]! } : { ambiguous: shortHits.length };
+  }
+  return { missing: true };
+}
+
+export interface FactLinkResult {
+  scanned: number;
+  linked: number;
+  ambiguous: number;
+  unmatched: number;
+}
+
+/**
+ * Link facts with no subject_entity_id, using the same conservative resolver
+ * as the write path. Only canon_fact.subject_entity_id is ever written.
+ */
+export function linkFactSubjects(
+  db: Db,
+  projectId: number,
+  opts: { dryRun?: boolean; limit?: number } = {},
+): FactLinkResult {
+  const limit = opts.limit === undefined ? -1 : Math.max(0, Math.floor(opts.limit));
+  const rows = db.all<{ id: number; subject: string }>(
+    'SELECT id, subject FROM canon_fact WHERE project_id = ? AND subject_entity_id IS NULL ORDER BY id LIMIT ?',
+    projectId,
+    limit,
+  );
+  const result: FactLinkResult = { scanned: rows.length, linked: 0, ambiguous: 0, unmatched: 0 };
+  for (const row of rows) {
+    const resolved = resolveSubjectEntity(db, projectId, row.subject);
+    if ('id' in resolved) {
+      if (!opts.dryRun) {
+        db.run(
+          'UPDATE canon_fact SET subject_entity_id = ? WHERE id = ? AND project_id = ? AND subject_entity_id IS NULL',
+          resolved.id,
+          row.id,
+          projectId,
+        );
+      }
+      result.linked++;
+    } else if ('ambiguous' in resolved) {
+      result.ambiguous++;
+    } else {
+      result.unmatched++;
+    }
+  }
+  return result;
+}
+
+export interface EntityCapacityResult {
+  scanned: number;
+  parked: number;
+  funneled: number;
+  skipped: number;
+  /** Candidates spared because another row/taxonomy references them. */
+  skippedReferenced: number;
+  /** Names of every candidate that would park / did park. */
+  parkedNames: string[];
+  /** Names of candidates whose quote supports a funnel fact. */
+  funneledNames: string[];
+}
+
+/** A stored name counts as proper when a token starts with a capital. */
+function properEntityName(name: string): boolean {
+  const tokens = name.trim().split(/\s+/).filter(Boolean);
+  if (!tokens.length) return false;
+  if (!tokens.some((token) => /^[A-Z]/.test(token))) return false;
+  if (tokens.length === 1 && tokens[0] === tokens[0]!.toLowerCase()) return false;
+  return true;
+}
+
+/**
+ * Park unproven entities: no ties, one mention, no role/status, no proper name.
+ *
+ * A failed candidate becomes a fact only when its own verified quote names the
+ * candidate noun and exactly one other, non-parked entity. The candidate is
+ * parked in every case; nothing is deleted, renamed or re-kinded.
+ */
+export function checkEntityCapacity(
+  db: Db,
+  projectId: number,
+  ids: Iterable<number>,
+  opts: { write: boolean },
+): EntityCapacityResult {
+  const result: EntityCapacityResult = {
+    scanned: 0,
+    parked: 0,
+    funneled: 0,
+    skipped: 0,
+    skippedReferenced: 0,
+    parkedNames: [],
+    funneledNames: [],
+  };
+  const unique = [...new Set(ids)];
+  const all = db.all<{ id: number; name: string; aliases: string; kind: string; review_status: string }>(
+    'SELECT id, name, aliases, kind, review_status FROM canon_entity WHERE project_id = ?',
+    projectId,
+  );
+  const hasTable = (name: string): boolean =>
+    !!db.get("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = ?", name);
+  const factSubjects = new Set(
+    db.all<{ id: number }>('SELECT DISTINCT subject_entity_id AS id FROM canon_fact WHERE project_id = ? AND subject_entity_id IS NOT NULL', projectId)
+      .map((row) => row.id),
+  );
+  const tieNoteEntities = new Set<number>();
+  if (hasTable('canon_tie_note')) {
+    for (const row of db.all<{ from_entity: number; to_entity: number }>(
+      'SELECT from_entity, to_entity FROM canon_tie_note WHERE project_id = ?',
+      projectId,
+    )) {
+      tieNoteEntities.add(row.from_entity);
+      tieNoteEntities.add(row.to_entity);
+    }
+  }
+  const eventParticipants = new Set<number>();
+  if (hasTable('canon_event_participant')) {
+    for (const row of db.all<{ entity_id: number }>(
+      'SELECT entity_id FROM canon_event_participant WHERE entity_id IN (SELECT id FROM canon_entity WHERE project_id = ?)',
+      projectId,
+    )) {
+      eventParticipants.add(row.entity_id);
+    }
+  }
+  // Timeline names are free text: a JSON participant list and a location
+  // phrase such as "the north wing". Match them with the exact phrase matcher
+  // instead of string equality, which never sees a name embedded in a phrase.
+  const timelinePhrases: string[] = [];
+  for (const row of db.all<{ participants: string; location: string }>(
+    'SELECT participants, location FROM canon_timeline WHERE project_id = ?',
+    projectId,
+  )) {
+    const location = row.location.trim();
+    if (location) timelinePhrases.push(location);
+    const participants = row.participants.trim();
+    if (!participants) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(participants);
+    } catch {
+      parsed = undefined;
+    }
+    if (Array.isArray(parsed)) {
+      for (const participant of parsed) {
+        if (typeof participant === 'string' && participant.trim()) {
+          timelinePhrases.push(participant.trim());
+        }
+      }
+    } else if (typeof parsed === 'string' && parsed.trim()) {
+      timelinePhrases.push(parsed.trim());
+    } else {
+      // Malformed or non-list payload: match the raw text as a phrase.
+      timelinePhrases.push(participants);
+    }
+  }
+  const hintNames = new Set<string>();
+  if (hasTable('canon_tie_hint')) {
+    for (const row of db.all<{ from_name: string; to_name: string }>(
+      'SELECT from_name, to_name FROM canon_tie_hint WHERE project_id = ?',
+      projectId,
+    )) {
+      for (const name of [row.from_name, row.to_name]) {
+        const canonical = canonicalName(name);
+        if (canonical) hintNames.add(canonical);
+      }
+    }
+  }
+  const quarantineNames = new Set<string>();
+  if (hasTable('quarantine_alias')) {
+    for (const row of db.all<{ name: string; candidate: string }>(
+      'SELECT name, candidate FROM quarantine_alias WHERE project_id = ?',
+      projectId,
+    )) {
+      for (const name of [row.name, row.candidate]) {
+        const canonical = canonicalName(name);
+        if (canonical) quarantineNames.add(canonical);
+      }
+    }
+  }
+  for (const id of unique) {
+    const entity = db.get<{
+      id: number;
+      name: string;
+      aliases: string;
+      kind: string;
+      role: string;
+      status: string;
+      mentions: number;
+      evidence: string;
+      source_refs: string;
+      review_status: string;
+      first_chunk: number | null;
+    }>(
+      `SELECT id, name, aliases, kind, role, status, mentions, evidence, source_refs, review_status, first_chunk
+         FROM canon_entity WHERE project_id = ? AND id = ?`,
+      projectId,
+      id,
+    );
+    if (!entity) continue;
+    result.scanned++;
+    // Only machine-accepted rows are candidates. Already-parked, rejected and
+    // human-confirmed rows are left alone.
+    if (entity.review_status !== 'accepted') continue;
+    const ties = db.get<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM canon_relation WHERE project_id = ? AND (from_entity = ? OR to_entity = ?)',
+      projectId,
+      id,
+      id,
+    )?.n ?? 0;
+    if (ties > 0) continue;
+    if (Number(entity.mentions ?? 0) > 1) continue;
+    if (entity.role.trim() || entity.status.trim()) continue;
+    if (properEntityName(entity.name)) continue;
+
+    const variants = [entity.name, ...strList(entity.aliases)]
+      .map((name) => canonicalName(name))
+      .filter(Boolean);
+    const taxonomyKind = entity.kind === 'species' || entity.kind === 'faction' || entity.kind === 'rule';
+    const referenced =
+      taxonomyKind ||
+      factSubjects.has(entity.id) ||
+      eventParticipants.has(entity.id) ||
+      tieNoteEntities.has(entity.id) ||
+      variants.some((name) => timelinePhrases.some((phrase) => nameMentionedExact(name, phrase))) ||
+      variants.some((name) => hintNames.has(name)) ||
+      variants.some((name) => quarantineNames.has(name));
+    if (referenced) {
+      result.skippedReferenced++;
+      continue;
+    }
+
+    const quote = entity.evidence.trim();
+    let funneled = false;
+    if (quote) {
+      const refs = fromJson<{ chunk?: unknown }[]>(entity.source_refs, []);
+      const refChunk = refs
+        .map((ref) => Number(ref?.chunk))
+        .find((value) => Number.isFinite(value) && value > 0);
+      const chunkId = refChunk ?? entity.first_chunk ?? null;
+      const chunk = chunkId
+        ? db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', chunkId)
+        : undefined;
+      if (chunk && normalise(chunk.text).includes(normalise(quote))) {
+        const quoteTokens = new Set(normalise(quote).split(' ').filter(Boolean));
+        const ownTokens = nameTokens(entity.name);
+        const namesOwn = ownTokens.some((token) => quoteTokens.has(token));
+        if (namesOwn) {
+          const others = all.filter(
+            (other) =>
+              other.id !== entity.id &&
+              (nameMentionedExact(other.name, quote) ||
+                strList(other.aliases).some((alias) => nameMentionedExact(alias, quote))),
+          );
+          if (others.length === 1) {
+            const other = others[0]!;
+            if (other.review_status !== 'needs_review' && other.review_status !== 'rejected') {
+              const sentences = splitSentences(quote);
+              const sentence = sentences.find((candidate) => {
+                const tokens = new Set(normalise(candidate).split(' ').filter(Boolean));
+                return (
+                  ownTokens.some((token) => tokens.has(token)) &&
+                  (nameMentionedExact(other.name, candidate) ||
+                    strList(other.aliases).some((alias) => nameMentionedExact(alias, candidate)))
+                );
+              }) ?? sentences[0] ?? quote;
+              const statement = sentence.trim();
+              if (statement) {
+                const existing = db.get<{ id: number }>(
+                  'SELECT id FROM canon_fact WHERE project_id = ? AND subject_entity_id = ? AND topic = ? AND evidence = ?',
+                  projectId,
+                  other.id,
+                  entity.name,
+                  statement,
+                );
+                if (!existing && opts.write) {
+                  db.run(
+                    `INSERT INTO canon_fact
+                       (project_id, topic, statement, kind, certainty, subject, evidence, source_refs, subject_entity_id, modality, created_at)
+                     VALUES (?, ?, ?, 'fact', 'confirmed', ?, ?, ?, ?, 'asserted', ?)`,
+                    projectId,
+                    entity.name,
+                    statement,
+                    other.name,
+                    statement,
+                    entity.source_refs || '[]',
+                    other.id,
+                    nowIso(),
+                  );
+                }
+                funneled = true;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    result.parked++;
+    result.parkedNames.push(entity.name);
+    if (funneled) {
+      result.funneled++;
+      result.funneledNames.push(entity.name);
+    } else {
+      result.skipped++;
+    }
+    if (opts.write) {
+      db.run(
+        "UPDATE canon_entity SET review_status = 'needs_review', updated_at = ? WHERE project_id = ? AND id = ?",
+        nowIso(),
+        projectId,
+        entity.id,
+      );
+    }
+  }
+  return result;
 }
 
 /* ------------------------------------------------------------- retrieval */
