@@ -22,12 +22,26 @@ export function wordCount(text: string): number {
 
 /** Split text into sentences (good enough for chunking and repetition checks). */
 export function splitSentences(text: string): string[] {
-  const out: string[] = [];
+  return sentenceSpans(text).map((span) => span.text);
+}
+
+interface SentenceSpan {
+  text: string;
+  start: number;
+  end: number;
+}
+
+/** Sentences with their offsets inside the given text. */
+function sentenceSpans(text: string): SentenceSpan[] {
+  const out: SentenceSpan[] = [];
   const re = /[^.!?\n]+(?:[.!?]+["')\]]*|$)/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text ?? '')) !== null) {
-    const s = m[0].trim();
-    if (s) out.push(s);
+    const raw = m[0];
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    const lead = raw.length - raw.trimStart().length;
+    out.push({ text: trimmed, start: m.index + lead, end: m.index + lead + trimmed.length });
   }
   return out;
 }
@@ -353,28 +367,48 @@ export function chunkText(
       pieces.push(block);
       continue;
     }
-    const sentences = splitSentences(block.text);
-    let group: string[] = [];
+    const spans = sentenceSpans(block.text);
+    let group: SentenceSpan[] = [];
     let groupWords = 0;
-    for (const sentence of sentences) {
-      const w = wordCount(sentence);
-      if (groupWords + w > maxWords && group.length) {
-        pieces.push({ ...block, text: group.join(' ') });
-        group = [];
-        groupWords = 0;
-      }
-      group.push(sentence);
+    const pushGroup = () => {
+      if (!group.length) return;
+      pieces.push({
+        ...block,
+        text: group.map((span) => span.text).join(' '),
+        charStart: block.charStart + group[0]!.start,
+        charEnd: block.charStart + group[group.length - 1]!.end,
+      });
+      group = [];
+      groupWords = 0;
+    };
+    for (const span of spans) {
+      const w = wordCount(span.text);
+      if (groupWords + w > maxWords && group.length) pushGroup();
+      group.push(span);
       groupWords += w;
     }
-    if (group.length) pieces.push({ ...block, text: group.join(' ') });
+    pushGroup();
   }
 
   const chunks: Chunk[] = [];
   let current: Block[] = [];
   let currentWords = 0;
+  let overlapOnly = false;
+
+  const clearCurrent = () => {
+    current = [];
+    currentWords = 0;
+    overlapOnly = false;
+  };
 
   const flushChunk = (keepOverlap = true) => {
     if (!current.length) return;
+    // A buffer holding only the previous chunk's overlap must never become a
+    // chunk of its own. Clear it and let the next new block start the chunk.
+    if (overlapOnly) {
+      clearCurrent();
+      return;
+    }
     const body = current.map((b) => b.text).join('\n\n');
     chunks.push({
       text: body,
@@ -385,23 +419,54 @@ export function chunkText(
       pageStart: current[0].page,
       pageEnd: current[current.length - 1].page,
     });
-    // Overlap: keep a little trailing context for the next chunk, but never so
-    // much that the next chunk starts out already full (which would repeat it).
     if (!keepOverlap) {
-      current = [];
-      currentWords = 0;
+      clearCurrent();
       return;
     }
-    const budget = Math.min(overlapWords, Math.floor(maxWords / 3));
+    // Overlap is a short context tail: whole blocks when they fit, otherwise
+    // the trailing sentences that fit the budget. A block is never kept whole
+    // just because it is the last one.
+    const budget = Math.max(0, Math.min(overlapWords, Math.floor(maxWords / 4)));
+    if (!budget) {
+      clearCurrent();
+      return;
+    }
     const keep: Block[] = [];
     let kept = 0;
     for (let i = current.length - 1; i >= 0 && kept < budget; i--) {
-      if (current[i].startsHeading) break;
-      keep.unshift(current[i]);
-      kept += wordCount(current[i].text);
+      const block = current[i];
+      if (block.startsHeading) break;
+      const remaining = budget - kept;
+      const wholeWords = wordCount(block.text);
+      if (wholeWords <= remaining) {
+        keep.unshift(block);
+        kept += wholeWords;
+        continue;
+      }
+      const spans = sentenceSpans(block.text);
+      const tail: SentenceSpan[] = [];
+      let tailWords = 0;
+      for (let j = spans.length - 1; j >= 0; j--) {
+        const w = wordCount(spans[j]!.text);
+        if (tailWords + w > remaining) break;
+        tail.unshift(spans[j]!);
+        tailWords += w;
+      }
+      if (tail.length) {
+        keep.unshift({
+          ...block,
+          text: tail.map((span) => span.text).join(' '),
+          charStart: block.charStart + tail[0]!.start,
+          charEnd: block.charStart + tail[tail.length - 1]!.end,
+          startsHeading: false,
+        });
+        kept += tailWords;
+      }
+      break;
     }
     current = keep;
-    currentWords = kept;
+    currentWords = keep.reduce((n, b) => n + wordCount(b.text), 0);
+    overlapOnly = keep.length > 0;
   };
 
   for (const block of pieces) {
@@ -409,13 +474,21 @@ export function chunkText(
     // never straddle a heading: a heading always starts a fresh chunk
     if (current.length && block.startsHeading) flushChunk(false);
     // Prefer to end a chunk on a page boundary, so a citation points at one
-    // page rather than a spread. Only worth it once the chunk has some meat.
+    // page rather than a spread. Page breaks never carry overlap: the break is
+    // already a citation boundary, and repeating text across it duplicates it.
     if (current.length && block.page !== current[0].page && currentWords >= Math.min(50, maxWords * 0.5)) {
-      flushChunk();
+      flushChunk(false);
     }
-    if (currentWords + w > maxWords && current.length) flushChunk();
+    if (currentWords + w > maxWords && current.length) {
+      flushChunk();
+      // The flush may have left a context tail behind. If the new block still
+      // does not fit with it, the tail is pure overhead: drop it and start the
+      // chunk with the new block.
+      if (currentWords + w > maxWords && current.length) clearCurrent();
+    }
     current.push(block);
     currentWords += w;
+    overlapOnly = false;
   }
   flushChunk();
 
