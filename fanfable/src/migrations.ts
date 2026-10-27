@@ -371,10 +371,12 @@ export function runMigrations(db: DatabaseSync): number {
     }
     db.exec('BEGIN');
     try {
-      if (migration.sql) db.exec(migration.sql);
+      // Columns first: later migrations may create indexes or run statements
+      // that depend on the columns this migration adds.
       for (const [table, column, definition] of migration.columns ?? []) {
         addColumn(db, table, column, definition);
       }
+      if (migration.sql) db.exec(migration.sql);
       db.exec(`PRAGMA user_version = ${migration.version}`);
       db.exec('COMMIT');
     } catch (err) {
