@@ -23,6 +23,7 @@ import type { LlmClient } from './llm.ts';
 import * as lorebook from './lorebook.ts';
 import { preferThin, readHandoff } from './chain-handoff.ts';
 import { truncate } from './text.ts';
+import { DIAGNOSTIC_RELATION_CUES } from './vocab.ts';
 
 /* ------------------------------------------------------------- diagnostics */
 
@@ -49,29 +50,6 @@ export interface LoreGap {
   /** What could be done about it. */
   suggestion: string;
 }
-
-/**
- * Words that state a relationship, and the kind of relationship they state.
- * Used to notice a relationship the source says plainly and the graph is
- * missing.
- */
-const RELATION_CUES: { re: RegExp; kind: string }[] = [
-  { re: /\b(?:his|her|their) (?:son|daughter)\b/i, kind: 'child of' },
-  { re: /\b(?:son|daughter) of\b/i, kind: 'child of' },
-  { re: /\b(?:brother|sister|sibling) of\b/i, kind: 'sibling of' },
-  { re: /\b(?:mother|father) of\b/i, kind: 'child of' },
-  { re: /\b(?:uncle|aunt) of\b/i, kind: 'relative of' },
-  { re: /\b(?:cousin|nephew|niece) of\b/i, kind: 'relative of' },
-  { re: /\b(?:wife|husband|spouse) of\b/i, kind: 'married to' },
-  { re: /\bhead(?:master|mistress) of\b/i, kind: 'leads' },
-  { re: /\bstudent of\b/i, kind: 'student of' },
-  { re: /\bmember of\b/i, kind: 'member of' },
-  { re: /\bworks? for\b/i, kind: 'works for' },
-  { re: /\bbelongs? to\b/i, kind: 'member of' },
-  { re: /\bfriend of\b/i, kind: 'friend of' },
-  { re: /\benemy of\b/i, kind: 'enemy of' },
-  { re: /\bmarried to\b/i, kind: 'married to' },
-];
 
 /** The kinds that describe the same relationship, so a near-match is a hit. */
 const RELATED_KINDS: Record<string, string[]> = {
@@ -302,7 +280,7 @@ export function diagnose(db: Db, projectId: number, opts: { limit?: number } = {
       if (entity.kind !== 'character') continue;
       const names = [entity.name, ...strList(entity.aliases)];
       if (!names.some((n) => lower.includes(n.toLowerCase()))) continue;
-      for (const cue of RELATION_CUES) {
+      for (const cue of DIAGNOSTIC_RELATION_CUES) {
         const match = cue.re.exec(passage.text);
         if (!match) continue;
         // Who is the other person? The nearest other name in the sentence.

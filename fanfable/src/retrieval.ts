@@ -29,6 +29,8 @@ import * as lore from './lore.ts';
 import * as lorebook from './lorebook.ts';
 import * as embeddings from './embeddings.ts';
 import * as graph from './graph.ts';
+import { RELATION_CUES } from './vocab.ts';
+import { nameMentioned } from './names.ts';
 
 export interface RetrievalRequest {
   /** The question or the scene's subject. */
@@ -127,15 +129,6 @@ export interface RetrievalPackage {
  * passage; it is answered by the sibling edge. "What did Serena say at the
  * bridge" is a lookup, and the words that make it one are checked first.
  */
-const RELATION_CUES = [
-  'sibling', 'brother', 'sister', 'parent', 'mother', 'father', 'son', 'daughter',
-  'child', 'aunt', 'uncle', 'cousin', 'nephew', 'niece', 'grandfather', 'grandmother',
-  'husband', 'wife', 'spouse', 'married', 'related', 'relation', 'relationship',
-  'friend', 'enemy', 'ally', 'mentor', 'teacher', 'student', 'member', 'belongs',
-  'leads', 'leader', 'knows', 'know', 'knew', 'works', 'serves', 'owes',
-  'met', 'married', 'killed', 'gave', 'took', 'joined', 'fought', 'betrayed',
-];
-
 /** Words that ask for a passage, a quotation or a stated fact. */
 const LOOKUP_OPENERS = [
   /^what did .+ (?:say|tell|write|answer|reply)\b/,
@@ -173,26 +166,6 @@ export function routeQuery(query: string, focus: string[] = []): RetrievalRoute 
   return 'vague';
 }
 
-function normaliseName(text: string): string {
-  return (text ?? '')
-    .toLowerCase()
-    .replace(/[’']s\b/g, '')
-    .replace(/[^a-z0-9 ]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function nameInText(name: string, text: string): boolean {
-  const needle = normaliseName(name);
-  if (!needle) return false;
-  const hay = normaliseName(text);
-  if (hay.includes(needle)) return true;
-  // "Serena" should count for "Serena Marsh" in a passage that uses the short
-  // form; the graph carries the aliases, the passage carries the mention.
-  const tokens = needle.split(' ').filter((t) => t.length > 2);
-  return tokens.length > 0 && tokens.every((t) => hay.includes(t));
-}
-
 function emptyGraphContext(): graph.GraphContext {
   return {
     nodes: [],
@@ -228,12 +201,14 @@ export async function retrieve(
 
   /* ------------------------------------------------- passages (FTS5) */
   const searchTerms = [query, ...focus].filter(Boolean).join(' ');
+  let bankProfile = lorebook.buildBankProfile(db, projectId, searchTerms);
   let passages: lore.Passage[] = [];
   if (searchTerms) {
     const expand = skipExpansion ? [] : await lore.expandQuery(llm, searchTerms);
     passages = lore.searchCanon(db, projectId, searchTerms, {
       limit: passageLimit,
       expand,
+      bankProfile,
     });
   }
 
@@ -290,6 +265,10 @@ export async function retrieve(
       computeVerdict();
     }
   }
+  if (lazyMined) {
+    // New rows landed, so the pre-mining profile is stale for the final rank.
+    bankProfile = lorebook.buildBankProfile(db, projectId, searchTerms);
+  }
 
   /**
    * Build the graph side, the supporting passages and the budgeted text.
@@ -338,10 +317,14 @@ export async function retrieve(
     const supporting: lore.Passage[] = [];
     const merged = [...passages];
     if (req.includePassages !== false) {
+      const known = new Set(merged.map((p) => p.chunkId));
+      const missing = graphContext.passages
+        .map((p) => p.chunkId)
+        .filter((chunkId) => !known.has(chunkId));
+      const byId = new Map(lore.getChunks(db, missing).map((p) => [p.chunkId, p]));
       for (const p of graphContext.passages) {
-        const found = merged.find((x) => x.chunkId === p.chunkId);
-        if (found) continue;
-        const chunk = lore.getChunk(db, p.chunkId);
+        if (known.has(p.chunkId)) continue;
+        const chunk = byId.get(p.chunkId);
         if (chunk) {
           supporting.push(chunk);
           merged.push(chunk);
@@ -357,10 +340,15 @@ export async function retrieve(
       deduped.push(p);
     }
 
+    // One shared ranker for every path that produced candidates (keyword,
+    // graph/PPR, dense fallback, bank-expanded). It only reorders: a query
+    // that names nobody in the bank keeps the order it came in with.
+    const ordered = lorebook.rankWithBank(db, projectId, searchTerms, deduped, bankProfile);
+
     const passageBudget = Math.round(maxWords * 0.30);
     const keptPassages: lore.Passage[] = [];
     let used = 0;
-    for (const p of deduped) {
+    for (const p of ordered) {
       const words = p.text.split(/\s+/).length;
       if (used + words > passageBudget && keptPassages.length) break;
       keptPassages.push(p);
@@ -389,13 +377,11 @@ export async function retrieve(
     const missing: string[] = [];
     for (const name of requested) {
       const inGraph = built.graphContext.nodes.some((node) =>
-        [node.name, ...node.aliases].some((n) => {
-          const a = normaliseName(n);
-          const b = normaliseName(name);
-          return !!a && (a === b || a.includes(b) || b.includes(a));
-        }),
+        [node.name, ...node.aliases].some(
+          (n) => nameMentioned(name, n) || nameMentioned(n, name),
+        ),
       );
-      const inText = built.keptPassages.some((p) => nameInText(name, p.text));
+      const inText = built.keptPassages.some((p) => nameMentioned(name, p.text));
       (inGraph || inText ? covered : missing).push(name);
     }
     return {

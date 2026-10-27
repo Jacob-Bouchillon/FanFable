@@ -27,8 +27,10 @@ import { Db, fromJson, strList } from './db.ts';
 import { DEFAULT_EMBED_MODEL, cosine, embedTexts, readVectors, resolveEmbedConfig, type EmbedFn } from './embeddings.ts';
 import type { LlmClient } from './llm.ts';
 import { filterDenseSeeds } from './recognition.ts';
-import { looksAlike, nameRelation, sharedSpeakerScene, speakerChunksByEntity } from './lorebook.ts';
+import { looksAlike, sharedSpeakerScene, speakerChunksByEntity } from './lorebook.ts';
 import { truncate } from './text.ts';
+import { GRAPH_STOPWORDS } from './vocab.ts';
+import { canonicalName, linkTokenMatch, nameMentionedFromTokens, nameRelation, textTokenSet } from './names.ts';
 
 /* --------------------------------------------- similarity-web weights
  *
@@ -1274,27 +1276,21 @@ export function traverse(graph: Graph, opts: TraverseOptions): TraversalResult {
 
 /* -------------------------------------------------------------- ranking */
 
-const STOP = new Set(
-  'a an the and or but if then else of to in on at by for with from as is are was were be been being it its this that these those he she they them his her their we you i not no so such than too very can will just don should now do does did have has had into over under again more most other some what which who whom when where why how all any both each few own same s t d ll m o re ve y'.split(
-    ' ',
-  ),
-);
-
 export function terms(text: string): string[] {
   return (text ?? '')
     .toLowerCase()
     .replace(/[^a-z0-9'\s]/g, ' ')
     .split(/\s+/)
-    .filter((w) => w.length > 2 && !STOP.has(w));
+    .filter((w) => w.length > 2 && !GRAPH_STOPWORDS.has(w));
 }
 
 /** How strongly a node matches the query terms. */
 export function matchScore(node: GraphNode, queryTerms: string[]): number {
   if (!queryTerms.length) return 0;
-  const hay = `${node.name} ${node.aliases.join(' ')} ${node.summary}`.toLowerCase();
+  const hay = textTokenSet(`${node.name} ${node.aliases.join(' ')} ${node.summary}`);
   let hits = 0;
   for (const t of queryTerms) {
-    if (hay.includes(t)) hits++;
+    if (linkTokenMatch(hay, t)) hits++;
   }
   return hits / queryTerms.length;
 }
@@ -1784,10 +1780,11 @@ export function resolveQuerySeeds(
 
   const namesInText = (node: GraphNode): boolean =>
     [node.name, ...node.aliases].some((n) => {
-      const ln = n.toLowerCase();
+      const hay = textTokenSet(n);
       return (
-        focusNames.some((f) => ln.includes(f) || f.includes(ln)) ||
-        queryTerms.some((t) => ln.includes(t))
+        focusNames.some((f) =>
+          nameMentionedFromTokens(f, canonicalName(n), hay, { partial: true }),
+        ) || queryTerms.some((t) => linkTokenMatch(hay, t))
       );
     });
 
@@ -1806,8 +1803,9 @@ export function resolveQuerySeeds(
     if (!from || !to) continue;
     if (from.kind !== 'canon-entity' && from.kind !== 'character') continue;
     if (to.kind !== 'canon-entity' && to.kind !== 'character') continue;
-    const label = `${edge.type} ${edge.description}`.toLowerCase();
-    if (!queryTerms.some((t) => label.includes(t))) continue;
+    const label = `${edge.type} ${edge.description}`;
+    const labelTokens = textTokenSet(label);
+    if (!queryTerms.some((t) => linkTokenMatch(labelTokens, t))) continue;
     if (!namesInText(from) && !namesInText(to)) continue;
     tripleHits.push({ edge, rank: BUCKET_RANK[relationBucket(edge.type)], at: tripleHits.length });
   }
@@ -1821,9 +1819,12 @@ export function resolveQuerySeeds(
   // 2. An event the query names.
   for (const node of graph.nodes.values()) {
     if (node.kind !== 'canon-event' && node.kind !== 'au-event') continue;
-    const hay = `${node.name} ${node.summary} ${node.aliases.join(' ')}`.toLowerCase();
-    const hits = queryTerms.filter((t) => hay.includes(t)).length;
-    const focusHit = focusNames.some((f) => hay.includes(f));
+    const text = `${node.name} ${node.summary} ${node.aliases.join(' ')}`;
+    const hay = textTokenSet(text);
+    const hits = queryTerms.filter((t) => linkTokenMatch(hay, t)).length;
+    const focusHit = focusNames.some((f) =>
+      nameMentionedFromTokens(f, canonicalName(text), hay, { partial: true }),
+    );
     if (hits >= 2 || (hits >= 1 && focusHit)) roots.add(node.id);
   }
   if (roots.size) return { roots: [...roots].slice(0, 10), via: 'event' };
@@ -2169,6 +2170,7 @@ export async function buildPprGraphContext(
   opts: GraphContextOptions = {},
 ): Promise<GraphContext> {
   const graph = loadGraph(db, projectId, { scope: opts.scope, web: opts.web });
+  const edgeById = new Map(graph.edges.map((edge) => [edge.id, edge]));
   const queryTerms = terms(opts.query ?? '');
   const focusNames = opts.focus ?? [];
 
@@ -2186,7 +2188,7 @@ export async function buildPprGraphContext(
   // so evidence near a seed outranks evidence several hops out.
   for (const root of seed.roots) {
     for (const edgeId of graph.adjacency.get(root) ?? []) {
-      const edge = graph.edges.find((e) => e.id === edgeId);
+      const edge = edgeById.get(edgeId);
       if (!edge) continue;
       const other = edge.from === root ? edge.to : edge.from;
       const node = graph.nodes.get(other);

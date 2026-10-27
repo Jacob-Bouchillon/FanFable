@@ -10,7 +10,7 @@
  * the UI can show the evidence, and the writer can be grounded in facts rather
  * than in a wall of retrieved text.
  */
-import { Db, nowIso, strList, toJson } from './db.ts';
+import { Db, fromJson, nowIso, strList, toJson } from './db.ts';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -18,7 +18,28 @@ import { asRecordArray, extractJson, salvageJsonArray, toStringArray } from './j
 import type { LlmClient } from './llm.ts';
 import { embedMissing, type EmbedFn } from './embeddings.ts';
 import { CORROBORATION_CAP, tripleKey, rankRows } from './edge-rank.ts';
-import { STOPWORDS, splitSentences, tokenize, truncate } from './text.ts';
+import { lexicalScore, splitSentences, tokenize, truncate } from './text.ts';
+import {
+  ANSWER_CUE_STOPWORDS,
+  KIND_PARTICLES,
+  KINSHIP_CUES,
+  MOMENT_WORDS,
+  PROOF_FILLER,
+  PROOF_TITLES,
+} from './vocab.ts';
+import { SEARCH_CANDIDATE_POOL } from './search-policy.ts';
+import {
+  canonicalName,
+  linkTokenMatch,
+  linkTokensMatch,
+  nameMentionedFromTokens,
+  nameRelation,
+  nameTokens,
+  NAME_DF_CAP,
+  NAME_MIN_TOKEN,
+  textTokenSet,
+} from './names.ts';
+export { canonicalName, nameRelation, nameTokens } from './names.ts';
 
 /* ------------------------------------------------------------------ models */
 
@@ -378,15 +399,6 @@ export interface WindowScore {
   reasons: string[];
 }
 
-/** Words that state a relationship or a role worth extracting. */
-const KINSHIP_CUES = [
-  'sibling', 'brother', 'sister', 'mother', 'father', 'son', 'daughter',
-  'parent', 'child', 'aunt', 'uncle', 'cousin', 'nephew', 'niece',
-  'husband', 'wife', 'spouse', 'married', 'widow',
-  'king', 'queen', 'prince', 'princess', 'lord', 'lady',
-  'master', 'servant', 'knight', 'captain', 'commander', 'heir',
-];
-
 /**
  * Capitalized words that look like names.
  *
@@ -618,7 +630,7 @@ export async function extractLore(
       .join(', ');
     opts.onProgress?.(
       `selected ${runList.length} of ${candidates.length} windows by priority (${summary}); ` +
-        `${candidates.length - runList.length} left unmined`,
+        `${candidates.length - runList.length} left unmined; ${runList.length} window model calls`,
     );
     stats.selection = {
       selected: runList.length,
@@ -1415,21 +1427,19 @@ function refsFor(chunk: ChunkRow | undefined): { source: string; locator: string
  * The relations call is only allowed to use these names, so it cannot invent a
  * person and cannot attach a relation to a name it hallucinated.
  */
-function windowEntityNames(db: Db, projectId: number, window: ChunkRow[]): string[] {
-  const hay = normalise(window.map((c) => c.text).join(' '));
-  const hayWords = new Set(hay.split(' ').filter((w) => w.length >= 3));
+export function windowEntityNames(db: Db, projectId: number, window: ChunkRow[]): string[] {
+  const hayCanonical = canonicalName(window.map((c) => c.text).join(' '));
+  const hayTokens = new Set(hayCanonical.split(' ').filter(Boolean));
   const names: string[] = [];
   for (const entity of listEntities(db, projectId)) {
-    const variants = [entity.name, ...entity.aliases].map(normalise).filter(Boolean);
-    if (variants.some((v) => hay.includes(v))) {
+    const variants = [entity.name, ...entity.aliases];
+    if (
+      variants.some((variant) =>
+        nameMentionedFromTokens(variant, hayCanonical, hayTokens, { partial: true }),
+      )
+    ) {
       names.push(entity.name);
-      continue;
     }
-    // Short-form mention: the window says "Dudley" for "Dudley Dursley".
-    // Listing the full name lets the relations call copy it exactly instead
-    // of improvising a short form the resolver would have to guess at.
-    const tokens = variants.flatMap((v) => v.split(' ')).filter((t) => t.length >= 3);
-    if (tokens.some((t) => hayWords.has(t))) names.push(entity.name);
   }
   // Finder spans ride along when a sidecar has recorded them: names the CPU
   // pointer saw in these passages, merged with the bank's names. Absent file
@@ -1631,9 +1641,6 @@ function applyFacts(
   return accepted;
 }
 
-const PROOF_TITLES = new Set(['mr', 'mrs', 'ms', 'miss', 'dr', 'professor', 'prof', 'aunt', 'uncle', 'madam', 'sir', 'dame', 'lady', 'lord']);
-const PROOF_FILLER = new Set(['and', 'the', 'she', 'his', 'her', 'you', 'our', 'for', 'are', 'was', 'were', 'has', 'have', 'had', 'that', 'this', 'with', 'from', 'they', 'them', 'its', 'our']);
-
 function proofTokens(text: string, minLen: number): Set<string> {
   return new Set(
     normalise(String(text ?? ''))
@@ -1683,6 +1690,916 @@ function proofRelevance(
     }
   }
   return true;
+}
+
+/* --------------------------------------------------- bank-aware ranking */
+
+/**
+ * One passage a caller already retrieved. Ranking only reorders these; it
+ * never drops one and never adds a passage the caller did not supply.
+ */
+export interface BankRankCandidate {
+  chunkId: number;
+  text?: string;
+  score?: number;
+}
+
+/**
+ * Weights for the shared bank-aware ranker. Tune here, not at call sites.
+ *
+ * A candidate scores as:
+ *   tier base + alias weight × alias hits + direction weight × lean
+ *     + lexical weight × lexical score
+ *
+ * Tier dominates, so a keeper always outranks a parked row and both outrank
+ * plain text. The smaller terms only order candidates inside a tier. Ranking
+ * is a reorder, never a filter: a passage with no bank backing keeps its place
+ * at the text tier, and a query that names nobody in the bank keeps its order.
+ */
+const BANK_RANK_TIER = { keeper: 3, parked: 2, mention: 1, text: 0 } as const;
+const BANK_RANK_ALIAS_WEIGHT = 0.35;
+const BANK_RANK_DIRECTION_WEIGHT = 0.35;
+const BANK_RANK_LEXICAL_WEIGHT = 0.2;
+/**
+ * Coverage of the other ends of a query's banked ties. Their aliases widen
+ * what a passage can match, but at a fraction of a directly named entity, and
+ * capped so a crowded scene cannot outrank the name the query asked about.
+ */
+const BANK_RANK_LINKED_ALIAS_WEIGHT = 0.02;
+const BANK_RANK_LINKED_ALIAS_CAP = 3;
+/** How many bank-backed chunks one query may add to a candidate pool. */
+const BANK_RANK_EXPAND_LIMIT = 40;
+
+type BankProofTier = keyof typeof BANK_RANK_TIER;
+
+interface BankRelationRow {
+  id: number;
+  fromId: number;
+  toId: number;
+  kind: string;
+  status: string;
+  chunks: number[];
+}
+
+export interface BankQueryProfile {
+  /** Query words that can name something (stopwords removed). */
+  tokens: string[];
+  /** The query as raw lowercase words, stopwords kept, for direction. */
+  words: string[];
+  /** Entities the query names directly, by name or alias. */
+  matched: Set<number>;
+  /** Entities one banked relation away from a matched entity. */
+  linked: Set<number>;
+  /** Bank tokens the query names, with exact (1) or fuzzy (0.5) weight. */
+  matchTokens: Map<string, number>;
+  /** Query tokens that linked to at least one bank token. */
+  matchedQuery: Set<string>;
+  /** Entities named by a query token that is not a relation-kind cue. */
+  named: Set<number>;
+  /** True when a correctly directed keeper already matches the exact kind. */
+  exactCue: boolean;
+  /** True when the query's content is only banked names (a name lookup). */
+  bareName: boolean;
+  /** True when the query asks for a relation (a cue matches a banked kind). */
+  bankActive: boolean;
+  /** Entity id -> first raw-word position of its name or alias. */
+  order: Map<number, number>;
+  /** Entity id -> identifying tokens of its name and aliases. */
+  entityTokens: Map<number, Set<string>>;
+  /** Relations touching a matched entity, with their proving chunks. */
+  relations: BankRelationRow[];
+}
+
+/**
+ * Map a query onto the bank: names and aliases first, then one relation hop.
+ *
+ * Nothing here reads outside the project, and nothing writes. A query that
+ * names no banked entity yields an empty profile, which is what keeps a
+ * nonsense question from surfacing a keeper.
+ */
+export function buildBankProfile(db: Db, projectId: number, query: string): BankQueryProfile {
+  const clean = (query ?? '').replace(/[’']s\b/g, '');
+  const tokens = tokenize(clean);
+  const words = (query ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9' ]+/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
+  const profile: BankQueryProfile = {
+    tokens,
+    words,
+    matched: new Set(),
+    linked: new Set(),
+    matchTokens: new Map(),
+    matchedQuery: new Set(),
+    named: new Set(),
+    exactCue: false,
+    bareName: false,
+    bankActive: false,
+    order: new Map(),
+    entityTokens: new Map(),
+    relations: [],
+  };
+  if (!tokens.length) return profile;
+
+  const rows = db.all<{ id: number; name: string; aliases: string }>(
+    'SELECT id, name, aliases FROM canon_entity WHERE project_id = ?',
+    projectId,
+  );
+  const allTokens = new Map<number, Set<string>>();
+  const frequency = new Map<string, number>();
+  for (const row of rows) {
+    const toks = proofTokens(row.name, 3);
+    for (const a of strList(row.aliases)) for (const t of proofTokens(a, 3)) toks.add(t);
+    allTokens.set(row.id, toks);
+    for (const token of toks) frequency.set(token, (frequency.get(token) ?? 0) + 1);
+  }
+  for (const [id, toks] of allTokens) {
+    profile.entityTokens.set(
+      id,
+      new Set(
+        [...toks].filter(
+          (token) =>
+            token.length >= NAME_MIN_TOKEN &&
+            (frequency.get(token) ?? 0) <= NAME_DF_CAP,
+        ),
+      ),
+    );
+  }
+
+  // Map the query's distinctive tokens onto entities. A shared surname can
+  // match several rows; that is the bank's existing ambiguity, and the ranker
+  // stays soft rather than deciding the merge here. A long token one edit
+  // away counts as the same name at half weight.
+  for (const [id, toks] of profile.entityTokens) {
+    for (const token of tokens) {
+      if (token.length < NAME_MIN_TOKEN) continue;
+      const hit = linkTokenMatch(toks, token);
+      if (!hit) continue;
+      profile.matched.add(id);
+      profile.matchedQuery.add(token);
+      const current = profile.matchTokens.get(hit.bankToken) ?? 0;
+      if (hit.weight > current) profile.matchTokens.set(hit.bankToken, hit.weight);
+    }
+  }
+  // A query made only of bank names/titles asks about the entity as a whole;
+  // a query with other content words asks something more specific and needs a
+  // matching relation kind before a banked tie can count as proof. "Where",
+  // "when", "why" and "how" ask for an attribute even when the rest is a name.
+  if (!profile.matched.size) return profile;
+  const attributeQuestion = /\b(where|when|why|how)\b/.test((query ?? '').toLowerCase());
+  profile.bareName =
+    !attributeQuestion &&
+    tokens.length > 0 &&
+    tokens.every((token) => profile.matchedQuery.has(token) || (frequency.get(token) ?? 0) > 0);
+
+  const relationRows = db.all<{
+    id: number;
+    from_entity: number;
+    to_entity: number;
+    kind: string;
+    review_status: string | null;
+    source_refs: string;
+  }>(
+    `SELECT id, from_entity, to_entity, kind, review_status, source_refs
+     FROM canon_relation WHERE project_id = ? ORDER BY id`,
+    projectId,
+  );
+  for (const row of relationRows) {
+    if (!profile.matched.has(row.from_entity) && !profile.matched.has(row.to_entity)) continue;
+    profile.linked.add(row.from_entity);
+    profile.linked.add(row.to_entity);
+    const chunks: number[] = [];
+    for (const ref of fromJson<{ chunk?: unknown }[]>(row.source_refs, [])) {
+      const chunk = Number(ref?.chunk);
+      if (Number.isFinite(chunk)) chunks.push(chunk);
+    }
+    profile.relations.push({
+      id: row.id,
+      fromId: row.from_entity,
+      toId: row.to_entity,
+      kind: row.kind,
+      status: row.review_status ?? 'accepted',
+      chunks,
+    });
+  }
+
+  // A relation kind's words are cues, not names. The set is built once so
+  // every path agrees which query words are touch tokens.
+  const cueWords = new Set<string>();
+  for (const row of relationRows) {
+    if (canonicalName(row.kind) === 'appears with') continue;
+    for (const token of answerKindTokens(row.kind)) cueWords.add(token);
+    for (const kind of inverseKinds(row.kind)) {
+      for (const token of answerKindTokens(kind)) cueWords.add(token);
+    }
+  }
+  profile.named.clear();
+  for (const [id, toks] of profile.entityTokens) {
+    for (const token of profile.tokens) {
+      if (cueWords.has(token)) continue;
+      if (linkTokenMatch(toks, token)) {
+        profile.named.add(id);
+        break;
+      }
+    }
+  }
+
+  // Raw-word position of each named entity, skipping cue words first so a
+  // title word cannot stand in for the person's actual name.
+  profile.order.clear();
+  for (const id of profile.named) {
+    const toks = profile.entityTokens.get(id);
+    if (!toks) continue;
+    let fallback = -1;
+    for (let i = 0; i < words.length; i++) {
+      const word = (words[i] ?? '').replace(/[’']s$/, '');
+      if (word.length < NAME_MIN_TOKEN) continue;
+      if (!linkTokenMatch(toks, word)) continue;
+      if (fallback < 0) fallback = i;
+      if (!cueWords.has(word)) {
+        profile.order.set(id, i);
+        break;
+      }
+    }
+    if (!profile.order.has(id) && fallback >= 0) profile.order.set(id, fallback);
+  }
+
+  profile.exactCue = profile.relations.some((relation) => {
+    if (relationTier(relation) !== 'keeper') return false;
+    if (!profile.named.has(relation.fromId) && !profile.named.has(relation.toId)) return false;
+    const hits = answerKindHits(profile, relation.kind);
+    if (hits === 0) return false;
+    return answerRelationLean(profile, relation, { kind: relation.kind, inverse: false, hits }) >= 0;
+  });
+
+  profile.bankActive =
+    profile.bareName ||
+    profile.relations.some((relation) => {
+      const shared = cueDirectionTouch(profile, relation);
+      return shared.touches && shared.cueHits > 0;
+    });
+  return profile;
+}
+
+/**
+ * What a relation is worth as proof.
+ *
+ * A keeper is confirmed (user or accepted) and states a tie. `appears_with`
+ * is a mention: two names in one passage, coverage and never evidence.
+ * Everything else is parked. Mirrors the answer rule: only keeper-grade ties
+ * may be stated.
+ */
+function relationTier(relation: BankRelationRow): BankProofTier {
+  const kind = canonicalName(relation.kind);
+  if (kind === 'appears with') return 'mention';
+  if (relation.status === 'accepted' || relation.status === 'user_confirmed') return 'keeper';
+  return 'parked';
+}
+
+/* ----------------------------------------- bank-answer cue and inverse rules */
+
+/**
+ * The role noun at the front of a relation kind: "master of" → "master",
+ * "partner with" → "partner", "married to" → "married", "partner" → "partner".
+ * Kinds only; entity names never pass through this.
+ */
+function kindHead(kind: string): string {
+  const canonical = canonicalName(kind);
+  for (const particle of KIND_PARTICLES) {
+    if (canonical.endsWith(` ${particle}`)) {
+      return canonical.slice(0, -(particle.length + 1)).trim();
+    }
+  }
+  return canonical;
+}
+
+/**
+ * One entry per unordered inverse pair. Both directions are built below, so a
+ * new pair cannot accidentally be added one-way. Bare role heads only.
+ */
+export const INVERSE_PAIRS: ReadonlyArray<readonly [string, string]> = [
+  ['master', 'apprentice'],
+  ['parent', 'child'],
+  ['parent', 'son'],
+  ['parent', 'daughter'],
+];
+
+/**
+ * Build the one-way lookup from the unordered pair list. Each side points at
+ * every partner it appears with; a shared head such as "parent" accumulates
+ * all of its children. The map and its lists are frozen at load.
+ */
+export function buildInverseMap(
+  pairs: ReadonlyArray<readonly [string, string]>,
+): ReadonlyMap<string, readonly string[]> {
+  const out = new Map<string, string[]>();
+  const link = (from: string, to: string): void => {
+    const list = out.get(from);
+    if (!list) out.set(from, [to]);
+    else if (!list.includes(to)) list.push(to);
+  };
+  for (const [left, right] of pairs) {
+    link(left, right);
+    link(right, left);
+  }
+  const frozen = new Map<string, readonly string[]>();
+  for (const [key, values] of out) frozen.set(key, Object.freeze(values));
+  return Object.freeze(frozen);
+}
+
+const KIND_INVERSES: ReadonlyMap<string, readonly string[]> = buildInverseMap(INVERSE_PAIRS);
+
+/** Kind words that can cue a relation; "of" and articles never count. */
+function answerKindTokens(kind: string): Set<string> {
+  return new Set(
+    tokenize(kindHead(kind)).filter(
+      (token) => token.length >= 3 && !ANSWER_CUE_STOPWORDS.has(token),
+    ),
+  );
+}
+
+function answerKindHits(profile: BankQueryProfile, kind: string): number {
+  const tokens = answerKindTokens(kind);
+  const query = new Set(profile.tokens);
+  return [...tokens].filter((token) => query.has(token)).length;
+}
+
+function inverseKinds(kind: string): readonly string[] {
+  return KIND_INVERSES.get(kindHead(kind)) ?? [];
+}
+
+interface AnswerCue {
+  kind: string;
+  inverse: boolean;
+  hits: number;
+}
+
+/**
+ * The kind the question actually names: the row's own kind first, then a
+ * universal inverse. "master of" therefore reaches an apprentice-of row.
+ */
+function answerCue(profile: BankQueryProfile, relation: BankRelationRow): AnswerCue | undefined {
+  const actualHits = answerKindHits(profile, relation.kind);
+  if (actualHits > 0) return { kind: relation.kind, inverse: false, hits: actualHits };
+  // A correctly directed keeper of the asked kind wins over an inverse
+  // reading. Inverse kinds are the fallback, not a second equal answer.
+  if (profile.exactCue) return undefined;
+  let best: AnswerCue | undefined;
+  for (const kind of inverseKinds(relation.kind)) {
+    const hits = answerKindHits(profile, kind);
+    if (hits > (best?.hits ?? 0)) best = { kind, inverse: true, hits };
+  }
+  return best;
+}
+
+/**
+ * Existing direction lean, with the arrow flipped when the question used the
+ * inverse kind. Still only reorders among keepers that touch a named entity.
+ */
+function answerRelationLean(
+  profile: BankQueryProfile,
+  relation: BankRelationRow,
+  cue: AnswerCue,
+): number {
+  const kindTokens = answerKindTokens(cue.kind);
+  let lean = Math.min(2, cue.hits);
+  const fromMatched = profile.named.has(relation.fromId);
+  const toMatched = profile.named.has(relation.toId);
+  if (fromMatched && toMatched) {
+    const fromOrder = profile.order.get(relation.fromId);
+    const toOrder = profile.order.get(relation.toId);
+    if (fromOrder !== undefined && toOrder !== undefined) {
+      const orderLean = fromOrder < toOrder ? 1 : -1;
+      lean += cue.inverse ? -orderLean : orderLean;
+    }
+    return lean;
+  }
+  const matchedId = fromMatched ? relation.fromId : toMatched ? relation.toId : undefined;
+  if (matchedId === undefined) return lean;
+  const side = querySideFor(profile, matchedId, kindTokens);
+  if (!side) return lean;
+  const agrees = cue.inverse
+    ? side === 'from'
+      ? matchedId === relation.toId
+      : matchedId === relation.fromId
+    : side === 'from'
+      ? matchedId === relation.fromId
+      : matchedId === relation.toId;
+  return lean + (agrees ? 1 : -2);
+}
+
+/**
+ * The shared cue/direction/touch decision.
+ *
+ * Touch means an endpoint is named by a query token that is not a relation
+ * cue. Cue hits use the kind head (particles stripped), the row's own kind
+ * first and the existing inverse pairs second. Direction uses the same grammar
+ * rules for both paths.
+ *
+ * `allowBareName` is only for the ranker's focus-name path: a query made only
+ * of names has no cue, but the ranker may still surface keeper evidence for a
+ * scene. The bank-answer line leaves it false because it must abstain when no
+ * relation was asked.
+ */
+interface CueDirectionTouch {
+  touches: boolean;
+  cueHits: number;
+  inverse: boolean;
+  lean: number;
+  /** The ranker may treat a bare-name query as evidence; the answer line may not. */
+  bare: boolean;
+}
+
+function cueDirectionTouch(
+  profile: BankQueryProfile,
+  relation: BankRelationRow,
+  allowBareName = false,
+): CueDirectionTouch {
+  const touches = profile.named.has(relation.fromId) || profile.named.has(relation.toId);
+  if (!touches) return { touches: false, cueHits: 0, inverse: false, lean: 0, bare: false };
+  const cue = answerCue(profile, relation);
+  if (!cue) {
+    return {
+      touches: true,
+      cueHits: 0,
+      inverse: false,
+      lean: 0,
+      bare: allowBareName && profile.bareName,
+    };
+  }
+  return {
+    touches: true,
+    cueHits: cue.hits,
+    inverse: cue.inverse,
+    lean: answerRelationLean(profile, relation, cue),
+    bare: false,
+  };
+}
+
+/**
+ * Which end of a "<role> of" relation the query puts a named entity on.
+ *
+ * Read from the grammar, not from book words:
+ *   "X's role"            → X is the one the role is to (`to`)
+ *   "X role" (no article) → same reading, apostrophe omitted
+ *   "X the role of"       → X has the role (`from`)
+ *   "the role of X"       → X is the one the role is to (`to`)
+ * A query that cannot be read stays neutral; direction only reorders.
+ */
+function querySideFor(
+  profile: BankQueryProfile,
+  entityId: number,
+  kindTokens: Set<string>,
+): 'from' | 'to' | undefined {
+  const position = profile.order.get(entityId);
+  if (position === undefined) return undefined;
+  const word = profile.words[position] ?? '';
+  if (/[’']s$/.test(word)) return 'to';
+  const cuePosition = profile.words.findIndex((entry) => kindTokens.has(entry));
+  if (cuePosition < 0) return undefined;
+  if (position > cuePosition) return 'to';
+  const between = profile.words.slice(position + 1, cuePosition);
+  return between.includes('the') ? 'from' : 'to';
+}
+
+/**
+ * How many of the query's names a passage actually carries.
+ *
+ * A token the query itself used to name a bank entity counts in full when the
+ * spelling is exact and at half weight when it is one typo away. The other
+ * ends of those entities' banked ties are expanded to their full alias token
+ * sets too, but at a fraction and capped: a page crowded with the queried
+ * person's associates cannot outrank the page naming the person.
+ */
+function aliasHits(profile: BankQueryProfile, text: string): number {
+  if (!text || !profile.matchTokens.size) return 0;
+  const words = new Set(tokenize(text));
+  let hits = 0;
+  for (const [token, weight] of profile.matchTokens) {
+    if (words.has(token)) hits += weight;
+  }
+  let linked = 0;
+  for (const id of profile.linked) {
+    if (profile.matched.has(id)) continue;
+    const toks = profile.entityTokens.get(id);
+    if (!toks) continue;
+    if ([...toks].some((token) => words.has(token))) linked++;
+  }
+  return hits + Math.min(linked, BANK_RANK_LINKED_ALIAS_CAP) * BANK_RANK_LINKED_ALIAS_WEIGHT;
+}
+
+/** The best proof a passage carries, and the direction lean of that proof. */
+function proofFor(profile: BankQueryProfile, chunkId: number): { tier: BankProofTier; lean: number } {
+  let tier: BankProofTier = 'text';
+  let lean = 0;
+  for (const relation of profile.relations) {
+    if (!relation.chunks.includes(chunkId)) continue;
+    const shared = cueDirectionTouch(profile, relation, true);
+    if (!shared.touches) continue;
+    if (shared.cueHits === 0 && !shared.bare) continue;
+    if (shared.lean < 0) continue;
+    const next = relationTier(relation);
+    const nextLean = shared.lean;
+    if (
+      BANK_RANK_TIER[next] > BANK_RANK_TIER[tier] ||
+      (next === tier && nextLean > lean)
+    ) {
+      tier = next;
+      lean = nextLean;
+    }
+  }
+  return { tier, lean };
+}
+
+/**
+ * Reorder retrieved passages by what the bank can prove about the query.
+ *
+ * Universal by construction: it knows only names, aliases, relation kinds,
+ * review status and source chunks. It carries no book terms and writes
+ * nothing. Callers keep their own candidate pool; this only sorts it.
+ */
+export function rankWithBank<T extends BankRankCandidate>(
+  db: Db,
+  projectId: number,
+  query: string,
+  candidates: T[],
+  providedProfile?: BankQueryProfile,
+): T[] {
+  if (candidates.length < 2) return candidates.slice();
+  const profile = providedProfile ?? buildBankProfile(db, projectId, query);
+  if (!profile.matched.size || !profile.bankActive) return candidates.slice();
+
+  const textCache = new Map<number, string>();
+  const scored = candidates.map((candidate, index) => {
+    let text = candidate.text ?? '';
+    if (!text) {
+      text = textCache.get(candidate.chunkId) ?? '';
+      if (!text) {
+        text =
+          db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', candidate.chunkId)?.text ?? '';
+        textCache.set(candidate.chunkId, text);
+      }
+    }
+    const proof = proofFor(profile, candidate.chunkId);
+    const lexical = Number.isFinite(candidate.score)
+      ? Math.max(0, Math.min(1, Number(candidate.score)))
+      : 0;
+    const score =
+      BANK_RANK_TIER[proof.tier] +
+      BANK_RANK_ALIAS_WEIGHT * aliasHits(profile, text) +
+      BANK_RANK_DIRECTION_WEIGHT * proof.lean +
+      BANK_RANK_LEXICAL_WEIGHT * lexical;
+    return { candidate, index, score };
+  });
+  scored.sort((a, b) => b.score - a.score || a.index - b.index);
+  return scored.map((entry) => entry.candidate);
+}
+
+/**
+ * Chunk ids the bank can vouch for on this query.
+ *
+ * Only relations that touch an entity the query names are returned, so a
+ * nonsense query adds nothing. Ordered by proof tier, then cue agreement,
+ * then relation id for determinism. Callers fetch the text; nothing is
+ * written and no relation is changed.
+ */
+export function bankLinkedChunkIds(
+  db: Db,
+  projectId: number,
+  query: string,
+  limit = BANK_RANK_EXPAND_LIMIT,
+  providedProfile?: BankQueryProfile,
+): number[] {
+  const profile = providedProfile ?? buildBankProfile(db, projectId, query);
+  if (!profile.matched.size || !profile.bankActive) return [];
+  const best = new Map<number, { tier: number; lean: number; relation: number }>();
+  for (const relation of profile.relations) {
+    const shared = cueDirectionTouch(profile, relation, true);
+    if (!shared.touches) continue;
+    if (shared.cueHits === 0 && !shared.bare) continue;
+    if (shared.lean < 0) continue;
+    const tier = BANK_RANK_TIER[relationTier(relation)];
+    const lean = shared.lean;
+    for (const chunk of relation.chunks) {
+      const current = best.get(chunk);
+      if (
+        !current ||
+        tier > current.tier ||
+        (tier === current.tier && lean > current.lean) ||
+        (tier === current.tier && lean === current.lean && relation.id < current.relation)
+      ) {
+        best.set(chunk, { tier, lean, relation: relation.id });
+      }
+    }
+  }
+  return [...best.entries()]
+    .sort(
+      (a, b) =>
+        b[1].tier - a[1].tier ||
+        b[1].lean - a[1].lean ||
+        a[1].relation - b[1].relation ||
+        a[0] - b[0],
+    )
+    .slice(0, limit)
+    .map(([chunkId]) => chunkId);
+}
+
+/**
+ * The bank's own answer line for an asked relation.
+ *
+ * Read-only. It reuses the same profile and ranking as retrieval, then keeps
+ * only keeper-grade, asserted relations whose kind the question names and
+ * whose arrow the question does not reverse. It never reads model prose and
+ * never joins identities: the names come from the relation row verbatim.
+ *
+ * When several keepers share the asked relation, the ranker's top proving
+ * passage decides; if that passage itself carries more than one keeper line,
+ * the result is `several` and the caller abstains.
+ */
+export interface BankAnswerResult {
+  status: 'keeper' | 'none' | 'several';
+  /** "From — kind To", bank names verbatim. */
+  line?: string;
+  quote?: string;
+  locator?: string;
+  reason?: string;
+}
+
+/**
+ * Parse the frozen status-of question shape. Shared by the answer guard and
+ * the bank answer line so both resolve the same pair.
+ */
+export function parseStatusPair(question: string): { a: string; b: string } | null {
+  const noScope = question.replace(/\s+as\s+of\s+.*$/i, '').trim();
+  const m = noScope.match(/status\s+of\s+(.+?)\s+to\s+(.+?)\s*$/i);
+  if (!m) return null;
+  const a = m[1].trim().replace(/^["'“”]+|["'“”]+$/g, '');
+  const b = m[2].trim().replace(/^["'“”]+|["'“”]+$/g, '');
+  if (!a || !b) return null;
+  return { a, b };
+}
+
+export interface PairKeeper {
+  id: number;
+  fromId: number;
+  toId: number;
+  fromName: string;
+  toName: string;
+  kind: string;
+  evidence: string;
+  modality: string;
+  reviewStatus: string;
+  locator?: string;
+}
+
+/**
+ * One keeper lookup for an explicit pair. It returns every accepted or
+ * user-confirmed row between the named sides, in either direction, keeping the
+ * guard's existing "any accepted tie" semantics. The answer line filters this
+ * to a plain relational keeper before rendering.
+ */
+export function lookupKeeperPair(
+  db: Db,
+  projectId: number,
+  a: string,
+  b: string,
+): PairKeeper[] {
+  const entities = listEntities(db, projectId);
+  const resolve = (name: string): number[] => {
+    const q = (name ?? '').trim().toLowerCase();
+    return entities
+      .filter(
+        (e) =>
+          e.name.toLowerCase() === q ||
+          e.aliases.some((alias) => alias.toLowerCase() === q),
+      )
+      .map((e) => e.id);
+  };
+  const idsA = resolve(a);
+  const idsB = resolve(b);
+  if (!idsA.length || !idsB.length) return [];
+  if (idsA.some((id) => idsB.includes(id))) return [];
+  const placeholders = (ids: number[]): string => ids.map(() => '?').join(',');
+  const rows = db.all<{
+    id: number;
+    from_entity: number;
+    to_entity: number;
+    from_name: string;
+    to_name: string;
+    kind: string;
+    evidence: string;
+    modality: string | null;
+    review_status: string | null;
+    source_refs: string;
+  }>(
+    `SELECT r.id, r.from_entity, r.to_entity, a.name AS from_name, b.name AS to_name,
+            r.kind, r.evidence, r.modality, r.review_status, r.source_refs
+     FROM canon_relation r
+     JOIN canon_entity a ON a.id = r.from_entity
+     JOIN canon_entity b ON b.id = r.to_entity
+     WHERE r.project_id = ?
+       AND r.review_status IN ('accepted','user_confirmed')
+       AND ((r.from_entity IN (${placeholders(idsA)}) AND r.to_entity IN (${placeholders(idsB)}))
+         OR (r.from_entity IN (${placeholders(idsB)}) AND r.to_entity IN (${placeholders(idsA)})))
+     ORDER BY r.id`,
+    projectId,
+    ...idsA,
+    ...idsB,
+    ...idsB,
+    ...idsA,
+  );
+  const chunkIds = rows.flatMap((row) =>
+    fromJson<{ chunk?: unknown }[]>(row.source_refs, [])
+      .map((ref) => Number(ref?.chunk))
+      .filter((id) => Number.isFinite(id)),
+  );
+  const locators = new Map(
+    (chunkIds.length
+      ? db.all<{ id: number; locator: string }>(
+          `SELECT id, locator FROM canon_chunk WHERE project_id = ?
+           AND id IN (${[...new Set(chunkIds)].map(() => '?').join(',')})`,
+          projectId,
+          ...[...new Set(chunkIds)],
+        )
+      : []
+    ).map((row) => [row.id, row.locator]),
+  );
+  return rows.map((row) => {
+    const chunk = fromJson<{ chunk?: unknown }[]>(row.source_refs, [])
+      .map((ref) => Number(ref?.chunk))
+      .find((id) => Number.isFinite(id));
+    return {
+      id: row.id,
+      fromId: row.from_entity,
+      toId: row.to_entity,
+      fromName: row.from_name,
+      toName: row.to_name,
+      kind: row.kind,
+      evidence: row.evidence,
+      modality: row.modality ?? 'asserted',
+      reviewStatus: row.review_status ?? 'accepted',
+      ...(chunk !== undefined && locators.has(chunk) ? { locator: locators.get(chunk)! } : {}),
+    };
+  });
+}
+
+export function bankAnswerForQuestion(
+  db: Db,
+  projectId: number,
+  question: string,
+  providedProfile?: BankQueryProfile,
+): BankAnswerResult {
+  const pair = parseStatusPair(question);
+  if (pair) {
+    const rows = lookupKeeperPair(db, projectId, pair.a, pair.b).filter(
+      (row) =>
+        canonicalName(row.kind) !== 'appears with' &&
+        (row.modality ?? 'asserted') === 'asserted',
+    );
+    if (!rows.length) {
+      return { status: 'none', reason: 'The bank holds no keeper for this pair.' };
+    }
+    const directed = directedPairStatus(db, projectId, rows[0]!.fromId, rows[0]!.toId);
+    const currentId = directed.forward.current?.id ?? directed.reverse.current?.id;
+    const row = rows.find((candidate) => candidate.id === currentId) ?? rows[0]!;
+    return {
+      status: 'keeper',
+      line: `${row.fromName} — ${row.kind} ${row.toName}`,
+      quote: row.evidence,
+      ...(row.locator ? { locator: row.locator } : {}),
+    };
+  }
+
+  const profile = providedProfile ?? buildBankProfile(db, projectId, question);
+  if (!profile.named.size) {
+    return { status: 'none', reason: 'No banked name matches this question.' };
+  }
+  if (!profile.bankActive) {
+    return { status: 'none', reason: 'The question does not name a banked relation.' };
+  }
+
+  const rows = db.all<{
+    id: number;
+    from_id: number;
+    to_id: number;
+    from_name: string;
+    to_name: string;
+    kind: string;
+    evidence: string;
+    modality: string | null;
+    review_status: string | null;
+  }>(
+    `SELECT r.id, r.from_entity AS from_id, r.to_entity AS to_id,
+            a.name AS from_name, b.name AS to_name, r.kind, r.evidence, r.modality,
+            r.review_status
+     FROM canon_relation r
+     JOIN canon_entity a ON a.id = r.from_entity
+     JOIN canon_entity b ON b.id = r.to_entity
+     WHERE r.project_id = ?`,
+    projectId,
+  );
+  const rowById = new Map(rows.map((row) => [row.id, row]));
+
+  const keepers: BankRelationRow[] = [];
+  for (const relation of profile.relations) {
+    if (relationTier(relation) !== 'keeper') continue;
+    const shared = cueDirectionTouch(profile, relation);
+    if (!shared.touches || shared.cueHits === 0) continue;
+    if (shared.lean < 0) continue;
+    const row = rowById.get(relation.id);
+    if (!row || (row.modality ?? 'asserted') !== 'asserted') continue;
+    keepers.push(relation);
+  }
+  if (!keepers.length) {
+    return { status: 'none', reason: 'The bank holds no keeper for this relation.' };
+  }
+
+  // Score the keeper passages with the same bank ranker Ask uses.
+  const chunkIds = [...new Set(keepers.flatMap((relation) => relation.chunks))];
+  const chunkRows = chunkIds.length
+    ? db.all<{ id: number; text: string; locator: string }>(
+        `SELECT id, text, locator FROM canon_chunk
+         WHERE project_id = ? AND id IN (${chunkIds.map(() => '?').join(',')})`,
+        projectId,
+        ...chunkIds,
+      )
+    : [];
+  const textById = new Map(chunkRows.map((row) => [row.id, row.text]));
+  const locatorById = new Map(chunkRows.map((row) => [row.id, row.locator]));
+  const candidates: { chunkId: number; text: string; relationId: number; score?: number }[] = [];
+  const seen = new Set<string>();
+  for (const relation of keepers) {
+    for (const chunkId of relation.chunks) {
+      const key = `${relation.id}:${chunkId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidates.push({ chunkId, text: textById.get(chunkId) ?? '', relationId: relation.id });
+    }
+  }
+  if (!candidates.length) {
+    return { status: 'none', reason: 'The keeper rows carry no proving passage.' };
+  }
+
+  // Match the lexical scores Ask gives these passages: only chunks inside the
+  // normal candidate pool carry an FTS score; a bank-expanded keeper starts at
+  // zero, exactly as it does in searchCanon.
+  const match = profile.tokens
+    .filter((token) => /^[a-z0-9']+$/.test(token))
+    .map((token) => `"${token}"`)
+    .join(' OR ');
+  const lexical = new Map<number, number>();
+  if (match) {
+    try {
+      const rows = db.all<{ id: number; rank: number }>(
+        `SELECT c.id, bm25(canon_chunk_fts) AS rank
+         FROM canon_chunk_fts
+         JOIN canon_chunk c ON c.id = canon_chunk_fts.rowid
+         WHERE canon_chunk_fts MATCH ? AND c.project_id = ?
+         ORDER BY rank LIMIT ?`,
+        match,
+        projectId,
+        SEARCH_CANDIDATE_POOL,
+      );
+      for (const row of rows) lexical.set(row.id, lexicalScore(Number(row.rank ?? 0)));
+    } catch {
+      // A malformed FTS query simply leaves the bank candidates unscored.
+    }
+  }
+  for (const candidate of candidates) candidate.score = lexical.get(candidate.chunkId) ?? 0;
+  // searchCanon sorts by this score before ranking; a bank-expanded keeper
+  // (score 0) therefore sits ahead of a weak FTS hit with a negative score.
+  candidates.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+
+  const ranked = rankWithBank(db, projectId, question, candidates, profile);
+  const top = ranked[0]!;
+  const lines = new Set<string>();
+  for (const candidate of ranked) {
+    if (candidate.chunkId !== top.chunkId) continue;
+    const row = rowById.get(candidate.relationId);
+    if (row) lines.add(`${row.from_name} — ${row.kind} ${row.to_name}`);
+  }
+  if (lines.size !== 1) {
+    return {
+      status: 'several',
+      reason: 'The top banked passage carries more than one keeper for this relation.',
+    };
+  }
+
+  const row = rowById.get(top.relationId)!;
+  // Reuse the same directed status the ties view uses: a superseded row is
+  // not the current tie, even if it is still a keeper.
+  const directed = directedPairStatus(db, projectId, row.from_id, row.to_id);
+  if (directed.forward.current?.id !== top.relationId) {
+    return { status: 'none', reason: 'The bank holds no current keeper for this relation.' };
+  }
+  const locator = locatorById.get(top.chunkId);
+  return {
+    status: 'keeper',
+    line: `${row.from_name} — ${row.kind} ${row.to_name}`,
+    quote: row.evidence,
+    ...(locator ? { locator } : {}),
+  };
 }
 
 /**
@@ -2316,49 +3233,6 @@ function normalise(text: string): string {
     .replace(/[^a-z0-9' ]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-}
-
-/**
- * A name reduced to what it is safe to compare on.
- *
- * Case, possessives, a leading article and punctuation are noise; a plural is
- * not, so "Dursley" and "Dursleys" is handled separately and a name is never
- * singularised on its own ("James" must not become "Jame").
- */
-export function canonicalName(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/[’']s\b/g, '')
-    .replace(/^(the|a|an)\s+/, '')
-    .replace(/[^a-z0-9' ]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-export function nameTokens(name: string): string[] {
-  return canonicalName(name).split(' ').filter(Boolean);
-}
-
-/**
- * How two names relate, deterministically.
- *
- *  - same:          the same name up to case, possessives and a plural
- *  - containment:   every word of the shorter name is in the longer one
- *  - null:          not a variant by rule
- */
-export function nameRelation(a: string, b: string): 'same' | 'containment' | null {
-  const ka = canonicalName(a);
-  const kb = canonicalName(b);
-  if (!ka || !kb) return null;
-  if (ka === kb) return 'same';
-  if (ka === `${kb}s` || kb === `${ka}s`) return 'same';
-  const ta = nameTokens(a);
-  const tb = nameTokens(b);
-  if (ta.length !== tb.length) {
-    const [short, long] = ta.length < tb.length ? [ta, tb] : [tb, ta];
-    if (short.length && short.every((t) => long.includes(t))) return 'containment';
-  }
-  return null;
 }
 
 /**
@@ -3576,17 +4450,6 @@ export function linkTimelineToEvents(
  * filler labels plus the action bucket, never from any one book: meeting,
  * giving, telling, seeing, wishing and refusing are moments everywhere.
  */
-const MOMENT_WORDS = new Set(
-  ('met meet gave give told tell saw see heard hear wished wish refused refuse ' +
-    'offered offer asked ask asks winked winks wink annoyed annoy punished punish ' +
-    'target follower follow questioned question explained explain disagreed disagree ' +
-    'comforted comfort admired admire disappointed disappoint proud shook shake ' +
-    'dropped drop talking talk rumored rumor signalled signaled signal watched watch ' +
-    'knows knew know known observed observe seen afraid frightened feared fear fears scared ' +
-    'killed kill kills killing murdered murder murders murdering assassinated assassinate assassinates assassinating')
-    .split(' '),
-);
-
 /** A generic kinship word drops when the same pair holds the specific one:
  * "parent of" says nothing once "father of" is banked. Universal sets only:
  * every generic maps to the specific words that entail it. */
@@ -3769,12 +4632,21 @@ function resolveShortName(db: Db, projectId: number, clean: string): number | un
 
 /* ------------------------------------------------------------- retrieval */
 
-export function listEntities(db: Db, projectId: number, kind?: EntityKind): CanonEntity[] {
+export function listEntities(
+  db: Db,
+  projectId: number,
+  kind?: EntityKind,
+  statuses?: readonly string[],
+): CanonEntity[] {
   const params: unknown[] = [projectId];
   let sql = 'SELECT * FROM canon_entity WHERE project_id = ?';
   if (kind) {
     sql += ' AND kind = ?';
     params.push(kind);
+  }
+  if (statuses?.length) {
+    sql += ` AND review_status IN (${statuses.map(() => '?').join(',')})`;
+    params.push(...statuses);
   }
   sql += ' ORDER BY kind, name';
   const rows = db.all<{
@@ -3809,7 +4681,24 @@ export function listEntities(db: Db, projectId: number, kind?: EntityKind): Cano
   }));
 }
 
-export function listRelations(db: Db, projectId: number): CanonRelation[] {
+export function listRelations(
+  db: Db,
+  projectId: number,
+  statuses?: readonly string[],
+): CanonRelation[] {
+  const params: unknown[] = [projectId];
+  let sql = `SELECT r.id, r.from_entity, r.to_entity, r.kind, r.description, r.evidence,
+            a.name AS from_name, b.name AS to_name, r.modality, r.conflict_status,
+            r.ledger_state, r.scope, r.review_status
+     FROM canon_relation r
+     JOIN canon_entity a ON a.id = r.from_entity
+     JOIN canon_entity b ON b.id = r.to_entity
+     WHERE r.project_id = ?`;
+  if (statuses?.length) {
+    sql += ` AND r.review_status IN (${statuses.map(() => '?').join(',')})`;
+    params.push(...statuses);
+  }
+  sql += ' ORDER BY r.id';
   const rows = db.all<{
     id: number;
     from_entity: number;
@@ -3825,14 +4714,8 @@ export function listRelations(db: Db, projectId: number): CanonRelation[] {
     scope: string | null;
     review_status: string | null;
   }>(
-    `SELECT r.id, r.from_entity, r.to_entity, r.kind, r.description, r.evidence,
-            a.name AS from_name, b.name AS to_name, r.modality, r.conflict_status,
-            r.ledger_state, r.scope, r.review_status
-     FROM canon_relation r
-     JOIN canon_entity a ON a.id = r.from_entity
-     JOIN canon_entity b ON b.id = r.to_entity
-     WHERE r.project_id = ? ORDER BY r.id`,
-    projectId,
+    sql,
+    ...params,
   );
   return rows.map((r) => ({
     id: r.id,
@@ -4151,8 +5034,9 @@ export function formatLoreBrief(brief: LoreBrief): string {
 /**
  * Find the lore entry a name refers to, exactly.
  *
- * Loose search is useful for questions ("what does the warden know") but
- * wrong for a person: "Harry Potter" must not return Aunt Petunia.
+ * IDENTITY policy: exact name, exact alias, or a fuller name with the asked
+ * name as a whole prefix. This deliberately does not use LINK/fuzzy matching;
+ * a question may be loose, but identity and merge decisions must not be.
  */
 export function findEntity(db: Db, projectId: number, name: string): CanonEntity | undefined {
   const clean = (name ?? '').trim().toLowerCase();
@@ -4180,28 +5064,36 @@ export function searchLore(db: Db, projectId: number, query: string, limit = 10)
 } {
   const q = query.trim().toLowerCase();
   if (!q) return { entities: [], relations: [], facts: [], timeline: [] };
-  const words = q.split(/[^a-z0-9']+/).filter((w) => w.length > 2);
+  const allEntities = listEntities(db, projectId, undefined, ['accepted', 'user_confirmed']);
+  const tokenDf = new Map<string, number>();
+  for (const entity of allEntities) {
+    const tokens = new Set<string>();
+    for (const variant of [entity.name, ...entity.aliases]) {
+      for (const token of canonicalName(variant).split(' ')) {
+        if (token.length >= NAME_MIN_TOKEN) tokens.add(token);
+      }
+    }
+    for (const token of tokens) tokenDf.set(token, (tokenDf.get(token) ?? 0) + 1);
+  }
+  const words = tokenize(q).filter((word) => (tokenDf.get(word) ?? 0) <= NAME_DF_CAP);
+  if (!words.length) return { entities: [], relations: [], facts: [], timeline: [] };
+  const matches = (hay: string): boolean => linkTokensMatch(words, textTokenSet(hay));
 
-  const entities = listEntities(db, projectId).filter((e) => {
+  const entities = allEntities.filter((e) => {
     if (e.reviewStatus !== 'accepted' && e.reviewStatus !== 'user_confirmed') return false;
-    const hay = `${e.name} ${e.aliases.join(' ')} ${e.summary} ${e.role}`.toLowerCase();
-    return words.some((w) => hay.includes(w));
+    return matches(`${e.name} ${e.aliases.join(' ')} ${e.summary} ${e.role}`);
   });
 
-  const rels = listRelations(db, projectId).filter((r) => {
-    if (r.reviewStatus !== 'accepted' && r.reviewStatus !== 'user_confirmed') return false;
-    const hay = `${r.fromName} ${r.toName} ${r.kind} ${r.description}`.toLowerCase();
-    return words.some((w) => hay.includes(w));
+  const rels = listRelations(db, projectId, ['accepted', 'user_confirmed']).filter((r) => {
+    return matches(`${r.fromName} ${r.toName} ${r.kind} ${r.description}`);
   });
 
   const facts = listFacts(db, projectId).filter((f) => {
-    const hay = `${f.topic} ${f.statement} ${f.subject}`.toLowerCase();
-    return words.some((w) => hay.includes(w));
+    return matches(`${f.topic} ${f.statement} ${f.subject}`);
   });
 
   const timeline = listTimeline(db, projectId).filter((t) => {
-    const hay = `${t.title} ${t.summary} ${t.participants.join(' ')} ${t.location}`.toLowerCase();
-    return words.some((w) => hay.includes(w));
+    return matches(`${t.title} ${t.summary} ${t.participants.join(' ')} ${t.location}`);
   });
 
   return {

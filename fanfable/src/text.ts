@@ -1,4 +1,18 @@
 /** Small text utilities shared by import, retrieval and continuity checking. */
+import { STOPWORDS } from './vocab.ts';
+
+/**
+ * Convert a SQLite FTS5 bm25 rank into a 0..1 lexical score where higher is
+ * a stronger match. FTS5 ranks are lower (more negative) for better matches;
+ * the old `1 / (1 + rank)` inverted that below -1. This keeps the order
+ * monotonic and bounded without changing any caller's sort direction.
+ */
+export function lexicalScore(bm25Rank: number): number {
+  const rank = Number(bm25Rank);
+  if (!Number.isFinite(rank) || rank >= 0) return 0;
+  const strength = -rank;
+  return strength / (1 + strength);
+}
 
 export function wordCount(text: string): number {
   const t = (text ?? '').trim();
@@ -17,14 +31,6 @@ export function splitSentences(text: string): string[] {
   }
   return out;
 }
-
-export const STOPWORDS = new Set(
-  ('a an the and or but if then else of to in on at by for with from as is are was were be been being ' +
-    'it its this that these those he she they them his her their we you i not no so such than too very ' +
-    'can will just don should now do does did have has had into over under again more most other some ' +
-    'what which who whom when where why how all any both each few own same s t d ll m o re ve y')
-    .split(' '),
-);
 
 export function tokenize(text: string): string[] {
   return (text ?? '')
