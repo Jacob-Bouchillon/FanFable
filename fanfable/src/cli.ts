@@ -139,6 +139,9 @@ ${C.bold('SOURCE MATERIAL')}
   lore hints [--limit n]           List ties whose endpoints are not in the bank
   lore link-facts [--dry-run] [--limit n]  Attach fact subjects to entities
   lore capacity [--dry-run] [--limit n]  Park unproven entities, funnel proven nouns
+  lore rulings export [--out path]  Export keepers, note rulings and alias identities by name
+  lore rulings replay --in path [--write] [--dry-run] [--limit n]
+                           Reapply an exported ruling file to this project
   lore ties --from A --to B [--at n]  What two people are to each other now, and before
   lore merge                       Merge entries that are the same under two names
   lore judge-aliases [--max n]     Rule on quarantined nickname pairs (one model call)
@@ -641,6 +644,58 @@ async function cmdLore(args: Args): Promise<void> {
       `scanned ${result.scanned}, parked ${result.parked}, funneled ${result.funneled}, skipped ${result.skipped}, skippedReferenced ${result.skippedReferenced}`,
     );
     return;
+  }
+
+  if (sub === 'rulings') {
+    const action = args._[2] ?? '';
+    if (action === 'export') {
+      const out = resolve(flagString(args, 'out') || 'testing/trials/rulings-export.json');
+      const payload = lorebook.exportRulings(db, project.id);
+      mkdirSync(dirname(out), { recursive: true });
+      writeFileSync(out, `${JSON.stringify(payload, null, 2)}\n`);
+      heading('Rulings export');
+      console.log(`  project ${C.bold(payload.counters.project)}`);
+      console.log(
+        `  keepers ${payload.counters.keepers}, note_rulings ${payload.counters.note_rulings}, identities ${payload.counters.identities}`,
+      );
+      console.log(C.dim(`  wrote ${out}`));
+      return;
+    }
+    if (action === 'replay') {
+      const input = flagString(args, 'in');
+      if (!input) throw new Error('--in <path> required');
+      const inputPath = resolve(input);
+      let raw: unknown;
+      try {
+        raw = JSON.parse(readFileSync(inputPath, 'utf8'));
+      } catch (err) {
+        throw new Error(`cannot read rulings export at ${inputPath}: ${(err as Error).message}`);
+      }
+      const write = args.flags.write === true && args.flags['dry-run'] !== true;
+      const limit = args.flags.limit === undefined
+        ? undefined
+        : Math.max(0, Math.floor(flagNumber(args, 'limit', 0)));
+      const result = lorebook.replayRulings(db, project.id, raw, { write, limit });
+      heading(write ? 'Rulings replay' : 'Rulings replay (dry run)');
+      const table: [string, lorebook.RulingReplayCategory][] = [
+        ['keepers', result.keepers],
+        ['note_rulings', result.note_rulings],
+        ['identities', result.identities],
+        ['total', result.total],
+      ];
+      for (const [label, row] of table) {
+        console.log(
+          `  ${label.padEnd(12)} total ${row.total}, resolved ${row.resolved}, applied ${row.applied}, ` +
+            `already_present ${row.already_present}, unresolved ${row.unresolved}`,
+        );
+      }
+      for (const issue of result.issues) {
+        const kind = issue.kind ? ` (${issue.kind})` : '';
+        console.log(`  ${C.yellow('unresolved')} ${issue.category} ${issue.from} -> ${issue.to}${kind}: ${issue.reason}`);
+      }
+      return;
+    }
+    throw new Error('rulings action required: export or replay');
   }
 
   if (sub === 'link-facts') {
