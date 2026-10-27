@@ -224,7 +224,11 @@ function requireProject(args: Args): controller.Project {
 
 function app(args: Args): controller.App {
   const project = requireProject(args);
-  return new controller.App(db, project.id, clientFrom(project.settings));
+  // A --model flag wins everywhere, same as the extract command's override.
+  // Without it the project (then global, then built-in) default applies.
+  const m = flagString(args, 'model');
+  const settings = m ? { ...(project.settings as object), model: m } : project.settings;
+  return new controller.App(db, project.id, clientFrom(settings));
 }
 
 function flagString(args: Args, name: string, fallback = ''): string {
@@ -305,8 +309,10 @@ async function cmdProject(args: Args): Promise<void> {
       const temp = flagNumber(args, 'temperature', NaN);
       if (Number.isFinite(temp)) patch.temperature = temp;
       if (Object.keys(patch).length) {
-        controller.updateProjectSettings(db, p.id, patch);
+        const updated = controller.updateProjectSettings(db, p.id, patch);
         console.log(`Updated settings for ${C.bold(p.name)}`);
+        console.log(JSON.stringify({ ...DEFAULT_LLM_SETTINGS, ...loadGlobalConfig(), ...updated.settings }, null, 2));
+        return;
       }
       console.log(JSON.stringify({ ...DEFAULT_LLM_SETTINGS, ...loadGlobalConfig(), ...p.settings }, null, 2));
       return;
@@ -703,6 +709,13 @@ async function cmdLore(args: Args): Promise<void> {
       `${C.green('added')} ${result.relations} relations, ${result.facts} facts ` +
         `from ${result.passages} passages (new entries are marked as needing review)`,
     );
+    const d = result.dropped ?? {};
+    const droppedTotal = Object.values(d).reduce((a, b) => a + (b as number), 0);
+    if (droppedTotal > 0) {
+      console.log(
+        `  ${C.dim(`dropped: ${Object.entries(d).filter(([, n]) => (n as number) > 0).map(([k, n]) => `${n} ${k}`).join(', ')}`)}`,
+      );
+    }
     return;
   }
 
@@ -1052,17 +1065,21 @@ async function cmdPlan(args: Args): Promise<void> {
     const chapterNumber = args.flags.chapter ? Number(args.flags.chapter) : undefined;
     heading(`Revising outline v${current.version}${chapterNumber ? ` (chapter ${chapterNumber})` : ''}`);
     const revised = await planner.reviseOutline(a.llm, current, instruction, { chapterNumber });
-    // Keep the approved material: only the parts the model changed are updated.
-    const updated = planner.updateOutline(db, project.id, current.id, {
+    // A revision is a new draft version, never an overwrite: history is kept,
+    // and the approved material stays official until the new draft is approved.
+    const updated = planner.saveOutline(db, project.id, {
       premise: revised.premise,
       divergence: revised.divergence,
+      divergenceRef: revised.divergenceRef,
+      canonRefs: revised.canonRefs,
       structure: revised.structure,
       chapters: revised.chapters,
       preferences: revised.preferences,
+      status: 'draft',
     });
     printOutline(updated);
     console.log(
-      `\n${C.dim('Approved chapters that were not targeted were left unchanged. Re-approve to make the revision official.')}`,
+      `\n${C.dim(`Saved as a new draft (v${updated.version}); the approved v${current.version} is untouched. Re-approve to make the revision official.`)}`,
     );
     return;
   }

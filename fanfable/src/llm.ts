@@ -61,6 +61,9 @@ export interface ChatRequest {
   temperature?: number;
   maxTokens?: number;
   stop?: string[];
+  /** Ask Ollama for constrained JSON output. Off by default; extraction
+   *  calls opt in. Only shapes the output, never the content. */
+  format?: 'json';
 }
 
 export interface ChatResponse {
@@ -207,6 +210,7 @@ class OllamaProvider implements LlmClient {
           model: this.settings.model,
           messages,
           stream: true,
+          ...(req.format ? { format: req.format } : {}),
           ...(this.settings.think !== undefined ? { think: this.settings.think } : {}),
           options: {
             temperature: req.temperature ?? this.settings.temperature,

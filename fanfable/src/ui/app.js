@@ -371,7 +371,7 @@ async function viewLore() {
       <div class="card">
         <div class="field">
           <label class="field-label" for="lore-question">Question about the source material</label>
-          <textarea class="input" id="lore-question" placeholder="Who is Kade, and what does he know about the wardens?"></textarea>
+          <textarea class="input" id="lore-question" placeholder="Who is the mentor, and what do they know about the crossing?"></textarea>
         </div>
         <div class="row" style="margin-top:var(--s3)">
           <button class="btn btn-primary" id="lore-ask">Ask</button>

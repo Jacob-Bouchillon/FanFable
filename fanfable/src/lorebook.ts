@@ -1828,8 +1828,8 @@ function applyRelations(
     }
     const misattached = thirdParty && !bothNamed;
     // A quote naming neither endpoint proves nothing about the pair, even
-    // with no third party in it ("Thus are lasting partnerships solidified"
-    // for a Plagueis → Damask tie). Pending, never accepted: pronoun and
+    // with no third party in it ("thus are lasting partnerships solidified"
+    // for a tie between two named people). Pending, never accepted: pronoun and
     // scene color can be re-proved, but they must not bank.
     const anyNamed = [fromId, toId].some((id) =>
       [...(roster.get(id) ?? [])].some((t) => proofTokens(span.quote, 3).has(t)),

@@ -421,17 +421,21 @@ const ENRICH_SYSTEM = `You are re-reading passages about one person or thing, be
 
 Reply with JSON only:
 {
-  "relations": [{"other":"Name","kind":"one short phrase, such as 'sister of'","description":"one sentence","quote":"an exact phrase from the passage"}],
+  "relations": [{"other":"a DIFFERENT name from the passages, never the subject above","kind":"a real relationship word, such as 'ally of', 'member of', 'sibling of'","direction":"outgoing if the SUBJECT has the tie to other (Valorum leads X), incoming if OTHER has the tie to the subject (X serves Valorum)","description":"one sentence","quote":"an exact phrase from the passage"}],
   "facts": [{"topic":"subject of the fact","statement":"what the source establishes","quote":"an exact phrase from the passage"}],
   "knowledge": [{"other":"Name","fact":"what this person knows or believes","certainty":"knows|believes|suspects|misunderstands"}]
 }
 
 Rules:
 - Only record what the passages state. Do not infer, and do not use general knowledge about the book.
-- "other" must be a name that appears in the passages.
-- The direction matters: if A is the sister of B, the relation is from A to B.
-- "quote" must be an exact phrase from the passage.
-- If the passages say nothing new, return empty arrays.`;
+- "other" must be a name that appears in the passages, and never the subject named above: a tie to self is not a tie.
+- Write a real relationship word for "kind" — copy the pattern, never the schema's example text.
+- The direction matters: outgoing means the subject has the tie to other (Valorum leads the faction); incoming means other has the tie to the subject (Pestage serves Valorum). Set it from the passage, never by default.
+- "quote" must be a phrase copied VERBATIM from the passage, long enough to state the tie on its own (a name plus the tie word), not your own words and not a two-word fragment.
+- A noun tie must be spoken in its quote: sister, brother, father and their kin only count when the proving sentence says the word. Never infer one.
+- Record only a lasting tie the passages state explicitly. A moment happens once (met, gave, told, saw) and is never a tie, even when stated.
+- Be exhaustive, not representative: list EVERY lasting tie and fact the passages state — a long list is good while a missed tie is bad. Do not stop after the first entry. When in doubt, include it with its quote.
+- If the passages truly state nothing, return empty arrays — but emptiness is the rare exception, not the default.`;
 
 /**
  * Re-read the passages that mention an entity and record what is missing.
@@ -455,7 +459,7 @@ export async function enrichEntity(
      */
     handoffPath?: string;
   } = {},
-): Promise<{ relations: number; facts: number; knowledge: number; passages: number }> {
+): Promise<{ relations: number; facts: number; knowledge: number; passages: number; dropped: Record<string, number> }> {
   const entity = lorebook.findEntity(db, projectId, name);
   if (!entity) throw new Error(`"${name}" is not in the lore index`);
   const names = [entity.name, ...entity.aliases];
@@ -491,7 +495,7 @@ export async function enrichEntity(
     }
   }
   const passages = ordered.slice(0, opts.maxPassages ?? 12);
-  if (!passages.length) return { relations: 0, facts: 0, knowledge: 0, passages: 0 };
+  if (!passages.length) return { relations: 0, facts: 0, knowledge: 0, passages: 0, dropped: {} };
 
   const existing = db.all<{ from_entity: number; to_entity: number; kind: string }>(
     'SELECT from_entity, to_entity, kind FROM canon_relation WHERE project_id = ?',
@@ -502,6 +506,7 @@ export async function enrichEntity(
   let relations = 0;
   let facts = 0;
   let knowledge = 0;
+  const dropped = { self: 0, unknown: 0, empty: 0, unparseable: 0, duplicate: 0 };
 
   // Read in windows so the model is not asked to cover everything at once.
   const windowSize = 4;
@@ -510,8 +515,9 @@ export async function enrichEntity(
     opts.onProgress?.(`reading passages ${start + 1}-${start + window.length} of ${passages.length}`);
 
     let parsed: Record<string, unknown>;
+    let res: { text: string };
     try {
-      const res = await llm.chat({
+      res = await llm.chat({
         system: ENRICH_SYSTEM,
         messages: [
           {
@@ -523,11 +529,19 @@ export async function enrichEntity(
                 .join('\n\n'),
           },
         ],
-        temperature: 0.1,
-        maxTokens: 1600,
+        temperature: 0,
+        maxTokens: 3000,
+        format: 'json',
       });
+    } catch (e) {
+      dropped.unparseable++;
+      console.error(`  [enrich] window starting at passage ${start + 1} failed: ${String(e).slice(0, 160)}`);
+      continue;
+    }
+    try {
       parsed = extractJson<Record<string, unknown>>(res.text) ?? {};
     } catch {
+      dropped.unparseable++;
       continue;
     }
 
@@ -537,18 +551,21 @@ export async function enrichEntity(
     for (const rel of asArray(parsed.relations)) {
       const otherName = String(rel.other ?? '').trim();
       const kind = String(rel.kind ?? '').trim().toLowerCase();
-      if (!otherName || !kind) continue;
+      if (!otherName || !kind) { dropped.empty++; continue; }
       const other = lorebook.findEntity(db, projectId, otherName);
-      if (!other || other.id === entity.id) continue;
-      const key = `${entity.id}:${other.id}:${kind}`;
-      if (have.has(key)) continue;
+      if (!other) { dropped.unknown++; continue; }
+      if (other.id === entity.id) { dropped.self++; continue; }
+      const incoming = String(rel.direction ?? 'outgoing').trim().toLowerCase() !== 'outgoing';
+      const [fromId, toId] = incoming ? [other.id, entity.id] : [entity.id, other.id];
+      const key = `${fromId}:${toId}:${kind}`;
+      if (have.has(key)) { dropped.duplicate++; continue; }
       have.add(key);
       db.run(
         `INSERT OR IGNORE INTO canon_relation (project_id, from_entity, to_entity, kind, description, evidence, source_refs, confidence, review_status, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         projectId,
-        entity.id,
-        other.id,
+        fromId,
+        toId,
         kind,
         String(rel.description ?? '').trim(),
         String(rel.quote ?? '').trim(),
@@ -586,7 +603,7 @@ export async function enrichEntity(
     }
   }
 
-  return { relations, facts, knowledge, passages: passages.length };
+  return { relations, facts, knowledge, passages: passages.length, dropped };
 }
 
 /* ------------------------------------------------------------- corrections */

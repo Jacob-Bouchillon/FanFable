@@ -279,7 +279,7 @@ export async function draftOutline(llm: LlmClient, req: PlanRequest): Promise<Om
   const res = await llm.chat({
     system: PLANNER_SYSTEM,
     messages: [{ role: 'user', content: user }],
-    temperature: 0.7,
+    temperature: 0.3,
     // An outline for a whole story is long. A model that writes more than the
     // default gets the room it needs; the rest are unaffected.
     maxTokens: Math.max(4000, llm.settings.maxTokens ?? 0),

@@ -14,7 +14,10 @@ Locked with the user. Plain words win over code words.
 - **passage** — one chunk of the book (~220 words).
 - **window** — 8 passages read together by the reader.
 - **bank** — saved readings (people, ties, quotes); status says what each row is worth.
-- **keeper** — a tie the strict checker confirmed with exact quotes.
+- **keeper** — a tie the strict checker confirmed with exact quotes, or that you confirmed with your word plus a quote (user-confirmed).
+- **defined relationship** — the only grade answers may state: a closed kind (aide of, master of, sibling of, ally of, lover of…), banked as keeper. If it isn't keeper-grade, it isn't stated.
+- **mention** — an `appears_with` edge: two names in one passage, no relationship claimed. Coverage, never evidence. Parked-grade by default, invisible to answers.
+- **lover** — an intimate tie, not married. Spouse means married; the words are not interchangeable — N44 was filed as spouse and corrected.
 - **parked** — a tie candidate held back, with a note saying why. Invisible to answers, never deleted.
 - **thin name** — a person with no saved ties.
 

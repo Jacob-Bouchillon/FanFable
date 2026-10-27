@@ -189,8 +189,8 @@ const IDENTITY_CLAIM_RES: RegExp[] = [
 
 /**
  * Bare copula ("X is Y") without an "also known as"-style marker.
- * Guarded: Y must read as a bare name, not name-plus-role ("Darth
- * Sidious's apprentice" is a relation phrasing, not an identity claim).
+ * Guarded: Y must read as a bare name, not name-plus-role ("the Dark
+ * Lord's apprentice" is a relation phrasing, not an identity claim).
  * Generic English relational words only — never book terms.
  */
 const COPULA_RE = /\b(?:is|was)\s+((?:the\s+)?[A-Z][\w']*(?:\s+[A-Z][\w']*)*)/;

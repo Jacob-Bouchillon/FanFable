@@ -962,6 +962,18 @@ export async function draftPlan(
     for (const s of ch.scenes) s.canonEventIds = check(s.canonEventIds, `chapter ${ch.number} scene "${s.title}"`);
   }
 
+  // A divergence that points at a canon event by number gets the same gate:
+  // free text ("when the council falls") passes untouched, but "canon event
+  // 12" with no 12 in the index is dropped with a warning, not banked blind.
+  const divRef = /canon event\s+#?(\d+)|event\s+#(\d+)/i.exec(data.divergenceRef ?? '');
+  if (divRef) {
+    const id = Number(divRef[1] ?? divRef[2]);
+    if (!Number.isFinite(id) || !validIds.has(id)) {
+      warnings.push(`divergence: dropped canon event reference ${id} (not in the canon index the model was given)`);
+      data.divergenceRef = '';
+    }
+  }
+
   // A premise that contradicts the canon is flagged, not silently accepted.
   for (const w of checkPremise(db, projectId, req.premise, req.divergence ?? '')) {
     warnings.push(`${w.kind}: ${w.message}`);

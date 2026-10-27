@@ -629,12 +629,15 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
           const revised = await planner.reviseOutline(llm(), current, String(body.instruction ?? ''), {
             chapterNumber,
           });
-          const updated = planner.updateOutline(db, p.id, current.id, {
+          const updated = planner.saveOutline(db, p.id, {
             premise: revised.premise,
             divergence: revised.divergence,
+            divergenceRef: revised.divergenceRef,
+            canonRefs: revised.canonRefs,
             structure: revised.structure,
             chapters: revised.chapters,
             preferences: revised.preferences,
+            status: 'draft',
           });
           return { outline: updated };
         });
