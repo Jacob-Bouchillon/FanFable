@@ -11,7 +11,7 @@
  * than in a wall of retrieved text.
  */
 import { Db, nowIso, strList, toJson } from './db.ts';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { asRecordArray, extractJson, salvageJsonArray, toStringArray } from './json.ts';
@@ -1255,7 +1255,7 @@ function dedupeRelations(db: Db, projectId: number): void {
     const description = row.description.length > first.description.length ? row.description : first.description;
     const evidence = row.evidence.length > first.evidence.length ? row.evidence : first.evidence;
     const sourceRefs = earliestRefs(db, first.source_refs, row.source_refs);
-    const review = first.review_status === 'needs_review' || row.review_status === 'needs_review' ? 'needs_review' : first.review_status;
+    const review = maxTrust(first.review_status, row.review_status);
     db.run(
       'UPDATE canon_relation SET description = ?, evidence = ?, source_refs = ?, review_status = ? WHERE id = ?',
       description,
@@ -1431,7 +1431,51 @@ function windowEntityNames(db: Db, projectId: number, window: ChunkRow[]): strin
     const tokens = variants.flatMap((v) => v.split(' ')).filter((t) => t.length >= 3);
     if (tokens.some((t) => hayWords.has(t))) names.push(entity.name);
   }
+  // Finder spans ride along when a sidecar has recorded them: names the CPU
+  // pointer saw in these passages, merged with the bank's names. Absent file
+  // means today's behavior, exactly as before. Universal: names only, never
+  // book-specific content in code.
+  for (const n of finderNamesFor(db, window)) {
+    if (!names.some((e) => e.toLowerCase() === n.toLowerCase())) names.push(n);
+  }
   return names.slice(0, 60);
+}
+
+/** Trust order for automatic merges: a human ruling always outranks the
+ * machine, and the machine never downgrades either on its own. Explicit
+ * user action (or a user-run review) is the only way a keeper changes. */
+function trustRank(status: string): number {
+  return status === 'user_confirmed' ? 2 : status === 'accepted' ? 1 : 0;
+}
+
+function maxTrust(a: string, b: string): string {
+  return trustRank(a) >= trustRank(b) ? a : b;
+}
+
+/** Cached finder-spans map: chunk seq -> names. Missing/unreadable = none. */
+const finderCache = new Map<string, Map<number, string[]>>();
+function finderNamesFor(db: Db, window: ChunkRow[]): string[] {
+  const path = join(dirname(db.path), 'finder-spans.json');
+  let bySeq = finderCache.get(path);
+  if (bySeq === undefined) {
+    bySeq = new Map();
+    try {
+      if (existsSync(path)) {
+        const raw = JSON.parse(readFileSync(path, 'utf8')) as Record<string, string[]>;
+        for (const [k, v] of Object.entries(raw)) {
+          if (Array.isArray(v)) bySeq.set(Number(k), [...new Set(v.map((s) => String(s).trim()).filter(Boolean))].slice(0, 40));
+        }
+      }
+    } catch {
+      bySeq = new Map();
+    }
+    finderCache.set(path, bySeq);
+  }
+  const out: string[] = [];
+  for (const c of window) {
+    for (const n of bySeq.get(c.seq) ?? []) if (!out.includes(n)) out.push(n);
+  }
+  return out;
 }
 
 /** Check a quote, counting what the gate did with it when the gate is on. */
@@ -1905,9 +1949,10 @@ function applyRelations(
         for (const [generic, kinds] of GENERIC_KINSHIP) {
           if (!kinds.has(lk)) continue;
           const stale = db.all<{ id: number }>(
-            'SELECT id FROM canon_relation WHERE project_id = ? AND lower(kind) = ? AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))',
+            'SELECT id FROM canon_relation WHERE project_id = ? AND lower(kind) = ? AND review_status != ? AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))',
             projectId,
             generic,
+            'user_confirmed',
             fromId,
             toId,
             toId,
@@ -1979,7 +2024,7 @@ function applyRelations(
         const sentence = description.length > existing.description.length ? description : existing.description;
         const quote = span.quote.length > existing.evidence.length ? span.quote : existing.evidence;
         const sourceRefs = earliestRefs(db, toJson(refs), existing.source_refs);
-        const mergedReview = rowReview === 'needs_review' || existing.review_status === 'needs_review' ? 'needs_review' : existing.review_status;
+        const mergedReview = maxTrust(rowReview, existing.review_status);
         db.run(
           'UPDATE canon_relation SET description = ?, evidence = ?, source_refs = ?, review_status = ? WHERE id = ?',
           sentence,
@@ -2535,8 +2580,8 @@ export function mergeEntityPair(db: Db, projectId: number, keep: CanonEntity, dr
       keep.id,
     );
     // Move relations over, and drop the ones that would now be duplicates.
-    const rels = db.all<{ id: number; from_entity: number; to_entity: number; kind: string; description: string; evidence: string }>(
-      'SELECT id, from_entity, to_entity, kind, description, evidence FROM canon_relation WHERE project_id = ? AND (from_entity = ? OR to_entity = ?)',
+    const rels = db.all<{ id: number; from_entity: number; to_entity: number; kind: string; description: string; evidence: string; review_status: string }>(
+      'SELECT id, from_entity, to_entity, kind, description, evidence, review_status FROM canon_relation WHERE project_id = ? AND (from_entity = ? OR to_entity = ?)',
       projectId,
       drop.id,
       drop.id,
@@ -2545,7 +2590,13 @@ export function mergeEntityPair(db: Db, projectId: number, keep: CanonEntity, dr
       const from = r.from_entity === drop.id ? keep.id : r.from_entity;
       const to = r.to_entity === drop.id ? keep.id : r.to_entity;
       if (from === to) {
-        db.run('DELETE FROM canon_relation WHERE id = ?', r.id);
+        // A tie to self proves merging went too far for this row, but a
+        // human-confirmed row is parked for review, never silently dropped.
+        if (r.review_status === 'user_confirmed') {
+          db.run("UPDATE canon_relation SET review_status = 'needs_review' WHERE id = ?", r.id);
+        } else {
+          db.run('DELETE FROM canon_relation WHERE id = ?', r.id);
+        }
         continue;
       }
       const existing = db.get<{ id: number }>(
