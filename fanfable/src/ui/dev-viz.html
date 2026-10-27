@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>fanfable dev visualizer</title>
+<link rel="stylesheet" href="/ui/style.css" />
+<link rel="stylesheet" href="/ui/dev-viz.css" />
+<link rel="icon" href="/ui/fanfable.png" type="image/png" />
+<meta name="theme-color" content="#2f6f6a" />
+<meta name="robots" content="noindex, nofollow" />
+</head>
+<body class="dv-body">
+<div class="dv-app">
+
+  <header class="dv-top">
+    <div class="dv-brand">
+      <img class="brand-mark" src="/ui/fanfable.png" alt="" />
+      <div>
+        <div class="brand-name">FanFable <span class="dv-dev-tag">dev visualizer</span></div>
+        <div class="brand-sub">bank first · web never canon · read only</div>
+      </div>
+    </div>
+
+    <nav class="dv-tabs" role="tablist" aria-label="Visualizer views">
+      <button class="dv-tab" role="tab" data-view="graph" aria-selected="true">Graph</button>
+      <button class="dv-tab" role="tab" data-view="index" aria-selected="false">Index</button>
+      <button class="dv-tab" role="tab" data-view="timeline" aria-selected="false">Timeline</button>
+      <button class="dv-tab" role="tab" data-view="reader" aria-selected="false">Reader</button>
+      <button class="dv-tab" role="tab" data-view="ask" aria-selected="false">Ask</button>
+    </nav>
+
+    <div class="dv-chrome">
+      <label class="dv-field dv-reveal" title="Hide rows whose first banked passage is after this position">
+        <span class="dv-field-label">Reveal</span>
+        <input type="range" id="dv-reveal" min="0" max="1" step="1" value="1" />
+        <span class="dv-reveal-label" id="dv-reveal-label">all</span>
+      </label>
+      <label class="dv-check" title="Hide model identifiers and the citation map; never writes ratings">
+        <input type="checkbox" id="dv-blind" />
+        <span>Blind</span>
+      </label>
+    </div>
+  </header>
+
+  <div class="dv-banner" id="dv-banner" hidden></div>
+
+  <main class="dv-view" id="dv-view">
+    <div class="skeleton-list"><div class="skeleton"></div><div class="skeleton"></div></div>
+  </main>
+
+  <footer class="dv-footer" id="dv-footer">
+    <span class="dv-muted">loading bank provenance…</span>
+  </footer>
+
+</div>
+
+<aside class="dv-drawer" id="dv-drawer" hidden aria-label="Entity detail"></aside>
+<div class="dv-tooltip" id="dv-tooltip" hidden></div>
+
+<script src="/ui/dev-viz.js"></script>
+</body>
+</html>

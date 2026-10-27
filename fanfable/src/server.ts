@@ -24,8 +24,16 @@ import * as planner from './planner.ts';
 import * as continuity from './continuity.ts';
 import { DEFAULT_LLM_SETTINGS, clientFrom, loadGlobalConfig, saveGlobalConfig } from './llm.ts';
 import { DEFAULT_CONTINUITY_SETTINGS, continuitySettings } from './continuity-settings.ts';
+import { devGraphSummary } from './dev-summary.ts';
 
 const UI_DIR = join(import.meta.dirname, 'ui');
+
+/**
+ * The dev visualizer is opt-in. It is a separate page and a separate
+ * read-only summary route; the ship UI never links to either. `--dev` on the
+ * CLI and FANFABLE_DEV=1 are the only ways in.
+ */
+const DEV_ENABLED = process.env.FANFABLE_DEV === '1' || process.argv.includes('--dev');
 
 /* ------------------------------------------------------------------- jobs */
 
@@ -171,6 +179,24 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
         serveStatic(res, join(UI_DIR, 'index.html'));
         return;
       }
+      if (method === 'GET' && (path === '/dev-viz' || path === '/dev-viz/')) {
+        if (!DEV_ENABLED) {
+          json(res, 404, { error: 'not found' });
+          return;
+        }
+        serveStatic(res, join(UI_DIR, 'dev-viz.html'));
+        return;
+      }
+      // The dev page's assets live beside the ship UI. Keep them out of reach
+      // when the dev switch is off, even though /ui/ is otherwise static.
+      if (
+        method === 'GET'
+        && !DEV_ENABLED
+        && (path === '/ui/dev-viz.html' || path === '/ui/dev-viz.js')
+      ) {
+        json(res, 404, { error: 'not found' });
+        return;
+      }
       if (method === 'GET' && path.startsWith('/ui/')) {
         const reqPath = normalize(decodeURIComponent(path.slice(4))).replace(/^(\.\.[\\/])+/, '');
         const file = resolve(UI_DIR, reqPath);
@@ -179,6 +205,50 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
           return;
         }
         serveStatic(res, file);
+        return;
+      }
+
+      /* --------------------------------------------------- dev visualizer */
+      if (path === '/api/dev/graph-summary' && method === 'GET') {
+        if (!DEV_ENABLED) {
+          json(res, 404, { error: 'not found' });
+          return;
+        }
+        const requested = (url.searchParams.get('project') ?? '').trim();
+        let p: controller.Project | undefined;
+        if (!requested) {
+          p = projectId === null ? undefined : controller.getProject(db, projectId);
+        } else {
+          const numeric = Number(requested);
+          p = Number.isInteger(numeric) && numeric > 0 ? controller.getProject(db, numeric) : undefined;
+          p ??= controller.getProjectByName(db, requested);
+        }
+        if (!p) {
+          json(res, 404, {
+            error: requested ? `no project called "${requested}"` : 'no project is selected',
+          });
+          return;
+        }
+        json(res, 200, devGraphSummary(db, p));
+        return;
+      }
+
+      if (path === '/api/dev/bank-answer' && method === 'GET') {
+        if (!DEV_ENABLED) {
+          json(res, 404, { error: 'not found' });
+          return;
+        }
+        const question = (url.searchParams.get('q') ?? '').trim();
+        if (activeId() === null) {
+          json(res, 200, { status: 'none', reason: 'No project is selected.' });
+          return;
+        }
+        if (!question) {
+          json(res, 200, { status: 'none', reason: 'No question was asked.' });
+          return;
+        }
+        const p = project();
+        json(res, 200, lorebook.bankAnswerForQuestion(db, p.id, question));
         return;
       }
 
