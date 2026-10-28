@@ -178,3 +178,62 @@ A claim can be wrong in three different ways, and they are not interchangeable:
 3. **Intentional divergence** — the premise deliberately changes canon after its divergence point. Recorded, not rejected.
 
 The system currently implements the first. The other two are the next correctness gap after the bank promotion.
+
+---
+
+## Appendix — paste-ready prompt for Task A
+
+```
+# Coder task: measure the unproposed character pairs (packet build + scoring scaffold)
+
+## Objective
+Find out whether the largest unmeasured population — character pairs that share passages but have no relation row — contains real, quotable relationships. Build the evidence packets and the scoring scaffold. Do not judge anything; verdicts come from an independent judge later.
+
+## Population
+Character entities only. A pair qualifies when:
+- both are kind='character' in the live bank;
+- they share at least one passage (name or alias, exact token);
+- there is no canon_relation row between them in either direction, at any status.
+Report the actual count (expected around 3,100).
+
+## Sample
+- 80 pairs, stratified by co-occurrence frequency (1, 2–3, 4–9, 10+) and by book position of first shared passage (thirds).
+- Deterministic seed 42. Record each pair's stratum and its population size so weighted estimates are possible.
+
+## Packets (mechanical, no model)
+For each sampled pair, in a stable order:
+- list every passage where both appear, capped at 6, chosen to spread across the book (earliest, latest, and evenly between);
+- for each, include one sentence of context either side where available;
+- include exact locators;
+- include nothing about the bank's status, sampling stratum, or that the pair lacks a relation.
+Write two files of 40 packets each under testing/trials/unproposed/, plus a CSV with id, pair, stratum, population weight, locators.
+
+## Packet instructions (exact wording to include at the top)
+Judge each pair from the passages only. Give one verdict:
+- A — Supported and quotable: a lasting relationship is established by a single identifiable sentence.
+- B — Supported, needs multiple sentences: the relationship is clear, but no single sentence establishes it.
+- C — Not a relationship: co-occurrence, a moment, or unrelated.
+- D — Indeterminate: the packet does not support a reliable verdict.
+For A and B quote the sentence(s) and locator. Give a reason of 12 words or fewer for every verdict. Do not use outside knowledge.
+
+## Scoring scaffold (no verdicts yet)
+Write a scoring script that reads a verdicts CSV (id,verdict,quote,locator,reason) and computes:
+- counts per verdict;
+- weighted percentages for A, B, C, D using stratum weights;
+- Wilson 95% intervals on the weighted A+B estimate;
+- estimated recoverable pairs among the full population;
+- a table of A and B pairs with quotes and locators for review.
+If the verdicts file is missing or has unfilled verdicts, print PENDING and exit 0. Never invent verdicts.
+
+## Boundaries
+MUST NOT: call a model, write to either bank, change statuses, change prompts/ranking, commit/push.
+All files under testing/trials/unproposed/. Zero book terms in code; packets are data.
+
+## Acceptance
+1. Population count reconciles; sample is 80 with strata and weights; selection reproducible from seed 42.
+2. Two packet files exist, 40 packets each; no packet mentions bank status or stratum.
+3. The CSV has weights; the scorer prints PENDING with no verdicts present.
+4. Spot-check three packets: every passage listed genuinely names both characters; locators correct.
+5. No files outside testing/trials/unproposed/ changed; suite unchanged and green; git status clean apart from ignored files.
+6. Report counts, packet sizes, and the exact judge instruction block.
+```
