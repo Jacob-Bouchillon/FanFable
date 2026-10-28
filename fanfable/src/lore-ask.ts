@@ -129,11 +129,47 @@ const INVERSE_HEADS = (() => {
 })();
 
 interface AssertedClaim {
+  /** Closed head or an open term used only for detection. */
   head: string;
+  kind?: string;
+  term?: string;
   direction: 'a-to-b' | 'b-to-a' | 'unknown';
+  unmapped?: boolean;
   /** A claim naming only one side of the asked pair. */
   offPair?: boolean;
 }
+
+interface OpenTerm {
+  term: string;
+  re: RegExp;
+  kind?: string;
+}
+
+/** Open wording detected for relationship checking, never for extraction. */
+const OPEN_TERMS: OpenTerm[] = [
+  { term: 'partnership', re: /\bpartnership\b/i, kind: 'partner with' },
+  { term: 'partner', re: /\bpartners?\b/i, kind: 'partner with' },
+  { term: 'alliance', re: /\balliance\b/i, kind: 'ally of' },
+  { term: 'allied', re: /\ballied\b/i, kind: 'ally of' },
+  { term: 'served under', re: /\bserved\s+(?:under|for)\b/i, kind: 'aide of' },
+  { term: 'served', re: /\bserved\b/i, kind: 'aide of' },
+  { term: 'worked for', re: /\bworked\s+(?:for|under)\b/i, kind: 'operative for' },
+  { term: 'employed', re: /\bemploy(?:ed|s|ment)?\b/i, kind: 'operative for' },
+  { term: 'mentor', re: /\bmentor(?:ed|s|ing)?\b/i, kind: 'mentor of' },
+  { term: 'student', re: /\bstudents?\b/i, kind: 'student of' },
+  { term: 'family', re: /\bfamily\b/i, kind: 'relative of' },
+  { term: 'related', re: /\brelated\b/i, kind: 'relative of' },
+  { term: 'married', re: /\bmarried\b/i, kind: 'married to' },
+  { term: 'friend', re: /\bfriends?\b/i, kind: 'friend of' },
+  { term: 'enemy', re: /\benem(?:y|ies)\b/i, kind: 'enemy of' },
+  { term: 'rival', re: /\brivals?\b/i, kind: 'enemy of' },
+  { term: 'subordinate', re: /\bsubordinates?\b/i },
+  { term: 'superior', re: /\bsuperiors?\b/i },
+  { term: 'employer', re: /\bemployers?\b/i },
+  { term: 'employee', re: /\bemployees?\b/i },
+  { term: 'bodyguard', re: /\bbodyguards?\b/i },
+  { term: 'informant', re: /\binformants?\b/i },
+];
 
 function cleanPairName(raw: string): string {
   return raw
@@ -210,17 +246,40 @@ function claimDirection(
     return owner(token);
   };
   const before = possessor(headIndex - 1);
-  if (before) {
-    // "A is B's sister": B owns the role, A is the subject.
-    if (before === 'b') return 'a-to-b';
-    return 'b-to-a';
-  }
+  if (before) return before === 'b' ? 'a-to-b' : 'b-to-a';
   if (words[headIndex + 1] === 'of') {
     const object = owner(words[headIndex + 2] ?? '');
     if (object === 'b') return 'a-to-b';
     if (object === 'a') return 'b-to-a';
   }
   return 'unknown';
+}
+
+/** Direction for open wording: nearest named subject before, object after. */
+function openTermDirection(
+  sentence: string,
+  term: OpenTerm,
+  sideATokens: Set<string>,
+  sideBTokens: Set<string>,
+): 'a-to-b' | 'b-to-a' | 'unknown' {
+  const match = term.re.exec(sentence);
+  if (!match) return 'unknown';
+  const before = sentence.slice(0, match.index).toLowerCase();
+  const after = sentence.slice(match.index + match[0].length).toLowerCase();
+  const side = (text: string): 'a' | 'b' | null => {
+    const tokens = text.split(/[^a-z0-9]+/);
+    for (const token of tokens) {
+      if (sideATokens.has(token)) return 'a';
+      if (sideBTokens.has(token)) return 'b';
+    }
+    return null;
+  };
+  const subject = side(before);
+  const object = side(after);
+  if (!subject || !object) return 'unknown';
+  const passive = /\b(?:was|were|is|are|been|being)\b[^.]*\bby\b/i.test(after) || /\bby\b[\s\S]*$/.test(after);
+  if (passive) return subject === 'b' ? 'a-to-b' : 'b-to-a';
+  return subject === 'a' && object === 'b' ? 'a-to-b' : subject === 'b' && object === 'a' ? 'b-to-a' : 'unknown';
 }
 
 function assertedClaims(
@@ -233,29 +292,46 @@ function assertedClaims(
   const sideBTokens = nameTokensOf(sideBVariants);
   const claims = new Map<string, AssertedClaim>();
   const sentences = draft.split(/[.!?\n]+/).map((sentence) => sentence.trim()).filter(Boolean);
+  const negated = (sentence: string): boolean =>
+    /\b(no|not|never|cannot|can't|does not|do not|isn't|wasn't|without|unsupported|unconfirmed|missing|unknown)\b/i.test(sentence);
   for (const sentence of sentences) {
-    if (/\b(no|not|never|cannot|can't|does not|do not|isn't|wasn't|without|unsupported|unconfirmed|missing|unknown)\b/i.test(sentence)) {
-      continue;
-    }
+    if (negated(sentence)) continue;
     const lower = sentence.toLowerCase();
     const namesA = sideAVariants.some((variant) => lower.includes(variant.toLowerCase()));
     const namesB = sideBVariants.some((variant) => lower.includes(variant.toLowerCase()));
-    if (!namesA || !namesB) continue;
+    const pronoun = /\b(he|she|they|him|her|them|his|hers|their|theirs)\b/i.test(sentence);
+    if (!(namesA && namesB) && !((namesA || namesB) && pronoun)) continue;
     for (const head of CLOSED_HEADS) {
       const forms = [head, PLURAL_HEADS[head]].filter(Boolean) as string[];
-      const present = forms.some((form) => new RegExp(`\\b${form}\\b`, 'i').test(sentence));
-      if (!present) continue;
+      if (!forms.some((form) => new RegExp(`\\b${form}\\b`, 'i').test(sentence))) continue;
       const direction = claimDirection(sentence, head, sideATokens, sideBTokens);
       claims.set(`${head}|${direction}`, { head, direction });
     }
-  }
-  if (!claims.size) {
-    // No sentence names both sides, but a closed relationship phrase is still
-    // asserted with one side: it cannot prove anything about the asked pair.
-    for (const sentence of sentences) {
-      if (/\b(no|not|never|cannot|can't|does not|do not|isn't|wasn't|without|unsupported|unconfirmed|missing|unknown)\b/i.test(sentence)) {
+    for (const term of OPEN_TERMS) {
+      if (!term.re.test(sentence)) continue;
+      const kind = term.kind;
+      const head = kind ? relationHead(kind) : term.term;
+      const direction = openTermDirection(sentence, term, sideATokens, sideBTokens);
+      const key = `${term.kind ?? `unmapped:${term.term}`}|${direction}`;
+      if (claims.has(key)) continue;
+      if (
+        kind &&
+        [...claims.values()].some((claim) => claim.kind === kind || claim.head === relationHead(kind))
+      ) {
         continue;
       }
+      claims.set(key, {
+        head,
+        kind,
+        term: term.term,
+        direction,
+        ...(kind ? {} : { unmapped: true }),
+      });
+    }
+  }
+  if (!claims.size) {
+    for (const sentence of sentences) {
+      if (negated(sentence)) continue;
       const lower = sentence.toLowerCase();
       const oneSide = sideAVariants.some((variant) => lower.includes(variant.toLowerCase())) ||
         sideBVariants.some((variant) => lower.includes(variant.toLowerCase()));
@@ -272,56 +348,140 @@ function assertedClaims(
   return [...claims.values()];
 }
 
-function keeperSupportsClaim(
+interface ClaimVerification {
+  supported: boolean;
+  reason?: 'unsupported-relationship' | 'unmapped-relationship' | 'direction-mismatch';
+}
+
+function verifyClaim(
   db: Db,
   projectId: number,
   pair: { a: string; b: string },
   sideA: { ids: number[] },
   sideB: { ids: number[] },
   claim: AssertedClaim,
-): boolean {
+): ClaimVerification {
+  if (claim.offPair) return { supported: false, reason: 'unsupported-relationship' };
   const keepers = lorebook.lookupKeeperPair(db, projectId, pair.a, pair.b);
+  if (claim.unmapped) {
+    return keepers.length
+      ? { supported: true }
+      : { supported: false, reason: 'unmapped-relationship' };
+  }
   const rowDirection = (fromId: number, toId: number): 'a-to-b' | 'b-to-a' | 'unknown' => {
     if (sideA.ids.includes(fromId) && sideB.ids.includes(toId)) return 'a-to-b';
     if (sideB.ids.includes(fromId) && sideA.ids.includes(toId)) return 'b-to-a';
     return 'unknown';
   };
-  if (claim.offPair) return false;
-  return keepers.some((row) => {
+  let matchedKind = false;
+  for (const row of keepers) {
     const rowHead = relationHead(row.kind);
     const inverse = INVERSE_HEADS.get(claim.head)?.has(rowHead) ?? false;
-    if (rowHead !== claim.head && !inverse) return false;
+    if (rowHead !== claim.head && !inverse) continue;
+    matchedKind = true;
     const direction = rowDirection(row.fromId, row.toId);
-    if (claim.direction === 'unknown' || direction === 'unknown') return true;
-    return inverse ? direction !== claim.direction : direction === claim.direction;
-  });
+    if (claim.direction === 'unknown' || direction === 'unknown') return { supported: true };
+    if (inverse ? direction !== claim.direction : direction === claim.direction) return { supported: true };
+  }
+  return {
+    supported: false,
+    reason: matchedKind ? 'direction-mismatch' : 'unsupported-relationship',
+  };
 }
 
 function claimLabel(pair: { a: string; b: string }, claim: AssertedClaim): string {
+  if (claim.unmapped) return `${pair.a} / ${pair.b} — ${claim.term}`;
   if (claim.direction === 'b-to-a') return `${pair.b} ${claim.head} ${pair.a}`;
   if (claim.direction === 'a-to-b') return `${pair.a} ${claim.head} ${pair.b}`;
   return `${pair.a} / ${pair.b} ${claim.head}`;
 }
 
+/** Normalise presentation only: quotes, dashes, case and whitespace. */
+function citationNormalize(text: string): string {
+  return (text ?? '')
+    .replace(/[“”«»]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/[–—−]/g, '-')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function quotedSpans(draft: string): string[] {
+  const spans: string[] = [];
+  const re = /["“]([^"”]+)["”]/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(draft)) !== null) {
+    const span = match[1]!.trim();
+    if (span.split(/\s+/).filter(Boolean).length < 6) continue;
+    // A quote attributed only to the extracted index ([Lore: ...]) is not a
+    // passage quotation; it never claims passage evidence.
+    const lineStart = draft.lastIndexOf('\n', match.index) + 1;
+    const lineEnd = draft.indexOf('\n', match.index);
+    const line = draft.slice(lineStart, lineEnd < 0 ? undefined : lineEnd);
+    // A quote attributed only to the extracted index ([Lore: ...]) is not a
+    // passage quotation; it never claims passage evidence.
+    if (/\[Lore:/i.test(line) && !/\[S\d/i.test(line)) continue;
+    spans.push(span);
+  }
+  return spans;
+}
+
+interface CitationCheck {
+  ok: boolean;
+  failing?: string;
+}
+
+function verifyCitations(draft: string, passages: Passage[]): CitationCheck {
+  const spans = quotedSpans(draft);
+  if (!spans.length) return { ok: true };
+  const haystacks = passages
+    .map((passage) => citationNormalize(passage.text))
+    .filter((text) => text.length > 0);
+  for (const span of spans) {
+    const needle = citationNormalize(span);
+    if (!needle) continue;
+    if (!haystacks.some((hay) => hay.includes(needle))) {
+      return { ok: false, failing: span };
+    }
+  }
+  return { ok: true };
+}
+
+function abstainAnswer(pair: { a: string; b: string }, draft: string, reason: string): string {
+  return (
+    `### Status of ${pair.a} to ${pair.b}\n\n` +
+    `Tie not established. The lore index does not authorise the claimed relationship between ${pair.a} and ${pair.b}.\n\n` +
+    `Reason: ${reason}\n\n` +
+    `---\nOriginal draft (uncorrected, kept for audit):\n${draft}`
+  );
+}
+
 /**
- * Verify the relationships an answer actually asserts for the asked pair.
+ * Verify quoted evidence and asserted relationships separately.
  *
- * Every closed relationship phrase is a claim; only a keeper of that kind (or
- * its closed inverse, in the opposite direction) supports it. All supported
- * leaves the draft untouched; none supported abstains; mixed keeps the answer
- * with one correction line naming what the bank does not hold.
+ * Check A: every quoted span must be a contiguous verbatim part of a retrieved
+ * passage. Check B: every relationship claim must have a keeper of that kind
+ * and direction, or for unmapped wording at least one keeper for the pair.
+ * Neither check authorises the other.
  */
 export function enforceStatusTieGuard(
   db: Db,
   projectId: number,
   question: string,
   draft: string,
-  _passages: Passage[],
+  passages: Passage[],
 ): string {
   // Test-only A/B switch. Unset or any value other than '1' keeps the guard.
   if (process.env.FANFABLE_NO_GUARD === '1') return draft;
   const pair = parsePairQuestion(question);
   if (!pair) return draft;
+
+  const citation = verifyCitations(draft, passages);
+  if (!citation.ok) {
+    return abstainAnswer(pair, draft, `quote-not-in-passage — "${citation.failing!.slice(0, 160)}"`);
+  }
+
   let entities: { id: number; name: string; aliases: string[] }[] = [];
   try {
     entities = lorebook.listEntities(db, projectId).map((entity) => ({
@@ -336,16 +496,14 @@ export function enforceStatusTieGuard(
   const sideB = entityVariantsFor(entities, pair.b);
   const claims = assertedClaims(draft, pair, sideA.variants, sideB.variants);
   if (!claims.length) return draft;
-  const supported = claims.filter((claim) => keeperSupportsClaim(db, projectId, pair, sideA, sideB, claim));
-  const unsupported = claims.filter((claim) => !supported.includes(claim));
+  const results = claims.map((claim) => ({ claim, result: verifyClaim(db, projectId, pair, sideA, sideB, claim) }));
+  const unsupported = results.filter((row) => !row.result.supported);
   if (!unsupported.length) return draft;
-  const abstain =
-    `### Status of ${pair.a} to ${pair.b}\n\n` +
-    `Tie not established. The lore index banks no keeper for the claimed relationship between ${pair.a} and ${pair.b}.\n\n` +
-    `---\nOriginal draft (uncorrected, kept for audit):\n${draft}`;
-  if (!supported.length) return abstain;
-  const labels = [...new Set(unsupported.map((claim) => claimLabel(pair, claim)))];
-  return `Correction: Bank holds no keeper for: ${labels.join('; ')}.\n\n${draft}`;
+  const supported = results.filter((row) => row.result.supported);
+  const reasons = [...new Set(unsupported.map((row) => row.result.reason ?? 'unsupported-relationship'))];
+  if (!supported.length) return abstainAnswer(pair, draft, reasons.join(', '));
+  const labels = [...new Set(unsupported.map((row) => claimLabel(pair, row.claim)))];
+  return `Correction: Bank holds no keeper for: ${labels.join('; ')} (${reasons.join(', ')}).\n\n${draft}`;
 }
 
 export async function answerLoreQuestion(
