@@ -11,6 +11,28 @@ Instead of relying on prompts alone, FanFable aims to build a connected understa
 
 FanFable runs locally using local AI models and a local database, keeping your books and stories on your own machine.
 
+## Requirements
+
+- **Node.js 22.18 or newer** — FanFable is TypeScript run directly by Node, and uses the built-in `node:sqlite`. There are no runtime npm dependencies.
+- **A local model server** — Ollama by default, on `http://127.0.0.1:11434`. The defaults are `llama3.1:8b` for writing and `nomic-embed-text` for retrieval. llama.cpp and any OpenAI-compatible gateway also work.
+- **Poppler** (`pdftotext`, `pdfinfo`) — only for importing PDFs. EPUB and DOCX need nothing extra.
+- **Disk and memory** — roughly 10 GB free for models, and 8 GB of VRAM (or 8–10 GB of RAM running on CPU) for an 8B model at Q4.
+
+Windows 11 and Linux are both supported. See [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) for the full list, platform notes, data locations, and hardware guidance.
+
+## Quick start
+
+```bash
+npm ci
+ollama pull llama3.1:8b
+ollama pull nomic-embed-text
+npm run fanfable -- project create my-story
+npm run fanfable -- import book.epub
+npm run fanfable -- serve        # http://127.0.0.1:8123
+```
+
+On Windows, PowerShell blocks `npm.ps1` by default; use `npm.cmd` or set the execution policy once. `npm run typecheck` and `npm test` check the build and run the offline test suite.
+
 ## Research
 
 I'm exploring ways to improve how AI retrieves and understands information from books, especially across long stories.
