@@ -28,6 +28,7 @@ import * as writer from './writer.ts';
 import * as continuity from './continuity.ts';
 import { continuitySettings, filterBySeverity } from './continuity-settings.ts';
 import { truncate, wordCount } from './text.ts';
+import { nameMentionedExact } from './names.ts';
 
 export interface Project {
   id: number;
@@ -790,6 +791,59 @@ export async function approveChapter(
   };
 }
 
+/** Keeper/provisional ties whose endpoints both appear in the chapter. */
+function keeperTiesForChapter(
+  db: Db,
+  projectId: number,
+  body: string,
+  statuses: string[],
+): continuity.KeeperTie[] {
+  const rows = db.all<{
+    kind: string;
+    evidence: string;
+    source_refs: string;
+    from_name: string;
+    from_aliases: string;
+    to_name: string;
+    to_aliases: string;
+  }>(
+    `SELECT r.kind, r.evidence, r.source_refs,
+            a.name AS from_name, a.aliases AS from_aliases,
+            b.name AS to_name, b.aliases AS to_aliases
+       FROM canon_relation r
+       JOIN canon_entity a ON a.id = r.from_entity
+       JOIN canon_entity b ON b.id = r.to_entity
+      WHERE r.project_id = ? AND r.review_status IN (${statuses.map(() => '?').join(',')})
+      ORDER BY r.id`,
+    projectId,
+    ...statuses,
+  );
+  const out: continuity.KeeperTie[] = [];
+  for (const row of rows) {
+    const fromVariants = [row.from_name, ...strList(row.from_aliases)];
+    const toVariants = [row.to_name, ...strList(row.to_aliases)];
+    if (!fromVariants.some((name) => nameMentionedExact(name, body))) continue;
+    if (!toVariants.some((name) => nameMentionedExact(name, body))) continue;
+    let locator = '';
+    try {
+      const refs = JSON.parse(row.source_refs || '[]') as { locator?: unknown }[];
+      locator = String(refs.find((ref) => typeof ref?.locator === 'string')?.locator ?? '');
+    } catch {
+      locator = '';
+    }
+    out.push({
+      fromName: row.from_name,
+      fromAliases: strList(row.from_aliases),
+      toName: row.to_name,
+      toAliases: strList(row.to_aliases),
+      kind: row.kind,
+      evidence: row.evidence,
+      locator,
+    });
+  }
+  return out;
+}
+
 /** Run the continuity checker over a chapter and persist the findings. */
 export async function runContinuityCheck(
   db: Db,
@@ -798,6 +852,7 @@ export async function runContinuityCheck(
   chapter: Chapter,
   outline: planner.Outline | undefined,
   bundle?: ContextBundle,
+  report?: { droppedModelIssues: number },
 ): Promise<continuity.ContinuityIssue[]> {
   const project = getProject(db, projectId);
   const settings = project ? continuitySettings(project) : { enabled: true, modelChecks: true, minSeverity: 'warning' as const, onDraft: true };
@@ -811,6 +866,7 @@ export async function runContinuityCheck(
         2,
       )
     : '';
+  const stats = { droppedModelIssues: 0 };
   const issues = await continuity.checkChapter(db, projectId, chapter, slice, {
     useModel: settings.modelChecks,
     llm,
@@ -818,7 +874,11 @@ export async function runContinuityCheck(
     memoryText: bundle?.memoryText ?? memory.renderContextSlice(slice),
     canonText: bundle?.canonText ?? '',
     connectedText: bundle?.connectedText ?? '',
+    keeperTies: keeperTiesForChapter(db, projectId, chapter.body, ['accepted', 'user_confirmed']),
+    provisionalTies: keeperTiesForChapter(db, projectId, chapter.body, ['provisional']),
+    stats,
   });
+  if (report) report.droppedModelIssues = stats.droppedModelIssues;
   const kept = filterBySeverity(issues, settings);
   db.run('DELETE FROM continuity_issue WHERE project_id = ? AND chapter_id = ?', projectId, chapter.id);
   continuity.saveIssues(db, projectId, chapter.id, kept);

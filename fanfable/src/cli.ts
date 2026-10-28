@@ -1380,8 +1380,10 @@ async function cmdCheck(args: Args): Promise<void> {
     chapter: outline?.chapters.find((c) => c.number === n),
     chapterNumber: n,
   });
-  const issues = await controller.runContinuityCheck(db, a.llm, project.id, chapter, outline, bundle);
+  const report = { droppedModelIssues: 0 };
+  const issues = await controller.runContinuityCheck(db, a.llm, project.id, chapter, outline, bundle, report);
   printIssues(issues);
+  console.log(C.dim(`dropped model issues: ${report.droppedModelIssues}`));
 }
 
 async function cmdIssues(args: Args): Promise<void> {

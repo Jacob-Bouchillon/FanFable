@@ -9,7 +9,8 @@
 import { Db, nowIso } from './db.ts';
 import { extractJson } from './json.ts';
 import type { LlmClient } from './llm.ts';
-import { similarity, truncate } from './text.ts';
+import { similarity, splitSentences, truncate } from './text.ts';
+import { nameMentionedExact } from './names.ts';
 import type { ContextSlice } from './memory.ts';
 import * as lorebook from './lorebook.ts';
 import { graphContinuityChecks } from './graph-checks.ts';
@@ -116,6 +117,16 @@ export function setIssueResolution(db: Db, projectId: number, issueId: number, r
 
 /* ------------------------------------------------- deterministic checks */
 
+export interface KeeperTie {
+  fromName: string;
+  fromAliases: string[];
+  toName: string;
+  toAliases: string[];
+  kind: string;
+  evidence: string;
+  locator: string;
+}
+
 export interface DeterministicInput {
   chapter: ChapterRecord;
   previousChapters: ChapterRecord[];
@@ -127,6 +138,10 @@ export interface DeterministicInput {
   canonEntities?: { name: string; kind: string; status: string; summary: string }[];
   /** Changes the author has already recorded, so they are not flagged again. */
   knownDivergences?: { description: string; subject: string }[];
+  /** Keeper-grade ties whose endpoints both appear in the chapter. */
+  keeperTies?: KeeperTie[];
+  /** Provisional ties whose endpoints both appear (notes only). */
+  provisionalTies?: KeeperTie[];
 }
 
 /**
@@ -233,6 +248,52 @@ export function deterministicChecks(input: DeterministicInput): ContinuityIssue[
     });
   }
 
+  // 5b. A chapter that explicitly denies a keeper-grade tie.
+  //     Omission is not contradiction: only a denial in a sentence that names
+  //     both sides (or one side plus a pronoun) is reported.
+  const denial = /\b(never\s+(?:met|served|knew|known)|no\s+(?:relationship|tie|connection)|not\s+(?:my|his|her|their|your)\s+(?:master|aide|apprentice|teacher|student|mentor|parent|child|friend|enemy|ally|spouse|husband|wife)|denied\s+(?:any\s+)?(?:connection|relationship|tie)|(?:was|were)\s+lying)\b/i;
+  const pronoun = /\b(he|she|they|him|her|them|his|hers|their|theirs|i|me|my|mine|we|us|our|ours)\b/i;
+  const sentences = splitSentences(chapter.body);
+  const denialFor = (tie: KeeperTie): string | null => {
+    const aVariants = [tie.fromName, ...tie.fromAliases].filter(Boolean);
+    const bVariants = [tie.toName, ...tie.toAliases].filter(Boolean);
+    for (const sentence of sentences) {
+      if (!denial.test(sentence)) continue;
+      const a = aVariants.some((name) => nameMentionedExact(name, sentence));
+      const b = bVariants.some((name) => nameMentionedExact(name, sentence));
+      if ((a && b) || ((a || b) && pronoun.test(sentence))) return sentence.trim();
+    }
+    return null;
+  };
+  for (const tie of input.keeperTies ?? []) {
+    const sentence = denialFor(tie);
+    if (!sentence) continue;
+    issues.push({
+      severity: 'error',
+      category: 'relationship',
+      message: `Chapter ${chapter.number} denies the keeper tie: ${tie.fromName} — ${tie.kind} — ${tie.toName}.`,
+      evidence: sentence,
+      suggestion:
+        `Keeper locator: ${tie.locator || 'unplaced'}. Keeper evidence: "${truncate(tie.evidence, 180)}". ` +
+        'If this scene intentionally changes the relationship, record the divergence.',
+      resolution: 'open',
+    });
+  }
+  for (const tie of input.provisionalTies ?? []) {
+    const sentence = denialFor(tie);
+    if (!sentence) continue;
+    issues.push({
+      severity: 'note',
+      category: 'relationship',
+      message:
+        `Chapter ${chapter.number} denies a provisional tie: ${tie.fromName} — ${tie.kind} — ${tie.toName}. ` +
+        'The bank holds only unverified evidence for this relationship.',
+      evidence: sentence,
+      suggestion: `Unverified locator: ${tie.locator || 'unplaced'}. Evidence: "${truncate(tie.evidence, 180)}".`,
+      resolution: 'open',
+    });
+  }
+
   // 6. Someone who is dead (or missing) in the source, but acts in this story.
   //    This is only possible because the book's lore was extracted, and it
   //    cannot be judged a mistake: an AU may well resurrect someone. It asks
@@ -252,12 +313,12 @@ export function deterministicChecks(input: DeterministicInput): ContinuityIssue[
     });
     if (explained) continue;
     issues.push({
-      severity: 'warning',
+      severity: 'note',
       category: 'canon-mix',
       message: `${name} is ${e.status || 'not present'} in the source material but appears in this chapter.`,
       evidence: e.summary || e.status,
       suggestion:
-        'If the story keeps them alive, record the change from canon so later chapters know it was intended.',
+        'Confirm whether this scene predates the recorded death. If the story keeps them alive, record the change from canon so later chapters know it was intended.',
       resolution: 'open',
     });
   }
@@ -375,6 +436,10 @@ export function mergeIssues(deterministic: ContinuityIssue[], model: ContinuityI
 
 export interface CheckOptions {
   useModel?: boolean;
+  /** Mutable report holder for dropped model issues. */
+  stats?: { droppedModelIssues: number };
+  keeperTies?: KeeperTie[];
+  provisionalTies?: KeeperTie[];
   llm?: LlmClient;
   outlineText?: string;
   memoryText?: string;
@@ -489,6 +554,8 @@ export async function checkChapter(
         projectId,
       )
       .map((d) => ({ description: d.description, subject: d.title ?? '' })),
+    keeperTies: opts.keeperTies,
+    provisionalTies: opts.provisionalTies,
   });
 
   let model: ContinuityIssue[] = [];
@@ -501,6 +568,20 @@ export async function checkChapter(
       connectedText: opts.connectedText ?? '',
       canonChangeText: opts.canonChangeText ?? '',
     });
+    const normaliseEvidence = (text: string): string =>
+      (text ?? '')
+        .replace(/[“”«»]/g, '"')
+        .replace(/[‘’]/g, "'")
+        .toLowerCase()
+        .replace(/\s+/g, ' ')
+        .trim();
+    const body = normaliseEvidence(chapter.body);
+    const before = model.length;
+    model = model.filter((issue) => {
+      const evidence = normaliseEvidence(issue.evidence);
+      return !!evidence && body.includes(evidence);
+    });
+    if (opts.stats) opts.stats.droppedModelIssues = before - model.length;
   }
 
   return mergeIssues(mergeIssues(deterministic, graphIssues), model);
