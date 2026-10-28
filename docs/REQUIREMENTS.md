@@ -166,7 +166,7 @@ in the repository — they hold books, run databases and blind-rating packets.
 node -v              # v22.18.0 or newer
 npm ci
 npm run typecheck    # exits 0
-npm test             # 465 tests, 0 failing
+npm test             # offline suite, 0 failing
 pdftotext -v         # only if you import PDFs
 ollama list          # shows the chat and embedding models
 npm run fanfable -- llm status
