@@ -2972,8 +2972,15 @@ export function parseStatusPair(question: string): { a: string; b: string } | nu
   const noScope = question.replace(/\s+as\s+of\s+.*$/i, '').trim();
   const m = noScope.match(/status\s+of\s+(.+?)\s+to\s+(.+?)\s*$/i);
   if (!m) return null;
-  const a = m[1].trim().replace(/^["'“”]+|["'“”]+$/g, '');
-  const b = m[2].trim().replace(/^["'“”]+|["'“”]+$/g, '');
+  const clean = (raw: string): string =>
+    raw
+      .trim()
+      .replace(/^["'“”]+|["'“”]+$/g, '')
+      .trim()
+      .replace(/[.,;:!?]+$/g, '')
+      .trim();
+  const a = clean(m[1]);
+  const b = clean(m[2]);
   if (!a || !b) return null;
   return { a, b };
 }

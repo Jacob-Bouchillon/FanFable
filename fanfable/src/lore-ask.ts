@@ -90,47 +90,262 @@ export function passageNamesBoth(passages: Passage[], variantsA: string[], varia
   });
 }
 
+const RELATION_PARTICLES = new Set(['of', 'to', 'with', 'for', 'a', 'an', 'the', 'in', 'on', 'as']);
+
+/** First content word of a closed kind: "master of" -> master. */
+function relationHead(kind: string): string {
+  return (kind ?? '')
+    .toLowerCase()
+    .split(/[^a-z]+/)
+    .filter(Boolean)
+    .find((word) => !RELATION_PARTICLES.has(word)) ?? '';
+}
+
+const PLURAL_HEADS: Record<string, string> = {
+  ally: 'allies', enemy: 'enemies', sibling: 'siblings', parent: 'parents',
+  child: 'children', spouse: 'spouses', partner: 'partners', friend: 'friends',
+  brother: 'brothers', sister: 'sisters', mother: 'mothers', father: 'fathers',
+  son: 'sons', daughter: 'daughters', cousin: 'cousins', uncle: 'uncles',
+  aunt: 'aunts', nephew: 'nephews', niece: 'nieces', leader: 'leaders',
+  member: 'members', student: 'students', teacher: 'teachers', mentor: 'mentors',
+  master: 'masters', apprentice: 'apprentices', aide: 'aides', assistant: 'assistants',
+  colleague: 'colleagues', peer: 'peers', relative: 'relatives', married: 'married',
+};
+
+const CLOSED_HEADS = new Set(
+  lorebook.CLOSED_ROLE_KINDS.map(relationHead).filter(Boolean),
+);
+
+const INVERSE_HEADS = (() => {
+  const map = new Map<string, Set<string>>();
+  const link = (a: string, b: string): void => {
+    if (!map.has(a)) map.set(a, new Set());
+    if (!map.has(b)) map.set(b, new Set());
+    map.get(a)!.add(b);
+    map.get(b)!.add(a);
+  };
+  for (const [left, right] of lorebook.INVERSE_PAIRS) link(left, right);
+  return map;
+})();
+
+interface AssertedClaim {
+  head: string;
+  direction: 'a-to-b' | 'b-to-a' | 'unknown';
+  /** A claim naming only one side of the asked pair. */
+  offPair?: boolean;
+}
+
+function cleanPairName(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^["'“”]+|["'“”]+$/g, '')
+    .trim()
+    .replace(/[.,;:!?]+$/g, '')
+    .trim();
+}
+
+function parsePairQuestion(question: string): { a: string; b: string; kind?: string } | null {
+  const noScope = question
+    .replace(/\s+as\s+of\s+.*$/i, '')
+    .trim()
+    .replace(/[.,;:!?]+$/g, '')
+    .trim();
+  let m = noScope.match(/status\s+of\s+(.+?)\s+to\s+(.+?)\s*$/i);
+  if (m) {
+    const a = cleanPairName(m[1]!);
+    const b = cleanPairName(m[2]!);
+    return a && b ? { a, b } : null;
+  }
+  m = noScope.match(/^(?:who|what)\s+is\s+(.+?)\s+to\s+(.+?)\s*$/i);
+  if (m) {
+    const a = cleanPairName(m[1]!);
+    const b = cleanPairName(m[2]!);
+    return a && b ? { a, b } : null;
+  }
+  m = noScope.match(/^how\s+are\s+(.+?)\s+and\s+(.+?)\s+related\s*$/i);
+  if (m) {
+    const a = cleanPairName(m[1]!);
+    const b = cleanPairName(m[2]!);
+    return a && b ? { a, b } : null;
+  }
+  m = noScope.match(/^is\s+(.+?)\s+(.+?)['’]s\s+(.+?)\s*$/i);
+  if (m) {
+    const a = cleanPairName(m[1]!);
+    const b = cleanPairName(m[2]!);
+    const kind = cleanPairName(m[3]!);
+    if (a && b) return { a, b, ...(kind ? { kind } : {}) };
+  }
+  return null;
+}
+
+function nameTokensOf(variants: string[]): Set<string> {
+  const out = new Set<string>();
+  for (const variant of variants) {
+    for (const token of variant.toLowerCase().split(/[^a-z0-9]+/)) {
+      if (token.length >= 2) out.add(token);
+    }
+  }
+  return out;
+}
+
+/** Which side owns the possessive or the object after "of"/a bare head. */
+function claimDirection(
+  sentence: string,
+  head: string,
+  sideATokens: Set<string>,
+  sideBTokens: Set<string>,
+): 'a-to-b' | 'b-to-a' | 'unknown' {
+  const words = sentence.toLowerCase().split(/\s+/).filter(Boolean);
+  const headIndex = words.findIndex((word) => word.replace(/[^a-z]/g, '') === head);
+  if (headIndex < 0) return 'unknown';
+  const owner = (token: string): 'a' | 'b' | null => {
+    const base = token.replace(/[^a-z'’]/g, '').replace(/['’]s$/, '');
+    if (sideATokens.has(base)) return 'a';
+    if (sideBTokens.has(base)) return 'b';
+    return null;
+  };
+  const possessor = (index: number): 'a' | 'b' | null => {
+    const token = words[index] ?? '';
+    if (!/['’]s$/.test(token)) return null;
+    return owner(token);
+  };
+  const before = possessor(headIndex - 1);
+  if (before) {
+    // "A is B's sister": B owns the role, A is the subject.
+    if (before === 'b') return 'a-to-b';
+    return 'b-to-a';
+  }
+  if (words[headIndex + 1] === 'of') {
+    const object = owner(words[headIndex + 2] ?? '');
+    if (object === 'b') return 'a-to-b';
+    if (object === 'a') return 'b-to-a';
+  }
+  return 'unknown';
+}
+
+function assertedClaims(
+  draft: string,
+  pair: { a: string; b: string },
+  sideAVariants: string[],
+  sideBVariants: string[],
+): AssertedClaim[] {
+  const sideATokens = nameTokensOf(sideAVariants);
+  const sideBTokens = nameTokensOf(sideBVariants);
+  const claims = new Map<string, AssertedClaim>();
+  const sentences = draft.split(/[.!?\n]+/).map((sentence) => sentence.trim()).filter(Boolean);
+  for (const sentence of sentences) {
+    if (/\b(no|not|never|cannot|can't|does not|do not|isn't|wasn't|without|unsupported|unconfirmed|missing|unknown)\b/i.test(sentence)) {
+      continue;
+    }
+    const lower = sentence.toLowerCase();
+    const namesA = sideAVariants.some((variant) => lower.includes(variant.toLowerCase()));
+    const namesB = sideBVariants.some((variant) => lower.includes(variant.toLowerCase()));
+    if (!namesA || !namesB) continue;
+    for (const head of CLOSED_HEADS) {
+      const forms = [head, PLURAL_HEADS[head]].filter(Boolean) as string[];
+      const present = forms.some((form) => new RegExp(`\\b${form}\\b`, 'i').test(sentence));
+      if (!present) continue;
+      const direction = claimDirection(sentence, head, sideATokens, sideBTokens);
+      claims.set(`${head}|${direction}`, { head, direction });
+    }
+  }
+  if (!claims.size) {
+    // No sentence names both sides, but a closed relationship phrase is still
+    // asserted with one side: it cannot prove anything about the asked pair.
+    for (const sentence of sentences) {
+      if (/\b(no|not|never|cannot|can't|does not|do not|isn't|wasn't|without|unsupported|unconfirmed|missing|unknown)\b/i.test(sentence)) {
+        continue;
+      }
+      const lower = sentence.toLowerCase();
+      const oneSide = sideAVariants.some((variant) => lower.includes(variant.toLowerCase())) ||
+        sideBVariants.some((variant) => lower.includes(variant.toLowerCase()));
+      if (!oneSide) continue;
+      for (const head of CLOSED_HEADS) {
+        const forms = [head, PLURAL_HEADS[head]].filter(Boolean) as string[];
+        if (!forms.some((form) => new RegExp(`\\b${form}\\b`, 'i').test(sentence))) continue;
+        claims.set(`${head}|off`, { head, direction: 'unknown', offPair: true });
+        break;
+      }
+      if (claims.size) break;
+    }
+  }
+  return [...claims.values()];
+}
+
+function keeperSupportsClaim(
+  db: Db,
+  projectId: number,
+  pair: { a: string; b: string },
+  sideA: { ids: number[] },
+  sideB: { ids: number[] },
+  claim: AssertedClaim,
+): boolean {
+  const keepers = lorebook.lookupKeeperPair(db, projectId, pair.a, pair.b);
+  const rowDirection = (fromId: number, toId: number): 'a-to-b' | 'b-to-a' | 'unknown' => {
+    if (sideA.ids.includes(fromId) && sideB.ids.includes(toId)) return 'a-to-b';
+    if (sideB.ids.includes(fromId) && sideA.ids.includes(toId)) return 'b-to-a';
+    return 'unknown';
+  };
+  if (claim.offPair) return false;
+  return keepers.some((row) => {
+    const rowHead = relationHead(row.kind);
+    const inverse = INVERSE_HEADS.get(claim.head)?.has(rowHead) ?? false;
+    if (rowHead !== claim.head && !inverse) return false;
+    const direction = rowDirection(row.fromId, row.toId);
+    if (claim.direction === 'unknown' || direction === 'unknown') return true;
+    return inverse ? direction !== claim.direction : direction === claim.direction;
+  });
+}
+
+function claimLabel(pair: { a: string; b: string }, claim: AssertedClaim): string {
+  if (claim.direction === 'b-to-a') return `${pair.b} ${claim.head} ${pair.a}`;
+  if (claim.direction === 'a-to-b') return `${pair.a} ${claim.head} ${pair.b}`;
+  return `${pair.a} / ${pair.b} ${claim.head}`;
+}
+
 /**
- * Downgrade an unsupported CONFIRMED tie to an explicit abstain. Returns the
- * original answer when the question is not a status-of pair, when the bank
- * holds an accepted tie, when one passage names both sides, or when the
- * draft never claims CONFIRMED. Otherwise the tie is not established: the
- * original draft is kept below for audit, never silently dropped.
+ * Verify the relationships an answer actually asserts for the asked pair.
+ *
+ * Every closed relationship phrase is a claim; only a keeper of that kind (or
+ * its closed inverse, in the opposite direction) supports it. All supported
+ * leaves the draft untouched; none supported abstains; mixed keeps the answer
+ * with one correction line naming what the bank does not hold.
  */
-function enforceStatusTieGuard(
+export function enforceStatusTieGuard(
   db: Db,
   projectId: number,
   question: string,
   draft: string,
-  passages: Passage[],
+  _passages: Passage[],
 ): string {
-  const pair = lorebook.parseStatusPair(question);
+  // Test-only A/B switch. Unset or any value other than '1' keeps the guard.
+  if (process.env.FANFABLE_NO_GUARD === '1') return draft;
+  const pair = parsePairQuestion(question);
   if (!pair) return draft;
-  if (!/\bconfirmed\b/i.test(draft)) return draft;
   let entities: { id: number; name: string; aliases: string[] }[] = [];
   try {
-    entities = lorebook
-      .listEntities(db, projectId)
-      .map((e) => ({ id: e.id, name: e.name, aliases: e.aliases ?? [] }));
+    entities = lorebook.listEntities(db, projectId).map((entity) => ({
+      id: entity.id,
+      name: entity.name,
+      aliases: entity.aliases ?? [],
+    }));
   } catch {
     return draft;
   }
   const sideA = entityVariantsFor(entities, pair.a);
   const sideB = entityVariantsFor(entities, pair.b);
-  // Same-row identity: a tie to self is never confirmed.
-  if (sideA.ids.length && sideA.ids.some((id) => sideB.ids.includes(id))) {
-    // Fall through to the abstain below.
-  } else if (lorebook.lookupKeeperPair(db, projectId, pair.a, pair.b).length > 0) {
-    return draft;
-  } else if (passageNamesBoth(passages, sideA.variants, sideB.variants)) {
-    return draft;
-  }
-  return (
+  const claims = assertedClaims(draft, pair, sideA.variants, sideB.variants);
+  if (!claims.length) return draft;
+  const supported = claims.filter((claim) => keeperSupportsClaim(db, projectId, pair, sideA, sideB, claim));
+  const unsupported = claims.filter((claim) => !supported.includes(claim));
+  if (!unsupported.length) return draft;
+  const abstain =
     `### Status of ${pair.a} to ${pair.b}\n\n` +
-    `Tie not established. The lore index banks no tie between ${pair.a} and ${pair.b}, ` +
-    `and no single retrieved passage names both and states the tie. Nothing here is confirmed.\n\n` +
-    `---\nOriginal draft (uncorrected, kept for audit):\n${draft}`
-  );
+    `Tie not established. The lore index banks no keeper for the claimed relationship between ${pair.a} and ${pair.b}.\n\n` +
+    `---\nOriginal draft (uncorrected, kept for audit):\n${draft}`;
+  if (!supported.length) return abstain;
+  const labels = [...new Set(unsupported.map((claim) => claimLabel(pair, claim)))];
+  return `Correction: Bank holds no keeper for: ${labels.join('; ')}.\n\n${draft}`;
 }
 
 export async function answerLoreQuestion(
