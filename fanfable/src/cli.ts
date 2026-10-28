@@ -29,7 +29,7 @@ import { listConflicts, resolveConflict } from './state-conflicts.ts';
 import * as memory from './memory.ts';
 import * as planner from './planner.ts';
 import * as continuity from './continuity.ts';
-import { continuitySettings } from './continuity-settings.ts';
+import { continuitySettings, filterBySeverity } from './continuity-settings.ts';
 import * as controller from './controller.ts';
 import * as retrieval from './retrieval.ts';
 import type { PassageTrail } from './graph.ts';
@@ -1397,7 +1397,10 @@ async function cmdIssues(args: Args): Promise<void> {
     console.log(`issue ${id} marked ${resolution}`);
     return;
   }
-  const issues = continuity.listIssues(db, project.id, { openOnly: args.flags.all !== true });
+  const all = args.flags.all === true;
+  const settings = continuitySettings(project);
+  let issues = continuity.listIssues(db, project.id, { openOnly: !all, minSeverity: all ? 'note' : settings.minSeverity });
+  issues = filterBySeverity(issues, all ? { ...settings, minSeverity: 'note' } : settings);
   heading('Continuity issues');
   if (!issues.length) {
     console.log('(none)');

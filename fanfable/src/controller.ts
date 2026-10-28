@@ -879,10 +879,12 @@ export async function runContinuityCheck(
     stats,
   });
   if (report) report.droppedModelIssues = stats.droppedModelIssues;
-  const kept = filterBySeverity(issues, settings);
+  // Every finding is persisted; minSeverity is a display filter, not a
+  // deletion rule. Callers that print get the filtered view.
+  const visible = filterBySeverity(issues, settings);
   db.run('DELETE FROM continuity_issue WHERE project_id = ? AND chapter_id = ?', projectId, chapter.id);
-  continuity.saveIssues(db, projectId, chapter.id, kept);
-  return kept;
+  continuity.saveIssues(db, projectId, chapter.id, issues);
+  return visible;
 }
 
 /* ------------------------------------------------------- impact analysis */

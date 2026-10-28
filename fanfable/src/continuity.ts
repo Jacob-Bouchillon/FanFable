@@ -75,7 +75,7 @@ export function saveIssues(db: Db, projectId: number, chapterId: number | null, 
 export function listIssues(
   db: Db,
   projectId: number,
-  opts: { chapterId?: number; openOnly?: boolean } = {},
+  opts: { chapterId?: number; openOnly?: boolean; minSeverity?: IssueSeverity } = {},
 ): (ContinuityIssue & { id: number; chapterNumber: number | null; createdAt: string })[] {
   const params: unknown[] = [projectId];
   let sql = `SELECT i.*, c.number AS chapter_number FROM continuity_issue i
@@ -98,7 +98,9 @@ export function listIssues(
     chapter_number: number | null;
     created_at: string;
   }>(sql, ...params);
-  return rows.map((r) => ({
+  const rank: Record<IssueSeverity, number> = { error: 0, warning: 1, note: 2 };
+  const floor = opts.minSeverity ? rank[opts.minSeverity] : 2;
+  return rows.filter((r) => rank[(r.severity as IssueSeverity)] <= floor).map((r) => ({
     id: r.id,
     severity: r.severity as IssueSeverity,
     category: r.category as IssueCategory,
@@ -253,15 +255,32 @@ export function deterministicChecks(input: DeterministicInput): ContinuityIssue[
   //     both sides (or one side plus a pronoun) is reported.
   const denial = /\b(never\s+(?:met|served|knew|known)|no\s+(?:relationship|tie|connection)|not\s+(?:my|his|her|their|your)\s+(?:master|aide|apprentice|teacher|student|mentor|parent|child|friend|enemy|ally|spouse|husband|wife)|denied\s+(?:any\s+)?(?:connection|relationship|tie)|(?:was|were)\s+lying)\b/i;
   const pronoun = /\b(he|she|they|him|her|them|his|hers|their|theirs|i|me|my|mine|we|us|our|ours)\b/i;
+  const speechVerb = /\b(said|says|asked|answered|replied|whispered|shouted|muttered|added|continued|called|told|explained|insisted|admitted|declared|demanded|looked|glanced|stared|nodded|smiled|frowned|turned)\b/i;
   const sentences = splitSentences(chapter.body);
+  const namesVariant = (variants: string[], text: string): boolean =>
+    variants.some((name) => nameMentionedExact(name, text));
+  const attributionTo = (text: string, variants: string[]): boolean =>
+    variants.some((name) => {
+      const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      return new RegExp(`(?:${speechVerb.source}\\s+(?:[^.!?]*\\s)?${escaped}\\b)|(?:\\b${escaped}\\b[^.!?]*\\s${speechVerb.source})`, 'i').test(text);
+    });
   const denialFor = (tie: KeeperTie): string | null => {
     const aVariants = [tie.fromName, ...tie.fromAliases].filter(Boolean);
     const bVariants = [tie.toName, ...tie.toAliases].filter(Boolean);
-    for (const sentence of sentences) {
+    for (let index = 0; index < sentences.length; index++) {
+      const sentence = sentences[index]!;
       if (!denial.test(sentence)) continue;
-      const a = aVariants.some((name) => nameMentionedExact(name, sentence));
-      const b = bVariants.some((name) => nameMentionedExact(name, sentence));
-      if ((a && b) || ((a || b) && pronoun.test(sentence))) return sentence.trim();
+      const a = namesVariant(aVariants, sentence);
+      const b = namesVariant(bVariants, sentence);
+      // Explicit path: both endpoints are named in this sentence.
+      if (a && b) return sentence.trim();
+      if (!a && !b) continue;
+      // Pronoun path: the sentence (or its predecessor) must attribute the
+      // speech or action to the other endpoint. A merely nearby name is not
+      // enough.
+      const other = a ? bVariants : aVariants;
+      const window = `${sentences[index - 2] ?? ''} ${sentences[index - 1] ?? ''} ${sentence}`;
+      if (pronoun.test(sentence) && attributionTo(window, other)) return sentence.trim();
     }
     return null;
   };
@@ -577,10 +596,28 @@ export async function checkChapter(
         .trim();
     const body = normaliseEvidence(chapter.body);
     const before = model.length;
-    model = model.filter((issue) => {
-      const evidence = normaliseEvidence(issue.evidence);
-      return !!evidence && body.includes(evidence);
-    });
+    model = model
+      .filter((issue) => {
+        const evidence = normaliseEvidence(issue.evidence);
+        return !!evidence && body.includes(evidence);
+      })
+      .map((issue) => {
+        // A dead-in-source finding is a question about story time, never a
+        // hard contradiction without evidence of when the scene happens.
+        if (
+          issue.severity !== 'note' &&
+          /\b(dead|deceased|killed|murdered|missing)\b/i.test(issue.message) &&
+          /\b(source|canon)\b/i.test(issue.message) &&
+          /\bappears?\b/i.test(issue.message)
+        ) {
+          return {
+            ...issue,
+            severity: 'note' as IssueSeverity,
+            suggestion: `${issue.suggestion} Confirm whether this scene predates the recorded death.`.trim(),
+          };
+        }
+        return issue;
+      });
     if (opts.stats) opts.stats.droppedModelIssues = before - model.length;
   }
 
