@@ -255,11 +255,14 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
       /* --------------------------------------------------------- session */
       if (path === '/api/session' && method === 'GET') {
         const p = projectId === null ? undefined : controller.getProject(db, projectId);
+        // The API key stays on the server: the UI sends settings, never reads the key back.
+        const saved: Record<string, unknown> = { ...(loadGlobalConfig() as object) };
+        delete saved.apiKey;
         json(res, 200, {
           projects: controller.listProjects(db).map((x) => ({ id: x.id, name: x.name, updatedAt: x.updatedAt })),
           currentProjectId: p?.id ?? null,
           projectName: p?.name ?? null,
-          model: { ...(loadGlobalConfig() as object), ...(p?.settings as object) },
+          model: { ...saved, ...(p?.settings as object) },
         });
         return;
       }

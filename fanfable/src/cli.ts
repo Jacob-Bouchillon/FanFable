@@ -15,6 +15,7 @@ import {
   LlmError,
   configPath,
   loadGlobalConfig,
+  resolveSettings,
   saveGlobalConfig,
 } from './llm.ts';
 import { clientFrom } from './llm.ts';
@@ -214,6 +215,8 @@ ${C.bold('MEMORY')}
 ${C.bold('MODEL')}
   llm status                       Check that the model server is reachable
   llm config --provider ollama --model llama3.1:8b --base-url http://127.0.0.1:11434
+  llm config --provider openai --base-url https://openrouter.ai/api --model qwen/qwen2.5-7b-instruct --api-key sk-...
+                                   --embedding-base-url http://127.0.0.1:11434 (keep embeddings local)
 
 ${C.bold('UI')}
   serve [--port 8123]               Open the browser interface (everything, in one place)
@@ -322,10 +325,16 @@ async function cmdProject(args: Args): Promise<void> {
       if (Object.keys(patch).length) {
         const updated = controller.updateProjectSettings(db, p.id, patch);
         console.log(`Updated settings for ${C.bold(p.name)}`);
-        console.log(JSON.stringify({ ...DEFAULT_LLM_SETTINGS, ...loadGlobalConfig(), ...updated.settings }, null, 2));
+        console.log(
+          JSON.stringify(
+            maskApiKey({ ...DEFAULT_LLM_SETTINGS, ...loadGlobalConfig(), ...updated.settings }),
+            null,
+            2,
+          ),
+        );
         return;
       }
-      console.log(JSON.stringify({ ...DEFAULT_LLM_SETTINGS, ...loadGlobalConfig(), ...p.settings }, null, 2));
+      console.log(JSON.stringify(maskApiKey({ ...DEFAULT_LLM_SETTINGS, ...loadGlobalConfig(), ...p.settings }), null, 2));
       return;
     }
     default:
@@ -1698,6 +1707,14 @@ async function cmdState(args: Args): Promise<void> {
   );
 }
 
+/** Printed settings never carry the whole key: prefix…suffix only. */
+function maskApiKey<T extends { apiKey?: string }>(settings: T): T {
+  if (typeof settings.apiKey === 'string' && settings.apiKey) {
+    settings.apiKey = `${settings.apiKey.slice(0, 6)}…${settings.apiKey.slice(-4)}`;
+  }
+  return settings;
+}
+
 async function cmdLlm(args: Args): Promise<void> {
   const sub = args._[1] ?? '';
   if (sub === 'config') {
@@ -1705,29 +1722,36 @@ async function cmdLlm(args: Args): Promise<void> {
     const provider = flagString(args, 'provider');
     const model = flagString(args, 'model');
     const baseUrl = flagString(args, 'base-url');
+    const apiKey = flagString(args, 'api-key');
+    const embeddingBaseUrl = flagString(args, 'embedding-base-url');
     const temperature = flagNumber(args, 'temperature', NaN);
     if (provider) patch.provider = provider as LlmSettings['provider'];
     if (model) patch.model = model;
     if (baseUrl) patch.baseUrl = baseUrl;
+    if (apiKey) patch.apiKey = apiKey;
+    if (embeddingBaseUrl) patch.embeddingBaseUrl = embeddingBaseUrl;
     if (Number.isFinite(temperature)) patch.temperature = temperature;
     saveGlobalConfig(patch);
-    console.log(JSON.stringify({ ...DEFAULT_LLM_SETTINGS, ...loadGlobalConfig() }, null, 2));
+    console.log(JSON.stringify(maskApiKey({ ...DEFAULT_LLM_SETTINGS, ...loadGlobalConfig() }), null, 2));
     return;
   }
 
   if (sub === 'status' || sub === '') {
-    const settings = { ...DEFAULT_LLM_SETTINGS, ...loadGlobalConfig() };
+    const settings = resolveSettings();
     heading('Model status');
     console.log(`provider: ${settings.provider}`);
     console.log(`base url: ${settings.baseUrl}`);
     console.log(`model: ${settings.model}`);
+    console.log(`api key: ${settings.apiKey ? C.green('set') : C.dim('not set')}`);
+    if (settings.embeddingBaseUrl) console.log(`embedding base url: ${settings.embeddingBaseUrl}`);
     const client = controller.createClient(settings);
     const ok = await client.available();
     console.log(ok ? C.green('server reachable') : C.red('server not reachable'));
     if (!ok) {
       console.log(
         C.dim(
-          'Start a local server, e.g. "ollama serve" (Ollama) or "llama-server -m model.gguf" (llama.cpp).',
+          'Start a local server, e.g. "ollama serve" (Ollama) or "llama-server -m model.gguf" (llama.cpp), ' +
+            'or set apiKey for a cloud gateway.',
         ),
       );
     }

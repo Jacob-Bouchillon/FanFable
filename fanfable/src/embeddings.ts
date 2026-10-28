@@ -12,6 +12,7 @@
  * behavior, never fail because an embedder is unreachable.
  */
 import { Db, nowIso } from './db.ts';
+import { loadGlobalConfig } from './llm.ts';
 
 export const DEFAULT_EMBED_MODEL = 'nomic-embed-text';
 export const EMBED_BATCH_SIZE = 32;
@@ -115,7 +116,13 @@ export interface StoredVector {
   vec: number[];
 }
 
-/** Resolve model + server from project settings, with CLI overrides. */
+/**
+ * Resolve model + server from project settings, with CLI overrides.
+ *
+ * `embeddingBaseUrl` comes before `baseUrl` because the chat backend may be a
+ * cloud gateway (OpenRouter and the like) that serves no /api/embed; the
+ * embedder has to keep pointing at the local Ollama.
+ */
 export function resolveEmbedConfig(
   db: Db,
   projectId: number,
@@ -128,15 +135,17 @@ export function resolveEmbedConfig(
   } catch {
     /* a broken settings blob still embeds with defaults */
   }
+  const global = loadGlobalConfig() as Record<string, unknown>;
+  const str = (o: Record<string, unknown>, k: string): string | undefined =>
+    typeof o[k] === 'string' && o[k] ? (o[k] as string) : undefined;
   const baseUrl =
     opts.baseUrl ??
-    (typeof settings.baseUrl === 'string' && settings.baseUrl ? settings.baseUrl : undefined) ??
+    str(settings, 'embeddingBaseUrl') ??
+    str(global, 'embeddingBaseUrl') ??
+    str(settings, 'baseUrl') ??
     opts.fallbackBaseUrl ??
     'http://127.0.0.1:11434';
-  const model =
-    opts.model ??
-    (typeof settings.embeddingModel === 'string' && settings.embeddingModel ? settings.embeddingModel : undefined) ??
-    DEFAULT_EMBED_MODEL;
+  const model = opts.model ?? str(settings, 'embeddingModel') ?? DEFAULT_EMBED_MODEL;
   return { baseUrl, model };
 }
 

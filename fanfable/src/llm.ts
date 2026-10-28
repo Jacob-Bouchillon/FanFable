@@ -36,6 +36,17 @@ export interface LlmSettings {
    * same budget as the answer.
    */
   think?: boolean;
+  /**
+   * Key for a gateway that checks one (OpenRouter and other cloud hosts).
+   * Unset for local servers. When config stores none, FANFABLE_API_KEY then
+   * OPENROUTER_API_KEY are used, so a key can stay out of the config file.
+   */
+  apiKey?: string;
+  /**
+   * Server used by the embedder (Ollama). Read by embeddings.ts only; set it
+   * when `baseUrl` points at a cloud chat gateway, which serves no /api/embed.
+   */
+  embeddingBaseUrl?: string;
 }
 
 export const DEFAULT_LLM_SETTINGS: LlmSettings = {
@@ -121,11 +132,21 @@ export function resolveSettings(overrides: Partial<LlmSettings> = {}): LlmSettin
     }
     return out;
   };
-  return {
+  const merged: LlmSettings = {
     ...DEFAULT_LLM_SETTINGS,
     ...clean(loadGlobalConfig()),
     ...clean(overrides),
   };
+  if (merged.apiKey === undefined) {
+    const envKey = apiKeyFallback();
+    if (envKey) merged.apiKey = envKey;
+  }
+  return merged;
+}
+
+/** Key from the environment, used only when config names none. */
+function apiKeyFallback(): string | undefined {
+  return process.env.FANFABLE_API_KEY || process.env.OPENROUTER_API_KEY || undefined;
 }
 
 /* ------------------------------------------------------------------ helpers */
@@ -140,13 +161,16 @@ function describeFetchError(err: unknown): string {
   return msg;
 }
 
-async function postJson(url: string, body: unknown, timeoutMs: number): Promise<any> {
+async function postJson(url: string, body: unknown, timeoutMs: number, apiKey?: string): Promise<any> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+      },
       body: JSON.stringify(body),
       signal: controller.signal,
     });
@@ -166,11 +190,14 @@ async function postJson(url: string, body: unknown, timeoutMs: number): Promise<
   }
 }
 
-async function getJson(url: string, timeoutMs: number): Promise<any> {
+async function getJson(url: string, timeoutMs: number, apiKey?: string): Promise<any> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { signal: controller.signal });
+    const res = await fetch(url, {
+      headers: apiKey ? { authorization: `Bearer ${apiKey}` } : undefined,
+      signal: controller.signal,
+    });
     if (!res.ok) throw new LlmError(`HTTP ${res.status}`);
     return await res.json();
   } catch (err) {
@@ -324,6 +351,7 @@ class OpenAiCompatProvider implements LlmClient {
         ...(req.stop ? { stop: req.stop } : {}),
       },
       this.settings.timeoutMs,
+      this.settings.apiKey,
     );
     return {
       text: data?.choices?.[0]?.message?.content ?? '',
@@ -339,7 +367,7 @@ class OpenAiCompatProvider implements LlmClient {
 
   async available(): Promise<boolean> {
     try {
-      await getJson(`${this.settings.baseUrl.replace(/\/$/, '')}/v1/models`, 3000);
+      await getJson(`${this.settings.baseUrl.replace(/\/$/, '')}/v1/models`, 3000, this.settings.apiKey);
       return true;
     } catch {
       return false;
@@ -424,5 +452,6 @@ export function clientFrom(projectSettings: unknown, opts: { useExtractionModel?
     timeoutMs: s.timeoutMs,
     seed: s.seed,
     think: s.think,
+    apiKey: s.apiKey,
   });
 }
