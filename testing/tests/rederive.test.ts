@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as controller from '../../fanfable/src/controller.ts';
 import { findUnverifiedKeepers } from '../../fanfable/src/lorebook.ts';
-import { applyPlan, checkCandidate, loadChunks, loadRows, planRow } from '../trials/evidence-audit/rederive-lib.ts';
+import { applyPlan, checkCandidate, loadChunks, loadRows, planRow } from './rederive-lib.ts';
 import { tempDb } from './helpers.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';
