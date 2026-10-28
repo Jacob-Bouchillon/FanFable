@@ -6,8 +6,13 @@ node_modules/
 .DS_Store
 fanfable.db
 .imports/
-# Local-only harness (never pushed): benchmark runs, ratings, corpora, scripts, tests
-testing/
+# Local-only harness run artifacts (never pushed). The suite itself is committed.
+testing/*
+!testing/tests/
+!testing/scripts/
+!testing/benchmarks/
+testing/benchmarks/*
+!testing/benchmarks/fixtures/
 
 # Local-only reference material (never pushed): upstream sources to read, not to ship
 RESOURCES/

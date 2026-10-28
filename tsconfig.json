@@ -15,5 +15,6 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["fanfable/**/*.ts", "testing/**/*.ts"]
+  "include": ["fanfable/**/*.ts", "testing/**/*.ts"],
+  "exclude": ["testing/trials/**"]
 }
