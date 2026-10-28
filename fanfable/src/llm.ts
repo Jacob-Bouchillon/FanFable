@@ -349,6 +349,9 @@ class OpenAiCompatProvider implements LlmClient {
         stream: false,
         ...(this.settings.seed !== undefined ? { seed: this.settings.seed } : {}),
         ...(req.stop ? { stop: req.stop } : {}),
+        // Same shape Ollama's format:'json' asks for, so extraction gets the
+        // same constraint on a gateway that has no `format` field.
+        ...(req.format === 'json' ? { response_format: { type: 'json_object' } } : {}),
       },
       this.settings.timeoutMs,
       this.settings.apiKey,
