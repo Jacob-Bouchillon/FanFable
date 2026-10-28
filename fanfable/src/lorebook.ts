@@ -4371,6 +4371,27 @@ function sameOrInverseKind(noteKind: string, rowKind: string): boolean {
   return inverseKinds(note).includes(rowHead) || inverseKinds(row).includes(noteHead);
 }
 
+/** Read the direction one sentence states for this kind and pair. */
+export function relationSentenceDirection(
+  kind: string,
+  evidence: string,
+  fromName: string,
+  fromAliases: string[],
+  toName: string,
+  toAliases: string[],
+): 'forward' | 'reverse' | 'unknown' {
+  return quoteDirection(canonicalKind(kind), evidence, {
+    fromId: 0,
+    toId: 0,
+    fromName,
+    toName,
+    fromAliases,
+    toAliases,
+    kind,
+    evidence,
+  });
+}
+
 /**
  * The one promotion guard. A parked tie may become a keeper only when all
  * four conditions hold: closed relationship-grade kind, no PARK ruling for the
