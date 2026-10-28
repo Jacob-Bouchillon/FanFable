@@ -50,6 +50,7 @@ interface DevRelationRow {
   kind: string;
   description: string;
   evidence: string;
+  supporting_evidence: string;
   source_refs: string;
   review_status: string | null;
   modality: string | null;
@@ -113,7 +114,7 @@ export function devGraphSummary(db: Db, project: controller.Project) {
 
   const relations = db.all<DevRelationRow>(
     `SELECT r.id, r.from_entity, r.to_entity, a.name AS from_name, b.name AS to_name,
-            r.kind, r.description, r.evidence, r.source_refs, r.review_status,
+            r.kind, r.description, r.evidence, r.supporting_evidence, r.source_refs, r.review_status,
             r.modality, r.conflict_status, r.scope, r.ledger_state
        FROM canon_relation r
        JOIN canon_entity a ON a.id = r.from_entity
@@ -197,6 +198,12 @@ export function devGraphSummary(db: Db, project: controller.Project) {
       kind: r.kind,
       description: r.description,
       evidence: r.evidence,
+      supportingEvidence: (() => {
+        try {
+          const raw = JSON.parse(r.supporting_evidence || '[]');
+          return Array.isArray(raw) ? raw : [];
+        } catch { return []; }
+      })(),
       reviewStatus: r.review_status ?? 'accepted',
       modality: r.modality ?? 'asserted',
       conflictStatus: r.conflict_status ?? 'none',
@@ -244,6 +251,7 @@ export function devGraphSummary(db: Db, project: controller.Project) {
       accepted: relations.filter((r) => (r.review_status ?? 'accepted') === 'accepted').length,
       userConfirmed: relations.filter((r) => r.review_status === 'user_confirmed').length,
       parked: relations.filter((r) => (r.review_status ?? 'accepted') === 'needs_review').length,
+      provisional: relations.filter((r) => r.review_status === 'provisional').length,
       coverage: relations.filter((r) => r.kind === 'appears_with').length,
       pendingNotes: count(
         "SELECT COUNT(*) AS n FROM canon_tie_note WHERE project_id = ? AND status = 'pending'",

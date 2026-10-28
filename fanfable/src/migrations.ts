@@ -343,6 +343,15 @@ export const MIGRATIONS: Migration[] = [
     `,
   },
   {
+    version: 14,
+    name: 'supporting evidence for relations',
+    // One cited proving quote per relation; superseded quotes move here as
+    // display-only context. Additive only; existing rows default to [].
+    columns: [
+      ['canon_relation', 'supporting_evidence', "TEXT NOT NULL DEFAULT '[]'"],
+    ],
+  },
+  {
     version: 3,
     name: 'chapter references for story graph records',
     // Knowledge, motives, secrets and relationships have to be removable when

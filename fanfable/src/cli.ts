@@ -139,15 +139,19 @@ ${C.bold('SOURCE MATERIAL')}
   lore hints [--limit n]           List ties whose endpoints are not in the bank
   lore link-facts [--dry-run] [--limit n]  Attach fact subjects to entities
   lore capacity [--dry-run] [--limit n]  Park unproven entities, funnel proven nouns
+  lore names [--limit n] [--diagnostics]  List the capitalization name roster (no writes)
   lore rulings export [--out path]  Export keepers, note rulings and alias identities by name
   lore rulings replay --in path [--write] [--dry-run] [--limit n]
                            Reapply an exported ruling file to this project
-  lore ties --from A --to B [--at n]  What two people are to each other now, and before
+  lore ties --from A --to B [--at n] [--supporting]
+                           What two people are to each other now, and before
   lore merge                       Merge entries that are the same under two names
   lore judge-aliases [--max n]     Rule on quarantined nickname pairs (one model call)
   lore diagnose                    Report what the index is probably missing
   lore enrich <name> [--handoff f] Re-read the passages about one character
-  lore notes [--resolve] [--max n] Parked tie failures; resolve them with one closed-vocabulary pass
+  lore notes [--prioritise] [--max n]  Rank parked ties for human review (no writes)
+  lore promote [--dry-run] [--limit n] [--find-evidence]
+                           Re-check provisional ties; only the proven rule decides
   lore evaluate [--max n]        Judge each banked tie with understanding; failures park as notes
   lore status [--watch [secs]]     How much of the book is read, banked, and waiting
   lore correct relation <id>       Correct a relation by hand
@@ -429,7 +433,8 @@ async function cmdLore(args: Args): Promise<void> {
     });
     console.log(
       `${C.green('extracted')} ${stats.entities} entities, ${stats.relations} relationships, ` +
-        `${stats.facts} facts, ${stats.timeline} timeline entries`,
+        `${stats.facts} facts, ${stats.timeline} timeline entries` +
+        (stats.provisional ? ` (${stats.provisional} provisional)` : ''),
     );
     if (stats.selection) {
       console.log(
@@ -445,7 +450,10 @@ async function cmdLore(args: Args): Promise<void> {
         C.dim(
           `  quotes: ${v.verified} verified, ${v.repointed} repointed, ${v.dropped} dropped` +
             (v.unresolved ? `, ${v.unresolved} relations named an unknown entity` : '') +
-            (v.hinted ? `, ${v.hinted} hints kept` : ''),
+            (v.hinted ? `, ${v.hinted} hints kept` : '') +
+            (v.retried
+              ? `, ${v.retried} strict quote retries (${v.retriedFixed} fixed, ${v.retriedFailed} failed)`
+              : ''),
         ),
       );
     }
@@ -544,6 +552,7 @@ async function cmdLore(args: Args): Promise<void> {
     if (!from) throw new Error(`no one called "${fromName}" (the --from side)`);
     const to = lorebook.findEntity(db, project.id, toName);
     if (!to) throw new Error(`no one called "${toName}" (the --to side)`);
+    const showSupporting = args.flags.supporting === true;
     const atRaw = flagNumber(args, 'at', NaN);
     const atSeq = Number.isFinite(atRaw) ? atRaw : undefined;
     const directed = lorebook.directedPairStatus(db, project.id, from.id, to.id, atSeq);
@@ -556,12 +565,25 @@ async function cmdLore(args: Args): Promise<void> {
       return;
     }
     const show = (r: lorebook.StatusRow): void => {
-      const badge = r.conflictStatus !== 'none' ? C.dim(` [${r.conflictStatus}]`) : '';
+      const promotion = r.reviewStatus === 'needs_review' ? lorebook.canPromoteRelation(db, project.id, r.id) : null;
+      const promoteBadge = promotion
+        ? promotion.ok
+          ? C.green(' [promotable]')
+          : C.dim(` [parked: ${promotion.reason}]`)
+        : '';
+      const badge = (r.conflictStatus !== 'none' ? C.dim(` [${r.conflictStatus}]`) : '') + promoteBadge;
       const support = (corroborated.get(r.id) ?? 1) > 1 ? C.dim(` [×${corroborated.get(r.id)} windows]`) : '';
       const where = r.locator ? C.dim(` [${r.locator}]`) : r.seq !== null ? C.dim(` (passage ${r.seq})`) : C.dim(' (unplaced)');
       console.log(`\n${C.bold(`${r.fromName} → ${r.toName}: ${r.kind}`)}${badge}${support}${where}`);
       if (r.description) console.log(`  ${r.description}`);
       if (r.evidence) console.log(`  ${C.dim(`"${r.evidence}"`)}`);
+      const supporting = r.supportingEvidence ?? [];
+      if (supporting.length) {
+        console.log(C.dim(`  supporting: ${supporting.length}${showSupporting ? '' : ' (use --supporting for quotes)'}`));
+        if (showSupporting) {
+          for (const item of supporting) console.log(C.dim(`    "${item.quote}"${item.reason ? ` (${item.reason})` : ''}`));
+        }
+      }
       if (r.modality !== 'asserted') console.log(`  ${C.dim(`framed as: ${r.modality}`)}`);
     };
     if (directed.forward.current) {
@@ -626,6 +648,32 @@ async function cmdLore(args: Args): Promise<void> {
       console.log(
         `  ${C.dim(`dropped: ${Object.entries(d).filter(([, n]) => (n as number) > 0).map(([k, n]) => `${n} ${k}`).join(', ')}`)}`,
       );
+    }
+    return;
+  }
+
+  if (sub === 'names') {
+    const limit = Math.max(1, Math.floor(flagNumber(args, 'limit', 25)));
+    const roster = lorebook.buildNameRoster(db, project.id);
+    heading('Name roster');
+    console.log(`  ${roster.entries.length} surfaces`);
+    for (const entry of roster.entries.slice(0, limit)) {
+      const variants = entry.surfaces.length > 1 ? C.dim(` [+${entry.surfaces.length - 1} variant${entry.surfaces.length > 2 ? 's' : ''}]`) : '';
+      console.log(
+        `  ${String(entry.count).padStart(4)}  ${entry.surface}${variants} ${C.dim(`(${entry.trustedSource})`)}`,
+      );
+    }
+    if (args.flags.diagnostics === true) {
+      const diagnostics = roster.diagnostics;
+      console.log('');
+      console.log(
+        `  sentence-initial candidates ${diagnostics.sentenceInitialCandidates}, ` +
+          `accepted ${diagnostics.accepted}, rejected ${diagnostics.rejected}`,
+      );
+      console.log('  top rejected:');
+      for (const row of diagnostics.topRejected) {
+        console.log(`    ${String(row.count).padStart(4)}  ${row.surface}`);
+      }
     }
     return;
   }
@@ -727,17 +775,58 @@ async function cmdLore(args: Args): Promise<void> {
     return;
   }
 
-  if (sub === 'notes') {
-    if (args.flags.resolve === true) {
-      heading('Resolving parked tie notes');
-      const result = await lorebook.resolveTieNotes(db, a.llm, project.id, {
-        maxNotes: flagNumber(args, 'max', 25),
-        onProgress: (m) => process.stdout.write(`  ${C.dim(m)}\n`),
+  if (sub === 'promote') {
+    const dryRun = args.flags['dry-run'] === true;
+    const limit = args.flags.limit === undefined
+      ? undefined
+      : Math.max(1, Math.floor(flagNumber(args, 'limit', 0)));
+    const findEvidence = args.flags['find-evidence'] === true;
+    heading(dryRun ? 'Provisional ties (dry run)' : 'Provisional ties');
+    if (findEvidence) {
+      const result = await lorebook.promoteProvisionalWithEvidence(db, a.llm, project.id, {
+        limit: limit ?? 5,
+        dryRun,
       });
       console.log(
-        `${C.green('resolved')} ${result.resolved} ties, ${result.confirmed} confirmed drops, ` +
-          `${result.unproven} left pending (${result.pending} still waiting)`,
+        `  checked ${result.checked}, returned ${result.returned}, verified ${result.verified}, ` +
+          `promoted ${result.promoted}, still provisional ${result.still.length}`,
       );
+      for (const row of result.failed) {
+        console.log(`  ${C.yellow('unverified')} #${row.id}: ${row.reason}`);
+      }
+      return;
+    }
+    const result = lorebook.promoteProvisional(db, project.id, { dryRun, limit });
+    const reasons = new Map<string, number>();
+    for (const row of result.still) reasons.set(row.reason, (reasons.get(row.reason) ?? 0) + 1);
+    console.log(`  checked ${result.checked}, promoted ${result.promoted}, still provisional ${result.still.length}`);
+    for (const [reason, count] of [...reasons.entries()].sort((x, y) => y[1] - x[1])) {
+      console.log(`  ${C.dim(`${count} ${reason}`)}`);
+    }
+    return;
+  }
+
+  if (sub === 'notes') {
+    if (args.flags.prioritise === true || args.flags.resolve === true) {
+      const queue = lorebook.prioritiseTieNotes(db, project.id, {
+        limit: flagNumber(args, 'max', 25),
+      });
+      heading('Prioritising parked tie notes');
+      if (!queue.length) {
+        console.log(C.dim('(no pending notes)'));
+        return;
+      }
+      for (const row of queue) {
+        const mark = row.decision.ok
+          ? C.green('promotable')
+          : C.yellow(row.decision.reason ?? 'review');
+        console.log(
+          `  ${mark} ${C.bold(row.fromName)} / ${C.bold(row.toName)} — ${row.kind}` +
+            (row.locator ? C.dim(` [${row.locator}]`) : ''),
+        );
+      }
+      const ready = queue.filter((row) => row.decision.ok).length;
+      console.log(C.dim(`${ready} promotable, ${queue.length - ready} need another look; nothing changed`));
       return;
     }
     const rows = db.all<{ reason: string; status: string; n: number }>(
@@ -750,7 +839,7 @@ async function cmdLore(args: Args): Promise<void> {
     }
     heading('Parked tie notes');
     for (const r of rows) console.log(`  ${r.n} ${r.reason} / ${r.status}`);
-    console.log(C.dim('run "fanfable lore notes --resolve" for one closed-vocabulary pass over the pending ones'));
+    console.log(C.dim('run "fanfable lore notes --prioritise" to rank the pending ones for review'));
     return;
   }
 

@@ -18,7 +18,7 @@ import { asRecordArray, extractJson, salvageJsonArray, toStringArray } from './j
 import type { LlmClient } from './llm.ts';
 import { embedMissing, type EmbedFn } from './embeddings.ts';
 import { CORROBORATION_CAP, tripleKey, rankRows } from './edge-rank.ts';
-import { lexicalScore, splitSentences, tokenize, truncate } from './text.ts';
+import { findHeadings, lexicalScore, splitSentences, tokenize, truncate } from './text.ts';
 import {
   ANSWER_CUE_STOPWORDS,
   KIND_PARTICLES,
@@ -63,6 +63,13 @@ export interface CanonEntity {
   reviewStatus: string;
 }
 
+export interface SupportingEvidence {
+  quote: string;
+  sourceRefs: { source?: string; locator?: string; chunk?: number }[];
+  reason: string;
+  movedAt: string;
+}
+
 export interface CanonRelation {
   id: number;
   fromId: number;
@@ -72,6 +79,8 @@ export interface CanonRelation {
   kind: string;
   description: string;
   evidence: string;
+  /** Display-only superseded quotes; never cited or answered. */
+  supportingEvidence: SupportingEvidence[];
   modality: string;
   conflictStatus: string;
   ledgerState: string;
@@ -259,6 +268,71 @@ Rules:
 - If the passage denies, doubts, or frames something as merely possible, record the claim normally but set modality to denied/possible/suspected with the denying quote as evidence; never store a denial as a plain fact.
 - No prose outside the JSON.`;
 
+/**
+ * Three invented examples for the relations call, off by default.
+ *
+ * Set FANFABLE_REL_FEWSHOT=1 to append them. They show the one distinction the
+ * rules ask for: a lasting tie with its exact quote, a moment that must not be
+ * banked, and a passage naming only one endpoint. No source content.
+ */
+export const EXTRACT_RELATIONS_FEWSHOT = `Examples (invented names):
+Passage: "Asha is Bram's sister, and the hall has always known it."
+Relation: {"from":"Asha","to":"Bram","kind":"sister of","evidence":"Asha is Bram's sister"}
+
+Passage: "Cora met Bram at the gate and waved."
+Relation: none. Meeting once is a moment, not a lasting tie.
+
+Passage: "Cora waited beside the cart."
+Relation: none. Only one known name is stated; a tie needs both endpoints named.`;
+
+/**
+ * Strict-mode additions: closed kinds and one both-names sentence.
+ *
+ * Built lazily so CLOSED_ROLE_KINDS stays imported from the vocabulary
+ * declared later in this module rather than copied here.
+ */
+export function strictRelationsPrompt(): string {
+  return `Strict mode:
+- Kinds are closed. Choose the closest allowed kind from this list and never invent a kind:
+  ${CLOSED_ROLE_KINDS.join(', ')}
+- evidence must be ONE contiguous sentence copied from the passage that contains a form of BOTH names. If no single sentence names both, return no entry for that pair.
+Example: the passage sentence "Asha is Bram's sister, and the hall has always known it." is one entry: {"from":"Asha","to":"Bram","kind":"sister of","evidence":"Asha is Bram's sister, and the hall has always known it."}`;
+}
+
+/** Strict mode is opt-in; every other path keeps the historical prompt. */
+export function strictRelationsEnabled(): boolean {
+  return process.env.FANFABLE_REL_STRICT === '1';
+}
+
+/** The relations system prompt; optional blocks sit behind their env switches. */
+export function relationsSystemPrompt(): string {
+  let prompt = EXTRACT_RELATIONS_SYSTEM;
+  if (process.env.FANFABLE_REL_FEWSHOT === '1') prompt += `\n\n${EXTRACT_RELATIONS_FEWSHOT}`;
+  if (strictRelationsEnabled()) prompt += `\n\n${strictRelationsPrompt()}`;
+  if (process.env.FANFABLE_REL_LIBERAL === '1') prompt += `\n\n${liberalRelationsPrompt()}`;
+  return prompt;
+}
+
+/**
+ * Liberal discovery additions: every stated or strongly implied relationship,
+ * the model's own wording, no lasting-only or both-names gate. Enabled only by
+ * FANFABLE_REL_LIBERAL=1; the proof rules downstream are unchanged.
+ */
+export function liberalRelationsPrompt(): string {
+  return `Liberal discovery mode (this overrides the lasting-tie, moment and noun rules above):
+- Record every relationship these passages state or strongly imply, whether it lasts or happens once.
+- Use your own short wording for the kind; do not restrict yourself to a fixed list.
+- Direction still matters: "from" is the one who has the relationship and "to" is the one it is to.
+- evidence must be one sentence copied from the passage, or empty if no single sentence states it. The sentence need not name both endpoints.
+- Never use outside knowledge.`;
+}
+
+/** Narrow re-ask for one relation whose quote does not name both endpoints. */
+export const EXTRACT_RELATIONS_RETRY_SYSTEM = `You repair one relationship quote.
+Reply with JSON only: {"quote":"..."}
+You are given a PASSAGE, a PAIR of names and a KIND. Return ONE contiguous sentence copied VERBATIM from the passage that contains a form of BOTH names. If no single sentence names both names, reply {"quote":"NONE"}.
+Never paraphrase, never join sentences, and never use any text that is not in the passage.`;
+
 export const EXTRACT_EVENTS_SYSTEM = `You read passages from a book and record what happens in them, in order.
 
 Reply with JSON only:
@@ -373,6 +447,12 @@ export interface VerificationStats {
   unsupported: number;
   /** Unresolved-endpoint claims kept in canon_tie_hint instead of dropped. */
   hinted: number;
+  /** Strict-mode relation quote retries attempted. */
+  retried: number;
+  /** Retries that returned a verbatim, both-names sentence. */
+  retriedFixed: number;
+  /** Retries that did not. */
+  retriedFailed: number;
 }
 
 /**
@@ -404,6 +484,8 @@ export interface ExtractLoreResult {
   /** Windows processed in this run. */
   windows: number;
   verification: VerificationStats;
+  /** Rows that passed the verbatim gate but failed the proven tier. */
+  provisional: number;
   emptyWindows: EmptyWindowReport[];
   quarantinedAliases: QuarantinedAlias[];
   mergedAliases: string[];
@@ -635,6 +717,8 @@ export async function extractLore(
   const mined = loadMinedSet(db, projectId);
   const ctx = loadChunkContext(db, projectId);
   const entityIdByName = new Map<string, number>();
+  // Names harvested from the whole book once, before any window runs.
+  const roster = buildNameRoster(db, projectId, chunks);
 
   const allWindows = sliceWindows(chunks, windowSize);
   // Bridges are recurrence across the book, so the frequencies are built over
@@ -688,6 +772,7 @@ export async function extractLore(
     totalChunks: chunks.length,
     onProgress: opts.onProgress,
     onWindow: opts.onWindow,
+    roster,
   });
 
   // Fold any duplicates left by earlier runs into one row per pair.
@@ -883,6 +968,7 @@ export async function ensureWindowsForChunks(
   if (!targets.length) return stats;
 
   const ctx = loadChunkContext(db, projectId);
+  const roster = buildNameRoster(db, projectId, chunks);
   await runWindowBatch(db, llm, projectId, targets, ctx, new Map<string, number>(), stats, {
     concurrency: Math.max(1, Math.min(opts.concurrency ?? 3, 4)),
     maxTokens: opts.maxTokens ?? 3000,
@@ -891,6 +977,7 @@ export async function ensureWindowsForChunks(
     totalChunks: chunks.length,
     onProgress: opts.onProgress,
     onWindow: opts.onWindow,
+    roster,
   });
 
   dedupeRelations(db, projectId);
@@ -960,7 +1047,8 @@ function blankResult(): ExtractLoreResult {
     timeline: 0,
     passages: 0,
     windows: 0,
-    verification: { claimed: 0, verified: 0, repointed: 0, dropped: 0, unresolved: 0, unrelated: 0, moment: 0, redundant: 0, unsupported: 0, hinted: 0 },
+    verification: { claimed: 0, verified: 0, repointed: 0, dropped: 0, unresolved: 0, unrelated: 0, moment: 0, redundant: 0, unsupported: 0, hinted: 0, retried: 0, retriedFixed: 0, retriedFailed: 0 },
+    provisional: 0,
     emptyWindows: [],
     quarantinedAliases: [],
     mergedAliases: [],
@@ -1041,6 +1129,8 @@ interface RunBatchOpts {
   totalChunks: number;
   onProgress?: (message: string) => void;
   onWindow?: (progress: ExtractWindowProgress) => void;
+  /** Book-wide capitalization roster, built once per extraction. */
+  roster?: NameRoster;
 }
 
 /** Run windows through the split (or legacy) path and mark them mined. */
@@ -1074,6 +1164,7 @@ async function runWindowBatch(
               ctx.neighboursOf,
               batch.maxTokens,
               index,
+              batch.roster,
             );
           }
         } catch (err) {
@@ -1171,6 +1262,8 @@ export function lastExtractionReport(
   at: string;
   windows: number;
   verification: VerificationStats;
+  /** Rows that passed the verbatim gate but failed the proven tier. */
+  provisional: number;
   emptyWindows: EmptyWindowReport[];
   quarantinedAliases: number;
   mergedAliases: number;
@@ -1473,13 +1566,458 @@ function refsFor(chunk: ChunkRow | undefined): { source: string; locator: string
   return chunk ? [{ source: chunk.source_title, locator: chunk.locator, chunk: chunk.id }] : [];
 }
 
+
+/* ------------------------------------------------------------ name roster */
+
+/** Ceiling for the relation prompt's name list, roster included. */
+export const WINDOW_NAME_CAP = 80;
+/** The list's pre-roster ceiling: bank and finder names keep their old size. */
+const WINDOW_BANK_NAME_CAP = 60;
+
+export interface NameRosterEntry {
+  /** Representative surface: the most frequent form in the group. */
+  surface: string;
+  /** Every accepted surface form collapsed into this entry. */
+  surfaces: string[];
+  tokens: string[];
+  count: number;
+  trustedSource: 'mid-sentence' | 'sentence-start-matched';
+}
+
+export interface NameRosterDiagnostics {
+  sentenceInitialCandidates: number;
+  accepted: number;
+  rejected: number;
+  topRejected: { surface: string; count: number }[];
+  /** Quote boundaries that began a new utterance segment. */
+  quotedStarts: number;
+  rejectedInvalid: number;
+  rejectedContraction: number;
+  rejectedFunctionWord: number;
+  rejectedTitleOnly: number;
+  rejectedCommonWord: number;
+  rejectedStoplist: number;
+  rejectedNoMidSentence: number;
+}
+
+export interface NameRoster {
+  entries: NameRosterEntry[];
+  diagnostics: NameRosterDiagnostics;
+}
+
+/**
+ * Words that start sentences but are not names.
+ *
+ * Pronouns, determiners, conjunctions, common adverbs and prepositions, plus
+ * the discourse starters prose leans on. Universal English function words:
+ * extend only with the same classes, never with names.
+ */
+const NAME_STARTER_STOPLIST = new Set([
+  'but', 'he', 'she', 'it', 'they', 'we', 'you', 'i', 'in', 'on', 'at', 'as', 'if',
+  'then', 'how', 'what', 'when', 'where', 'why', 'who', 'his', 'her', 'their', 'the',
+  'a', 'an', 'and', 'or', 'so', 'yet', 'for', 'not', 'no', 'yes', 'that', 'this',
+  'these', 'those', 'there', 'here', 'now', 'later', 'before', 'after', 'once', 'still',
+  'even', 'only', 'just', 'also', 'perhaps', 'maybe', 'suddenly', 'finally', 'however',
+  'meanwhile', 'while', 'because', 'though', 'although', 'unless', 'until', 'since',
+  // Same classes, for sentences opening on a preposition or connective.
+  'about', 'above', 'across', 'afterwards', 'against', 'along', 'among', 'around',
+  'behind', 'below', 'beneath', 'beside', 'besides', 'between', 'beyond', 'by',
+  'despite', 'down', 'during', 'except', 'from', 'inside', 'into', 'near', 'of', 'off',
+  'onto', 'out', 'outside', 'over', 'past', 'through', 'throughout', 'toward',
+  'towards', 'under', 'up', 'upon', 'with', 'within', 'without', 'first', 'second',
+  'third', 'next', 'last', 'another', 'each', 'every', 'both', 'few', 'many', 'most',
+  'some', 'such', 'than', 'too', 'very', 'well', 'almost', 'already', 'always',
+  'never', 'often', 'sometimes', 'soon', 'today', 'tomorrow', 'yesterday', 'again',
+  'away', 'back', 'forward', 'instead', 'otherwise',
+]);
+
+/** Universal titles that name a role, not a person, when they stand alone. */
+const NAME_TITLE_WORDS = new Set([
+  'mr', 'mrs', 'ms', 'dr', 'sir', 'madam', 'lord', 'lady', 'captain', 'commander',
+  'general', 'senator', 'master', 'darth', 'magister', 'count', 'duke', 'king',
+  'queen', 'prince', 'father', 'mother', 'brother', 'sister',
+]);
+
+interface RosterToken {
+  text: string;
+  capitalized: boolean;
+  usable: boolean;
+}
+
+interface RosterRun {
+  tokens: RosterToken[];
+  startIndex: number;
+}
+
+/** Words only: possessives stripped, punctuation used as run boundaries. */
+function rosterSentenceTokens(sentence: string): RosterToken[] {
+  const out: RosterToken[] = [];
+  const re = /[A-Za-z0-9][A-Za-z0-9'’\-]*/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(sentence)) !== null) {
+    const raw = match[0];
+    const text = raw.replace(/['’]s$/i, '').replace(/['’]$/, '');
+    const letters = text.replace(/[^A-Za-z]/g, '');
+    const capitalized = /^[A-Z]/.test(text);
+    const allCapsArtifact = letters.length > 1 && letters === letters.toUpperCase();
+    const pureDigits = letters.length === 0;
+    out.push({
+      text,
+      capitalized,
+      usable: text.length >= 2 && capitalized && !allCapsArtifact && !pureDigits,
+    });
+  }
+  return out;
+}
+
+/** Maximal runs of capitalized tokens; punctuation ends a run. */
+function capitalizedRuns(tokens: RosterToken[]): RosterRun[] {
+  const runs: RosterRun[] = [];
+  let current: RosterToken[] = [];
+  let start = 0;
+  tokens.forEach((token, index) => {
+    if (token.capitalized) {
+      if (!current.length) start = index;
+      current.push(token);
+      return;
+    }
+    if (current.length) {
+      runs.push({ tokens: current, startIndex: start });
+      current = [];
+    }
+  });
+  if (current.length) runs.push({ tokens: current, startIndex: start });
+  return runs;
+}
+
+/**
+ * Split one sentence at quotation boundaries.
+ *
+ * A capital right after an opening quote begins an utterance, so it is
+ * sentence-initial, never mid-sentence. Straight single quotes count only at a
+ * word edge; an apostrophe inside a word does not split.
+ */
+function quoteSegments(sentence: string): string[] {
+  const segments: string[] = [];
+  let current = '';
+  for (let i = 0; i < sentence.length; i++) {
+    const ch = sentence[i]!;
+    const doubleQuote = ch === '"' || ch === '“' || ch === '”';
+    const singleQuote =
+      ch === "'" &&
+      (i === 0 ||
+        /[\s([{—–-]/.test(sentence[i - 1] ?? '') ||
+        /[\s)\]},.;:!?—–-]/.test(sentence[i + 1] ?? ''));
+    if (doubleQuote || singleQuote) {
+      if (current.trim()) segments.push(current.trim());
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  if (current.trim()) segments.push(current.trim());
+  return segments.length ? segments : [sentence];
+}
+
+function sentenceKey(text: string): string {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/^[#\s]+/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** Heading surfaces for one chunk, from the same detection import used. */
+function chunkHeadingKeys(chunk: ChunkRow): Set<string> {
+  const keys = new Set<string>();
+  const add = (text: string): void => {
+    const key = sentenceKey(text);
+    if (key) keys.add(key);
+  };
+  add(chunk.heading);
+  for (const heading of findHeadings(chunk.text)) add(heading.heading);
+  return keys;
+}
+
+type RunRejection =
+  | 'invalid'
+  | 'contraction'
+  | 'function-word'
+  | 'title-only'
+  | 'common-word';
+
+interface RunCheck {
+  surface: string;
+  tokens: string[];
+  reason?: RunRejection;
+}
+
+/**
+ * One capitalized run, checked against the universal exclusions.
+ *
+ * Function words are rejected in both passes, so the mid-sentence vocabulary
+ * never contains "the" or "and". A lone title is a role, not a name; a lone
+ * common word is only a name when the bank already knows it as one.
+ */
+function evaluateRosterRun(
+  run: RosterRun,
+  context: { lowercaseWords: Set<string>; bankedNames: Set<string> },
+): RunCheck {
+  const slice = run.tokens.slice(0, 4);
+  const usable = slice.filter((token) => token.usable);
+  const surface = (usable.length ? usable : slice).map((token) => token.text).join(' ');
+  if (!usable.length || usable.length !== slice.length) {
+    return { surface, tokens: [], reason: 'invalid' };
+  }
+  const tokens = usable.map((token) => token.text.toLowerCase());
+  if (tokens.some((token) => /['’]/.test(token) && !/['’]s$/i.test(token))) {
+    return { surface, tokens, reason: 'contraction' };
+  }
+  if (tokens.some((token) => STOPWORDS.has(token))) {
+    return { surface, tokens, reason: 'function-word' };
+  }
+  if (tokens.every((token) => NAME_TITLE_WORDS.has(token))) {
+    return { surface, tokens, reason: 'title-only' };
+  }
+  if (
+    tokens.length === 1 &&
+    context.lowercaseWords.has(tokens[0]!) &&
+    !context.bankedNames.has(canonicalName(surface))
+  ) {
+    return { surface, tokens, reason: 'common-word' };
+  }
+  return { surface, tokens };
+}
+
+/**
+ * Group exact variants that differ only by titles, e.g. "Ashaline" and
+ * "Lady Ashaline". A distinctive token must be at least five letters; no
+ * identity is decided, only candidate counting stops duplicating a form.
+ */
+function variantKey(entry: NameRosterEntry): string | null {
+  const distinctive = entry.tokens.filter((token) => !NAME_TITLE_WORDS.has(token));
+  if (!distinctive.length) return null;
+  if (!distinctive.some((token) => token.length >= 5)) return null;
+  return [...new Set(distinctive)].sort(compareText).join(' ');
+}
+
+function collapseVariants(entries: NameRosterEntry[]): NameRosterEntry[] {
+  const groups = new Map<string, NameRosterEntry[]>();
+  const collapsed: NameRosterEntry[] = [];
+  for (const entry of entries) {
+    const key = variantKey(entry);
+    if (!key) {
+      collapsed.push(entry);
+      continue;
+    }
+    const list = groups.get(key);
+    if (list) list.push(entry);
+    else groups.set(key, [entry]);
+  }
+  for (const members of groups.values()) {
+    const surfaces = [...members]
+      .sort((a, b) => b.count - a.count || compareText(a.surface, b.surface))
+      .map((member) => member.surface);
+    collapsed.push({
+      surface: surfaces[0]!,
+      surfaces,
+      tokens: [...new Set(members.flatMap((member) => member.tokens))].sort(compareText),
+      count: members.reduce((sum, member) => sum + member.count, 0),
+      trustedSource: members.some((member) => member.trustedSource === 'mid-sentence')
+        ? 'mid-sentence'
+        : 'sentence-start-matched',
+    });
+  }
+  return collapsed.sort((a, b) => b.count - a.count || compareText(a.surface, b.surface));
+}
+
+/**
+ * Book-wide name candidates from capitalization alone.
+ *
+ * Pass A records every capitalized run *inside* an utterance segment, so the
+ * closed set of sentence starters never enters the vocabulary. Pass B revisits
+ * segment starts and keeps a run only when one of its tokens was already seen
+ * inside a segment. Two passes, no model calls, no persistence.
+ */
+export function buildNameRoster(
+  db: Db,
+  projectId: number,
+  loaded?: ChunkRow[],
+): NameRoster {
+  const chunks = loaded ?? loadOrderedChunks(db, projectId);
+  const bankedNames = new Set<string>();
+  for (const row of db.all<{ name: string; aliases: string }>(
+    'SELECT name, aliases FROM canon_entity WHERE project_id = ?',
+    projectId,
+  )) {
+    const name = canonicalName(row.name);
+    if (name) bankedNames.add(name);
+    for (const alias of strList(row.aliases)) {
+      const key = canonicalName(alias);
+      if (key) bankedNames.add(key);
+    }
+  }
+  const contextFor = (chunk: ChunkRow) => ({
+    // Whole words that really appear lowercase, not the lowercase form of a
+    // capitalized name elsewhere in the same chunk.
+    lowercaseWords: new Set(chunk.text.match(/\b[a-z][a-z'’-]*\b/g) ?? []),
+    bankedNames,
+  });
+
+  const midTokens = new Set<string>();
+  const midSurfaces = new Map<string, { surface: string; tokens: string[]; count: number }>();
+
+  for (const chunk of chunks) {
+    const headings = chunkHeadingKeys(chunk);
+    const context = contextFor(chunk);
+    for (const sentence of splitSentences(chunk.text)) {
+      if (headings.has(sentenceKey(sentence))) continue;
+      for (const segment of quoteSegments(sentence)) {
+        const runs = capitalizedRuns(rosterSentenceTokens(segment));
+        for (const run of runs) {
+          // Segment-initial capitalization is the thing Pass B judges.
+          if (run.startIndex === 0) continue;
+          const check = evaluateRosterRun(run, context);
+          if (check.reason) continue;
+          const tokens = check.tokens;
+          for (const token of tokens) midTokens.add(token);
+          const key = check.surface.toLowerCase();
+          const existing = midSurfaces.get(key);
+          if (existing) existing.count++;
+          else midSurfaces.set(key, { surface: check.surface, tokens, count: 1 });
+        }
+      }
+    }
+  }
+
+  const startedSurfaces = new Map<string, { surface: string; tokens: string[]; count: number }>();
+  const rejectedSurfaces = new Map<string, number>();
+  const diagnostics: NameRosterDiagnostics = {
+    sentenceInitialCandidates: 0,
+    accepted: 0,
+    rejected: 0,
+    topRejected: [],
+    quotedStarts: 0,
+    rejectedInvalid: 0,
+    rejectedContraction: 0,
+    rejectedFunctionWord: 0,
+    rejectedTitleOnly: 0,
+    rejectedCommonWord: 0,
+    rejectedStoplist: 0,
+    rejectedNoMidSentence: 0,
+  };
+
+  const reject = (reason: RunRejection | 'stoplist' | 'no-mid', surface: string): void => {
+    diagnostics.rejected++;
+    rejectedSurfaces.set(surface, (rejectedSurfaces.get(surface) ?? 0) + 1);
+    if (reason === 'invalid') diagnostics.rejectedInvalid++;
+    else if (reason === 'contraction') diagnostics.rejectedContraction++;
+    else if (reason === 'function-word') diagnostics.rejectedFunctionWord++;
+    else if (reason === 'title-only') diagnostics.rejectedTitleOnly++;
+    else if (reason === 'common-word') diagnostics.rejectedCommonWord++;
+    else if (reason === 'stoplist') diagnostics.rejectedStoplist++;
+    else diagnostics.rejectedNoMidSentence++;
+  };
+
+  for (const chunk of chunks) {
+    const headings = chunkHeadingKeys(chunk);
+    const context = contextFor(chunk);
+    for (const sentence of splitSentences(chunk.text)) {
+      if (headings.has(sentenceKey(sentence))) continue;
+      const segments = quoteSegments(sentence);
+      diagnostics.quotedStarts += Math.max(0, segments.length - 1);
+      for (const segment of segments) {
+        const runs = capitalizedRuns(rosterSentenceTokens(segment));
+        const initial = runs.find((run) => run.startIndex === 0);
+        if (!initial) continue;
+        diagnostics.sentenceInitialCandidates++;
+        const check = evaluateRosterRun(initial, context);
+        if (check.reason) {
+          reject(check.reason, check.surface);
+          continue;
+        }
+        const firstWord = check.tokens[0] ?? '';
+        if (NAME_STARTER_STOPLIST.has(firstWord)) {
+          reject('stoplist', check.surface);
+          continue;
+        }
+        if (!check.tokens.some((token) => midTokens.has(token))) {
+          reject('no-mid', check.surface);
+          continue;
+        }
+        diagnostics.accepted++;
+        const key = check.surface.toLowerCase();
+        const existing = startedSurfaces.get(key);
+        if (existing) existing.count++;
+        else startedSurfaces.set(key, { surface: check.surface, tokens: check.tokens, count: 1 });
+      }
+    }
+  }
+
+  const exact = new Map<string, NameRosterEntry>();
+  for (const [key, value] of midSurfaces) {
+    exact.set(key, {
+      surface: value.surface,
+      surfaces: [value.surface],
+      tokens: value.tokens,
+      count: value.count,
+      trustedSource: 'mid-sentence',
+    });
+  }
+  for (const [key, value] of startedSurfaces) {
+    const existing = exact.get(key);
+    if (existing) {
+      existing.count += value.count;
+      continue;
+    }
+    exact.set(key, {
+      surface: value.surface,
+      surfaces: [value.surface],
+      tokens: value.tokens,
+      count: value.count,
+      trustedSource: 'sentence-start-matched',
+    });
+  }
+
+  diagnostics.topRejected = [...rejectedSurfaces.entries()]
+    .map(([surface, count]) => ({ surface, count }))
+    .sort((a, b) => b.count - a.count || compareText(a.surface, b.surface))
+    .slice(0, 20);
+
+  return { entries: collapseVariants([...exact.values()]), diagnostics };
+}
+
+/**
+ * One surface for this entry in the window: the first variant actually present
+ * whole-word, else the representative when one of its tokens occurs. Collapsed
+ * variants never become two entries in the same list.
+ */
+function rosterEntryInWindow(
+  entry: NameRosterEntry,
+  hayCanonical: string,
+  hayTokens: Set<string>,
+): string[] {
+  const present = entry.surfaces.find((surface) => {
+    const canonical = canonicalName(surface);
+    return !!canonical && ` ${hayCanonical} `.includes(` ${canonical} `);
+  });
+  if (present) return [present];
+  return entry.tokens.some((token) => hayTokens.has(token)) ? [entry.surface] : [];
+}
+
 /**
  * The entities this window actually mentions.
  *
  * The relations call is only allowed to use these names, so it cannot invent a
  * person and cannot attach a relation to a name it hallucinated.
  */
-export function windowEntityNames(db: Db, projectId: number, window: ChunkRow[]): string[] {
+export function windowEntityNames(
+  db: Db,
+  projectId: number,
+  window: ChunkRow[],
+  roster?: NameRoster,
+): string[] {
   const hayCanonical = canonicalName(window.map((c) => c.text).join(' '));
   const hayTokens = new Set(hayCanonical.split(' ').filter(Boolean));
   const names: string[] = [];
@@ -1500,7 +2038,46 @@ export function windowEntityNames(db: Db, projectId: number, window: ChunkRow[])
   for (const n of finderNamesFor(db, window)) {
     if (!names.some((e) => e.toLowerCase() === n.toLowerCase())) names.push(n);
   }
-  return names.slice(0, 60);
+  // The bank keeps exactly the list it had before the roster: the old 60-name
+  // ceiling, deduped. Raising the total to 80 gives the roster room instead of
+  // letting a saturated bank list squeeze every new name out.
+  const bankNames = uniqueNames(names).slice(0, WINDOW_BANK_NAME_CAP);
+  // Roster names are book-wide capitalization candidates, so a person the
+  // entity call never banked can still be related inside a window that names
+  // them. Whole-word only; the roster is names, never identities.
+  const merged = [...bankNames];
+  if (roster) {
+    for (const entry of roster.entries) {
+      if (!rosterEntryInWindow(entry, hayCanonical, hayTokens)) continue;
+      merged.push(entry.surface);
+    }
+  }
+  return uniqueNames(merged).slice(0, WINDOW_NAME_CAP);
+}
+
+/** The cleaned roster alone (no bank or finder names) for the window. */
+export function windowRosterNames(window: ChunkRow[], roster: NameRoster): string[] {
+  const hayCanonical = canonicalName(window.map((chunk) => chunk.text).join(' '));
+  const hayTokens = new Set(hayCanonical.split(' ').filter(Boolean));
+  const names: string[] = [];
+  for (const entry of roster.entries) {
+    for (const surface of rosterEntryInWindow(entry, hayCanonical, hayTokens)) names.push(surface);
+  }
+  return uniqueNames(names).slice(0, WINDOW_NAME_CAP);
+}
+
+/** Case-insensitive stable dedupe for one window's name list. */
+function uniqueNames(names: string[]): string[] {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const name of names) {
+    const clean = name.trim();
+    const key = clean.toLowerCase();
+    if (!clean || seen.has(key)) continue;
+    seen.add(key);
+    unique.push(clean);
+  }
+  return unique;
 }
 
 /** Trust order for automatic merges: a human ruling always outranks the
@@ -2454,6 +3031,8 @@ export function lookupKeeperPair(
     review_status: string | null;
     source_refs: string;
   }>(
+    // Citations read only the primary evidence. supporting_evidence is
+    // display-only context and must never be quoted as proof.
     `SELECT r.id, r.from_entity, r.to_entity, a.name AS from_name, b.name AS to_name,
             r.kind, r.evidence, r.modality, r.review_status, r.source_refs
      FROM canon_relation r
@@ -2801,6 +3380,140 @@ function bankMomentEvent(
   );
 }
 
+/** Strict-mode kind mapping: a closed kind wins, otherwise the first one stays. */
+export function strictRelationKind(kind: string): string {
+  const parts = normaliseKinds(kind);
+  return parts.find((part) => isClosedRoleKind(part)) ?? parts[0] ?? 'related to';
+}
+
+/** How many narrow quote re-asks one window may spend. */
+export const MAX_RELATION_RETRIES_PER_WINDOW = 5;
+
+interface RelationEndpoint {
+  id: number;
+  name: string;
+  aliases: string;
+}
+
+function endpointNamed(endpoint: RelationEndpoint, text: string): boolean {
+  return (
+    nameMentionedExact(endpoint.name, text) ||
+    strList(endpoint.aliases).some((alias) => nameMentionedExact(alias, text))
+  );
+}
+
+function quoteNamesBothEntities(
+  from: RelationEndpoint,
+  to: RelationEndpoint,
+  quote: string,
+): boolean {
+  return endpointNamed(from, quote) && endpointNamed(to, quote);
+}
+
+/** True when the text is one sentence of the passage, not a paraphrase. */
+function sentenceFromPassage(passage: string, sentence: string): boolean {
+  const needle = normalise(sentence);
+  if (!needle || needle.length < 8) return false;
+  if (!normalise(passage).includes(needle)) return false;
+  return splitSentences(passage).some((candidate) => normalise(candidate).includes(needle));
+}
+
+async function askRelationSentence(
+  llm: LlmClient,
+  passage: string,
+  fromName: string,
+  toName: string,
+  kind: string,
+): Promise<string | null> {
+  try {
+    const res = await llm.chat({
+      system: EXTRACT_RELATIONS_RETRY_SYSTEM,
+      messages: [
+        {
+          role: 'user',
+          content: `PAIR: ${fromName} — ${kind || 'related to'} — ${toName}\n\nPASSAGE:\n${passage}`,
+        },
+      ],
+      temperature: 0,
+      maxTokens: 200,
+    });
+    const text = (res.text ?? '').trim();
+    if (!text) return null;
+    let sentence = '';
+    try {
+      const body = text.replace(/```json|```/g, '').trim();
+      const parsed = JSON.parse(body.slice(body.indexOf('{'), body.lastIndexOf('}') + 1)) as {
+        quote?: unknown;
+      };
+      sentence = String(parsed.quote ?? '').trim();
+    } catch {
+      sentence = text;
+    }
+    if (!sentence || /^none$/i.test(sentence)) return null;
+    return sentence;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Strict mode only: re-ask once for relations whose quote names fewer than
+ * both endpoints, then keep the repaired sentence only when it is verbatim
+ * from the cited passage and names both. Unresolved endpoints are skipped —
+ * they already become hints. At most five calls per window.
+ */
+async function retryRelationQuotes(
+  db: Db,
+  llm: LlmClient,
+  projectId: number,
+  window: ChunkRow[],
+  raws: Record<string, unknown>[],
+  entityIdByName: Map<string, number>,
+  stats: ExtractLoreResult,
+): Promise<void> {
+  let used = 0;
+  for (const raw of raws) {
+    if (used >= MAX_RELATION_RETRIES_PER_WINDOW) break;
+    const fromName = String(raw.from ?? '').trim();
+    const toName = String(raw.to ?? '').trim();
+    const fromId = resolveEntity(db, projectId, entityIdByName, fromName);
+    const toId = resolveEntity(db, projectId, entityIdByName, toName);
+    if (!fromId || !toId || fromId === toId) continue;
+    const chunk = chunkAt(window, raw.chunk_index);
+    const passage = chunk?.text ?? window.map((c) => c.text).join('\n\n');
+    if (!passage.trim()) continue;
+    const from = db.get<{ name: string; aliases: string }>(
+      'SELECT name, aliases FROM canon_entity WHERE project_id = ? AND id = ?',
+      projectId,
+      fromId,
+    );
+    const to = db.get<{ name: string; aliases: string }>(
+      'SELECT name, aliases FROM canon_entity WHERE project_id = ? AND id = ?',
+      projectId,
+      toId,
+    );
+    if (!from || !to) continue;
+    const endpoints = {
+      from: { id: fromId, name: from.name, aliases: from.aliases },
+      to: { id: toId, name: to.name, aliases: to.aliases },
+    };
+    if (quoteNamesBothEntities(endpoints.from, endpoints.to, String(raw.evidence ?? ''))) continue;
+    used++;
+    stats.verification.retried++;
+    const sentence = await askRelationSentence(llm, passage, from.name, to.name, String(raw.kind ?? ''));
+    if (
+      sentence &&
+      sentenceFromPassage(passage, sentence) &&
+      quoteNamesBothEntities(endpoints.from, endpoints.to, sentence)
+    ) {
+      raw.evidence = sentence;
+      stats.verification.retriedFixed++;
+    } else {
+      stats.verification.retriedFailed++;
+    }
+  }
+}
+
 /** Write the relation section. Returns how many claims were accepted. */
 function applyRelations(
   db: Db,
@@ -2972,7 +3685,35 @@ function applyRelations(
           break;
         }
       }
-      const rowReview = flagged ? 'needs_review' : review;
+      // Proven tier: a closed kind whose quote passes verbatim but misses the
+      // tie word is provisional, not parked. Open vocabulary and coverage
+      // still park for a human relabel.
+      let rowReview = flagged === 'open-vocab' ? 'needs_review' : flagged === 'unsupported' ? 'provisional' : review;
+      if (rowReview === 'provisional' && flagged === 'unsupported') stats.provisional++;
+      if (rowReview === 'accepted') {
+        const guardChunk = span.chunkId
+          ? db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', span.chunkId)
+          : chunk;
+        const fromAliases = db.get<{ aliases: string }>('SELECT aliases FROM canon_entity WHERE id = ?', fromId);
+        const toAliases = db.get<{ aliases: string }>('SELECT aliases FROM canon_entity WHERE id = ?', toId);
+        const proven = provenRelation(
+          {
+            fromId,
+            toId,
+            fromName,
+            toName,
+            fromAliases: strList(fromAliases?.aliases),
+            toAliases: strList(toAliases?.aliases),
+            kind,
+            evidence: span.quote,
+          },
+          { chunkText: guardChunk?.text ?? null },
+        );
+        if (!proven.ok) {
+          rowReview = 'provisional';
+          stats.provisional++;
+        }
+      }
       // The same claim in two words: one pair, one quote, one head verb
       // ("trusts with life" beside "trusts with important task"). Merge into
       // the earliest row instead of banking both; the longer telling wins,
@@ -3031,7 +3772,34 @@ function applyRelations(
         const sentence = description.length > existing.description.length ? description : existing.description;
         const quote = span.quote.length > existing.evidence.length ? span.quote : existing.evidence;
         const sourceRefs = earliestRefs(db, toJson(refs), existing.source_refs);
-        const mergedReview = maxTrust(rowReview, existing.review_status);
+        let mergedReview = maxTrust(rowReview, existing.review_status);
+        // A parked row merged with a fresh accepted claim is a promotion:
+        // the one guard decides, never the merge.
+        if (mergedReview === 'accepted' && existing.review_status !== 'accepted' && existing.review_status !== 'user_confirmed') {
+          const refsForGuard = fromJson<{ chunk?: unknown }[]>(sourceRefs, []);
+          const guardChunkId = refsForGuard
+            .map((ref) => Number(ref?.chunk))
+            .find((value) => Number.isFinite(value) && value > 0);
+          const guardChunk = guardChunkId
+            ? db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', guardChunkId)
+            : chunk;
+          const fromRow = db.get<{ aliases: string }>('SELECT aliases FROM canon_entity WHERE id = ?', fromId);
+          const toRow = db.get<{ aliases: string }>('SELECT aliases FROM canon_entity WHERE id = ?', toId);
+          const promoted = canPromote(
+            {
+              fromId,
+              toId,
+              fromName,
+              toName,
+              fromAliases: strList(fromRow?.aliases),
+              toAliases: strList(toRow?.aliases),
+              kind,
+              evidence: quote,
+            },
+            { db, projectId, chunkText: guardChunk?.text ?? null },
+          );
+          if (!promoted.ok) mergedReview = 'needs_review';
+        }
         db.run(
           'UPDATE canon_relation SET description = ?, evidence = ?, source_refs = ?, review_status = ? WHERE id = ?',
           sentence,
@@ -3164,6 +3932,7 @@ async function extractWindowSplit(
   neighboursOf: (id: number | undefined) => ChunkRow[],
   maxTokens: number,
   index: number,
+  roster?: NameRoster,
 ): Promise<void> {
   const passages = passageBlock(window);
   const answers: string[] = [];
@@ -3200,12 +3969,21 @@ async function extractWindowSplit(
 
   // (b) Relationships between names that already exist. Names go in the
   //     system prompt, so the model cannot quietly widen the cast.
-  const names = windowEntityNames(db, projectId, window);
+  const names = process.env.FANFABLE_REL_ROSTER === '1' && roster
+    ? windowRosterNames(window, roster)
+    : windowEntityNames(db, projectId, window, roster);
   if (names.length) {
-    const system = `${EXTRACT_RELATIONS_SYSTEM}\n\nKNOWN ENTITIES:\n${names.map((n) => `- ${n}`).join('\n')}`;
+    const system = `${relationsSystemPrompt()}\n\nKNOWN ENTITIES:\n${names.map((n) => `- ${n}`).join('\n')}`;
     const second = await ask(system, Math.min(3000, maxTokens), 0);
     if (second !== null) {
-      const relations = parseSection(second, 'relations');
+      let relations = parseSection(second, 'relations');
+      if (strictRelationsEnabled()) {
+        relations = relations.map((raw) => ({
+          ...raw,
+          kind: strictRelationKind(String(raw.kind ?? '')),
+        }));
+        await retryRelationQuotes(db, llm, projectId, window, relations, entityIdByName, stats);
+      }
       parsedClaims += relations.length;
       accepted += applyRelations(db, projectId, relations, window, entityIdByName, stats, neighboursOf, true);
     }
@@ -3461,6 +4239,513 @@ export const CLOSED_ROLE_KINDS = [
 /** True when the kind resolves to the closed role-noun list. */
 export function isClosedRoleKind(kind: string): boolean {
   return CLOSED_ROLE_KINDS.includes((kind ?? '').trim().toLowerCase());
+}
+
+
+/** Kinds that record coverage only (who shared a passage), never a tie. */
+const COVERAGE_KINDS = new Set(['appears with', 'appears in', 'cooccurrence', 'co-occurrence']);
+
+/** Relationship-grade kinds: closed, never coverage, never a moment. */
+export const RELATIONSHIP_GRADE_KINDS: ReadonlySet<string> = new Set(
+  CLOSED_ROLE_KINDS.filter((kind) => !COVERAGE_KINDS.has(kind) && !isMomentKind(kind)),
+);
+
+export type PromoteReason =
+  | 'open-vocab'
+  | 'coverage-only'
+  | 'ruled-park'
+  | 'quote-not-verbatim'
+  | 'tie-word-absent'
+  | 'endpoint-unnamed'
+  | 'direction-mismatch'
+  | 'moment';
+
+export interface PromoteRow {
+  fromId: number;
+  toId: number;
+  fromName: string;
+  toName: string;
+  fromAliases?: string[];
+  toAliases?: string[];
+  kind: string;
+  evidence: string;
+}
+
+export interface PromoteContext {
+  db: Db;
+  projectId: number;
+  /** Text of the passage the quote cites. */
+  chunkText?: string | null;
+}
+
+export interface PromoteDecision {
+  ok: boolean;
+  reason?: PromoteReason;
+}
+
+function canonicalKind(kind: string): string {
+  return (kind ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/_/g, ' ')
+    .replace(/\s+/g, ' ');
+}
+
+function endpointTokens(name: string, aliases: string[]): Set<string> {
+  const out = new Set<string>();
+  for (const variant of [name, ...aliases]) {
+    for (const token of nameTokens(variant)) if (token.length >= 2) out.add(token);
+  }
+  return out;
+}
+
+/**
+ * One-direction proof: a possessive owner before the tie head ("Bram's
+ * sister") or an object after "of" ("the sister of Bram"). Returns forward
+ * when "to" owns the relationship, reverse when "from" does, and unknown when
+ * the sentence gives no clear owner (pronouns, bare labels).
+ */
+function quoteDirection(
+  kind: string,
+  evidence: string,
+  row: PromoteRow,
+): 'forward' | 'reverse' | 'unknown' {
+  const words = normalise(evidence).split(' ').filter(Boolean);
+  if (!words.length) return 'unknown';
+  const kindWords = normalise(kind).split(' ').filter(Boolean)
+    .filter((word) => !['of', 'to', 'with', 'for', 'a', 'an', 'the', 'in', 'on', 'as'].includes(word));
+  const head = kindWords[0];
+  if (!head) return 'unknown';
+  const from = endpointTokens(row.fromName, row.fromAliases ?? []);
+  const to = endpointTokens(row.toName, row.toAliases ?? []);
+  const ownerOf = (token: string): 'from' | 'to' | null => {
+    const base = token.replace(/['’]s$/, '');
+    if (from.has(base)) return 'from';
+    if (to.has(base)) return 'to';
+    return null;
+  };
+  let forward = false;
+  for (let at = 0; at < words.length; at++) {
+    if (words[at] !== head) continue;
+    // "Bram's sister" / "Bram’s sister"
+    if (at > 0 && /['’]s$/.test(words[at - 1]!)) {
+      const owner = ownerOf(words[at - 1]!);
+      if (owner === 'to') forward = true;
+      if (owner === 'from') return 'reverse';
+    }
+    // "the sister of Bram"
+    if (words[at + 1] === 'of' && words[at + 2]) {
+      const object = ownerOf(words[at + 2]!);
+      if (object === 'to') forward = true;
+      if (object === 'from') return 'reverse';
+      continue;
+    }
+    // Appositive role-holder: "his Master, Lord Corin" means Corin holds the
+    // role, so for "master of" that is the object side, not the subject.
+    // Titles between the role and the name are skipped.
+    let holderAt = at + 1;
+    while (holderAt < words.length && (NAME_TITLE_WORDS.has(words[holderAt]!) || PROOF_TITLES.has(words[holderAt]!))) {
+      holderAt++;
+    }
+    if (holderAt < words.length && holderAt > at + 1) {
+      const holder = ownerOf(words[holderAt]!);
+      if (holder === 'to') return 'reverse';
+      if (holder === 'from') forward = true;
+    }
+  }
+  return forward ? 'forward' : 'unknown';
+}
+
+/** Same kind, or the inverse class the human already ruled on. */
+function sameOrInverseKind(noteKind: string, rowKind: string): boolean {
+  const note = canonicalKind(noteKind);
+  const row = canonicalKind(rowKind);
+  if (!note || !row) return false;
+  if (note === row) return true;
+  const noteHead = kindHead(note);
+  const rowHead = kindHead(row);
+  if (noteHead === rowHead) return true;
+  return inverseKinds(note).includes(rowHead) || inverseKinds(row).includes(noteHead);
+}
+
+/**
+ * The one promotion guard. A parked tie may become a keeper only when all
+ * four conditions hold: closed relationship-grade kind, no PARK ruling for the
+ * pair or its inverse class, a verbatim both-endpoints quote, and a direction
+ * the sentence actually states. Evidence is deliberately not compared for a
+ * PARK: a different quote for a ruled pair does not reopen it; it belongs in
+ * the inbox as a pending note, never a status change.
+ */
+function provenKindReason(kind: string): PromoteReason | null {
+  if (COVERAGE_KINDS.has(kind)) return 'coverage-only';
+  if (isMomentKind(kind)) return 'moment';
+  if (!isClosedRoleKind(kind)) return 'open-vocab';
+  if (!RELATIONSHIP_GRADE_KINDS.has(kind)) return 'coverage-only';
+  return null;
+}
+
+function provenQuoteReason(row: PromoteRow, chunkText?: string | null): PromoteReason | null {
+  const quote = normalise(row.evidence);
+  const chunk = chunkText ?? '';
+  if (!row.evidence.trim() || !chunk || !normalise(chunk).includes(quote)) {
+    return 'quote-not-verbatim';
+  }
+  const named = (name: string, aliases: string[]): boolean =>
+    nameMentionedExact(name, row.evidence) ||
+    aliases.some((alias) => nameMentionedExact(alias, row.evidence));
+  if (!named(row.fromName, row.fromAliases ?? []) || !named(row.toName, row.toAliases ?? [])) {
+    return 'endpoint-unnamed';
+  }
+  if (isUnsupportedKind(row.kind, row.evidence)) return 'tie-word-absent';
+  if (quoteDirection(canonicalKind(row.kind), row.evidence, row) === 'reverse') {
+    return 'direction-mismatch';
+  }
+  return null;
+}
+
+/**
+ * Pure proven-tier check: closed relationship-grade kind plus a verbatim,
+ * both-endpoints, tie-stating, correctly directed quote. No PARK lookup and no
+ * database access; extraction uses it to choose accepted vs provisional.
+ */
+export function provenRelation(row: PromoteRow, context: { chunkText?: string | null }): PromoteDecision {
+  const kindReason = provenKindReason(canonicalKind(row.kind));
+  if (kindReason) return { ok: false, reason: kindReason };
+  const quoteReason = provenQuoteReason(row, context.chunkText);
+  if (quoteReason) return { ok: false, reason: quoteReason };
+  return { ok: true };
+}
+
+export function canPromote(row: PromoteRow, context: PromoteContext): PromoteDecision {
+  const kind = canonicalKind(row.kind);
+  const kindReason = provenKindReason(kind);
+  if (kindReason) return { ok: false, reason: kindReason };
+  // A PARK binds the pair and its inverse class, not one quote: the same pair
+  // offered with fresh evidence is still ruled out. New evidence belongs in
+  // the inbox as a pending note for the user, never a status change.
+  const parked = context.db.all<{ attempted_kind: string }>(
+    `SELECT attempted_kind FROM canon_tie_note
+      WHERE project_id = ? AND lower(ruling) LIKE 'park%'
+        AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))`,
+    context.projectId,
+    row.fromId,
+    row.toId,
+    row.toId,
+    row.fromId,
+  );
+  if (parked.some((note) => sameOrInverseKind(note.attempted_kind, kind))) {
+    return { ok: false, reason: 'ruled-park' };
+  }
+  const quoteReason = provenQuoteReason(row, context.chunkText);
+  if (quoteReason) return { ok: false, reason: quoteReason };
+  return { ok: true };
+}
+
+
+/** Load one relation and check only the pure proven tier (no PARK lookup). */
+export function provenRelationById(
+  db: Db,
+  projectId: number,
+  relationId: number,
+): PromoteDecision {
+  const guarded = loadGuardRow(db, projectId, relationId);
+  if (!guarded) return { ok: false, reason: 'quote-not-verbatim' };
+  return provenRelation(guarded.row, { chunkText: guarded.chunkText });
+}
+
+interface GuardedRow {
+  row: PromoteRow;
+  chunkText: string | null;
+}
+
+function loadGuardRow(db: Db, projectId: number, relationId: number): GuardedRow | null {
+  const row = db.get<{
+    from_entity: number;
+    to_entity: number;
+    kind: string;
+    evidence: string;
+    source_refs: string;
+    from_name: string;
+    from_aliases: string;
+    to_name: string;
+    to_aliases: string;
+  }>(
+    `SELECT r.from_entity, r.to_entity, r.kind, r.evidence, r.source_refs,
+            a.name AS from_name, a.aliases AS from_aliases,
+            b.name AS to_name, b.aliases AS to_aliases
+       FROM canon_relation r
+       JOIN canon_entity a ON a.id = r.from_entity
+       JOIN canon_entity b ON b.id = r.to_entity
+      WHERE r.project_id = ? AND r.id = ?`,
+    projectId,
+    relationId,
+  );
+  if (!row) return null;
+  let chunkText: string | null = null;
+  try {
+    const refs = JSON.parse(row.source_refs || '[]') as { chunk?: unknown }[];
+    const chunkId = refs.find((ref) => Number.isFinite(Number(ref?.chunk)) && Number(ref?.chunk) > 0)?.chunk;
+    if (chunkId) {
+      chunkText = db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', Number(chunkId))?.text ?? null;
+    }
+  } catch {
+    chunkText = null;
+  }
+  return {
+    row: {
+      fromId: row.from_entity,
+      toId: row.to_entity,
+      fromName: row.from_name,
+      toName: row.to_name,
+      fromAliases: strList(row.from_aliases),
+      toAliases: strList(row.to_aliases),
+      kind: row.kind,
+      evidence: row.evidence,
+    },
+    chunkText,
+  };
+}
+
+export interface PromoteProvisionalResult {
+  checked: number;
+  promoted: number;
+  still: { id: number; reason: string }[];
+}
+
+/** Promote provisional rows whose stored quote passes the proven check. */
+export function promoteProvisional(
+  db: Db,
+  projectId: number,
+  opts: { ids?: number[]; dryRun?: boolean; limit?: number } = {},
+): PromoteProvisionalResult {
+  const ids = opts.ids?.length ? opts.ids : null;
+  let rows: { id: number }[];
+  if (ids) {
+    rows = db.all<{ id: number }>(
+      `SELECT id FROM canon_relation WHERE project_id = ? AND review_status = 'provisional' AND id IN (${ids.map(() => '?').join(',')}) ORDER BY id`,
+      projectId,
+      ...ids,
+    );
+  } else {
+    rows = db.all<{ id: number }>(
+      `SELECT id FROM canon_relation WHERE project_id = ? AND review_status = 'provisional' ORDER BY id${opts.limit ? ' LIMIT ?' : ''}`,
+      projectId,
+      ...(opts.limit ? [Math.max(1, opts.limit)] : []),
+    );
+  }
+  const result: PromoteProvisionalResult = { checked: rows.length, promoted: 0, still: [] };
+  for (const row of rows) {
+    // Promotion uses the full guard, PARK included: a provisional row cannot
+    // walk around a human ruling that the pure proven check does not see.
+    const decision = canPromoteRelation(db, projectId, row.id);
+    if (decision.ok) {
+      result.promoted++;
+      if (!opts.dryRun) {
+        db.run(
+          "UPDATE canon_relation SET review_status = 'accepted' WHERE id = ? AND project_id = ? AND review_status = 'provisional'",
+          row.id,
+          projectId,
+        );
+      }
+    } else {
+      result.still.push({ id: row.id, reason: decision.reason ?? 'unproven' });
+    }
+  }
+  return result;
+}
+
+export interface ReclassifyAcceptedResult {
+  checked: number;
+  demoted: number;
+  reasons: Record<string, number>;
+}
+
+/**
+ * Move accepted rows that fail the proven check to provisional. Only the
+ * user-confirmed tier is exempt; demotion is never automatic except for this
+ * one-time reclassification of machine-accepted rows.
+ */
+export function reclassifyAccepted(
+  db: Db,
+  projectId: number,
+  opts: { dryRun?: boolean } = {},
+): ReclassifyAcceptedResult {
+  const rows = db.all<{ id: number }>(
+    "SELECT id FROM canon_relation WHERE project_id = ? AND review_status = 'accepted' ORDER BY id",
+    projectId,
+  );
+  const result: ReclassifyAcceptedResult = { checked: rows.length, demoted: 0, reasons: {} };
+  for (const row of rows) {
+    const decision = provenRelationById(db, projectId, row.id);
+    if (decision.ok) continue;
+    result.demoted++;
+    const reason = decision.reason ?? 'unproven';
+    result.reasons[reason] = (result.reasons[reason] ?? 0) + 1;
+    if (!opts.dryRun) {
+      db.run(
+        "UPDATE canon_relation SET review_status = 'provisional' WHERE id = ? AND project_id = ? AND review_status = 'accepted'",
+        row.id,
+        projectId,
+      );
+    }
+  }
+  return result;
+}
+
+export interface FindEvidenceResult extends PromoteProvisionalResult {
+  returned: number;
+  verified: number;
+  failed: { id: number; reason: string }[];
+}
+
+/**
+ * Optional evidence finder: one narrow model call per provisional row asks for
+ * the sentence naming both endpoints and stating the tie. Only the returned
+ * sentence's verification matters; the model's opinion never does. The stored
+ * quote is not rewritten (the boundary forbids quote changes), so promotion
+ * means the returned sentence passed the same proven check.
+ */
+export async function promoteProvisionalWithEvidence(
+  db: Db,
+  llm: LlmClient,
+  projectId: number,
+  opts: { limit?: number; dryRun?: boolean } = {},
+): Promise<FindEvidenceResult> {
+  const rows = db.all<{ id: number }>(
+    `SELECT id FROM canon_relation WHERE project_id = ? AND review_status = 'provisional' ORDER BY id LIMIT ?`,
+    projectId,
+    Math.max(1, opts.limit ?? 5),
+  );
+  const result: FindEvidenceResult = {
+    checked: rows.length,
+    promoted: 0,
+    still: [],
+    returned: 0,
+    verified: 0,
+    failed: [],
+  };
+  for (const row of rows) {
+    const guarded = loadGuardRow(db, projectId, row.id);
+    if (!guarded || !guarded.chunkText) {
+      result.still.push({ id: row.id, reason: 'quote-not-verbatim' });
+      continue;
+    }
+    let sentence = '';
+    try {
+      const res = await llm.chat({
+        system: `You find one proving sentence. Reply with JSON only: {"sentence":"..."} or {"sentence":"NONE"}.
+Return ONE contiguous sentence copied VERBATIM from the passage that names a form of BOTH ${guarded.row.fromName} and ${guarded.row.toName} and states that ${guarded.row.fromName} is ${guarded.row.toName}'s ${guarded.row.kind}.
+If no single sentence does, reply {"sentence":"NONE"}. Never paraphrase or use outside knowledge.`,
+        messages: [{
+          role: 'user',
+          content: `PASSAGE:\n${guarded.chunkText}`,
+        }],
+        temperature: 0,
+        maxTokens: 200,
+        format: 'json',
+      });
+      const body = String(res.text ?? '').replace(/```json|```/g, '').trim();
+      const start = body.indexOf('{');
+      const end = body.lastIndexOf('}');
+      const parsed = start >= 0 && end >= start ? JSON.parse(body.slice(start, end + 1)) : null;
+      sentence = String(parsed?.sentence ?? '').trim();
+    } catch {
+      sentence = '';
+    }
+    if (!sentence || /^none$/i.test(sentence)) {
+      result.still.push({ id: row.id, reason: 'quote-not-verbatim' });
+      continue;
+    }
+    result.returned++;
+    const candidate = { ...guarded.row, evidence: sentence };
+    const decision = canPromote(candidate, { db, projectId, chunkText: guarded.chunkText });
+    if (!decision.ok) {
+      result.failed.push({ id: row.id, reason: decision.reason ?? 'unproven' });
+      result.still.push({ id: row.id, reason: decision.reason ?? 'unproven' });
+      continue;
+    }
+    result.verified++;
+    result.promoted++;
+    if (!opts.dryRun) {
+      const previous = db.get<{ evidence: string; source_refs: string; supporting_evidence: string }>(
+        'SELECT evidence, source_refs, supporting_evidence FROM canon_relation WHERE id = ? AND project_id = ?',
+        row.id,
+        projectId,
+      );
+      if (previous) {
+        const supporting = fromJson<Record<string, unknown>[]>(previous.supporting_evidence, []);
+        supporting.push({
+          quote: previous.evidence,
+          source_refs: fromJson<unknown[]>(previous.source_refs, []),
+          reason: 'superseded',
+          moved_at: nowIso(),
+        });
+        db.run(
+          `UPDATE canon_relation
+              SET evidence = ?, supporting_evidence = ?, review_status = 'accepted'
+            WHERE id = ? AND project_id = ? AND review_status = 'provisional'`,
+          sentence,
+          toJson(supporting),
+          row.id,
+          projectId,
+        );
+      }
+    }
+  }
+  return result;
+}
+
+/** Load one relation row and run the guard against its own passage. */
+export function canPromoteRelation(
+  db: Db,
+  projectId: number,
+  relationId: number,
+): PromoteDecision {
+  const row = db.get<{
+    from_entity: number;
+    to_entity: number;
+    kind: string;
+    evidence: string;
+    source_refs: string;
+    from_name: string;
+    from_aliases: string;
+    to_name: string;
+    to_aliases: string;
+  }>(
+    `SELECT r.from_entity, r.to_entity, r.kind, r.evidence, r.source_refs,
+            a.name AS from_name, a.aliases AS from_aliases,
+            b.name AS to_name, b.aliases AS to_aliases
+       FROM canon_relation r
+       JOIN canon_entity a ON a.id = r.from_entity
+       JOIN canon_entity b ON b.id = r.to_entity
+      WHERE r.project_id = ? AND r.id = ?`,
+    projectId,
+    relationId,
+  );
+  if (!row) return { ok: false, reason: 'quote-not-verbatim' };
+  let chunkText: string | null = null;
+  try {
+    const refs = JSON.parse(row.source_refs || '[]') as { chunk?: unknown }[];
+    const chunkId = refs.find((ref) => Number.isFinite(Number(ref?.chunk)) && Number(ref?.chunk) > 0)?.chunk;
+    if (chunkId) {
+      chunkText = db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', Number(chunkId))?.text ?? null;
+    }
+  } catch {
+    chunkText = null;
+  }
+  return canPromote(
+    {
+      fromId: row.from_entity,
+      toId: row.to_entity,
+      fromName: row.from_name,
+      toName: row.to_name,
+      fromAliases: strList(row.from_aliases),
+      toAliases: strList(row.to_aliases),
+      kind: row.kind,
+      evidence: row.evidence,
+    },
+    { db, projectId, chunkText },
+  );
 }
 
 /** Park a dropped tie for the batched relabeling pass. Reruns collide on
@@ -4096,215 +5381,96 @@ export async function judgeQuarantine(
 
 /* ------------------------------------------------- tie-note relabeling */
 
-export interface TieNoteResolution {
-  resolved: number;
-  confirmed: number;
-  unproven: number;
-  checked: number;
-  pending: number;
+export interface TiePriority {
+  id: number;
+  fromName: string;
+  toName: string;
+  kind: string;
+  evidence: string;
+  locator: string;
+  decision: PromoteDecision;
 }
 
 /**
- * One closed-vocabulary pass over parked tie notes.
+ * Rank pending tie notes for human review.
  *
- * Each pending note (a moment label or a quote-silent noun) is re-asked once
- * with its proving passage: name one label from the closed universal list,
- * or unresolvable, with an exact quote. Anything banked re-enters through
- * the same gates (moment, support, endpoint naming) — the pass can only
- * promote what the rules would have kept. Malformed answers stay pending:
- * fail-open per note, exactly like the quarantine judge.
+ * Read-only: no model calls and no status writes. Model agreement never
+ * promotes a tie; the guard decides what a human sees first.
  */
-export async function resolveTieNotes(
+export function prioritiseTieNotes(
   db: Db,
-  llm: LlmClient,
   projectId: number,
-  opts: { maxNotes?: number; afterId?: number; onProgress?: (message: string) => void } = {},
-): Promise<TieNoteResolution> {
-  const maxNotes = Math.max(1, opts.maxNotes ?? 25);
+  opts: { limit?: number; afterId?: number } = {},
+): TiePriority[] {
+  const limit = Math.max(1, opts.limit ?? 50);
   const afterId = Math.max(0, opts.afterId ?? 0);
-  const remaining = (): number =>
-    db.get<{ n: number }>(
-      "SELECT COUNT(*) AS n FROM canon_tie_note WHERE project_id = ? AND status = 'pending'",
-      projectId,
-    )?.n ?? 0;
   const notes = db.all<{
     id: number;
     from_entity: number;
     to_entity: number;
     attempted_kind: string;
-    reason: string;
     evidence: string;
     source_refs: string;
     from_name: string;
+    from_aliases: string;
     to_name: string;
+    to_aliases: string;
   }>(
-    `SELECT n.id, n.from_entity, n.to_entity, n.attempted_kind, n.reason, n.evidence,
-            n.source_refs, fe.name AS from_name, te.name AS to_name
+    `SELECT n.id, n.from_entity, n.to_entity, n.attempted_kind, n.evidence, n.source_refs,
+            fe.name AS from_name, fe.aliases AS from_aliases,
+            te.name AS to_name, te.aliases AS to_aliases
        FROM canon_tie_note n
        JOIN canon_entity fe ON fe.id = n.from_entity
        JOIN canon_entity te ON te.id = n.to_entity
-      WHERE n.project_id = ? AND n.status = 'pending' AND n.id > ? ORDER BY n.id LIMIT ?`,
+      WHERE n.project_id = ? AND n.status = 'pending' AND n.id > ?
+      ORDER BY n.id`,
     projectId,
     afterId,
-    maxNotes,
   );
-  let resolved = 0;
-  let confirmed = 0;
-  let unproven = 0;
-  const norm = (s: string): string =>
-    s.replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/\s+/g, ' ').trim();
-  const settle = (id: number, status: 'resolved' | 'confirmed-drop', ruling: string): void => {
-    db.run(
-      "UPDATE canon_tie_note SET status = ?, ruling = ?, ruled_at = ? WHERE id = ? AND project_id = ?",
-      status,
-      ruling,
-      nowIso(),
-      id,
-      projectId,
-    );
-  };
+  const out: TiePriority[] = [];
   for (const note of notes) {
-    opts.onProgress?.(`note ${note.from_name} / ${note.to_name} (${note.attempted_kind})`);
-    let chunkId: number | null = null;
+    let chunkText: string | null = null;
+    let locator = '';
     try {
       const refs = JSON.parse(note.source_refs || '[]') as { chunk?: unknown }[];
-      for (const ref of refs) {
-        const n = Number(ref?.chunk);
-        if (Number.isFinite(n) && n > 0) {
-          chunkId = n;
-          break;
-        }
+      const chunkId = refs.find((ref) => Number.isFinite(Number(ref?.chunk)) && Number(ref?.chunk) > 0)?.chunk;
+      if (chunkId) {
+        const chunk = db.get<{ text: string; locator: string }>(
+          'SELECT text, locator FROM canon_chunk WHERE id = ?',
+          Number(chunkId),
+        );
+        chunkText = chunk?.text ?? null;
+        locator = chunk?.locator ?? '';
       }
     } catch {
-      chunkId = null;
+      chunkText = null;
     }
-    const chunk = chunkId
-      ? db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', chunkId)
-      : null;
-    if (!chunk?.text) {
-      unproven++;
-      continue;
-    }
-    const passage = chunk.text.slice(0, 1500);
-    // What the pair did together rides along: actions are context for the
-    // tie decision. Both names in the recorded participants, newest first.
-    const like = (s: string): string => s.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
-    const doings = db.all<{ title: string; summary: string }>(
-      `SELECT title, summary FROM canon_event WHERE project_id = ? AND participants LIKE ? ESCAPE '\\' AND participants LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT 5`,
-      projectId,
-      `%${like(note.from_name)}%`,
-      `%${like(note.to_name)}%`,
+    const decision = canPromote(
+      {
+        fromId: note.from_entity,
+        toId: note.to_entity,
+        fromName: note.from_name,
+        toName: note.to_name,
+        fromAliases: strList(note.from_aliases),
+        toAliases: strList(note.to_aliases),
+        kind: note.attempted_kind,
+        evidence: note.evidence,
+      },
+      { db, projectId, chunkText },
     );
-    const context = doings.length
-      ? `WHAT THEY DID TOGETHER:\n${doings.map((d) => `- ${d.title}${d.summary ? `: ${d.summary.slice(0, 140)}` : ''}`).join('\n')}\n\n`
-      : '';
-    let label = '';
-    let quote = '';
-    try {
-      const res = await llm.chat({
-        system:
-          'You relabel one claimed tie using only the passage. Reply with JSON only: {"label": "exactly one of the allowed labels, or unresolvable", "quote": "an exact phrase from the passage"}. Start with {. No other words.',
-        messages: [{
-          role: 'user',
-          content:
-            `PAIR: ${note.from_name} / ${note.to_name}\nOLD LABEL: ${note.attempted_kind}\n` +
-            `ALLOWED: ${CLOSED_ROLE_KINDS.join(', ')}\n\n${context}PASSAGE:\n${passage}`,
-        }],
-        temperature: 0.1,
-        maxTokens: 300,
-      });
-      const raw = (res.text ?? '').replace(/```json|```/g, '');
-      const parsed = JSON.parse(raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1)) as {
-        label?: unknown;
-        quote?: unknown;
-      };
-      label = String(parsed.label ?? '').trim().toLowerCase();
-      quote = norm(String(parsed.quote ?? ''));
-    } catch {
-      unproven++;
-      continue;
-    }
-    if (!label || label === 'unresolvable') {
-      // No tie here after all: clear the flagged attempt so it stops
-      // showing up badged, and close the note. Accepted rows are never
-      // touched — only flagged ones of the attempted label.
-      db.run(
-        `DELETE FROM canon_relation WHERE project_id = ? AND lower(kind) = ? AND review_status = 'needs_review'
-          AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))`,
-        projectId,
-        note.attempted_kind.toLowerCase(),
-        note.from_entity,
-        note.to_entity,
-        note.to_entity,
-        note.from_entity,
-      );
-      settle(note.id, 'confirmed-drop', label || 'unresolvable');
-      confirmed++;
-      continue;
-    }
-    if (!CLOSED_ROLE_KINDS.includes(label) || isMomentKind(label)) {
-      unproven++;
-      continue;
-    }
-    if (quote.length <= 10 || !norm(passage).includes(quote) || isUnsupportedKind(label, quote)) {
-      unproven++;
-      continue;
-    }
-    if (!quoteNamesEndpoint(db, projectId, note.from_entity, note.to_entity, quote)) {
-      unproven++;
-      continue;
-    }
-    const dup = db.get<{ id: number }>(
-      'SELECT id FROM canon_relation WHERE project_id = ? AND lower(kind) = ? AND review_status = ? AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))',
-      projectId,
-      label,
-      'accepted',
-      note.from_entity,
-      note.to_entity,
-      note.to_entity,
-      note.from_entity,
-    );
-    if (!dup) {
-      // The relabeled tie supersedes the flagged attempt: remove flagged rows
-      // of the old label so the pair is not counted twice, then bank clean.
-      // Never resolve without a row: a colliding needs_review row leaves the
-      // note pending for a human rather than marking success with no bank.
-      db.run(
-        `DELETE FROM canon_relation WHERE project_id = ? AND lower(kind) = ? AND review_status = 'needs_review'
-          AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))`,
-        projectId,
-        note.attempted_kind.toLowerCase(),
-        note.from_entity,
-        note.to_entity,
-        note.to_entity,
-        note.from_entity,
-      );
-      const added = db.run(
-        `INSERT OR IGNORE INTO canon_relation (project_id, from_entity, to_entity, kind, description, evidence, source_refs, modality, review_status, created_at)
-          VALUES (?, ?, ?, ?, '', ?, ?, 'asserted', 'accepted', ?)`,
-        projectId,
-        note.from_entity,
-        note.to_entity,
-        label,
-        quote,
-        note.source_refs,
-        nowIso(),
-      );
-      if (added.changes === 0) {
-        unproven++;
-        continue;
-      }
-    }
-    settle(note.id, 'resolved', label);
-    resolved++;
+    out.push({
+      id: note.id,
+      fromName: note.from_name,
+      toName: note.to_name,
+      kind: note.attempted_kind,
+      evidence: note.evidence,
+      locator,
+      decision,
+    });
   }
-  const out = { resolved, confirmed, unproven, checked: notes.length, pending: remaining() };
-  writeAuditNote(projectId, 'relabel', [
-    `notes checked: ${out.checked}`,
-    `resolved: ${out.resolved}, confirmed drops: ${out.confirmed}, left pending: ${out.unproven}`,
-    `still waiting: ${out.pending}`,
-  ], db);
-  return out;
+  return out
+    .sort((a, b) => (a.decision.ok === b.decision.ok ? 0 : a.decision.ok ? -1 : 1) || a.id - b.id)
+    .slice(0, limit);
 }
 
 export interface TieEvaluation {
@@ -5972,6 +7138,7 @@ export function listRelations(
 ): CanonRelation[] {
   const params: unknown[] = [projectId];
   let sql = `SELECT r.id, r.from_entity, r.to_entity, r.kind, r.description, r.evidence,
+            r.supporting_evidence,
             a.name AS from_name, b.name AS to_name, r.modality, r.conflict_status,
             r.ledger_state, r.scope, r.review_status
      FROM canon_relation r
@@ -5990,6 +7157,7 @@ export function listRelations(
     kind: string;
     description: string;
     evidence: string;
+    supporting_evidence: string;
     from_name: string;
     to_name: string;
     modality: string | null;
@@ -6010,6 +7178,12 @@ export function listRelations(
     kind: r.kind,
     description: r.description,
     evidence: r.evidence,
+    supportingEvidence: fromJson<Record<string, unknown>[]>(r.supporting_evidence, []).map((item) => ({
+      quote: String(item.quote ?? ''),
+      sourceRefs: Array.isArray(item.source_refs) ? item.source_refs : [],
+      reason: String(item.reason ?? ''),
+      movedAt: String(item.moved_at ?? ''),
+    })),
     modality: r.modality ?? 'asserted',
     conflictStatus: r.conflict_status ?? 'none',
     ledgerState: r.ledger_state ?? 'verified',
@@ -6057,6 +7231,7 @@ export function pairHistory(
     kind: string;
     description: string;
     evidence: string;
+    supporting_evidence: string;
     from_name: string;
     to_name: string;
     modality: string | null;
@@ -6067,6 +7242,7 @@ export function pairHistory(
     source_refs: string;
   }>(
     `SELECT r.id, r.from_entity, r.to_entity, r.kind, r.description, r.evidence,
+            r.supporting_evidence,
             a.name AS from_name, b.name AS to_name, r.modality, r.conflict_status,
             r.ledger_state, r.scope, r.review_status, r.source_refs
      FROM canon_relation r
@@ -6095,6 +7271,12 @@ export function pairHistory(
       kind: r.kind,
       description: r.description,
       evidence: r.evidence,
+      supportingEvidence: fromJson<Record<string, unknown>[]>(r.supporting_evidence, []).map((item) => ({
+        quote: String(item.quote ?? ''),
+        sourceRefs: Array.isArray(item.source_refs) ? item.source_refs : [],
+        reason: String(item.reason ?? ''),
+        movedAt: String(item.moved_at ?? ''),
+      })),
       modality: r.modality ?? 'asserted',
       conflictStatus: r.conflict_status ?? 'none',
       ledgerState: r.ledger_state ?? 'verified',

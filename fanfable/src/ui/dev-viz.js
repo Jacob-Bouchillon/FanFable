@@ -127,6 +127,7 @@
     if (status === 'accepted') return 'accepted (strict checker)';
     if (status === 'user_confirmed') return 'keeper (user-confirmed)';
     if (status === 'needs_review') return 'parked (needs review)';
+    if (status === 'provisional') return 'provisional (not in answers)';
     if (status === 'rejected') return 'rejected';
     return status || 'unknown';
   }
@@ -134,7 +135,7 @@
   function statusBadge(status) {
     const cls = status === 'user_confirmed' || status === 'accepted'
       ? 'dv-badge-ok'
-      : status === 'needs_review'
+      : status === 'needs_review' || status === 'provisional'
         ? 'dv-badge-warn'
         : 'dv-badge-muted';
     return `<span class="dv-badge ${cls}">${esc(statusLabel(status))}</span>`;
@@ -146,12 +147,13 @@
       return edge.reviewStatus === 'user_confirmed' ? 'keeper (user-confirmed)' : 'keeper (accepted)';
     }
     if (edge.reviewStatus === 'needs_review') return 'parked (needs review)';
+    if (edge.reviewStatus === 'provisional') return 'provisional (not in answers)';
     return statusLabel(edge.reviewStatus);
   }
 
   function edgeNote(edge) {
     if (edge.coverage) return 'mention only — coverage, never a relationship';
-    if (edge.reviewStatus === 'needs_review') return 'held back — invisible to answers';
+    if (edge.reviewStatus === 'needs_review' || edge.reviewStatus === 'provisional') return 'held back — invisible to answers';
     return 'stated in answers';
   }
 
@@ -399,6 +401,7 @@
       <span data-count-relations>ties <b>${fmt(c.relations)}</b></span>
       <span data-count-keepers>keepers <b>${fmt(c.keepers)}</b> <span class="dv-muted">(${fmt(c.userConfirmed)} user-confirmed + ${fmt(c.accepted)} accepted)</span></span>
       <span data-count-parked>parked <b>${fmt(c.parked)}</b> <span class="dv-muted">(${fmt(c.coverage)} coverage)</span></span>
+      <span data-count-provisional>provisional <b>${fmt(c.provisional ?? 0)}</b></span>
       <span data-count-pending>pending notes <b>${fmt(c.pendingNotes)}</b></span>
       <span data-count-timeline>timeline <b>${fmt(c.timeline)}</b></span>
       <span class="dv-readonly">read-only · the viz wrote nothing</span>
@@ -520,7 +523,7 @@
   function graphEdgeVisible(edge) {
     if (!canReveal(edge, state.reveal)) return false;
     if (state.graphStatus === 'keepers') return isKeeper(edge.reviewStatus);
-    if (state.graphStatus === 'parked') return edge.reviewStatus === 'needs_review' && !edge.coverage;
+    if (state.graphStatus === 'parked') return (edge.reviewStatus === 'needs_review' || edge.reviewStatus === 'provisional') && !edge.coverage;
     if (state.graphStatus === 'coverage') return edge.coverage;
     if (state.graphStatus === 'thin') return false;
     return true;
@@ -988,6 +991,7 @@
     for (const n of nodes) byKind[n.kind] = (byKind[n.kind] ?? 0) + 1;
     const keeper = edges.filter((e) => isKeeper(e.reviewStatus)).length;
     const parked = edges.filter((e) => e.reviewStatus === 'needs_review' && !e.coverage).length;
+    const provisional = edges.filter((e) => e.reviewStatus === 'provisional' && !e.coverage).length;
     const coverage = edges.filter((e) => e.coverage).length;
     const thin = nodes.filter((n) => n.thin).length;
     return `
@@ -995,6 +999,7 @@
       ${KIND_ORDER.filter((k) => byKind[k]).map((k) => `<span class="dv-key"><i class="dv-dot dv-dot-${k}"></i>${esc(KIND_LABEL[k])} ${fmt(byKind[k])}</span>`).join('')}
       <span class="dv-key"><i class="dv-line dv-line-keeper"></i>keeper tie ${fmt(keeper)}</span>
       <span class="dv-key"><i class="dv-line dv-line-parked"></i>parked ${fmt(parked)}</span>
+      <span class="dv-key"><i class="dv-line dv-line-parked"></i>provisional ${fmt(provisional)}</span>
       <span class="dv-key"><i class="dv-line dv-line-coverage"></i>appears_with coverage ${fmt(coverage)} <span class="dv-muted">(never a relationship)</span></span>
       <span class="dv-key"><i class="dv-ring"></i>thin name ${fmt(thin)}</span>
     `;
@@ -1830,6 +1835,12 @@
 
   function tieHtml(edge, node) {
     const other = edge.fromId === node.id ? edge.toName : edge.fromName;
+    const supporting = Array.isArray(edge.supportingEvidence) ? edge.supportingEvidence : [];
+    const supportingHtml = supporting.length
+      ? `<details class="dv-supporting"><summary>supporting: ${fmt(supporting.length)}</summary>
+           <ul>${supporting.map((item) => `<li>${esc(item.quote || '(no quote)')}${item.reason ? ` <span class="dv-muted">(${esc(item.reason)})</span>` : ''}</li>`).join('')}</ul>
+         </details>`
+      : '';
     return `
       <div class="dv-tie ${edge.coverage ? 'is-coverage' : isKeeper(edge.reviewStatus) ? 'is-keeper' : 'is-parked'}">
         <div class="dv-tie-head">
@@ -1839,6 +1850,7 @@
         </div>
         <blockquote>${esc(edge.evidence || '(no quote banked)')}</blockquote>
         <div class="dv-tie-meta">${esc(edge.locator || 'unplaced')} · ${esc(edgeNote(edge))}</div>
+        ${supportingHtml}
       </div>
     `;
   }
