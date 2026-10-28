@@ -499,7 +499,7 @@ export async function enrichEntity(
   let relations = 0;
   let facts = 0;
   let knowledge = 0;
-  const dropped = { self: 0, unknown: 0, empty: 0, unparseable: 0, duplicate: 0 };
+  const dropped: Record<string, number> = { self: 0, unknown: 0, empty: 0, unparseable: 0, duplicate: 0, 'no-ref': 0 };
 
   // Read in windows so the model is not asked to cover everything at once.
   const windowSize = 4;
@@ -553,20 +553,29 @@ export async function enrichEntity(
       const key = `${fromId}:${toId}:${kind}`;
       if (have.has(key)) { dropped.duplicate++; continue; }
       have.add(key);
-      db.run(
-        `INSERT OR IGNORE INTO canon_relation (project_id, from_entity, to_entity, kind, description, evidence, source_refs, confidence, review_status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        projectId,
-        fromId,
-        toId,
+      const evidence = String(rel.quote ?? '').trim();
+      const normalize = (text: string): string => (text ?? '').toLowerCase().replace(/\s+/g, ' ').trim();
+      const sourcePassage = evidence
+        ? window.find((p) => normalize(p.text).includes(normalize(evidence)))
+        : undefined;
+      if (!sourcePassage) {
+        // No passage can be tied to this claim: park it instead of inserting
+        // a relation that can never be quoted or repaired.
+        const noteRefs = toJson([{ source: window[0]?.source_title ?? '', locator: window[0]?.locator ?? '' }]);
+        lorebook.persistTieNote(db, projectId, fromId, toId, kind, 'no-ref', evidence, noteRefs);
+        dropped['no-ref'] = (dropped['no-ref'] ?? 0) + 1;
+        continue;
+      }
+      lorebook.insertRelation(db, projectId, {
+        fromEntity: fromId,
+        toEntity: toId,
         kind,
-        String(rel.description ?? '').trim(),
-        String(rel.quote ?? '').trim(),
-        toJson([{ source: window[0].source_title, locator: window[0].locator }]),
-        0.7,
-        'needs_review',
-        nowIso(),
-      );
+        description: String(rel.description ?? '').trim(),
+        evidence,
+        sourceRefs: toJson([{ source: sourcePassage.source_title, locator: sourcePassage.locator, chunk: sourcePassage.id }]),
+        confidence: 0.7,
+        reviewStatus: 'needs_review',
+      });
       relations++;
     }
 

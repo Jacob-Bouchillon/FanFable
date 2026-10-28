@@ -3818,20 +3818,16 @@ function applyRelations(
         accepted++;
         continue;
       }
-      db.run(
-        `INSERT INTO canon_relation (project_id, from_entity, to_entity, kind, description, evidence, source_refs, modality, review_status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        projectId,
-        fromId,
-        toId,
+      insertRelation(db, projectId, {
+        fromEntity: fromId,
+        toEntity: toId,
         kind,
-        String(raw.description ?? '').trim(),
-        span.quote,
-        toJson(refs),
-        normaliseModality(raw.modality),
-        rowReview,
-        nowIso(),
-      );
+        description: String(raw.description ?? '').trim(),
+        evidence: span.quote,
+        sourceRefs: toJson(refs),
+        modality: normaliseModality(raw.modality),
+        reviewStatus: rowReview,
+      });
       stats.relations++;
       accepted++;
     }
@@ -4755,15 +4751,86 @@ export function canPromoteRelation(
   );
 }
 
+export interface RelationInsert {
+  fromEntity: number;
+  toEntity: number;
+  kind: string;
+  description?: string;
+  evidence: string;
+  sourceRefs: string;
+  modality?: string;
+  reviewStatus?: string;
+  confidence?: number;
+}
+
+/**
+ * The one relation insert. Every relation must carry a numeric chunk id so it
+ * can be quoted, adjudicated and repaired; a locator alone is not enough.
+ */
+export function insertRelation(
+  db: Db,
+  projectId: number,
+  row: RelationInsert,
+): number {
+  const refs = fromJson<{ chunk?: unknown }[]>(row.sourceRefs, []);
+  if (!refs.some((ref) => {
+    const id = Number(ref?.chunk);
+    return Number.isFinite(id) && id > 0;
+  })) {
+    throw new Error('relation insert refused: source_refs must contain a numeric chunk id');
+  }
+  return db.run(
+    `INSERT INTO canon_relation (project_id, from_entity, to_entity, kind, description, evidence, source_refs, confidence, modality, review_status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    projectId,
+    row.fromEntity,
+    row.toEntity,
+    row.kind,
+    row.description ?? '',
+    row.evidence,
+    row.sourceRefs,
+    row.confidence ?? 1.0,
+    row.modality ?? 'asserted',
+    row.reviewStatus ?? 'accepted',
+    nowIso(),
+  ).lastInsertRowid;
+}
+
+/** Read-only audit: relations whose refs name a source/locator but no chunk. */
+export function findLocatorOnlyRefs(db: Db, projectId: number): number[] {
+  const rows = db.all<{ id: number; source_refs: string }>(
+    'SELECT id, source_refs FROM canon_relation WHERE project_id = ? ORDER BY id',
+    projectId,
+  );
+  const out: number[] = [];
+  for (const row of rows) {
+    let refs: { source?: unknown; locator?: unknown; chunk?: unknown }[] = [];
+    try {
+      const parsed = JSON.parse(row.source_refs || '[]');
+      if (Array.isArray(parsed)) refs = parsed;
+    } catch {
+      refs = [];
+    }
+    if (!refs.length) continue;
+    const hasChunk = refs.some((ref) => {
+      const id = Number(ref?.chunk);
+      return Number.isFinite(id) && id > 0;
+    });
+    const hasLocator = refs.some((ref) => String(ref?.locator ?? '').trim() || String(ref?.source ?? '').trim());
+    if (!hasChunk && hasLocator) out.push(row.id);
+  }
+  return out;
+}
+
 /** Park a dropped tie for the batched relabeling pass. Reruns collide on
  * the pair-plus-label index and add nothing. */
-function persistTieNote(
+export function persistTieNote(
   db: Db,
   projectId: number,
   fromId: number,
   toId: number,
   attemptedKind: string,
-  reason: 'moment' | 'unsupported' | 'open-vocab' | 'evaluation',
+  reason: 'moment' | 'unsupported' | 'open-vocab' | 'evaluation' | 'no-ref',
   evidence: string,
   sourceRefs: string,
   ruling = '',
