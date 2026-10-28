@@ -343,6 +343,16 @@ export const MIGRATIONS: Migration[] = [
     `,
   },
   {
+    version: 15,
+    name: 'confirmed_by_user provenance',
+    // The status becomes the effective retrieval tier; the flag remembers the
+    // human decision even when the row is later quarantined.
+    columns: [
+      ['canon_relation', 'confirmed_by_user', 'INTEGER NOT NULL DEFAULT 0'],
+    ],
+    sql: `UPDATE canon_relation SET confirmed_by_user = 1 WHERE review_status = 'user_confirmed';`,
+  },
+  {
     version: 14,
     name: 'supporting evidence for relations',
     // One cited proving quote per relation; superseded quotes move here as

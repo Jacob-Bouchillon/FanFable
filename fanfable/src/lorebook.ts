@@ -4822,6 +4822,80 @@ export function findLocatorOnlyRefs(db: Db, projectId: number): number[] {
   return out;
 }
 
+export interface UnverifiedKeeper {
+  id: number;
+  fromName: string;
+  toName: string;
+  kind: string;
+  reviewStatus: string;
+  reason: 'no-ref' | 'quote-not-verbatim';
+}
+
+/** Normalise only presentation: quotes, dashes, case and whitespace. */
+function auditNormalize(text: string): string {
+  return (text ?? '')
+    .replace(/[“”«»]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/[–—−]/g, '-')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Keeper rows whose evidence is not a contiguous verbatim span of a cited
+ * chunk. Spliced or paraphrased text fails: normalisation never joins or
+ * reorders sentences, it only flattens presentation.
+ */
+export function findUnverifiedKeepers(db: Db, projectId: number): UnverifiedKeeper[] {
+  const chunks = db.all<{ id: number; text: string }>(
+    'SELECT id, text FROM canon_chunk WHERE project_id = ?',
+    projectId,
+  );
+  const textById = new Map(chunks.map((chunk) => [chunk.id, auditNormalize(chunk.text)]));
+  const rows = db.all<{
+    id: number;
+    kind: string;
+    evidence: string;
+    source_refs: string;
+    review_status: string;
+    from_name: string;
+    to_name: string;
+  }>(
+    `SELECT r.id, r.kind, r.evidence, r.source_refs, r.review_status,
+            a.name AS from_name, b.name AS to_name
+       FROM canon_relation r
+       JOIN canon_entity a ON a.id = r.from_entity
+       JOIN canon_entity b ON b.id = r.to_entity
+      WHERE r.project_id = ? AND r.review_status IN ('accepted','user_confirmed')
+      ORDER BY r.id`,
+    projectId,
+  );
+  const out: UnverifiedKeeper[] = [];
+  for (const row of rows) {
+    let refs: { chunk?: unknown }[] = [];
+    try {
+      const parsed = JSON.parse(row.source_refs || '[]');
+      if (Array.isArray(parsed)) refs = parsed;
+    } catch {
+      refs = [];
+    }
+    const chunkIds = refs
+      .map((ref) => Number(ref?.chunk))
+      .filter((id) => Number.isFinite(id) && textById.has(id));
+    const needle = auditNormalize(row.evidence);
+    if (!chunkIds.length) {
+      out.push({ id: row.id, fromName: row.from_name, toName: row.to_name, kind: row.kind, reviewStatus: row.review_status, reason: 'no-ref' });
+      continue;
+    }
+    const found = !!needle && chunkIds.some((id) => textById.get(id)!.includes(needle));
+    if (!found) {
+      out.push({ id: row.id, fromName: row.from_name, toName: row.to_name, kind: row.kind, reviewStatus: row.review_status, reason: 'quote-not-verbatim' });
+    }
+  }
+  return out;
+}
+
 /** Park a dropped tie for the batched relabeling pass. Reruns collide on
  * the pair-plus-label index and add nothing. */
 export function persistTieNote(
@@ -7025,8 +7099,11 @@ export function replayRulings(
       } else {
         keeperReport.applied++;
         writes.push({
-          sql: 'UPDATE canon_relation SET review_status = ? WHERE id = ? AND project_id = ?',
-          params: [keeper.review_status, existing.id, projectId],
+          sql: `UPDATE canon_relation
+                   SET review_status = ?,
+                       confirmed_by_user = CASE WHEN ? = 'user_confirmed' THEN 1 ELSE confirmed_by_user END
+                 WHERE id = ? AND project_id = ?`,
+          params: [keeper.review_status, keeper.review_status, existing.id, projectId],
         });
       }
       continue;
@@ -7040,8 +7117,8 @@ export function replayRulings(
     writes.push({
       sql: `INSERT INTO canon_relation
               (project_id, from_entity, to_entity, kind, description, evidence, source_refs,
-               confidence, review_status, created_at)
-            VALUES (?, ?, ?, ?, '', ?, ?, 1.0, ?, ?)`,
+               confidence, review_status, confirmed_by_user, created_at)
+            VALUES (?, ?, ?, ?, '', ?, ?, 1.0, ?, ?, ?)`,
       params: [
         projectId,
         from.id,
@@ -7050,6 +7127,7 @@ export function replayRulings(
         keeper.evidence,
         JSON.stringify(refs),
         keeper.review_status,
+        keeper.review_status === 'user_confirmed' ? 1 : 0,
         now,
       ],
     });

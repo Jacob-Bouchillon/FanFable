@@ -153,6 +153,7 @@ ${C.bold('SOURCE MATERIAL')}
   lore notes [--prioritise] [--max n]  Rank parked ties for human review (no writes)
   lore promote [--dry-run] [--limit n] [--find-evidence]
                            Re-check provisional ties; only the proven rule decides
+  lore integrity [--limit n]  List keepers whose evidence is not verbatim (exit 1 if any)
   lore evaluate [--max n]        Judge each banked tie with understanding; failures park as notes
   lore status [--watch [secs]]     How much of the book is read, banked, and waiting
   lore correct relation <id>       Correct a relation by hand
@@ -781,6 +782,25 @@ async function cmdLore(args: Args): Promise<void> {
       }
     }
     console.log(C.dim(`${pending} pending`));
+    return;
+  }
+
+  if (sub === 'integrity') {
+    const limit = Math.max(1, Math.floor(flagNumber(args, 'limit', 50)));
+    const rows = lorebook.findUnverifiedKeepers(db, project.id);
+    heading('Evidence integrity');
+    if (!rows.length) {
+      console.log(C.green('every keeper quote is verbatim in a cited chunk'));
+      return;
+    }
+    for (const row of rows.slice(0, limit)) {
+      console.log(
+        `  ${C.yellow(row.reason)} ${C.bold(row.fromName)} / ${C.bold(row.toName)} — ${row.kind}` +
+          ` ${C.dim(`[${row.reviewStatus}]`)}`,
+      );
+    }
+    console.log(C.dim(`${rows.length} unverified keeper(s); nothing has been changed`));
+    process.exitCode = 1;
     return;
   }
 

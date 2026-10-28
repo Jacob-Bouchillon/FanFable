@@ -643,6 +643,9 @@ export function correctRelation(
     id,
     projectId,
   );
+  if (patch.confirm !== false) {
+    db.run('UPDATE canon_relation SET confirmed_by_user = 1 WHERE id = ? AND project_id = ?', id, projectId);
+  }
   return true;
 }
 
