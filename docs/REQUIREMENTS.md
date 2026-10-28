@@ -114,10 +114,12 @@ Two things bite on a fresh Windows box:
 
    Open a new terminal afterwards so `node` and `npm` are on `PATH`.
 
-2. **Poppler has no installer that edits `PATH`.** The winget package is a zip
-   extracted under `%LOCALAPPDATA%\Microsoft\WinGet\Packages\`. Add its `bin`
-   folder to `PATH`, then confirm `pdftotext -v` works. Without it, PDF import
-   fails with an explicit message; EPUB and DOCX still work.
+2. **Poppler arrives without a shell refresh.** The winget package is a zip
+   extracted under `%LOCALAPPDATA%\Microsoft\WinGet\Packages\`, and winget adds
+   its `bin` folder to your user `PATH`. A terminal that was already open will
+   not see it: open a new one and confirm `pdftotext -v`. If that still fails,
+   add the folder to `PATH` by hand. Without it, PDF import fails with an
+   explicit message; EPUB and DOCX still work.
 
 Nothing else is platform-specific: no symlinks, no POSIX shell, no `make`. The
 `npm` scripts are plain `node` invocations. Use `npm.cmd`/`node` from PowerShell,
