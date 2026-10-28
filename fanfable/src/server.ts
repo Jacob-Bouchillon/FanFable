@@ -26,6 +26,15 @@ import { DEFAULT_LLM_SETTINGS, clientFrom, loadGlobalConfig, saveGlobalConfig } 
 import { DEFAULT_CONTINUITY_SETTINGS, continuitySettings } from './continuity-settings.ts';
 import { devGraphSummary } from './dev-summary.ts';
 
+/** Settings returned to the UI never carry the whole API key. */
+export function maskSettingsForOutput<T extends Record<string, unknown>>(settings: T): T {
+  const copy = { ...settings } as Record<string, unknown>;
+  if (typeof copy.apiKey === 'string' && copy.apiKey) {
+    copy.apiKey = `${copy.apiKey.slice(0, 6)}…${copy.apiKey.slice(-4)}`;
+  }
+  return copy as T;
+}
+
 const UI_DIR = join(import.meta.dirname, 'ui');
 
 /**
@@ -955,9 +964,10 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
         const p = activeId() === null ? undefined : project();
         const global = loadGlobalConfig() as Record<string, unknown>;
         delete global.lastProject;
+        const mergedGlobal = { ...DEFAULT_LLM_SETTINGS, ...global };
         json(res, 200, {
-          global: { ...DEFAULT_LLM_SETTINGS, ...global },
-          project: { ...DEFAULT_LLM_SETTINGS, ...global, ...(p?.settings ?? {}) },
+          global: maskSettingsForOutput(mergedGlobal),
+          project: maskSettingsForOutput({ ...DEFAULT_LLM_SETTINGS, ...global, ...(p?.settings ?? {}) }),
           continuity: p ? continuitySettings(p) : DEFAULT_CONTINUITY_SETTINGS,
         });
         return;
@@ -976,7 +986,10 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
         const p = project();
         controller.updateProjectSettings(db, p.id, patch);
         if (body.continuity === undefined) saveGlobalConfig(patch as never);
-        json(res, 200, { ok: true, settings: controller.getProject(db, p.id)!.settings });
+        json(res, 200, {
+          ok: true,
+          settings: maskSettingsForOutput(controller.getProject(db, p.id)!.settings),
+        });
         return;
       }
 

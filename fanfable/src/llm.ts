@@ -11,7 +11,7 @@
  *   openai    -> POST {baseUrl}/v1/chat/completions   (any compatible local gateway)
  *   mock      -> offline deterministic stub, used by the test suite
  */
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -119,9 +119,16 @@ export function loadGlobalConfig(): Partial<LlmSettings> {
 
 export function saveGlobalConfig(patch: Partial<LlmSettings>): void {
   const p = configPath();
-  mkdirSync(dirname(p), { recursive: true });
+  mkdirSync(dirname(p), { recursive: true, mode: 0o700 });
   const current = loadGlobalConfig();
   writeFileSync(p, JSON.stringify({ ...current, ...patch }, null, 2));
+  // Owner-only on every write. A platform without chmod support simply keeps
+  // its native permissions; the config still saves.
+  try {
+    chmodSync(p, 0o600);
+  } catch {
+    /* unsupported platform */
+  }
 }
 
 export function resolveSettings(overrides: Partial<LlmSettings> = {}): LlmSettings {
@@ -161,6 +168,39 @@ function describeFetchError(err: unknown): string {
   return msg;
 }
 
+/**
+ * True when the endpoint is this machine. Credentials never travel to a local
+ * server, including the default Ollama endpoint.
+ */
+export function isLocalEndpoint(url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return true;
+  }
+  const host = parsed.hostname
+    .toLowerCase()
+    .replace(/^\[|\]$/g, '')
+    .replace(/\.+$/, '');
+  if (host === 'localhost' || host.endsWith('.localhost')) return true;
+  if (host === 'host.docker.internal') return true;
+  if (host === '0.0.0.0') return true;
+  if (host === '::1' || host === '0:0:0:0:0:0:0:1') return true;
+  if (/^127(?:\.\d{1,3}){3}$/.test(host)) return true;
+  return false;
+}
+
+/** Authorization header only for non-local endpoints. */
+export function authHeadersFor(url: string, apiKey?: string): Record<string, string> {
+  if (!apiKey || isLocalEndpoint(url)) return {};
+  return { authorization: `Bearer ${apiKey}` };
+}
+
+function redactSecret(message: string, apiKey?: string): string {
+  return apiKey ? message.split(apiKey).join('[redacted]') : message;
+}
+
 async function postJson(url: string, body: unknown, timeoutMs: number, apiKey?: string): Promise<any> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -169,14 +209,17 @@ async function postJson(url: string, body: unknown, timeoutMs: number, apiKey?: 
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+        ...authHeadersFor(url, apiKey),
       },
       body: JSON.stringify(body),
       signal: controller.signal,
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new LlmError(`LLM request failed (${res.status}) ${text.slice(0, 400)}`, res.status);
+      throw new LlmError(
+        redactSecret(`LLM request failed (${res.status}) ${text.slice(0, 400)}`, apiKey),
+        res.status,
+      );
     }
     return await res.json();
   } catch (err) {
@@ -184,7 +227,7 @@ async function postJson(url: string, body: unknown, timeoutMs: number, apiKey?: 
     if ((err as Error).name === 'AbortError') {
       throw new LlmError(`LLM request timed out after ${timeoutMs}ms`);
     }
-    throw new LlmError(`LLM request failed: ${describeFetchError(err)}`);
+    throw new LlmError(redactSecret(`LLM request failed: ${describeFetchError(err)}`, apiKey));
   } finally {
     clearTimeout(timer);
   }
@@ -195,14 +238,14 @@ async function getJson(url: string, timeoutMs: number, apiKey?: string): Promise
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
-      headers: apiKey ? { authorization: `Bearer ${apiKey}` } : undefined,
+      headers: Object.keys(authHeadersFor(url, apiKey)).length ? authHeadersFor(url, apiKey) : undefined,
       signal: controller.signal,
     });
-    if (!res.ok) throw new LlmError(`HTTP ${res.status}`);
+    if (!res.ok) throw new LlmError(redactSecret(`HTTP ${res.status}`, apiKey));
     return await res.json();
   } catch (err) {
     if (err instanceof LlmError) throw err;
-    throw new LlmError(`Request failed: ${describeFetchError(err)}`);
+    throw new LlmError(redactSecret(`Request failed: ${describeFetchError(err)}`, apiKey));
   } finally {
     clearTimeout(timer);
   }
@@ -290,7 +333,7 @@ class OllamaProvider implements LlmClient {
       if ((err as Error).name === 'AbortError') {
         throw new LlmError(`LLM request timed out after ${this.settings.timeoutMs}ms`);
       }
-      throw new LlmError(`LLM request failed: ${describeFetchError(err)}`);
+      throw new LlmError(redactSecret(`LLM request failed: ${describeFetchError(err)}`, this.settings.apiKey));
     } finally {
       clearTimeout(timer);
       if (reader) {

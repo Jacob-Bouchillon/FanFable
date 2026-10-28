@@ -105,10 +105,9 @@ function globalState(): Record<string, unknown> {
 }
 
 function setGlobalState(patch: Record<string, unknown>): void {
-  const p = configPath();
-  mkdirSync(dirname(p), { recursive: true });
-  const current = globalState();
-  writeFileSync(p, JSON.stringify({ ...current, ...patch }, null, 2));
+  // Every config write goes through saveGlobalConfig so permissions and merge
+  // semantics stay in one place.
+  saveGlobalConfig(patch as Partial<LlmSettings>);
 }
 
 /* ------------------------------------------------------------------- help */
