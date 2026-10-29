@@ -40,3 +40,10 @@ coverage/
 
 # Local backup files
 *.bak.*
+
+# Trial harness scripts are committed; their data (db, json, sheets, tsv) stays local
+!testing/trials/
+testing/trials/*
+!testing/trials/**/
+!testing/trials/**/*.ts
+testing/trials/**/backup/

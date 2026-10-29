@@ -1,0 +1,11 @@
+import * as lore from '/home/jacob/Documents/FanFable/fanfable/src/lore.ts';
+import { seedProject, tempDb, mockProvider } from '/home/jacob/Documents/FanFable/testing/tests/helpers.ts';
+const { db } = tempDb();
+const project = seedProject(db, 'guard-check');
+const llm = mockProvider(() => 'CONFIRMED: Serena Marsh is the apprentice of Kade [S1].');
+const passages = [{ chunkId: 1, sourceId: 1, sourceTitle: 't', path: 't', locator: 'p. 1', heading: '', text: 'Serena Marsh watched it from the ridge.', score: 1 }];
+const res = await lore.answerLoreQuestion(db, llm as never, project.id, 'status of Serena Marsh to Kade', { search: passages as never });
+console.log('guarded_has_abstain=', /Tie not established/.test(res.answer));
+console.log('guarded_keeps_audit=', /Original draft/.test(res.answer));
+console.log('first_line=', res.answer.split('\n')[0]);
+db.close();
