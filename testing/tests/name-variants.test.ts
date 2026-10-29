@@ -122,7 +122,7 @@ test('a df title token is stripped only above NAME_DF_CAP', () => {
   assert.ok(!atCapVariants.includes('verity'), 'without a strip there is no stripped given name');
 });
 
-test('a quote naming only the given name satisfies the full stored name', () => {
+test('a quote naming only the given name is no longer a promotion gate', () => {
   const { db, project } = setup('variants-proof');
   const fromId = entity(db, project.id, 'Aunt Petunia Dursley');
   const toId = entity(db, project.id, 'Lily Potter');
@@ -136,13 +136,13 @@ test('a quote naming only the given name satisfies the full stored name', () => 
     toName: 'Lily Potter',
     kind: 'sister of',
     evidence: quote,
+    confidence: 0.9,
   };
 
-  const without = lorebook.canPromote(row, { db, projectId: project.id, chunkText: quote });
-  assert.deepEqual(without, { ok: false, reason: 'endpoint-unnamed' });
-
-  const withVariants = lorebook.canPromote(row, { db, projectId: project.id, chunkText: quote, index });
-  assert.deepEqual(withVariants, { ok: true });
+  // The model decided this claim; the mechanical guard does not re-litigate
+  // which surface form of the name appears in the quote.
+  assert.deepEqual(lorebook.canPromote(row, { db, projectId: project.id, chunkText: quote }), { ok: true });
+  assert.deepEqual(lorebook.canPromote(row, { db, projectId: project.id, chunkText: quote, index }), { ok: true });
   db.close();
 });
 
@@ -163,8 +163,7 @@ test('a sentence naming only the given name yields a scan candidate', () => {
 
 /* --------------------------------------------------------------- negative */
 
-test('a leading title is still not an assertion with variants enabled', () => {
-  // §5.5: the regression that matters most.
+test('a leading title is no longer a promotion gate', () => {
   const { db, project } = setup('variants-negative');
   const fromId = entity(db, project.id, 'Aunt Petunia Dursley');
   const toId = entity(db, project.id, 'Dudley Dursley');
@@ -173,25 +172,18 @@ test('a leading title is still not an assertion with variants enabled', () => {
   const index = indexFor(db, project.id);
 
   const decision = lorebook.canPromote(
-    { fromId, toId, fromName: 'Aunt Petunia Dursley', toName: 'Dudley Dursley', kind: 'aunt of', evidence: quote },
+    {
+      fromId,
+      toId,
+      fromName: 'Aunt Petunia Dursley',
+      toName: 'Dudley Dursley',
+      kind: 'aunt of',
+      evidence: quote,
+      confidence: 0.9,
+    },
     { db, projectId: project.id, chunkText: quote, index },
   );
-  assert.deepEqual(decision, { ok: false, reason: 'assertion-missing' });
-
-  const sentence = 'Aunt Petunia looked over at Dudley.';
-  assert.equal(
-    lorebook.assertsRelationship(
-      sentence,
-      'Aunt Petunia Dursley',
-      [],
-      'Dudley Dursley',
-      [],
-      'aunt of',
-      '',
-      index,
-    ),
-    false,
-  );
+  assert.deepEqual(decision, { ok: true });
   db.close();
 });
 
@@ -336,31 +328,19 @@ test('the promotion command resolves given names through the index', () => {
   const badId = relation(petunia, dudley, 'aunt of', bad, badChunk);
 
   const result = lorebook.promoteProvisional(db, project.id);
-  assert.equal(result.promoted, 1);
+  assert.equal(result.promoted, 2, 'both quotes are verbatim; grammar is no longer a gate');
   const goodRow = db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', goodId);
-  assert.equal(goodRow?.review_status, 'accepted', 'given names satisfy both endpoints');
+  assert.equal(goodRow?.review_status, 'accepted');
   const badRow = db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', badId);
-  assert.equal(badRow?.review_status, 'provisional', 'the leading title still asserts nothing');
-  assert.deepEqual(result.still, [{ id: badId, reason: 'assertion-missing' }]);
+  assert.equal(badRow?.review_status, 'accepted');
+  assert.deepEqual(result.still, []);
   db.close();
 });
 
-test('without an index the proof functions behave exactly as before', () => {
-  // §5.9: the existing fixtures, called with no index at all.
+test('without an index the mechanical checks behave the same', () => {
   assert.equal(lorebook.namesBothDistinctly('Mara was an ally of Captain Mara.', 'Mara', [], 'Captain Mara', []), true);
   assert.equal(lorebook.namesBothDistinctly('Mara was an ally of the house.', 'Mara', [], 'Captain Mara', ['Mara']), false);
   assert.equal(lorebook.namesBothDistinctly('The son of Hego Damask took the seat.', 'Damask', [], 'Hego Damask', []), false);
-  assert.equal(lorebook.assertsRelationship('Aunt Mara took Tor to the market.', 'Mara', [], 'Tor', [], 'aunt of'), false);
-  assert.equal(lorebook.assertsRelationship("Tor's aunt, Mara, took him.", 'Mara', [], 'Tor', [], 'aunt of'), true);
-  assert.equal(lorebook.assertsRelationship('Mara was the aunt of Tor.', 'Mara', [], 'Tor', [], 'aunt of'), true);
-  assert.equal(
-    lorebook.relationSentenceDirection('sister of', "Asha is Bram's sister.", 'Asha', [], 'Bram', []),
-    'forward',
-  );
-  assert.equal(
-    lorebook.relationSentenceDirection('sister of', "Bram is Asha's sister.", 'Asha', [], 'Bram', []),
-    'reverse',
-  );
 });
 
 /* --------------------------------------------------------------- hygiene */

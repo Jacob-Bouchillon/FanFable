@@ -1,10 +1,10 @@
 /**
- * The one promotion guard: closed relationship-grade kinds, no resolved PARK
- * ruling for the same evidence, and a verbatim both-endpoints quote whose
- * direction the sentence states.
+ * The promotion guard is mechanical: quote in the source, both roster
+ * entities, not the same person, the author's PARK, and the confidence
+ * threshold. Grammar, concept membership and direction are not verdicts.
  *
- * The seven refusal fixtures are the adjudication rows, passed as data; no
- * bank is read. Positive and rule-reason controls use invented names.
+ * The old adjudication fixtures are kept as data: they now pass the mechanical
+ * guard, which is the point of the claim-confidence change.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -21,7 +21,7 @@ function setup(
 ) {
   const { db } = tempDb();
   const project = controller.createProject(db, `promote-${fromName}-${toName}`.slice(0, 60));
-  const fromId = db.run(
+  const fromId = Number(db.run(
     'INSERT INTO canon_entity (project_id, kind, name, aliases, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
     project.id,
     'character',
@@ -29,8 +29,8 @@ function setup(
     '[]',
     AT,
     AT,
-  ).lastInsertRowid;
-  const toId = db.run(
+  ).lastInsertRowid);
+  const toId = Number(db.run(
     'INSERT INTO canon_entity (project_id, kind, name, aliases, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
     project.id,
     'character',
@@ -38,7 +38,7 @@ function setup(
     '[]',
     AT,
     AT,
-  ).lastInsertRowid;
+  ).lastInsertRowid);
   if (prior) {
     db.run(
       `INSERT INTO canon_tie_note
@@ -57,10 +57,16 @@ function setup(
   return { db, project, fromId, toId };
 }
 
-function decide(
-  fixture: { from: string; to: string; kind: string; evidence: string; prior?: { evidence: string; ruling: string; kind?: string } },
-  chunkText = fixture.evidence,
-) {
+interface Fixture {
+  from: string;
+  to: string;
+  kind: string;
+  evidence: string;
+  confidence?: number;
+  prior?: { evidence: string; ruling: string; kind?: string };
+}
+
+function decide(fixture: Fixture, chunkText = fixture.evidence) {
   const { db, project, fromId, toId } = setup(fixture.from, fixture.to, fixture.prior);
   const decision = lorebook.canPromote(
     {
@@ -70,6 +76,7 @@ function decide(
       toName: fixture.to,
       kind: fixture.kind,
       evidence: fixture.evidence,
+      confidence: fixture.confidence,
     },
     { db, projectId: project.id, chunkText },
   );
@@ -79,83 +86,38 @@ function decide(
 
 const RULED_PARK = 'PARK (user: he only had 1; 2026-10-27)';
 
-const FIXTURES = [
+const OLD_REFUSALS: Fixture[] = [
   {
-    name: 'coverage row',
-    from: 'Maa Kaap',
-    to: 'Doo Zuto',
-    kind: 'appears_with',
+    from: 'Maa Kaap', to: 'Doo Zuto', kind: 'appears_with',
     evidence: 'love the work, or perhaps be on the run—from the law, yourself, or whoever else.',
-    reason: 'coverage-only' as const,
   },
   {
-    name: 'coverage row, second pair',
-    from: 'Alderaanian Senator Bail Antilles',
-    to: 'Senator Eelen Li',
-    kind: 'appears_with',
+    from: 'Alderaanian Senator Bail Antilles', to: 'Senator Eelen Li', kind: 'appears_with',
     evidence: 'Servants hurried over to take Valorum’s and Taria’s veda cloth cloaks.',
-    reason: 'coverage-only' as const,
   },
   {
-    name: 'resolved PARK, master direction',
-    from: 'Darth Plagueis',
-    to: 'Darth Venamis',
-    kind: 'master of',
-    evidence: 'Plagueis had been instructed to be on the lookout for suitable beings, just as Tenebrous had been when he had discovered Venamis.',
-    prior: {
-      evidence: 'Plagueis had been instructed to be on the lookout for suitable beings, just as Tenebrous had been when he had discovered Venamis.',
-      ruling: RULED_PARK,
-      kind: 'master of',
-    },
-    reason: 'ruled-park' as const,
-  },
-  {
-    name: 'resolved PARK, apprentice direction',
-    from: 'Darth Venamis',
-    to: 'Darth Plagueis',
-    kind: 'apprentice of',
-    evidence: 'I accept that I must apprentice myself to you.',
-    prior: { evidence: 'I accept that I must apprentice myself to you.', ruling: RULED_PARK, kind: 'apprentice of' },
-    reason: 'ruled-park' as const,
-  },
-  {
-    name: 'open vocabulary, contacting',
-    from: 'Darth Plagueis',
-    to: 'Palpatine',
-    kind: 'contacting',
+    from: 'Darth Plagueis', to: 'Palpatine', kind: 'contacting',
     evidence: 'No. The young human—Palpatine. A deep-space transmission.',
-    reason: 'open-vocab' as const,
   },
   {
-    name: 'open vocabulary, family',
-    from: 'Ronhar Kim',
-    to: 'Jedi Knights',
-    kind: 'family of',
+    from: 'Ronhar Kim', to: 'Jedi Knights', kind: 'family of',
     evidence: 'But that he considers the Temple to be his home and the Jedi to be his family.',
-    reason: 'open-vocab' as const,
   },
   {
-    name: 'open vocabulary, challenged',
-    from: 'Darth Plagueis',
-    to: 'Darth Sidious',
-    kind: 'challenged',
+    from: 'Darth Plagueis', to: 'Darth Sidious', kind: 'challenged',
     evidence: 'This being who had survived assassinations and killed countless opponents merely gazed at Sidious, until it struck him that Plagueis was challenging him!',
-    reason: 'open-vocab' as const,
   },
 ];
 
-for (const fixture of FIXTURES) {
-  test(`refuses ${fixture.name} with ${fixture.reason}`, () => {
-    const decision = decide(fixture);
-    assert.deepEqual(decision, { ok: false, reason: fixture.reason });
+for (const fixture of OLD_REFUSALS) {
+  test(`no longer refuses ${fixture.kind}: ${fixture.from} / ${fixture.to}`, () => {
+    assert.deepEqual(decide(fixture), { ok: true });
   });
 }
 
 test('a PARK binds a different quote for the same pair and kind', () => {
   const decision = decide({
-    from: 'Darth Plagueis',
-    to: 'Darth Venamis',
-    kind: 'master of',
+    from: 'Darth Plagueis', to: 'Darth Venamis', kind: 'master of',
     evidence: 'Plagueis had been instructed to be on the lookout for suitable beings.',
     prior: {
       evidence: 'A completely different sentence from the one offered now.',
@@ -168,9 +130,7 @@ test('a PARK binds a different quote for the same pair and kind', () => {
 
 test('a PARK binds the inverse kind for the same pair', () => {
   const decision = decide({
-    from: 'Darth Plagueis',
-    to: 'Darth Venamis',
-    kind: 'master of',
+    from: 'Darth Plagueis', to: 'Darth Venamis', kind: 'master of',
     evidence: 'Plagueis had been instructed to be on the lookout for suitable beings.',
     prior: {
       evidence: 'A completely different sentence from the one offered now.',
@@ -198,61 +158,78 @@ test('a PARK on an unrelated kind does not block the pair', () => {
 
 test('a closed-kind, quote-verified, unruled pair passes', () => {
   const decision = decide({
-    from: 'Asha',
-    to: 'Bram',
-    kind: 'sister of',
-    evidence: "Asha is Bram's sister.",
+    from: 'Asha', to: 'Bram', kind: 'sister of', evidence: "Asha is Bram's sister.",
   });
   assert.deepEqual(decision, { ok: true });
 });
 
-test('the guard refuses a reversed sentence', () => {
+test('direction is not judged', () => {
   const { db, project, fromId, toId } = setup('Bram', 'Asha');
   const quote = "Asha is Bram's sister.";
   const decision = lorebook.canPromote(
     { fromId, toId, fromName: 'Bram', toName: 'Asha', kind: 'sister of', evidence: quote },
     { db, projectId: project.id, chunkText: quote },
   );
-  assert.deepEqual(decision, { ok: false, reason: 'direction-mismatch' });
+  assert.deepEqual(decision, { ok: true });
   db.close();
 });
 
-test('the guard refuses a quote that is not in the cited chunk', () => {
+test('the guard refuses a quote that is not in the cited chunk, whatever the score', () => {
   const decision = decide({
-    from: 'Asha',
-    to: 'Bram',
-    kind: 'sister of',
-    evidence: "Asha is Bram's sister.",
+    from: 'Asha', to: 'Bram', kind: 'sister of', evidence: "Asha is Bram's sister.", confidence: 1,
   }, 'Asha waited by the gate.');
   assert.deepEqual(decision, { ok: false, reason: 'quote-not-verbatim' });
 });
 
-test('the guard refuses a quote naming one endpoint', () => {
+test('one endpoint in the quote is not a promotion requirement', () => {
   const decision = decide({
-    from: 'Asha',
-    to: 'Bram',
-    kind: 'sister of',
-    evidence: 'Asha waited by the gate.',
+    from: 'Asha', to: 'Bram', kind: 'sister of', evidence: 'Asha waited by the gate.',
   });
+  assert.deepEqual(decision, { ok: true });
+});
+
+test('a missing tie word is not a promotion requirement', () => {
+  const decision = decide({
+    from: 'Asha', to: 'Bram', kind: 'apprentice of', evidence: "Asha and Bram's lanterns met at the gate.",
+  });
+  assert.deepEqual(decision, { ok: true });
+});
+
+test('a moment label is not a guard veto', () => {
+  const decision = decide({
+    from: 'Asha', to: 'Bram', kind: 'met', evidence: 'Asha met Bram at the gate.',
+  });
+  assert.deepEqual(decision, { ok: true });
+});
+
+test('a claim below the threshold stays provisional', () => {
+  const decision = decide({
+    from: 'Asha', to: 'Bram', kind: 'friend of', evidence: 'Asha and Bram came in together.', confidence: 0.6,
+  });
+  assert.deepEqual(decision, { ok: false, reason: 'below-threshold' });
+});
+
+test('a claim at or above the threshold passes', () => {
+  const decision = decide({
+    from: 'Asha', to: 'Bram', kind: 'friend of', evidence: 'Asha and Bram came in together.', confidence: 0.7,
+  });
+  assert.deepEqual(decision, { ok: true });
+});
+
+test('a label outside the concept set can bank but stays unqueryable as a concept', () => {
+  const decision = decide({
+    from: 'Asha', to: 'Bram', kind: 'contacting', evidence: 'Asha contacted Bram by radio.', confidence: 0.9,
+  });
+  assert.deepEqual(decision, { ok: true });
+  assert.equal(lorebook.isClosedRoleKind('contacting'), false);
+});
+
+test('an entity outside the roster is refused', () => {
+  const { db, project } = setup('Asha', 'Bram');
+  const decision = lorebook.canPromote(
+    { fromId: 9991, toId: 9992, fromName: 'Asha', toName: 'Bram', kind: 'friend of', evidence: 'Asha met Bram.', confidence: 1 },
+    { db, projectId: project.id, chunkText: 'Asha met Bram.' },
+  );
   assert.deepEqual(decision, { ok: false, reason: 'endpoint-unnamed' });
-});
-
-test('the guard refuses a quote that never speaks the tie word', () => {
-  const decision = decide({
-    from: 'Asha',
-    to: 'Bram',
-    kind: 'apprentice of',
-    evidence: "Asha and Bram's lanterns met at the gate.",
-  });
-  assert.deepEqual(decision, { ok: false, reason: 'tie-word-absent' });
-});
-
-test('the guard refuses a moment kind', () => {
-  const decision = decide({
-    from: 'Asha',
-    to: 'Bram',
-    kind: 'met',
-    evidence: 'Asha met Bram at the gate.',
-  });
-  assert.deepEqual(decision, { ok: false, reason: 'moment' });
+  db.close();
 });

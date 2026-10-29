@@ -50,8 +50,11 @@ function entity(name: string) {
   };
 }
 
-function relation(from: string, to: string, kind: string, evidence: string) {
-  return { from, to, kind, description: '', chunk_index: 0, evidence };
+function relation(from: string, to: string, kind: string, evidence: string, strength = 0.9) {
+  return {
+    from, to, kind, description: '', chunk_index: 0, evidence, strength,
+    asserted: true, names_both: true, other_person: 'named', hedge: 'certain', kind_fit: 'yes',
+  };
 }
 
 function splitMock(relations: unknown[]) {
@@ -103,12 +106,12 @@ function mkEntity(db: ReturnType<typeof tempDb>['db'], projectId: number, name: 
   ).lastInsertRowid;
 }
 
-test('extraction writes accepted only when proven, provisional otherwise', async () => {
+test('extraction tiers at the model score', async () => {
   const { db, project } = setup();
   const llm = splitMock([
-    relation('Asha', 'Bram', 'sister of', "Asha is Bram's sister."),
-    relation('Asha', 'Bram', 'friend of', "Asha is Bram's sister."),
-    relation('Asha', 'Bram', 'brother of', 'Asha waited by the gate.'),
+    relation('Asha', 'Bram', 'sister of', "Asha is Bram's sister.", 0.9),
+    relation('Asha', 'Bram', 'friend of', "Asha is Bram's sister.", 0.6),
+    relation('Asha', 'Bram', 'brother of', 'Asha waited by the gate.', 0.9),
   ]);
   const stats = await lorebook.extractLore(db, llm as never, project.id, {
     windowSize: 8,
@@ -120,10 +123,10 @@ test('extraction writes accepted only when proven, provisional otherwise', async
     project.id,
   );
   const status = (kind: string) => rows.find((row) => row.kind === kind)?.review_status;
-  assert.equal(status('sister of'), 'accepted', 'both names + tie word + direction is proven');
-  assert.equal(status('friend of'), 'provisional', 'tie word absent is provisional');
-  assert.equal(status('brother of'), 'provisional', 'one endpoint named is provisional');
-  assert.equal(stats.provisional, 2);
+  assert.equal(status('sister of'), 'accepted', 'at/above the threshold banks');
+  assert.equal(status('friend of'), 'provisional', 'below the threshold queues');
+  assert.equal(status('brother of'), 'accepted', 'grammar is not a tier');
+  assert.equal(stats.provisional, 1);
   db.close();
 });
 
@@ -164,7 +167,7 @@ test('promoteProvisional is dry-run safe, rule-only and idempotent', () => {
   const weak = insertRelation(db, project.id, asha, bram, 'brother of', 'Asha waited by the gate.', chunkId);
 
   const dry = lorebook.promoteProvisional(db, project.id, { dryRun: true });
-  assert.equal(dry.promoted, 1);
+  assert.equal(dry.promoted, 2, 'both quotes are verbatim and carry the default confidence');
   assert.equal(
     db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', provable)!.review_status,
     'provisional',
@@ -172,21 +175,20 @@ test('promoteProvisional is dry-run safe, rule-only and idempotent', () => {
   );
 
   const real = lorebook.promoteProvisional(db, project.id);
-  assert.equal(real.promoted, 1);
-  assert.equal(real.still.length, 1);
-  assert.equal(real.still[0]!.id, weak);
+  assert.equal(real.promoted, 2);
+  assert.equal(real.still.length, 0);
   assert.equal(
     db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', provable)!.review_status,
     'accepted',
   );
   assert.equal(
     db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', weak)!.review_status,
-    'provisional',
+    'accepted',
   );
 
   const second = lorebook.promoteProvisional(db, project.id);
   assert.equal(second.promoted, 0);
-  assert.equal(second.checked, 1);
+  assert.equal(second.checked, 0);
   db.close();
 });
 
@@ -202,8 +204,7 @@ test('--find-evidence promotes only a returned sentence that verifies', async ()
   const llm = mockProvider((req) => {
     const system = req.system ?? '';
     if (system.includes('find one proving sentence')) {
-      const user = (req.messages ?? []).map((m) => m.content).join('\n');
-      return user.includes('Cora')
+      return system.includes('Cora')
         ? JSON.stringify({ sentence: 'This sentence is not in the passage.' })
         : JSON.stringify({ sentence: "Asha is Bram's sister." });
     }

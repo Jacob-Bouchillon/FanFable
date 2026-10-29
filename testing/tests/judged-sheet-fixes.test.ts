@@ -98,7 +98,7 @@ test('directed status separates the two arrows (#8)', () => {
   db.close();
 });
 
-test('open vocabulary parks; endpoint-silent closed kinds park too', async () => {
+test('open vocabulary is no longer a promotion verdict; missing score queues both', async () => {
   const { db } = tempDb();
   const project = seedProject(db, 'open-vocab');
   const { chunk } = chunkRefs(db, project.id);
@@ -118,13 +118,10 @@ test('open vocabulary parks; endpoint-silent closed kinds park too', async () =>
   const rows = db.all<{ kind: string; review_status: string }>(`SELECT kind, review_status FROM canon_relation WHERE project_id = ? ORDER BY kind`, project.id);
   const enc = rows.find((r) => r.kind === 'encourager of');
   const aide = rows.find((r) => r.kind === 'aide of');
-  assert.ok(enc, 'verb phrase row exists');
-  assert.equal(enc!.review_status, 'needs_review', 'encourager parks, never banks accepted');
-  // Neither endpoint is named in this thin quote, so the closed-kind tie
-  // parks too — stating the tie is required to bank. See bank-gates.
-  assert.ok(aide, 'endpoint-silent row still exists for relabeling');
-  assert.equal(aide!.review_status, 'provisional', 'one named endpoint makes a closed kind provisional');
+  assert.equal(enc?.review_status, 'provisional', 'no model score, so it queues');
+  assert.equal(aide?.review_status, 'provisional', 'no model score, so it queues');
+  assert.equal(lorebook.isClosedRoleKind('encourager of'), false, 'the concept set still governs querying');
   const note = db.get<{ reason: string }>(`SELECT reason FROM canon_tie_note WHERE project_id = ? AND attempted_kind = 'encourager of'`, project.id);
-  assert.equal(note?.reason, 'open-vocab');
+  assert.equal(note, undefined, 'the old open-vocab note is gone');
   db.close();
 });

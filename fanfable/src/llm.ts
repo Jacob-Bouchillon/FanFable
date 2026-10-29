@@ -31,11 +31,11 @@ export interface LlmSettings {
   /** Fixes the random seed, so the same prompt gives the same result. */
   seed?: number;
   /**
-   * For models that think out loud. false turns the thinking off, which is
-   * what a comparison needs: the thinking tokens otherwise come out of the
-   * same budget as the answer.
+   * For models that think out loud. false asks for no thinking, but some
+   * builds ignore it; 'low'/'medium'/'high' set the reasoning level, and the
+   * thinking tokens otherwise come out of the same budget as the answer.
    */
-  think?: boolean;
+  think?: boolean | 'low' | 'medium' | 'high';
   /**
    * Key for a gateway that checks one (OpenRouter and other cloud hosts).
    * Unset for local servers. When config stores none, FANFABLE_API_KEY then

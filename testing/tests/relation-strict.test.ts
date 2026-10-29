@@ -54,9 +54,15 @@ function relation(evidence: string, kind = 'sister of') {
     from: 'Asha',
     to: 'Bram',
     kind,
+    kind_source: 'sister',
     description: '',
     chunk_index: 0,
     evidence,
+    strength: 0.9,
+    asserted: true,
+    names_both: true,
+    other_person: 'named',
+    hedge: 'certain', kind_fit: 'yes',
   };
 }
 
@@ -135,7 +141,7 @@ test('one retry repairs a partly named quote and the relation banks accepted', a
   db.close();
 });
 
-test('a retry sentence that is not verbatim is refused and the relation parks', async () => {
+test('a failed retry leaves the original quote, which can bank on its own', async () => {
   const { db, project } = setup();
   const counter = { retries: 0 };
   const llm = mock([relation('Asha waited by the gate.')], JSON.stringify({ quote: 'Bram is Asha brother.' }), counter);
@@ -151,7 +157,7 @@ test('a retry sentence that is not verbatim is refused and the relation parks', 
     project.id,
   )!;
   assert.equal(row.evidence, 'Asha waited by the gate.');
-  assert.equal(row.review_status, 'provisional');
+  assert.equal(row.review_status, 'accepted', 'the original quote is verbatim and the model scored it; both names are no longer required');
   db.close();
 });
 

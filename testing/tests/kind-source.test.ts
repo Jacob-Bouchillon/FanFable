@@ -76,12 +76,11 @@ test('the words are stored with the row', () => {
   db.close();
 });
 
-test('without the words, the same quote fails the tie check', () => {
+test('without the words, the same quote still passes: kind_source is provenance', () => {
   const quote = 'Mara threw in with Tor before the vote.';
   const { db, project, id } = setup('kind-source-absent', quote);
   const decision = lorebook.canPromoteRelation(db, project.id, id);
-  assert.equal(decision.ok, false);
-  assert.equal(decision.reason, 'tie-word-absent');
+  assert.equal(decision.ok, true);
   db.close();
 });
 
@@ -93,11 +92,10 @@ test('with the words, the same quote passes', () => {
   db.close();
 });
 
-test('words that are not in the quote prove nothing', () => {
+test('foreign words are not a promotion check either', () => {
   const quote = 'Mara threw in with Tor before the vote.';
   const { db, project, id } = setup('kind-source-foreign', quote, 'backed');
   const decision = lorebook.canPromoteRelation(db, project.id, id);
-  assert.equal(decision.ok, false);
-  assert.equal(decision.reason, 'tie-word-absent');
+  assert.equal(decision.ok, true, 'the quote is verbatim; kind_source is stored for audit');
   db.close();
 });

@@ -435,11 +435,12 @@ test('moment labels and third-person proofs are flagged and counted, not silentl
     'SELECT kind, review_status FROM canon_relation WHERE project_id = ? ORDER BY id',
     project.id,
   );
-  assert.equal(rows.length, 0, 'moments never bank as ties, flagged or otherwise; only third-person proof drops outright too');
+  // The relevance/third-person gate is gone: the model's claim is kept in the
+  // queue (no score, so provisional), and only the two moments route to events.
   const statusOf = (kind: string) => rows.find((r) => r.kind === kind)?.review_status;
-  assert.equal(statusOf('owes'), undefined, 'third-person proof is gone, not banked anywhere');
+  assert.equal(rows.length, 1, 'the non-moment claim queues instead of being dropped');
+  assert.equal(statusOf('owes'), 'provisional', 'no model score, so it stays provisional');
   assert.ok(stats.verification.moment >= 2, 'the moment flags are counted');
-  assert.ok(stats.verification.unrelated >= 1, 'the third-person drop is counted');
   const moments = db.all<{ title: string }>('SELECT title FROM canon_event WHERE project_id = ?', project.id);
   assert.equal(moments.length, 2, 'both moments live on as events');
   db.close();
@@ -471,8 +472,7 @@ test('a generic kinship word drops beside the specific one', async () => {
     project.id,
   );
   assert.deepEqual(rows.map((r) => r.kind), ['brother of'], 'the specific stands; the generic drops beside it');
-  assert.deepEqual(rows.map((r) => r.review_status), ['needs_review'], 'endpoint silence parks even the stated noun');
-  assert.ok(stats.verification.unsupported >= 1, 'the silent-quote flag is counted');
+  assert.deepEqual(rows.map((r) => r.review_status), ['provisional'], 'no model score, so it queues');
   assert.ok(stats.verification.moment >= 1, 'the observed-by moment is counted');
   const events = db.all<{ title: string; quote: string }>(
     'SELECT title, quote FROM canon_event WHERE project_id = ?',
@@ -504,8 +504,7 @@ test('a noun tie needs its word in the quote', async () => {
     project.id,
   );
   assert.deepEqual(rows.map((r) => r.kind), ['brother of', 'cousin of'], 'both stay; nothing is deleted');
-  assert.deepEqual(rows.map((r) => r.review_status), ['needs_review', 'provisional'], 'no endpoint parks; a silent noun with one endpoint is provisional');
-  assert.ok(stats.verification.unsupported >= 1, 'the silent-quote flag is counted');
+  assert.deepEqual(rows.map((r) => r.review_status), ['provisional', 'provisional'], 'no model score keeps both in the queue');
   db.close();
 });
 
@@ -558,7 +557,7 @@ test('a parked moment is queued for review, never banked by a model', async () =
   const queue = lorebook.prioritiseTieNotes(db, project.id);
   assert.equal(queue.length, 1, 'the pending note enters the review queue');
   assert.equal(queue[0].decision.ok, false);
-  assert.equal(queue[0].decision.reason, 'moment');
+  assert.equal(queue[0].decision.reason, 'below-threshold', 'a note has no model score');
   const rows = db.all<{ kind: string }>('SELECT kind FROM canon_relation WHERE project_id = ?', project.id);
   assert.deepEqual(rows, [], 'a model queue position never writes a relation');
   const left = db.get<{ n: number }>("SELECT COUNT(*) AS n FROM canon_tie_note WHERE project_id = ? AND status = 'pending'", project.id);
@@ -604,7 +603,7 @@ test('the evaluator keeps what the quote shows and parks the rest', async () => 
   // Open vocabulary parks at extraction now: both rows bank flagged with
   // open-vocab notes instead of accepted. The judge still rules keep/drop.
   const banked = db.all<{ kind: string; review_status: string }>('SELECT kind, review_status FROM canon_relation WHERE project_id = ? ORDER BY id', project.id);
-  assert.deepEqual(banked.map((r) => r.review_status), ['needs_review', 'needs_review'], 'verb phrases park, never bank accepted');
+  assert.deepEqual(banked.map((r) => r.review_status), ['provisional', 'provisional'], 'no model score queues both');
   let calls = 0;
   const judgeMock = mockProvider(() => {
     calls++;
@@ -613,7 +612,7 @@ test('the evaluator keeps what the quote shows and parks the rest', async () => 
   const result = await lorebook.evaluateTies(db, judgeMock, project.id, { maxTies: 10 });
   assert.deepEqual([result.kept, result.parked, result.unproven], [1, 1, 0], 'one kept, one parked, none stranded');
   const left = db.all<{ kind: string; review_status: string }>('SELECT kind, review_status FROM canon_relation WHERE project_id = ? ORDER BY id', project.id);
-  assert.deepEqual(left.map((r) => [r.kind, r.review_status]), [['trusted with life', 'needs_review'], ['accompanies', 'needs_review']], 'the kept tie stays pending; the dropped one waits flagged');
+  assert.deepEqual(left.map((r) => [r.kind, r.review_status]), [['trusted with life', 'provisional'], ['accompanies', 'needs_review']], 'the kept tie stays queued; the dropped one waits flagged');
   const notes = db.all<{ attempted_kind: string; status: string }>(`SELECT attempted_kind, status FROM canon_tie_note WHERE project_id = ? AND attempted_kind = 'accompanies'`, project.id);
   assert.deepEqual(notes.map((n) => [n.attempted_kind, n.status]), [['accompanies', 'pending']], 'the dropped tie waits as a note');
   db.close();

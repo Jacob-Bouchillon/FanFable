@@ -75,30 +75,14 @@ test('the relations prompt carries the glossary', () => {
   assert.ok(prompt.includes('- disliked (symmetric) —'));
 });
 
-test('a cited phrase proves a concept without the label word', () => {
-  assert.equal(
-    lorebook.assertsRelationship('Mara sided with Tor at the gate.', 'Mara', [], 'Tor', [], 'ally of', 'sided with'),
-    true,
-  );
-  assert.equal(
-    lorebook.assertsRelationship('Mara threw in with Tor before the vote.', 'Mara', [], 'Tor', [], 'ally of', 'threw in with'),
-    true,
-  );
-  assert.equal(
-    lorebook.assertsRelationship('Mara loathed Tor in a quiet way.', 'Mara', [], 'Tor', [], 'disliked', 'loathed'),
-    true,
-  );
-});
-
-test('an unrelated sentence still fails the kind', () => {
+test('an unrelated sentence still fails the label-word diagnostic', () => {
+  // The concept set remains for labelling and queryability. This diagnostic
+  // is not the promotion guard: the model's citation and confidence decide.
   assert.equal(lorebook.isUnsupportedKind('ally of', 'Mara met Tor at the gate.'), true);
   assert.equal(lorebook.isUnsupportedKind('friend of', 'Mara paid the toll.'), true);
 });
 
-test('a nearby kin word does not prove a generic relative, but a citation does', () => {
+test('a nearby kin word does not satisfy the generic relative label', () => {
   assert.equal(lorebook.isUnsupportedKind('relative of', 'Aunt Mara took Tor to the market.'), true);
-  assert.equal(
-    lorebook.assertsRelationship('Mara was kin to Tor.', 'Mara', [], 'Tor', [], 'relative of', 'kin'),
-    true,
-  );
 });
+

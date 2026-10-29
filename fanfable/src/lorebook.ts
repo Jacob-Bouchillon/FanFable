@@ -246,6 +246,22 @@ Rules:
 - If the passage denies, doubts, or frames something as merely possible, record the claim normally but set modality to denied/possible/suspected with the denying quote as evidence; never store a denial as a plain fact.
 - No prose outside the JSON.`;
 
+/** The shared rating questions: extraction and the assess pass use the same block. */
+export const ASSESSMENT_QUESTIONS = `Before you rate, answer these questions about the quote.
+Judge each one yourself; do not look for a rule to follow.
+
+- Does the quote identify both people? A nickname or title counts if a reader
+  would connect it. A pronoun counts if the passage makes the referent clear.
+- Does the sentence state the relationship, or only imply it? Implication is
+  fine if a careful reader would agree it is there.
+- Where one person is referred to indirectly, how clear is the reference in
+  the surrounding text?
+- Is the kind right for what the sentence says? A correct pair does not rescue
+  a wrong kind.
+- Does the author sound certain, or is this hedged, doubted or denied?
+- Given your answers, how strongly does this quote support the claim? Give a
+  number from 0 to 1 and one sentence saying why.`;
+
 export const EXTRACT_RELATIONS_SYSTEM = `You read passages from a book and record relationships between the known entities listed below.
 
 Reply with JSON only:
@@ -256,22 +272,28 @@ Reply with JSON only:
      "kind":"one of the defined relationship concepts, exactly as written",
      "kind_source":"the passage's own words that express the concept, copied verbatim",
      "description":"one sentence","chunk_index":0,"evidence":"a short exact quote",
+     "anchor":"the sentence naming the other person when the quote names only one, copied verbatim; empty when the quote names both",
+     "names_both": false, "other_person": "named|pronoun|role|absent",
+     "asserted": true, "hedge": "certain|hedged|doubted|denied",
+     "kind_fit": "yes|partly|no", "strength": 0.7,
+     "why":"one sentence of reasoning",
      "modality":"asserted|denied|possible|suspected — only include when not asserted"}
   ]
 }
 
 Rules:
 - "from" and "to" must both be names from the KNOWN ENTITIES list. Do not invent a name, and do not use a name that is not listed, even if it appears in the passage.
-- Record only a lasting tie these passages state explicitly. A tie stays true pages later (family, lasting roles, friend or enemy). A moment happens once (met, gave, told, saw, wished, refused) and is never a tie, even when stated: moments belong to events, and a moment label is dropped and counted. A noun tie must be spoken in its quote: sister, brother, father and their kin only bank when the proving sentence says the word. Never infer one.
-- Be exhaustive, not representative: list EVERY lasting tie the passages state explicitly — most windows contain several, and a long list is good while a missed tie is bad. Do not stop after the first few entries, and do not pad the list with moments. When in doubt whether a stated tie is lasting, include it with its quote and let the gates decide.
-- evidence must be a phrase copied VERBATIM from the passage, long enough to state the tie on its own (a name plus the tie word), not your own words and not a two-word fragment.
+- Record only a lasting tie the passages state or clearly imply. A tie stays true pages later (family, lasting roles, friend or enemy). A moment happens once (met, gave, told, saw, wished, refused) and is never a tie: moments belong to events.
+- Be exhaustive, not representative: list EVERY lasting tie the passages support — most windows contain several, and a long list is good while a missed tie is bad. When in doubt, include it with its quote and let the strength answer decide.
+- evidence must be a phrase copied VERBATIM from the passage, not your own words. It may name one endpoint or both.
+- When the quote names only one endpoint, put in "anchor" one contiguous sentence from the same passage, copied VERBATIM, that names the other person. Leave "anchor" empty when the quote names both.
 - One relation per entry, with one kind. If two people have several relationships, write a separate entry for each.
 - kind must be exactly one of the defined relationship concepts below; never invent a kind. kind_source must be the passage's own words that express that concept, copied verbatim from the quote.
 - The direction matters: "from" is the one who has the relationship and "to" is the one it is to. If Harry is Petunia's nephew, it is from="Harry", to="Petunia", kind="nephew of".
 - chunk_index is the number shown in front of each passage.
-- evidence must be a short phrase copied from the passage, not your own words.
-- If the passages state no new relationship, return an empty array.
-- If the passage denies, doubts, or frames something as merely possible, record the claim normally but set modality to denied/possible/suspected with the denying quote as evidence; never store a denial as a plain fact.
+- names_both is true when the quote itself names both people; other_person says how the other side is named (named, pronoun, role, absent). asserted is true when the quote states the tie rather than only implying it. hedge is certain, hedged, doubted or denied. kind_fit is yes, partly or no. strength is your answer to the last question, from 0 to 1. why is one sentence of reasoning, stored for audit and never parsed.
+- If the passage denies, doubts, or frames something as merely possible, set asserted=false, hedge to doubted or denied, and the low strength that follows; also set modality.
+${ASSESSMENT_QUESTIONS}
 - No prose outside the JSON.`;
 
 /**
@@ -3652,8 +3674,7 @@ function applyRelations(
   index?: RosterIndex,
 ): number {
   let accepted = 0;
-  // Fresh per call: entities created earlier in the same run are visible.
-  const roster = rosterTokens(db, projectId);
+  const minConfidence = projectMinConfidence(db, projectId);
   for (const raw of raws) {
     const fromName = String(raw.from ?? '').trim();
     const toName = String(raw.to ?? '').trim();
@@ -3662,7 +3683,8 @@ function applyRelations(
     if (!fromId || !toId || fromId === toId) {
       // A relation naming someone the bank has never seen is a recall hole,
       // not noise: keep the names, kind and quote as a hint. No entity is
-      // created and nothing is promoted to a relation.
+      // created and nothing is promoted to a relation. Same-person claims are
+      // refused by the mechanical identity check.
       if (gate) stats.verification.unresolved++;
       if (!fromId || !toId) {
         const chunk = chunkAt(window, raw.chunk_index);
@@ -3692,95 +3714,93 @@ function applyRelations(
       }
       continue;
     }
+    const kinds = normaliseKinds(String(raw.kind ?? ''));
     const chunk = chunkAt(window, raw.chunk_index);
     const span = spanFor(raw.evidence, chunk, neighboursOf(chunk?.id), gate, stats.verification);
-    if (span.status === 'dropped') continue;
-    // The model may name the words in the quote that express the kind. Keep
-    // them only when they are verbatim in the quote the guard will check.
-    const kindSourceRaw = String(raw.kind_source ?? '').trim();
-    const kindSource =
-      kindSourceRaw && normalise(span.quote).includes(normalise(kindSourceRaw)) ? kindSourceRaw : '';
-    // Hard gate (gated path only): a quote about neither endpoint names a
-    // third roster person instead. Never written — an unprovable tie is
-    // worse than a missing one. The pre-gate path keeps its lenient flag.
-    const relevant = proofRelevance(roster, fromId, toId, span.quote);
-    // Misattached proof: the quote names a third roster person without
-    // naming both endpoints (Pax Teem + Aks Moe proving Pax Teem + Kim).
-    // Never accepted — at best pending until a both-endpoints quote arrives.
-    const bothNamed = [fromId, toId].every((id) =>
-      [...(roster.get(id) ?? [])].some((t) => proofTokens(span.quote, 3).has(t)),
-    );
-    let thirdParty = false;
-    if (!bothNamed) {
-      const words = proofTokens(span.quote, 3);
-      for (const [id, toks] of roster) {
-        if (id === fromId || id === toId) continue;
-        for (const t of toks) {
-          if (words.has(t)) { thirdParty = true; break; }
-        }
-        if (thirdParty) break;
-      }
-    }
-    const misattached = thirdParty && !bothNamed;
-    // A quote naming neither endpoint proves nothing about the pair, even
-    // with no third party in it ("thus are lasting partnerships solidified"
-    // for a tie between two named people). Pending, never accepted: pronoun and
-    // scene color can be re-proved, but they must not bank.
-    const anyNamed = [fromId, toId].some((id) =>
-      [...(roster.get(id) ?? [])].some((t) => proofTokens(span.quote, 3).has(t)),
-    );
-    const review = relevant && !misattached && anyNamed ? 'accepted' : 'needs_review';
-    if (!relevant && gate) {
-      stats.verification.unrelated++;
-      continue;
-    }
-    const refs = span.chunkId !== null
+    const refs = span.status !== 'dropped' && span.chunkId !== null
       ? [{ source: span.source, locator: span.locator, chunk: span.chunkId }]
       : refsFor(chunk);
-    // Endpoint silence leaves a case file, not just a parked row: without a
-    // note the relabel pass would never reconsider the tie. Only for closed
-    // kinds — open vocabulary gets its own note below, and the unique index
-    // keeps one note per pair+kind.
-    if (relevant && !misattached && !anyNamed) {
-      const firstKind = normaliseKinds(String(raw.kind ?? ''))[0] ?? 'related to';
-      if (isClosedRoleKind(firstKind)) {
-        stats.verification.unsupported++;
-        persistTieNote(db, projectId, fromId, toId, firstKind, 'unsupported', span.quote, toJson(refs), '', kindSource);
-      }
+    const passageText = span.status !== 'dropped' && span.chunkId !== null
+      ? pageEvidenceText(db, span.chunkId) ??
+        db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', span.chunkId)?.text ??
+        chunk?.text ??
+        ''
+      : chunk?.text ?? '';
+
+    // Check 1: the quote must exist in the cited passage. A fabrication is a
+    // case file, never a row.
+    const quoteVerbatim =
+      span.status !== 'dropped' &&
+      span.quote.trim().length > 0 &&
+      passageText.length > 0 &&
+      normalise(passageText).includes(normalise(span.quote));
+    if (!quoteVerbatim) {
+      stats.verification.unsupported++;
+      persistTieNote(
+        db,
+        projectId,
+        fromId,
+        toId,
+        kinds[0] ?? 'related to',
+        'unsupported-citation',
+        String(raw.evidence ?? '').trim(),
+        toJson(refs),
+      );
+      continue;
     }
-    const kinds = normaliseKinds(String(raw.kind ?? ''));
+
+    // Check 1 also covers the anchor: it is part of the citation.
+    const anchorRaw = String(raw.anchor ?? '').trim();
+    const anchorVerbatim =
+      anchorRaw.length > 0 && passageText.length > 0 && normalise(passageText).includes(normalise(anchorRaw));
+    if (anchorRaw && !anchorVerbatim) {
+      stats.verification.unsupported++;
+      persistTieNote(db, projectId, fromId, toId, kinds[0] ?? 'related to', 'unsupported-citation', anchorRaw, toJson(refs));
+      continue;
+    }
+    const anchorEvidence = anchorVerbatim ? anchorRaw : '';
+
+    // The model's own judgement, recorded as provenance. The confidence alone
+    // decides the tier; none of the assessment fields are a grammar gate.
+    const assessment = readClaimAssessment(raw);
+    const confidence = assessment.strength;
+    const supporting = assessmentSupporting(assessment);
+    const rowReview = claimTier(confidence, minConfidence);
+    if (rowReview === 'provisional') stats.provisional++;
+
+    const kindSourceRaw = String(raw.kind_source ?? '').trim();
+    const kindSource =
+      kindSourceRaw &&
+      (normalise(span.quote).includes(normalise(kindSourceRaw)) ||
+        (anchorEvidence.length > 0 && normalise(anchorEvidence).includes(normalise(kindSourceRaw))))
+        ? kindSourceRaw
+        : '';
+
     for (const kind of kinds) {
-      // Moments are not ties, flagged or otherwise: what happened belongs to
-      // events. The happening banks as an event with both people attached;
-      // the tie question parks as a note. Counted throughout, never lost.
-      // Silent nouns keep a flagged tie row: the label IS relationship-
-      // shaped, only its quote is silent. The judge or a human decides.
-      let flagged: 'unsupported' | 'open-vocab' | null = null;
+      // Moments are not ties: the happening banks as an event with both people
+      // attached, and the tie question stays in the queue. Routed before the
+      // citation check so a denied moment still reaches the event index.
       if (isMomentKind(kind)) {
         stats.verification.moment++;
         bankMomentEvent(db, projectId, fromId, toId, kind, String(raw.description ?? '').trim(), span, chunk);
         persistTieNote(db, projectId, fromId, toId, kind, 'moment', span.quote, toJson(refs), '', kindSource);
         continue;
       }
-      // Without a citation the label's own word must be in the quote. With one,
-      // the cited words carry the claim even when the label does not appear.
-      if (!kindSource && isUnsupportedKind(kind, span.quote)) {
+      // Citation honesty: a quoted sub-span may not hide a hedge or denial in
+      // the sentence that holds it. This is the only grammatical check left,
+      // and it protects the source, not a theory of relationships.
+      const citationReason = provenQuoteReason(
+        { fromId, toId, fromName, toName, kind, evidence: span.quote, kindSource, anchorEvidence },
+        passageText,
+        index,
+      );
+      if (citationReason) {
         stats.verification.unsupported++;
-        persistTieNote(db, projectId, fromId, toId, kind, 'unsupported', span.quote, toJson(refs), '', kindSource);
-        flagged = 'unsupported';
-      }
-      // Open vocabulary parks: the kind is no closed role noun (kinship,
-      // titled role, human-gated peer/colleague), so it can never bank
-      // accepted. It stays pending with reason open-vocab-kind — the
-      // encourager/acknowledger class — invisible to status until cleared.
-      if (!flagged && !isClosedRoleKind(kind)) {
-        stats.verification.unsupported++;
-        persistTieNote(db, projectId, fromId, toId, kind, 'open-vocab', span.quote, toJson(refs), '', kindSource);
-        flagged = 'open-vocab';
+        persistTieNote(db, projectId, fromId, toId, kind, 'unsupported-citation', span.quote, toJson(refs), '', kindSource);
+        continue;
       }
       // A generic kinship word repeats a specific one: "parent of" beside
-      // "father of" says nothing new. Pure dedupe, not a meaning judgment:
-      // the generic drops, the specific stands, the counter ticks.
+      // "father of" says nothing new. Pure dedupe, not a meaning judgment.
       const lk = kind.toLowerCase();
       const specifics = GENERIC_KINSHIP.get(lk);
       if (specifics) {
@@ -3799,8 +3819,8 @@ function applyRelations(
           continue;
         }
       } else {
-        for (const [generic, kinds] of GENERIC_KINSHIP) {
-          if (!kinds.has(lk)) continue;
+        for (const [generic, genericKinds] of GENERIC_KINSHIP) {
+          if (!genericKinds.has(lk)) continue;
           const stale = db.all<{ id: number }>(
             'SELECT id FROM canon_relation WHERE project_id = ? AND lower(kind) = ? AND review_status != ? AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))',
             projectId,
@@ -3818,48 +3838,23 @@ function applyRelations(
           break;
         }
       }
-      // Proven tier: a closed kind whose quote passes verbatim but misses the
-      // tie word is provisional, not parked. Open vocabulary and coverage
-      // still park for a human relabel.
-      let rowReview = flagged === 'open-vocab' ? 'needs_review' : flagged === 'unsupported' ? 'provisional' : review;
-      if (rowReview === 'provisional' && flagged === 'unsupported') stats.provisional++;
-      if (rowReview === 'accepted') {
-        const guardChunkText = span.chunkId
-          ? pageEvidenceText(db, span.chunkId) ??
-            db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', span.chunkId)?.text ??
-            null
-          : chunk?.text ?? null;
-        const fromAliases = db.get<{ aliases: string }>('SELECT aliases FROM canon_entity WHERE id = ?', fromId);
-        const toAliases = db.get<{ aliases: string }>('SELECT aliases FROM canon_entity WHERE id = ?', toId);
-        const proven = provenRelation(
-          {
-            fromId,
-            toId,
-            fromName,
-            toName,
-            fromAliases: strList(fromAliases?.aliases),
-            toAliases: strList(toAliases?.aliases),
-            kind,
-            evidence: span.quote,
-            kindSource,
-          },
-          { chunkText: guardChunkText, index },
-        );
-        if (!proven.ok) {
-          rowReview = 'provisional';
-          stats.provisional++;
-        }
-      }
-      // The same claim in two words: one pair, one quote, one head verb
-      // ("trusts with life" beside "trusts with important task"). Merge into
-      // the earliest row instead of banking both; the longer telling wins,
-      // exactly like the same-label merge below.
+      // The same claim in two words: one pair, one quote, one head verb.
       const headWord = (k: string): string => {
         const stop = new Set(['a', 'an', 'the', 'to', 'of', 'with', 'by', 'for', 'in', 'on', 'at']);
         return k.toLowerCase().split(/[^a-z]+/).filter((w) => w && !stop.has(w))[0] ?? '';
       };
-      const rivals = db.all<{ id: number; kind: string; description: string; evidence: string; source_refs: string; review_status: string }>(
-        `SELECT id, kind, description, evidence, source_refs, review_status FROM canon_relation
+      const rivals = db.all<{
+        id: number;
+        kind: string;
+        description: string;
+        evidence: string;
+        source_refs: string;
+        review_status: string;
+        confidence: number;
+        supporting_evidence: string;
+      }>(
+        `SELECT id, kind, description, evidence, source_refs, review_status, confidence, supporting_evidence
+           FROM canon_relation
           WHERE project_id = ? AND evidence = ? AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))
           ORDER BY id`,
         projectId,
@@ -3875,25 +3870,46 @@ function applyRelations(
         const sentence = description.length > twin.description.length ? description : twin.description;
         const quote = span.quote.length > twin.evidence.length ? span.quote : twin.evidence;
         const sourceRefs = earliestRefs(db, toJson(refs), twin.source_refs);
-        const twinReview = rowReview === 'needs_review' || twin.review_status === 'needs_review' ? 'needs_review' : twin.review_status;
+        const twinReview = maxTrust(rowReview, twin.review_status);
+        const twinConfidence = Math.max(Number(twin.confidence) || 0, confidence);
         db.run(
-          'UPDATE canon_relation SET kind = ?, description = ?, evidence = ?, source_refs = ?, review_status = ? WHERE id = ?',
+          `UPDATE canon_relation
+              SET kind = ?, description = ?, evidence = ?, source_refs = ?, review_status = ?,
+                  confidence = ?, supporting_evidence = ?,
+                  kind_source = CASE WHEN ? <> '' THEN ? ELSE kind_source END,
+                  anchor_evidence = CASE WHEN ? <> '' THEN ? ELSE anchor_evidence END
+            WHERE id = ?`,
           twin.kind,
           sentence,
           quote,
           sourceRefs,
           twinReview,
+          twinConfidence,
+          appendAssessment(twin.supporting_evidence, assessment),
+          kindSource,
+          kindSource,
+          anchorEvidence,
+          anchorEvidence,
           twin.id,
         );
         accepted++;
         continue;
       }
-      const existing = db.get<{ id: number; kind: string; description: string; evidence: string; source_refs: string; review_status: string }>(
-        `SELECT id, kind, description, evidence, source_refs, review_status
-         FROM canon_relation
-         WHERE project_id = ? AND lower(kind) = ?
-           AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))
-         ORDER BY id LIMIT 1`,
+      const existing = db.get<{
+        id: number;
+        kind: string;
+        description: string;
+        evidence: string;
+        source_refs: string;
+        review_status: string;
+        confidence: number;
+        supporting_evidence: string;
+      }>(
+        `SELECT id, kind, description, evidence, source_refs, review_status, confidence, supporting_evidence
+           FROM canon_relation
+          WHERE project_id = ? AND lower(kind) = ?
+            AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))
+          ORDER BY id LIMIT 1`,
         projectId,
         kind.toLowerCase(),
         fromId,
@@ -3908,40 +3924,25 @@ function applyRelations(
         const sentence = description.length > existing.description.length ? description : existing.description;
         const quote = span.quote.length > existing.evidence.length ? span.quote : existing.evidence;
         const sourceRefs = earliestRefs(db, toJson(refs), existing.source_refs);
-        let mergedReview = maxTrust(rowReview, existing.review_status);
-        // A parked row merged with a fresh accepted claim is a promotion:
-        // the one guard decides, never the merge.
-        if (mergedReview === 'accepted' && existing.review_status !== 'accepted' && existing.review_status !== 'user_confirmed') {
-          const refsForGuard = fromJson<{ chunk?: unknown }[]>(sourceRefs, []);
-          const guardChunkId = refsForGuard
-            .map((ref) => Number(ref?.chunk))
-            .find((value) => Number.isFinite(value) && value > 0);
-          const guardChunk = guardChunkId
-            ? { text: pageEvidenceText(db, guardChunkId) ?? db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', guardChunkId)?.text ?? '' }
-            : chunk;
-          const fromRow = db.get<{ aliases: string }>('SELECT aliases FROM canon_entity WHERE id = ?', fromId);
-          const toRow = db.get<{ aliases: string }>('SELECT aliases FROM canon_entity WHERE id = ?', toId);
-          const promoted = canPromote(
-            {
-              fromId,
-              toId,
-              fromName,
-              toName,
-              fromAliases: strList(fromRow?.aliases),
-              toAliases: strList(toRow?.aliases),
-              kind,
-              evidence: quote,
-            },
-            { db, projectId, chunkText: guardChunk?.text ?? null, index },
-          );
-          if (!promoted.ok) mergedReview = 'needs_review';
-        }
+        const mergedReview = maxTrust(rowReview, existing.review_status);
+        const mergedConfidence = Math.max(Number(existing.confidence) || 0, confidence);
         db.run(
-          'UPDATE canon_relation SET description = ?, evidence = ?, source_refs = ?, review_status = ? WHERE id = ?',
+          `UPDATE canon_relation
+              SET description = ?, evidence = ?, source_refs = ?, review_status = ?,
+                  confidence = ?, supporting_evidence = ?,
+                  kind_source = CASE WHEN ? <> '' THEN ? ELSE kind_source END,
+                  anchor_evidence = CASE WHEN ? <> '' THEN ? ELSE anchor_evidence END
+            WHERE id = ?`,
           sentence,
           quote,
           sourceRefs,
           mergedReview,
+          mergedConfidence,
+          appendAssessment(existing.supporting_evidence, assessment),
+          kindSource,
+          kindSource,
+          anchorEvidence,
+          anchorEvidence,
           existing.id,
         );
         accepted++;
@@ -3955,8 +3956,11 @@ function applyRelations(
         evidence: span.quote,
         sourceRefs: toJson(refs),
         kindSource,
+        anchorEvidence,
         modality: normaliseModality(raw.modality),
         reviewStatus: rowReview,
+        confidence,
+        supportingEvidence: supporting,
       });
       stats.relations++;
       accepted++;
@@ -4634,6 +4638,7 @@ export type PromoteReason =
   | 'same-identity'
   | 'quarantined-entity'
   | 'assertion-missing'
+  | 'below-threshold'
   | 'moment';
 
 export interface PromoteRow {
@@ -4648,9 +4653,10 @@ export interface PromoteRow {
   /** Verbatim words from the quote that express the kind, when the model named
    * them ("sided with" for ally of). */
   kindSource?: string;
-  /** The sentence that asserts the relationship, when the quote only supplies
-   * context (a pronoun, a neighbouring name). */
+  /** The sentence that names the other endpoint, when the quote names one. */
   anchorEvidence?: string;
+  /** The model's own estimate that the passage establishes this relation. */
+  confidence?: number;
 }
 
 export interface PromoteContext {
@@ -4658,9 +4664,10 @@ export interface PromoteContext {
   projectId: number;
   /** Text of the passage the quote cites. */
   chunkText?: string | null;
-  /** Optional per-command roster index; when supplied, the proof matchers see
-   * derived name variants in addition to explicit names and aliases. */
+  /** Optional per-command roster index, kept for name-variant resolution. */
   index?: RosterIndex;
+  /** Override the project's `minConfidence` (tests and one-off commands). */
+  minConfidence?: number;
 }
 
 export interface PromoteDecision {
@@ -4703,10 +4710,9 @@ function endpointTokens(name: string, aliases: string[], index?: RosterIndex): S
 }
 
 /**
- * One-direction proof: a possessive owner before the tie head ("Bram's
- * sister") or an object after "of" ("the sister of Bram"). Returns forward
- * when "to" owns the relationship, reverse when "from" does, and unknown when
- * the sentence gives no clear owner (pronouns, bare labels).
+ * Diagnostic only: the direction a sentence reads for a kind. Promotion does
+ * not consult it (direction is the model's); the evidence-repair and audit
+ * tools use it to describe what the text says.
  */
 function quoteDirection(
   kind: string,
@@ -4728,8 +4734,6 @@ function quoteDirection(
     if (to.has(base)) return 'to';
     return null;
   };
-  // Name spans for subject-verb-object direction. Possessives are stripped so
-  // a name token and the same name owning a noun align.
   const bases = words.map((word) => word.replace(/['’]s$/, ''));
   const spansOf = (name: string, aliases: string[]): Array<[number, number]> => {
     const out: Array<[number, number]> = [];
@@ -4754,22 +4758,17 @@ function quoteDirection(
   let forward = false;
   for (let at = 0; at < words.length; at++) {
     if (words[at] !== head) continue;
-    // "Bram's sister" / "Bram’s sister"
     if (at > 0 && /['’]s$/.test(words[at - 1]!)) {
       const owner = ownerOf(words[at - 1]!);
       if (owner === 'to') forward = true;
       if (owner === 'from') return 'reverse';
     }
-    // "the sister of Bram"
     if (words[at + 1] === 'of' && words[at + 2]) {
       const object = ownerOf(words[at + 2]!);
       if (object === 'to') forward = true;
       if (object === 'from') return 'reverse';
       continue;
     }
-    // Appositive role-holder: "his Master, Lord Corin" means Corin holds the
-    // role, so for "master of" that is the object side, not the subject.
-    // Titles between the role and the name are skipped.
     let holderAt = at + 1;
     while (holderAt < words.length && (NAME_TITLE_WORDS.has(words[holderAt]!) || PROOF_TITLES.has(words[holderAt]!))) {
       holderAt++;
@@ -4779,9 +4778,6 @@ function quoteDirection(
       if (holder === 'to') return 'reverse';
       if (holder === 'from') forward = true;
     }
-    // Subject-verb-object: in "Mara loathed Tor" the subject states direction.
-    // A possessive before the head ("Bram's sister is Asha") is a different
-    // construction and is not read this way.
     if (!passive.has(words[at - 1] ?? '') && !/['’]s$/.test(words[at - 1] ?? '')) {
       const subjectFrom = fromSpans.some(
         ([s, e]) => e >= at - 2 && e <= at - 1 && !coordinatedBetween([s, e], [at, at]),
@@ -4798,19 +4794,7 @@ function quoteDirection(
   return forward ? 'forward' : 'unknown';
 }
 
-/** Same kind, or the inverse class the human already ruled on. */
-function sameOrInverseKind(noteKind: string, rowKind: string): boolean {
-  const note = canonicalKind(noteKind);
-  const row = canonicalKind(rowKind);
-  if (!note || !row) return false;
-  if (note === row) return true;
-  const noteHead = kindHead(note);
-  const rowHead = kindHead(row);
-  if (noteHead === rowHead) return true;
-  return inverseKinds(note).includes(rowHead) || inverseKinds(row).includes(noteHead);
-}
-
-/** Read the direction one sentence states for this kind and pair. */
+/** Diagnostic only; see `quoteDirection`. */
 export function relationSentenceDirection(
   kind: string,
   evidence: string,
@@ -4832,116 +4816,124 @@ export function relationSentenceDirection(
   }, index);
 }
 
-/**
- * The one promotion guard. A parked tie may become a keeper only when all
- * four conditions hold: closed relationship-grade kind, no PARK ruling for the
- * pair or its inverse class, a verbatim both-endpoints quote, and a direction
- * the sentence actually states. Evidence is deliberately not compared for a
- * PARK: a different quote for a ruled pair does not reopen it; it belongs in
- * the inbox as a pending note, never a status change.
- */
-function provenKindReason(kind: string): PromoteReason | null {
-  if (COVERAGE_KINDS.has(kind)) return 'coverage-only';
-  if (isMomentKind(kind)) return 'moment';
-  if (!isClosedRoleKind(kind)) return 'open-vocab';
-  if (!RELATIONSHIP_GRADE_KINDS.has(kind)) return 'coverage-only';
+function sameOrInverseKind(noteKind: string, rowKind: string): boolean {
+  const note = canonicalKind(noteKind);
+  const row = canonicalKind(rowKind);
+  if (!note || !row) return false;
+  if (note === row) return true;
+  const noteHead = kindHead(note);
+  const rowHead = kindHead(row);
+  if (noteHead === rowHead) return true;
+  return inverseKinds(note).includes(rowHead) || inverseKinds(row).includes(noteHead);
+}
+
+/** Minimum model confidence a claim needs to bank, unless the project overrides it. */
+export const DEFAULT_MIN_CONFIDENCE = 0.7;
+
+/** Read the project's `minConfidence` setting, clamped to 0..1. */
+export function projectMinConfidence(db: Db, projectId: number): number {
+  const row = db.get<{ settings: string }>('SELECT settings FROM project WHERE id = ?', projectId);
+  try {
+    const value = Number((JSON.parse(row?.settings || '{}') as { minConfidence?: unknown }).minConfidence);
+    if (Number.isFinite(value)) return Math.min(1, Math.max(0, value));
+  } catch {
+    /* a malformed setting means the default, never a crash */
+  }
+  return DEFAULT_MIN_CONFIDENCE;
+}
+
+/** The tier a model claim gets from its own score. */
+export function claimTier(confidence: number, minConfidence = DEFAULT_MIN_CONFIDENCE): 'accepted' | 'provisional' {
+  return Number.isFinite(confidence) && confidence >= minConfidence ? 'accepted' : 'provisional';
+}
+
+/** The model's assessment of one claim. Stored as provenance, never as a rule. */
+export interface ClaimAssessment {
+  names_both: boolean;
+  other_person: 'named' | 'pronoun' | 'role' | 'absent' | '';
+  asserted: boolean;
+  hedge: 'certain' | 'hedged' | 'doubted' | 'denied' | '';
+  kind_fit: 'yes' | 'partly' | 'no' | '';
+  strength: number;
+  why: string;
+}
+
+/** Read the assessment defensively. A missing score is zero, never a pass. */
+export function readClaimAssessment(raw: Record<string, unknown>): ClaimAssessment {
+  // `confidence` is the pre-question field; new assessments carry `strength`.
+  const numeric = Number(raw.strength ?? raw.confidence);
+  const strength = Number.isFinite(numeric) ? Math.min(1, Math.max(0, numeric)) : 0;
+  const other = String(raw.other_person ?? '').trim().toLowerCase();
+  const hedge = String(raw.hedge ?? '').trim().toLowerCase();
+  const kindFit = String(raw.kind_fit ?? '').trim().toLowerCase();
+  return {
+    names_both: raw.names_both === true,
+    other_person:
+      other === 'named' || other === 'pronoun' || other === 'role' || other === 'absent' ? other : '',
+    asserted: raw.asserted !== false,
+    hedge:
+      hedge === 'certain' || hedge === 'hedged' || hedge === 'doubted' || hedge === 'denied' ? hedge : '',
+    kind_fit: kindFit === 'yes' || kindFit === 'partly' || kindFit === 'no' ? kindFit : '',
+    strength,
+    why: String(raw.why ?? '').trim(),
+  };
+}
+
+/** The assessment carried inside `supporting_evidence` (no new column). */
+export function assessmentSupporting(assessment: ClaimAssessment): string {
+  return toJson([{ assessment }]);
+}
+
+/** Read the assessment back from a stored supporting_evidence blob. */
+export function storedAssessment(supportingEvidence: string): ClaimAssessment | null {
+  for (const item of fromJson<Record<string, unknown>[]>(supportingEvidence, [])) {
+    const nested = item?.assessment;
+    if (nested && typeof nested === 'object') return readClaimAssessment(nested as Record<string, unknown>);
+  }
   return null;
 }
 
+/** Add one assessment to an existing supporting_evidence array. */
+function appendAssessment(supportingEvidence: string, assessment: ClaimAssessment): string {
+  const items = fromJson<Record<string, unknown>[]>(supportingEvidence, []);
+  items.push({ assessment });
+  return toJson(items);
+}
+
+/**
+ * The mechanical promotion guard. It certifies only what code can see: the
+ * quote and any anchor are in the cited passage, and a quoted fragment does not
+ * hide a hedge or denial in the sentence that holds it. Meaning, linkage,
+ * direction and label fitness are the model's and are recorded with the claim.
+ */
 function provenQuoteReason(row: PromoteRow, chunkText?: string | null, index?: RosterIndex): PromoteReason | null {
-  const quote = normalise(row.evidence);
   const chunk = chunkText ?? '';
-  if (!row.evidence.trim() || !chunk || !normalise(chunk).includes(quote)) {
+  if (!row.evidence.trim() || !chunk || !normalise(chunk).includes(normalise(row.evidence))) {
     return 'quote-not-verbatim';
   }
   const anchor = (row.anchorEvidence ?? '').trim();
-  if (anchor && !normalise(chunk).includes(normalise(anchor))) {
-    return 'quote-not-verbatim';
-  }
-  const bothNamed = namesBothDistinctly(
-    anchor ? `${anchor} ${row.evidence}` : row.evidence,
-    row.fromName,
-    row.fromAliases ?? [],
-    row.toName,
-    row.toAliases ?? [],
-    index,
-  );
-  if (!bothNamed) {
-    if (
-      anchor ||
-      !anchorNamesMissingEndpoint(
-        row.evidence,
-        chunk,
-        row.fromName,
-        row.fromAliases ?? [],
-        row.toName,
-        row.toAliases ?? [],
-        index,
-      )
-    ) {
-      return 'endpoint-unnamed';
-    }
-  }
-  // The citation is checked, not a head word: the model's own words when it
-  // supplied them, otherwise the label's own word. No synonym list is consulted
-  // and the cited wording never substitutes for a claim it does not carry.
-  const source = (row.kindSource ?? '').trim();
-  const sourceInQuote = source.length > 0 && normalise(row.evidence).includes(normalise(source));
-  const sourceInAnchor = source.length > 0 && anchor.length > 0 && normalise(anchor).includes(normalise(source));
-  const labelInQuote = source.length === 0 && !isUnsupportedKind(row.kind, row.evidence);
-  const labelInAnchor = source.length === 0 && anchor.length > 0 && !isUnsupportedKind(row.kind, anchor);
-  if (!sourceInQuote && !sourceInAnchor && !labelInQuote && !labelInAnchor) return 'tie-word-absent';
-  // The assertion must live in one span. The quote and the anchor may together
-  // name both people, but neither span may borrow the other's assertion.
-  const evidenceAsserts = assertsRelationship(
-    row.evidence,
-    row.fromName,
-    row.fromAliases ?? [],
-    row.toName,
-    row.toAliases ?? [],
-    row.kind,
-    row.kindSource ?? '',
-    index,
-  );
-  const anchorAsserts =
-    anchor.length > 0 &&
-    assertsRelationship(anchor, row.fromName, row.fromAliases ?? [], row.toName, row.toAliases ?? [], row.kind, row.kindSource ?? '', index);
-  if (!evidenceAsserts && !anchorAsserts) return 'assertion-missing';
-  // The model may quote only the positive core of a denied or hedged sentence
-  // ("Mara feared Tor" from "Perhaps Mara feared Tor"). Check the sentence that
-  // holds the assertion, not just the quoted fragment.
-  const assertionSpan = evidenceAsserts ? row.evidence : anchor;
-  const holdingSentence =
-    splitSentences(chunk).find((sentence) => normalise(sentence).includes(normalise(assertionSpan))) ?? assertionSpan;
-  if (leadingDenialOrHedge(holdingSentence, row, index)) return 'assertion-missing';
-  // Direction belongs to directional concepts only. A symmetric concept is the
-  // same claim in either order, so its reverse is never a mismatch.
-  if (isDirectionalKind(row.kind)) {
-    const citationInAnchor = source
-      ? sourceInAnchor && !sourceInQuote
-      : labelInAnchor && !labelInQuote;
-    const directionSpan = citationInAnchor ? anchor : row.evidence;
-    const phrase = source
-      ? citationWords(source, row.kind, row.fromName, row.fromAliases ?? [], row.toName, row.toAliases ?? [], index)
-          .find((word) => !CITATION_STOP.has(word)) ?? row.kind
-      : row.kind;
-    if (quoteDirection(canonicalKind(phrase), directionSpan, row, index) === 'reverse') {
-      return 'direction-mismatch';
-    }
+  if (anchor && !normalise(chunk).includes(normalise(anchor))) return 'quote-not-verbatim';
+  // Citation honesty, not grammar: "Mara feared Tor" may not be quoted from
+  // "Perhaps Mara feared Tor" as though the hedge were not there.
+  for (const span of anchor ? [row.evidence, anchor] : [row.evidence]) {
+    const holding = splitSentences(chunk).find((sentence) => normalise(sentence).includes(normalise(span))) ?? span;
+    if (leadingDenialOrHedge(holding, row, index)) return 'assertion-missing';
   }
   return null;
 }
 
 /**
- * Pure proven-tier check: closed relationship-grade kind plus a verbatim,
- * both-endpoints, tie-stating, correctly directed quote. No PARK lookup and no
- * database access; extraction uses it to choose accepted vs provisional.
+ * Pure mechanical check plus the confidence threshold. No database access; the
+ * context supplies the passage and, when needed, the threshold.
  */
-export function provenRelation(row: PromoteRow, context: { chunkText?: string | null; index?: RosterIndex }): PromoteDecision {
-  const kindReason = provenKindReason(canonicalKind(row.kind));
-  if (kindReason) return { ok: false, reason: kindReason };
+export function provenRelation(
+  row: PromoteRow,
+  context: { chunkText?: string | null; index?: RosterIndex; minConfidence?: number },
+): PromoteDecision {
   const quoteReason = provenQuoteReason(row, context.chunkText, context.index);
   if (quoteReason) return { ok: false, reason: quoteReason };
+  const min = context.minConfidence ?? DEFAULT_MIN_CONFIDENCE;
+  if (claimTier(row.confidence ?? 1, min) !== 'accepted') return { ok: false, reason: 'below-threshold' };
   return { ok: true };
 }
 
@@ -4976,23 +4968,50 @@ function nestedCharacterNames(
   return nests(a, b) || nests(b, a);
 }
 
+/** True when the two rows share a name or alias: one person split in two. */
+function sharedIdentityRows(db: Db, projectId: number, fromId: number, toId: number): boolean {
+  const rows = db.all<{ name: string; aliases: string }>(
+    'SELECT name, aliases FROM canon_entity WHERE project_id = ? AND id IN (?, ?)',
+    projectId,
+    fromId,
+    toId,
+  );
+  if (rows.length !== 2) return false;
+  const keys = (row: { name: string; aliases: string }): Set<string> =>
+    new Set([canonicalName(row.name), ...strList(row.aliases).map((alias) => canonicalName(alias))].filter(Boolean));
+  const a = keys(rows[0]!);
+  const b = keys(rows[1]!);
+  for (const key of a) if (b.has(key)) return true;
+  return false;
+}
+
+/**
+ * The promotion decision: three mechanical checks, the author's PARK rulings,
+ * and the author's confidence threshold. The model decides the claim; this
+ * function only refuses fabrications, missing people, the same person twice,
+ * author-ruled pairs, and claims below the author's bar.
+ */
 export function canPromote(row: PromoteRow, context: PromoteContext): PromoteDecision {
+  if (row.fromId === row.toId) return { ok: false, reason: 'same-identity' };
   if (nestedCharacterNames(context.db, context.projectId, row.fromId, row.toId, row.fromName, row.toName)) {
     return { ok: false, reason: 'same-identity' };
   }
-  // A character held back as a probable common noun cannot hold a tie either.
-  const held = context.db.get<{ id: number }>(
-    "SELECT id FROM canon_entity WHERE id IN (?, ?) AND review_status = 'quarantined' LIMIT 1",
+  if (sharedIdentityRows(context.db, context.projectId, row.fromId, row.toId)) {
+    return { ok: false, reason: 'same-identity' };
+  }
+  const entities = context.db.all<{ id: number; review_status: string }>(
+    'SELECT id, review_status FROM canon_entity WHERE project_id = ? AND id IN (?, ?)',
+    context.projectId,
     row.fromId,
     row.toId,
   );
-  if (held) return { ok: false, reason: 'quarantined-entity' };
-  const kind = canonicalKind(row.kind);
-  const kindReason = provenKindReason(kind);
-  if (kindReason) return { ok: false, reason: kindReason };
-  // A PARK binds the pair and its inverse class, not one quote: the same pair
-  // offered with fresh evidence is still ruled out. New evidence belongs in
-  // the inbox as a pending note for the user, never a status change.
+  if (entities.length !== 2) return { ok: false, reason: 'endpoint-unnamed' };
+  // A character held back as a probable common noun cannot hold a tie either.
+  if (entities.some((entity) => entity.review_status === 'quarantined')) {
+    return { ok: false, reason: 'quarantined-entity' };
+  }
+  // An author's PARK is a ruling, not a theory of truth: it still binds the
+  // pair and its inverse class.
   const parked = context.db.all<{ attempted_kind: string }>(
     `SELECT attempted_kind FROM canon_tie_note
       WHERE project_id = ? AND lower(ruling) LIKE 'park%'
@@ -5003,11 +5022,13 @@ export function canPromote(row: PromoteRow, context: PromoteContext): PromoteDec
     row.toId,
     row.fromId,
   );
-  if (parked.some((note) => sameOrInverseKind(note.attempted_kind, kind))) {
+  if (parked.some((note) => sameOrInverseKind(note.attempted_kind, row.kind))) {
     return { ok: false, reason: 'ruled-park' };
   }
   const quoteReason = provenQuoteReason(row, context.chunkText, context.index);
   if (quoteReason) return { ok: false, reason: quoteReason };
+  const min = context.minConfidence ?? projectMinConfidence(context.db, context.projectId);
+  if (claimTier(row.confidence ?? 1, min) !== 'accepted') return { ok: false, reason: 'below-threshold' };
   return { ok: true };
 }
 
@@ -5024,10 +5045,6 @@ function mentionSpans(text: string, name: string, aliases: string[], index?: Ros
   }
   return spans;
 }
-
-/** Linking prepositions/conjunctions that turn a phrase into a relation
- * ("sided with", "member of", "sworn to") instead of a bare scene verb. */
-const EVIDENCE_LINK_TAIL = new Set(['to', 'with', 'for', 'of', 'from', 'in', 'on', 'as']);
 
 /** Words only: possessives split out, punctuation to spaces, lowercased. */
 function assertionWords(text: string): string[] {
@@ -5048,14 +5065,6 @@ function labelHeadForms(kind: string): Set<string> {
   if (!head) return new Set();
   const forms = new Set([head, ...headForms(head)]);
   return forms;
-}
-
-/** True when the quote word can carry the label's head: the same word, an
- * inflection, or a noun built on it ("partnership" for partner). */
-function matchesLabelHead(word: string, head: string, forms: Set<string>): boolean {
-  if (!word) return false;
-  if (forms.has(word)) return true;
-  return head.length > 2 && word.length > head.length && word.startsWith(head);
 }
 
 /** Negation and uncertainty markers. An asserted tie cannot ride on a denied or
@@ -5098,23 +5107,6 @@ function citationWords(
   return assertionWords(source).filter((token) => !nameWords.has(token) || keep.has(token) || token === head);
 }
 
-/** Anchor phrases a citation can supply: the cleaned phrase, then each of its
- * content words. Exact matching only; the citation is verbatim by construction. */
-function citationAnchors(tokens: string[]): { tokens: string[]; labelHead: boolean }[] {
-  const out: { tokens: string[]; labelHead: boolean }[] = [];
-  const seen = new Set<string>();
-  const push = (candidate: string[]): void => {
-    if (!candidate.length) return;
-    const key = candidate.join(' ');
-    if (seen.has(key)) return;
-    seen.add(key);
-    out.push({ tokens: candidate, labelHead: false });
-  };
-  push(tokens);
-  for (const token of tokens) if (!CITATION_STOP.has(token)) push([token]);
-  return out;
-}
-
 /**
  * True when the clause leading up to the assertion denies or hedges it. The
  * model may quote only the positive core ("Mara feared Tor") from a sentence
@@ -5143,240 +5135,6 @@ function leadingDenialOrHedge(sentence: string, row: PromoteRow, index?: RosterI
   // back a few tokens covers "Perhaps Mara feared Tor" and "Mara did not trust
   // Tor" without importing an unrelated clause earlier in the sentence.
   return words.slice(Math.max(0, at - 4), at).some((word) => NEGATORS.has(word) || HEDGES.has(word));
-}
-
-/** Determiners, pronouns and the possessive marker: what may not qualify a
- * bare "partner" ("Harry's partner" is a pairing, not a lasting tie). */
-const PARTNER_NON_QUALIFIERS = new Set([
-  'a', 'an', 'the', 'my', 'your', 'his', 'her', 'its', 'our', 'their',
-  'this', 'that', 'these', 'those', 'some', 'any', 'no', 'every', 'each',
-  'both', 'either', 'neither', 'another', 'such', 'all', 'whose', 'which',
-  'what', 'who', 'whom', 'you', 'we', 'he', 'she', 'they', 'it', 'i', 'me',
-  'him', 'them', 'us', "'s", "'",
-]);
-
-/** Bare "partner"/"partners" needs a qualifier: a noun/adjective immediately
- * before ("business partner"), or a following preposition ("partner in"). */
-function partnerQualified(words: string[], at: number): boolean {
-  const before = words[at - 1] ?? '';
-  if (before && !PARTNER_NON_QUALIFIERS.has(before)) return true;
-  return EVIDENCE_LINK_TAIL.has(words[at + 1] ?? '');
-}
-
-interface EvidenceAnalysis {
-  asserted: boolean;
-  bothNamed: boolean;
-  coordinated: boolean;
-  sceneVerb: boolean;
-}
-
-function analyseEvidence(
-  quote: string,
-  fromName: string,
-  fromAliases: string[],
-  toName: string,
-  toAliases: string[],
-  kind: string,
-  kindSource = '',
-  index?: RosterIndex,
-): EvidenceAnalysis {
-  const words = assertionWords(quote);
-  const kindKey = (kind ?? '').trim().toLowerCase();
-  const head = kindHeadWord(kind);
-  const sourcePhrase = kindSource.trim() ? assertionWords(kindSource) : [];
-  const analysis: EvidenceAnalysis = { asserted: false, bothNamed: false, coordinated: false, sceneVerb: false };
-  if (!words.length) return analysis;
-  const spansOf = (name: string, aliases: string[]): Array<[number, number]> => {
-    const out: Array<[number, number]> = [];
-    for (const variant of explicitVariants(name, aliases, index)) {
-      const target = assertionWords(variant);
-      if (!target.length) continue;
-      for (let i = 0; i + target.length <= words.length; i++) {
-        if (target.every((word, k) => words[i + k] === word)) out.push([i, i + target.length - 1]);
-      }
-    }
-    return out;
-  };
-  const fromSpans = spansOf(fromName, fromAliases);
-  const toSpans = spansOf(toName, toAliases);
-  const coordinatedBetween = (a: [number, number], b: [number, number]): boolean => {
-    const lo = a[1] <= b[0] ? a[1] : b[1] <= a[0] ? b[1] : a[0];
-    const hi = a[1] <= b[0] ? b[0] : b[1] <= a[0] ? a[0] : a[1];
-    for (let at = lo; at <= hi; at++) if (words[at] === 'and' || words[at] === 'or') return true;
-    return false;
-  };
-  analysis.bothNamed = fromSpans.some((a) => toSpans.some((b) => a[1] < b[0] || b[1] < a[0]));
-  analysis.coordinated = analysis.bothNamed && fromSpans.some((a) => toSpans.some((b) => coordinatedBetween(a, b)));
-  // A bare "partner"/"partners" with no qualifier is a pairing, not a tie.
-  if (kindKey === 'partner') {
-    for (let at = 0; at < words.length; at++) {
-      if (words[at] !== 'partner' && words[at] !== 'partners') continue;
-      if (!partnerQualified(words, at)) {
-        analysis.sceneVerb = true;
-        break;
-      }
-    }
-  }
-  if (!head) return analysis;
-
-  // The anchor is the cited words when the model supplied them. Without a
-  // citation only the label's own head can anchor, so an unspelled concept
-  // never proves itself. No synonym list is consulted either way.
-  const forms = labelHeadForms(kind);
-  const anchors: { tokens: string[]; labelHead: boolean }[] = sourcePhrase.length
-    ? citationAnchors(citationWords(kindSource, kind, fromName, fromAliases, toName, toAliases, index))
-    : [{ tokens: [head], labelHead: true }];
-
-  const near = (spans: Array<[number, number]>, anchorStart: number, anchorEnd: number): boolean =>
-    spans.some((span) => {
-      if (!(span[0] <= anchorStart + 4 && span[1] >= anchorStart - 4)) return false;
-      return !coordinatedBetween(span, [anchorStart, anchorEnd]);
-    });
-  // The other endpoint sits either just after the anchor noun or just before
-  // the possessive owner ("Mara was Tor's aunt"). A third name further down the
-  // sentence is not part of this phrase.
-  const besidePhrase = (spans: Array<[number, number]>, anchorStart: number, anchorEnd: number, ownerSpan: [number, number]): boolean =>
-    spans.some(([start, end]) => {
-      if (coordinatedBetween([start, end], [anchorStart, anchorEnd])) return false;
-      if (start > anchorEnd && start <= anchorEnd + 3) return true;
-      if (end < ownerSpan[0] && ownerSpan[0] - end <= 3) return true;
-      return false;
-    });
-  const disturbed = (from: number, to: number): boolean =>
-    words
-      .slice(Math.max(0, from), Math.min(words.length, to + 1))
-      .some((word) => NEGATORS.has(word) || HEDGES.has(word));
-  const passive = new Set(['was', 'were', 'been', 'had', 'have', 'is', 'are', 'be', 'being']);
-  const copula = new Set(['was', 'were', 'is', 'are', 'been', 'being', 'be']);
-  for (const anchor of anchors) {
-    for (let i = 0; i + anchor.tokens.length <= words.length; i++) {
-      const matches = anchor.labelHead
-        ? matchesLabelHead(words[i]!, head, forms)
-        : anchor.tokens.every((word, k) => words[i + k] === word);
-      if (!matches) continue;
-      const end = i + anchor.tokens.length - 1;
-      // A word that sits inside an endpoint's own name is part of what that
-      // person is called, not a statement about the other endpoint.
-      if (
-        fromSpans.some(([start, e]) => start <= end && e >= i) ||
-        toSpans.some(([start, e]) => start <= end && e >= i)
-      ) {
-        continue;
-      }
-      // Bare "partner"/"partners" needs a qualifier to prove a lasting tie.
-      if (
-        kindKey === 'partner' &&
-        anchor.tokens.length === 1 &&
-        (words[i] === 'partner' || words[i] === 'partners') &&
-        !partnerQualified(words, i)
-      ) {
-        continue;
-      }
-      if (disturbed(i - 3, end)) continue;
-      // Possessive ("Dudley's aunt", "Dudley's best friend").
-      for (const back of [1, 2]) {
-        if (i <= back || words[i - back] !== "'s") continue;
-        const owner = words[i - back - 1]!;
-        const ownerSpan = [...fromSpans, ...toSpans].find(([start, e]) => words[start] === owner || words[e] === owner);
-        if (!ownerSpan || coordinatedBetween(ownerSpan, [i, end])) continue;
-        const ownerIsFrom = fromSpans.some(([start, e]) => words[start] === owner || words[e] === owner);
-        const ownerIsTo = toSpans.some(([start, e]) => words[start] === owner || words[e] === owner);
-        if (ownerIsFrom && besidePhrase(toSpans, i, end, ownerSpan)) return { ...analysis, asserted: true };
-        if (ownerIsTo && besidePhrase(fromSpans, i, end, ownerSpan)) return { ...analysis, asserted: true };
-      }
-      // Of-phrase ("the aunt of X").
-      if (words[end + 1] === 'of') {
-        for (let at = end + 2; at <= Math.min(end + 3, words.length - 1); at++) {
-          if (coordinatedBetween([i, end], [at, at])) continue;
-          if (fromSpans.some(([start]) => start === at) && near(toSpans, i, end)) return { ...analysis, asserted: true };
-          if (toSpans.some(([start]) => start === at) && near(fromSpans, i, end)) return { ...analysis, asserted: true };
-        }
-      }
-      // Copular prepositional pair ("X was married to Y", "X was a member of Y").
-      const prepositionAt = EVIDENCE_LINK_TAIL.has(anchor.tokens[anchor.tokens.length - 1]!)
-        ? end
-        : EVIDENCE_LINK_TAIL.has(words[end + 1] ?? '')
-          ? end + 1
-          : -1;
-      if (prepositionAt >= 0) {
-        const objectAt = prepositionAt + 1;
-        if (
-          (copula.has(words[i - 1] ?? '') || copula.has(words[i - 2] ?? '')) &&
-          !coordinatedBetween([i, end], [objectAt, objectAt])
-        ) {
-          if (fromSpans.some(([start]) => start === objectAt) && near(toSpans, i, end)) return { ...analysis, asserted: true };
-          if (toSpans.some(([start]) => start === objectAt) && near(fromSpans, i, end)) return { ...analysis, asserted: true };
-        }
-      }
-      // Subject-verb-object, active voice only: "Tor mentored Mara". A negator
-      // or hedge between subject and verb denies the claim rather than making it.
-      if (!passive.has(words[i - 1] ?? '')) {
-        const subject = [fromSpans, toSpans].find((spans) =>
-          spans.some(
-            ([start, e]) =>
-              e >= i - 2 &&
-              e <= i - 1 &&
-              !coordinatedBetween([start, e], [i, end]) &&
-              !disturbed(e + 1, i - 1),
-          ),
-        );
-        if (subject) {
-          const other = subject === fromSpans ? toSpans : fromSpans;
-          if (
-            other.some(
-              ([start, e]) =>
-                start >= end + 1 &&
-                start <= end + 3 &&
-                !coordinatedBetween([i, end], [start, e]) &&
-                !disturbed(end + 1, start - 1),
-            )
-          ) {
-            return { ...analysis, asserted: true };
-          }
-        }
-      }
-    }
-  }
-  return analysis;
-}
-
-export type EvidenceClass = 'asserted' | 'scene' | 'none';
-
-/**
- * Classify a quote's link between two endpoints.
- *
- * `asserted` — the tightened assertion rule passes.
- * `scene`    — both endpoints are named and a scene verb or a coordinated
- *              list links them, but no assertion holds.
- * `none`     — neither.
- */
-export function classifyEvidence(
-  quote: string,
-  fromName: string,
-  fromAliases: string[],
-  toName: string,
-  toAliases: string[],
-  kind: string,
-  kindSource = '',
-  index?: RosterIndex,
-): EvidenceClass {
-  const analysis = analyseEvidence(quote, fromName, fromAliases, toName, toAliases, kind, kindSource, index);
-  if (analysis.asserted) return 'asserted';
-  if (analysis.bothNamed && (analysis.coordinated || analysis.sceneVerb)) return 'scene';
-  return 'none';
-}
-
-export function assertsRelationship(
-  quote: string,
-  fromName: string,
-  fromAliases: string[],
-  toName: string,
-  toAliases: string[],
-  kind: string,
-  kindSource = '',
-  index?: RosterIndex,
-): boolean {
-  return classifyEvidence(quote, fromName, fromAliases, toName, toAliases, kind, kindSource, index) === 'asserted';
 }
 
 /** The head noun of a kind: "aunt of" gives "aunt". */
@@ -5422,36 +5180,6 @@ export function namesBothDistinctly(
   return from.some(([s1, e1]) => to.some(([s2, e2]) => e1 < s2 || e2 < s1));
 }
 
-/**
- * True when the quote names one endpoint and the sentence beside it names the
- * other — the "his onetime rival, X" case, where the tie is stated with a
- * pronoun or a description. The anchor must sit in the same passage, and the
- * quote itself must still carry the tie word (checked separately).
- */
-function anchorNamesMissingEndpoint(
-  quote: string,
-  chunkText: string,
-  fromName: string,
-  fromAliases: string[],
-  toName: string,
-  toAliases: string[],
-  index?: RosterIndex,
-): boolean {
-  const fromInQuote = mentionSpans(quote, fromName, fromAliases, index).length > 0;
-  const toInQuote = mentionSpans(quote, toName, toAliases, index).length > 0;
-  if (fromInQuote === toInQuote) return false; // both or neither: not this path
-  const sentences = splitSentences(chunkText);
-  const needle = normalise(quote);
-  const at = sentences.findIndex((sentence) => normalise(sentence).includes(needle));
-  if (at < 0) return false;
-  const anchor = [sentences[at - 1], sentences[at + 1]].filter(Boolean).join(' ');
-  const missing = fromInQuote
-    ? mentionSpans(anchor, toName, toAliases, index)
-    : mentionSpans(anchor, fromName, fromAliases, index);
-  return missing.length > 0;
-}
-
-
 /** Load one relation and check only the pure proven tier (no PARK lookup). */
 export function provenRelationById(
   db: Db,
@@ -5461,7 +5189,11 @@ export function provenRelationById(
 ): PromoteDecision {
   const guarded = loadGuardRow(db, projectId, relationId);
   if (!guarded) return { ok: false, reason: 'quote-not-verbatim' };
-  return provenRelation(guarded.row, { chunkText: guarded.chunkText, index });
+  return provenRelation(guarded.row, {
+    chunkText: guarded.chunkText,
+    index,
+    minConfidence: projectMinConfidence(db, projectId),
+  });
 }
 
 interface GuardedRow {
@@ -5482,8 +5214,9 @@ function loadGuardRow(db: Db, projectId: number, relationId: number): GuardedRow
     to_aliases: string;
     kind_source: string;
     anchor_evidence: string;
+    confidence: number;
   }>(
-    `SELECT r.from_entity, r.to_entity, r.kind, r.evidence, r.source_refs, r.kind_source, r.anchor_evidence,
+    `SELECT r.from_entity, r.to_entity, r.kind, r.evidence, r.source_refs, r.kind_source, r.anchor_evidence, r.confidence,
             a.name AS from_name, a.aliases AS from_aliases,
             b.name AS to_name, b.aliases AS to_aliases
        FROM canon_relation r
@@ -5520,6 +5253,7 @@ function loadGuardRow(db: Db, projectId: number, relationId: number): GuardedRow
       evidence: row.evidence,
       kindSource: row.kind_source,
       anchorEvidence: row.anchor_evidence,
+      confidence: row.confidence,
     },
     chunkText,
   };
@@ -5663,13 +5397,14 @@ export function auditAcceptedRelations(
       source_refs: string;
       kind_source: string;
       anchor_evidence: string;
+      confidence: number;
       from_name: string;
       from_aliases: string;
       to_name: string;
       to_aliases: string;
     }>(
       `SELECT r.id, r.from_entity, r.to_entity, r.kind, r.evidence, r.source_refs,
-              r.kind_source, r.anchor_evidence,
+              r.kind_source, r.anchor_evidence, r.confidence,
               a.name AS from_name, a.aliases AS from_aliases,
               b.name AS to_name, b.aliases AS to_aliases
          FROM canon_relation r
@@ -5725,23 +5460,12 @@ export function auditAcceptedRelations(
       evidence: row.evidence,
       kindSource: row.kind_source,
       anchorEvidence: row.anchor_evidence,
+      confidence: row.confidence,
     };
     const decision = canPromote(promoteRow, { db, projectId, chunkText });
-    const anchor = (row.anchor_evidence ?? '').trim();
-    const source = (row.kind_source ?? '').trim();
-    const citationInAnchor = source
-      ? anchor.length > 0 && normalise(anchor).includes(normalise(source))
-      : anchor.length > 0 && !isUnsupportedKind(row.kind, anchor);
-    const directionSpan = citationInAnchor ? anchor : row.evidence;
-    const direction = relationSentenceDirection(
-      source || row.kind,
-      directionSpan,
-      row.from_name,
-      fromAliases,
-      row.to_name,
-      toAliases,
-    );
-    const cannotJudge = decision.ok && isDirectionalKind(row.kind) && direction === 'unknown';
+    // Direction is the model's now, so the audit reports no grammar verdict.
+    const direction = 'unknown' as const;
+    const cannotJudge = false;
     if (decision.ok) result.passing++;
     else {
       const reason = decision.reason ?? 'unproven';
@@ -5901,8 +5625,9 @@ export function canPromoteRelation(
     to_name: string;
     to_aliases: string;
     kind_source: string;
+    confidence: number;
   }>(
-    `SELECT r.from_entity, r.to_entity, r.kind, r.evidence, r.source_refs, r.kind_source,
+    `SELECT r.from_entity, r.to_entity, r.kind, r.evidence, r.source_refs, r.kind_source, r.confidence,
             a.name AS from_name, a.aliases AS from_aliases,
             b.name AS to_name, b.aliases AS to_aliases
        FROM canon_relation r
@@ -5938,6 +5663,7 @@ export function canPromoteRelation(
       kind: row.kind,
       evidence: row.evidence,
       kindSource: row.kind_source,
+      confidence: row.confidence,
     },
     { db, projectId, chunkText, index },
   );
@@ -5958,6 +5684,8 @@ export interface RelationInsert {
   modality?: string;
   reviewStatus?: string;
   confidence?: number;
+  /** Provenance: the model's assessment, stored as JSON. */
+  supportingEvidence?: string;
 }
 
 /**
@@ -5977,8 +5705,8 @@ export function insertRelation(
     throw new Error('relation insert refused: source_refs must contain a numeric chunk id');
   }
   return db.run(
-    `INSERT INTO canon_relation (project_id, from_entity, to_entity, kind, description, evidence, source_refs, confidence, modality, review_status, kind_source, anchor_evidence, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO canon_relation (project_id, from_entity, to_entity, kind, description, evidence, source_refs, confidence, modality, review_status, kind_source, anchor_evidence, supporting_evidence, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     projectId,
     row.fromEntity,
     row.toEntity,
@@ -5991,6 +5719,7 @@ export function insertRelation(
     row.reviewStatus ?? 'accepted',
     row.kindSource ?? '',
     row.anchorEvidence ?? '',
+    row.supportingEvidence ?? '[]',
     nowIso(),
   ).lastInsertRowid;
 }
@@ -6103,7 +5832,7 @@ export function persistTieNote(
   fromId: number,
   toId: number,
   attemptedKind: string,
-  reason: 'moment' | 'unsupported' | 'open-vocab' | 'evaluation' | 'no-ref',
+  reason: 'moment' | 'unsupported' | 'unsupported-citation' | 'open-vocab' | 'evaluation' | 'no-ref',
   evidence: string,
   sourceRefs: string,
   ruling = '',
@@ -6598,99 +6327,13 @@ export function scanAnchoredCandidates(db: Db, projectId: number): AnchoredCandi
  * still apply: closed relationship-grade kind, no PARK ruling, no reversed
  * direction, and two different identities.
  */
-export function resolveAccumulatedNotes(db: Db, projectId: number): number {
-  const notes = db.all<{
-    id: number;
-    from_entity: number;
-    to_entity: number;
-    attempted_kind: string;
-    evidence: string;
-    source_refs: string;
-  }>(
-    `SELECT id, from_entity, to_entity, attempted_kind, evidence, source_refs
-       FROM canon_tie_note WHERE project_id = ? AND status = 'pending'`,
-    projectId,
-  );
-  // One index for this pass: names may be matched by given name or surname.
-  const index = commandRosterIndex(db, projectId);
-  let promoted = 0;
-  for (const note of notes) {
-    const kind = canonicalKind(note.attempted_kind);
-    if (provenKindReason(kind)) continue;
-    const spans = noteSpans(note);
-    if (spans.length < 2) continue;
-    const from = db.get<{ name: string; aliases: string }>(
-      'SELECT name, aliases FROM canon_entity WHERE id = ?',
-      note.from_entity,
-    );
-    const to = db.get<{ name: string; aliases: string }>(
-      'SELECT name, aliases FROM canon_entity WHERE id = ?',
-      note.to_entity,
-    );
-    if (!from || !to) continue;
-    const fromAliases = strList(from.aliases);
-    const toAliases = strList(to.aliases);
-    if (nestedCharacterNames(db, projectId, note.from_entity, note.to_entity, from.name, to.name)) continue;
-    const parked = db.all<{ attempted_kind: string }>(
-      `SELECT attempted_kind FROM canon_tie_note
-        WHERE project_id = ? AND lower(ruling) LIKE 'park%'
-          AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))`,
-      projectId,
-      note.from_entity,
-      note.to_entity,
-      note.to_entity,
-      note.from_entity,
-    );
-    if (parked.some((row) => sameOrInverseKind(row.attempted_kind, kind))) continue;
-
-    // Every span must be verbatim in its own page.
-    let allVerbatim = true;
-    for (const span of spans) {
-      const page =
-        pageEvidenceText(db, span.chunk as number) ??
-        db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', span.chunk as number)?.text ??
-        '';
-      if (!page || !normalise(page).includes(normalise(span.quote))) {
-        allVerbatim = false;
-        break;
-      }
-    }
-    if (!allVerbatim) continue;
-
-    const joined = spans.map((span) => span.quote).join(' ');
-    if (!namesBothDistinctly(joined, from.name, fromAliases, to.name, toAliases, index)) continue;
-    const tieSpan = spans.find((span) =>
-      span.kindSource
-        ? normalise(span.quote).includes(normalise(span.kindSource))
-        : !isUnsupportedKind(kind, span.quote),
-    );
-    if (!tieSpan) continue;
-    if (
-      relationSentenceDirection(tieSpan.kindSource || kind, tieSpan.quote, from.name, fromAliases, to.name, toAliases, index) ===
-      'reverse'
-    ) {
-      continue;
-    }
-
-    insertRelation(db, projectId, {
-      fromEntity: note.from_entity,
-      toEntity: note.to_entity,
-      kind,
-      description: '',
-      evidence: tieSpan.quote,
-      sourceRefs: JSON.stringify([
-        { source: tieSpan.source ?? '', locator: tieSpan.locator ?? '', chunk: tieSpan.chunk },
-      ]),
-      reviewStatus: 'accepted',
-    });
-    db.run(
-      "UPDATE canon_tie_note SET status = 'resolved', ruling = 'promoted', ruled_at = ? WHERE id = ?",
-      nowIso(),
-      note.id,
-    );
-    promoted++;
-  }
-  return promoted;
+/**
+ * Notes stay in the review queue. A note carries no model confidence, so the
+ * author's threshold cannot tier it; auto-promoting one would be a second
+ * definition of truth. Kept as a compatibility entry point for callers.
+ */
+export function resolveAccumulatedNotes(_db: Db, _projectId: number): number {
+  return 0;
 }
 
 export interface TieHint {
@@ -7374,6 +7017,9 @@ export function prioritiseTieNotes(
         toAliases: strList(note.to_aliases),
         kind: note.attempted_kind,
         evidence: note.evidence,
+        // A note carries no model confidence: it is a queue item, never a
+        // claim that can clear the author's threshold.
+        confidence: 0,
       },
       { db, projectId, chunkText, index },
     );
@@ -7544,6 +7190,234 @@ export async function evaluateTies(
     `kept: ${out.kept}, parked: ${out.parked}, untouched: ${out.unproven}`,
   ], db);
   return out;
+}
+
+/** The assessment call: the pair and kind are fixed; only the support is judged. */
+export const ASSESS_RELATIONS_SYSTEM = `You assess one existing relationship claim. The pair and the kind are fixed; do not replace them and do not look for a different relationship.
+
+Reply with JSON only:
+{"names_both": false, "other_person": "named|pronoun|role|absent",
+ "asserted": true, "hedge": "certain|hedged|doubted|denied",
+ "kind_fit": "yes|partly|no", "strength": 0.7, "why": "one sentence"}
+
+- names_both: does the quote itself name both people?
+- other_person: how the other side is named in the quote (named, pronoun, role, absent).
+- asserted: does the quote state the claim, or only suggest it?
+- hedge: certain, hedged, doubted or denied.
+- kind_fit: is the kind right for what the sentence says (yes, partly, no)?
+- why: one sentence, stored for audit, never parsed.
+${ASSESSMENT_QUESTIONS}
+- No prose outside the JSON.`;
+
+export type AssessSkip =
+  | 'no-quote'
+  | 'already-assessed'
+  | 'entity-unresolved'
+  | 'quote-not-verbatim'
+  | 'model-error';
+
+export interface AssessRow {
+  id: number;
+  fromName: string;
+  toName: string;
+  kind: string;
+  reviewStatus: string;
+  strength: number;
+}
+
+export interface AssessResult {
+  rows: AssessRow[];
+  assessed: number;
+  skipped: Record<AssessSkip, number>;
+  bands: Record<string, number>;
+  threshold: number;
+  aboveThreshold: number;
+  aboveByStatus: Record<string, number>;
+  userConfirmedAverage: number | null;
+  wrote: number;
+}
+
+export interface AssessOptions {
+  limit?: number;
+  /** Report cutoff; default 0.7. Never gates a write. */
+  minConfidence?: number;
+  write?: boolean;
+  refresh?: boolean;
+  onProgress?: (message: string) => void;
+}
+
+const clamp01 = (value: number): number =>
+  Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0;
+
+/**
+ * Score the rows already in the bank against their own quotes.
+ *
+ * One model call per existing claim; the pair and kind are passed in and never
+ * re-derived. Dry run by default. With `write`, the assessment is appended to
+ * supporting_evidence and the strength replaces `confidence`; `review_status`
+ * is deliberately untouched.
+ */
+export async function assessRelations(
+  db: Db,
+  llm: LlmClient,
+  projectId: number,
+  opts: AssessOptions = {},
+): Promise<AssessResult> {
+  const threshold = clamp01(opts.minConfidence ?? DEFAULT_MIN_CONFIDENCE);
+  const bands: Record<string, number> = {
+    '0.0-0.5': 0,
+    '0.5-0.6': 0,
+    '0.6-0.7': 0,
+    '0.7-0.8': 0,
+    '0.8-0.9': 0,
+    '0.9-1.0': 0,
+  };
+  const skipped: Record<AssessSkip, number> = {
+    'no-quote': 0,
+    'already-assessed': 0,
+    'entity-unresolved': 0,
+    'quote-not-verbatim': 0,
+    'model-error': 0,
+  };
+  const result: AssessResult = {
+    rows: [],
+    assessed: 0,
+    skipped,
+    bands,
+    threshold,
+    aboveThreshold: 0,
+    aboveByStatus: {},
+    userConfirmedAverage: null,
+    wrote: 0,
+  };
+  // Empty quotes are not claims to score; they are counted, then excluded.
+  skipped['no-quote'] =
+    db.get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM canon_relation WHERE project_id = ? AND trim(evidence) = ''",
+      projectId,
+    )?.n ?? 0;
+
+  const limit = opts.limit === undefined ? null : Math.max(1, Math.floor(opts.limit));
+  const rows = db.all<{
+    id: number;
+    from_entity: number;
+    to_entity: number;
+    kind: string;
+    evidence: string;
+    source_refs: string;
+    anchor_evidence: string;
+    review_status: string;
+    supporting_evidence: string;
+    from_name: string;
+    to_name: string;
+  }>(
+    `SELECT r.id, r.from_entity, r.to_entity, r.kind, r.evidence, r.source_refs,
+            r.anchor_evidence, r.review_status, r.supporting_evidence,
+            a.name AS from_name, b.name AS to_name
+       FROM canon_relation r
+       LEFT JOIN canon_entity a ON a.id = r.from_entity
+       LEFT JOIN canon_entity b ON b.id = r.to_entity
+      WHERE r.project_id = ? AND trim(r.evidence) <> ''
+      ORDER BY r.id${limit === null ? '' : ' LIMIT ?'}`,
+    ...(limit === null ? [projectId] : [projectId, limit]),
+  );
+
+  const statusValues = new Map<string, number[]>();
+  for (const row of rows) {
+    opts.onProgress?.(`${row.from_name} / ${row.to_name} (${row.kind})`);
+    if (!opts.refresh && storedAssessment(row.supporting_evidence)) {
+      skipped['already-assessed']++;
+      continue;
+    }
+    // Both endpoints must still be in the roster.
+    const entities = db.all<{ id: number }>(
+      'SELECT id FROM canon_entity WHERE project_id = ? AND id IN (?, ?)',
+      projectId,
+      row.from_entity,
+      row.to_entity,
+    );
+    if (entities.length !== 2) {
+      skipped['entity-unresolved']++;
+      continue;
+    }
+    const chunkId = firstChunkOf(row.source_refs);
+    const chunkText = chunkId === undefined
+      ? null
+      : pageEvidenceText(db, chunkId) ??
+        db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', chunkId)?.text ??
+        null;
+    if (!chunkText || !normalise(chunkText).includes(normalise(row.evidence))) {
+      skipped['quote-not-verbatim']++;
+      continue;
+    }
+
+    let parsed: Record<string, unknown> = {};
+    try {
+      const res = await llm.chat({
+        system: ASSESS_RELATIONS_SYSTEM,
+        messages: [{
+          role: 'user',
+          content:
+            `PAIR: ${row.from_name} / ${row.to_name}\n` +
+            `KIND: ${row.kind}\n` +
+            `QUOTE: ${row.evidence}\n` +
+            `ANCHOR: ${row.anchor_evidence.trim() || '(none)'}\n\n` +
+            'How strongly does the quote support this claim, for these two people, as this kind?',
+        }],
+        temperature: 0.1,
+        maxTokens: 300,
+        format: 'json',
+      });
+      parsed = extractJson<Record<string, unknown>>(res.text ?? '') ?? {};
+    } catch {
+      skipped['model-error']++;
+      continue;
+    }
+
+    const strength = clamp01(Number(parsed.strength ?? parsed.confidence));
+    const assessment = readClaimAssessment({ ...parsed, strength });
+    result.rows.push({
+      id: row.id,
+      fromName: row.from_name,
+      toName: row.to_name,
+      kind: row.kind,
+      reviewStatus: row.review_status,
+      strength,
+    });
+    result.assessed++;
+    const status = row.review_status || 'unknown';
+    const values = statusValues.get(status) ?? [];
+    values.push(strength);
+    statusValues.set(status, values);
+    if (strength >= threshold) {
+      result.aboveThreshold++;
+      result.aboveByStatus[status] = (result.aboveByStatus[status] ?? 0) + 1;
+    }
+    bands[
+      strength >= 0.9 ? '0.9-1.0'
+      : strength >= 0.8 ? '0.8-0.9'
+      : strength >= 0.7 ? '0.7-0.8'
+      : strength >= 0.6 ? '0.6-0.7'
+      : strength >= 0.5 ? '0.5-0.6'
+      : '0.0-0.5'
+    ]++;
+    if (opts.write) {
+      db.run(
+        'UPDATE canon_relation SET confidence = ?, supporting_evidence = ? WHERE id = ? AND project_id = ?',
+        strength,
+        appendAssessment(row.supporting_evidence, assessment),
+        row.id,
+        projectId,
+      );
+      result.wrote++;
+    }
+  }
+
+  const confirmed = statusValues.get('user_confirmed') ?? [];
+  result.userConfirmedAverage = confirmed.length
+    ? Number((confirmed.reduce((sum, value) => sum + value, 0) / confirmed.length).toFixed(3))
+    : null;
+  return result;
 }
 
 /* ------------------------------------------------- timeline ↔ event join */

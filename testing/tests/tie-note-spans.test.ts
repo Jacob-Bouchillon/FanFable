@@ -74,24 +74,19 @@ test('a second note for the same pair adds a span instead of being ignored', () 
   db.close();
 });
 
-test('spans from two pages resolve the note into a keeper', () => {
+test('notes are not auto-promoted; two spans stay in the review queue', () => {
   const { db, project, from, to } = setup('note-promote');
   const a = chunk(db, project.id, 'Mara sided with the northern house.', 1);
   const b = chunk(db, project.id, 'Tor commanded the northern house.', 2);
   lorebook.persistTieNote(db, project.id, from, to, 'ally of', 'unsupported', 'Mara sided with the northern house.', a.refs, '', 'sided with');
   lorebook.persistTieNote(db, project.id, from, to, 'ally of', 'unsupported', 'Tor commanded the northern house.', b.refs);
-  assert.equal(lorebook.resolveAccumulatedNotes(db, project.id), 1);
-  const rel = db.get<{ evidence: string; review_status: string }>(
-    'SELECT evidence, review_status FROM canon_relation WHERE project_id = ?',
-    project.id,
-  );
-  assert.ok(rel);
-  assert.equal(rel.review_status, 'accepted');
-  assert.equal(rel.evidence, 'Mara sided with the northern house.');
+  assert.equal(lorebook.resolveAccumulatedNotes(db, project.id), 0, 'a note has no model confidence, so it cannot be tiered');
+  const rel = db.get<{ id: number }>('SELECT id FROM canon_relation WHERE project_id = ?', project.id);
+  assert.equal(rel, undefined, 'nothing is banked');
   const note = db.get<{ status: string; ruling: string }>('SELECT status, ruling FROM canon_tie_note WHERE project_id = ?', project.id);
   assert.ok(note);
-  assert.equal(note.status, 'resolved');
-  assert.equal(note.ruling, 'promoted');
+  assert.equal(note.status, 'pending');
+  assert.equal(note.ruling, '');
   db.close();
 });
 

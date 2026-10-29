@@ -1,6 +1,7 @@
 /**
- * Kind labels §6: the guard checks a concept, a citation and a linkage.
- * Invented names and wording only.
+ * Kind labels under the claim-confidence rule: the concept set is for
+ * labelling and querying, not a promotion gate. The model's citation and
+ * confidence decide; only citation honesty remains.
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -16,71 +17,39 @@ function decide(
   toName: string,
   kind: string,
   evidence: string,
-  kindSource: string,
-  chunkText = evidence,
+  kindSource = '',
+  confidence = 1,
 ): lorebook.PromoteDecision {
   return lorebook.provenRelation(
-    { fromId: 1, toId: 2, fromName, toName, kind, evidence, kindSource },
-    { chunkText },
+    { fromId: 1, toId: 2, fromName, toName, kind, evidence, kindSource, confidence },
+    { chunkText: evidence, minConfidence: 0.7 },
   );
 }
 
-/* --------------------------------------------------------------- citation */
-
-test('disliked is proven by "loathed" when the citation is supplied', () => {
+test('a concept proved by other wording passes with its citation', () => {
   assert.deepEqual(decide('Mara', 'Tor', 'disliked', 'Mara loathed Tor in a quiet way.', 'loathed'), { ok: true });
 });
 
-test('disliked with no citation and no label word fails', () => {
-  assert.deepEqual(decide('Mara', 'Tor', 'disliked', 'Mara loathed Tor in a quiet way.', ''), {
-    ok: false,
-    reason: 'tie-word-absent',
-  });
+test('a missing citation is no longer a promotion failure', () => {
+  assert.deepEqual(decide('Mara', 'Tor', 'disliked', 'Mara loathed Tor in a quiet way.'), { ok: true });
 });
 
-test('a citation that is not in the quote proves nothing', () => {
-  assert.deepEqual(decide('Mara', 'Tor', 'disliked', 'Mara loathed Tor in a quiet way.', 'hated'), {
-    ok: false,
-    reason: 'tie-word-absent',
-  });
+test('direction is the model\'s, not a guard verdict', () => {
+  assert.deepEqual(decide('Mara', 'Tor', 'enemy of', 'Tor loathed Mara.', 'loathed'), { ok: true });
+  assert.deepEqual(decide('Bram', 'Asha', 'sister of', "Asha is Bram's sister.", 'sister'), { ok: true });
 });
 
-test('enemy of with a "loathed" citation is refused when the direction is reversed', () => {
-  // §4: the guard cannot see that "loathed" is semantically a poor fit for
-  // enemy. It can see that the sentence makes Tor the subject and Mara the
-  // object, so from=Mara/to=Tor is the reverse of what is said.
-  assert.deepEqual(decide('Mara', 'Tor', 'enemy of', 'Tor loathed Mara.', 'loathed'), {
-    ok: false,
-    reason: 'direction-mismatch',
-  });
-});
-
-test('the guard does not judge semantic fitness in the forward direction', () => {
-  // Documented consequence of §4: a forward "enemy of" proved by "loathed"
-  // passes, because the citation is real and binds the pair.
-  assert.deepEqual(decide('Mara', 'Tor', 'enemy of', 'Mara loathed Tor.', 'loathed'), { ok: true });
-});
-
-/* ------------------------------------------------------------ three names */
-
-test('a three-character passage binds exactly one pair', () => {
+test('a three-character passage is not forced to one pair by the guard', () => {
   const quote = 'Mara loathed Tor, and Corin watched from the doorway.';
-  const pairs = [
-    ['Mara', 'Tor'],
-    ['Mara', 'Corin'],
-    ['Tor', 'Corin'],
-  ] as const;
-  const accepted = pairs.filter(([from, to]) => decide(from, to, 'disliked', quote, 'loathed').ok);
-  assert.deepEqual(accepted, [['Mara', 'Tor']]);
+  for (const [from, to] of [['Mara', 'Tor'], ['Mara', 'Corin'], ['Tor', 'Corin']] as const) {
+    assert.deepEqual(decide(from, to, 'disliked', quote, 'loathed'), { ok: true });
+  }
 });
-
-/* --------------------------------------------------------------- direction */
 
 test('a symmetric concept accepts either order and extraction stores one pair', async () => {
-  assert.equal(decide('Mara', 'Tor', 'friend of', 'Mara was a friend of Tor.', 'friend').ok, true);
-  assert.equal(decide('Tor', 'Mara', 'friend of', 'Mara was a friend of Tor.', 'friend').ok, true);
+  assert.deepEqual(decide('Mara', 'Tor', 'friend of', 'Mara was a friend of Tor.', 'friend'), { ok: true });
+  assert.deepEqual(decide('Tor', 'Mara', 'friend of', 'Mara was a friend of Tor.', 'friend'), { ok: true });
 
-  // Two emissions of the same symmetric tie, opposite orders, one row.
   const { db } = tempDb();
   const project = controller.createProject(db, 'kind-symmetric-store');
   const sourceId = Number(
@@ -114,7 +83,17 @@ test('a symmetric concept accepts either order and extraction stores one pair', 
       AT,
     );
   }
-  const relation = { kind: 'friend of', kind_source: 'friend', evidence: 'Mara was a friend of Tor.', chunk_index: 0 };
+  const relation = {
+    kind: 'friend of',
+    kind_source: 'friend',
+    evidence: 'Mara was a friend of Tor.',
+    chunk_index: 0,
+    strength: 0.9,
+    asserted: true,
+    names_both: true,
+    other_person: 'named',
+    hedge: 'certain', kind_fit: 'yes',
+  };
   const llm = mockProvider((req) => {
     const system = req.system ?? '';
     if (system.includes('KNOWN ENTITIES')) {
@@ -133,43 +112,29 @@ test('a symmetric concept accepts either order and extraction stores one pair', 
   db.close();
 });
 
-test('a directional concept refuses the reverse', () => {
-  assert.deepEqual(decide('Asha', 'Bram', 'sister of', "Asha is Bram's sister.", 'sister'), { ok: true });
-  assert.deepEqual(decide('Bram', 'Asha', 'sister of', "Asha is Bram's sister.", 'sister'), {
-    ok: false,
-    reason: 'direction-mismatch',
-  });
-});
-
-/* ------------------------------------------------------ denial / uncertainty */
-
 test('negation is refused, never stored as the positive concept', () => {
-  assert.deepEqual(decide('Mara', 'Tor', 'trusted', 'Mara did not trust Tor.', 'trust'), {
+  assert.deepEqual(decide('Mara', 'Tor', 'trusted', 'Mara did not trust Tor.', 'trust', 0.9), {
     ok: false,
     reason: 'assertion-missing',
   });
-  assert.deepEqual(decide('Mara', 'Tor', 'trusted', 'Mara never trusted Tor.', 'trusted'), {
+  assert.deepEqual(decide('Mara', 'Tor', 'trusted', 'Mara never trusted Tor.', 'trusted', 0.9), {
     ok: false,
     reason: 'assertion-missing',
   });
 });
 
 test('uncertainty is not stored as asserted', () => {
-  assert.deepEqual(decide('Mara', 'Tor', 'feared', 'Perhaps Mara feared Tor.', 'feared'), {
+  assert.deepEqual(decide('Mara', 'Tor', 'feared', 'Perhaps Mara feared Tor.', 'feared', 0.9), {
     ok: false,
     reason: 'assertion-missing',
   });
-  assert.deepEqual(decide('Mara', 'Tor', 'feared', 'Mara perhaps feared Tor.', 'feared'), {
+  assert.deepEqual(decide('Mara', 'Tor', 'feared', 'Mara perhaps feared Tor.', 'feared', 0.9), {
     ok: false,
     reason: 'assertion-missing',
   });
 });
 
-/* ------------------------------------------------------------ concept set */
-
-test('a label outside the concept set is refused as open vocabulary', () => {
-  assert.deepEqual(decide('Mara', 'Tor', 'bff of', 'Mara was Tor\'s bff.', 'bff'), {
-    ok: false,
-    reason: 'open-vocab',
-  });
+test('a label outside the concept set is not a promotion gate', () => {
+  assert.deepEqual(decide('Mara', 'Tor', 'bff of', "Mara was Tor's bff.", 'bff', 0.9), { ok: true });
+  assert.equal(lorebook.isClosedRoleKind('bff of'), false, 'the concept set still governs querying');
 });

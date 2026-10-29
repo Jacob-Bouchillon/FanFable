@@ -88,7 +88,7 @@ function statusOf(db: Db, id: number): string {
   return db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', id)!.review_status;
 }
 
-test('the three cited shapes fail with assertion-missing', () => {
+test('the three cited shapes now pass the mechanical guard', () => {
   const { db } = tempDb();
   const project = createProject(db, 'audit-shapes');
   const chunk = addChunk(
@@ -117,11 +117,11 @@ test('the three cited shapes fail with assertion-missing', () => {
 
   const result = lorebook.auditAcceptedRelations(db, project.id, { write: true });
   assert.equal(result.audited, 3);
-  assert.deepEqual(result.failing, { 'assertion-missing': 3 });
+  assert.deepEqual(result.failing, {});
   for (const id of [coordinated, action, titleInsideName]) {
-    assert.equal(result.rows.find((row) => row.id === id)?.guard, 'assertion-missing');
-    assert.equal(result.rows.find((row) => row.id === id)?.action, 'demote');
-    assert.equal(statusOf(db, id), 'provisional');
+    assert.equal(result.rows.find((row) => row.id === id)?.guard, 'ok');
+    assert.equal(result.rows.find((row) => row.id === id)?.action, 'keep');
+    assert.equal(statusOf(db, id), 'accepted');
   }
   db.close();
 });
@@ -139,7 +139,7 @@ test('a genuinely asserted row passes and is untouched', () => {
   // A failure alongside it, so the write path runs.
   const badChunk = addChunk(db, project.id, 'Mara and Tor came in together.');
   const bad = addRelation(db, project.id, mara, tor, 'friend of', {
-    evidence: 'Mara and Tor came in together.',
+    evidence: 'This sentence is not in the book.',
     refs: refsFor(badChunk),
   });
 
@@ -172,7 +172,7 @@ test('a missing or non-verbatim quote fails', () => {
   db.close();
 });
 
-test('a quote naming both people but asserting nothing fails', () => {
+test('a quote naming both people but asserting nothing passes the mechanical guard', () => {
   const { db } = tempDb();
   const project = createProject(db, 'audit-cooccurrence');
   const chunk = addChunk(db, project.id, 'Mara and Tor spoke about their aunt.');
@@ -184,12 +184,13 @@ test('a quote naming both people but asserting nothing fails', () => {
   });
 
   const result = lorebook.auditAcceptedRelations(db, project.id, { write: true });
-  assert.deepEqual(result.failing, { 'assertion-missing': 1 });
-  assert.equal(statusOf(db, row), 'provisional');
+  assert.deepEqual(result.failing, {});
+  assert.equal(result.passing, 1);
+  assert.equal(statusOf(db, row), 'accepted');
   db.close();
 });
 
-test('an unknown direction is counted separately, not passed as proof', () => {
+test('direction is reported, not judged', () => {
   const { db } = tempDb();
   const project = createProject(db, 'audit-direction');
   const chunk = addChunk(db, project.id, 'Mara was mentor to Tor.');
@@ -203,11 +204,11 @@ test('an unknown direction is counted separately, not passed as proof', () => {
   const result = lorebook.auditAcceptedRelations(db, project.id, { write: true });
   assert.equal(result.audited, 1);
   assert.equal(result.passing, 1);
-  assert.equal(result.cannotJudge, 1);
+  assert.equal(result.cannotJudge, 0);
   const audited = result.rows[0]!;
   assert.equal(audited.guard, 'ok');
   assert.equal(audited.direction, 'unknown');
-  assert.equal(audited.cannotJudge, true);
+  assert.equal(audited.cannotJudge, false);
   assert.equal(audited.action, 'keep');
   assert.equal(statusOf(db, row), 'accepted');
   db.close();
@@ -240,7 +241,7 @@ test('a second write run changes nothing', () => {
   const mara = addEntity(db, project.id, 'Mara');
   const tor = addEntity(db, project.id, 'Tor');
   addRelation(db, project.id, mara, tor, 'aunt of', {
-    evidence: 'Mara and Tor came in together.',
+    evidence: 'This sentence is not in the book.',
     refs: refsFor(chunk),
   });
 

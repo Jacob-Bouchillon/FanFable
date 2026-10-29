@@ -63,22 +63,27 @@ async function bankedStatus(relations: unknown[]): Promise<{ status: string | nu
 
 const COAT = 'Serena Marsh watched it from the ridge, wrapped in a coat that had belonged to her brother';
 
-test('noun-silent tie is provisional, with a note', async () => {
+test('a noun-silent tie without a model score stays provisional', async () => {
   const { status, note } = await bankedStatus([{
     from: 'Serena Marsh', to: 'Kade', kind: 'apprentice of', description: 'x', chunk_index: 0,
     evidence: 'Two hundred yards, said Kade behind her',
   }]);
-  assert.equal(status, 'provisional');
-  assert.ok(note >= 1, 'unsupported claim leaves a relabel note');
+  assert.equal(status, 'provisional', 'a missing confidence is zero, never a pass');
+  assert.equal(note, 0, 'the concept set is not a promotion gate, so it leaves no relabel note');
 });
 
-test('quote naming neither endpoint parks instead of banking', async () => {
+test('a quote naming neither endpoint does not bank without a model score', async () => {
   const { status, note } = await bankedStatus([{
     from: 'Serena Marsh', to: 'Kade', kind: 'brother of', description: 'x', chunk_index: 0,
     evidence: 'wrapped in a coat that had belonged to her brother',
   }]);
-  assert.equal(status, 'needs_review');
-  assert.ok(note >= 1, 'endpoint silence leaves a case file so the tie can come back');
+  assert.equal(status, 'provisional', 'below threshold stays in the queue');
+  assert.equal(note, 0);
+});
+
+test('a label outside the concept set is still unqueryable as a concept', () => {
+  assert.equal(lorebook.isClosedRoleKind('contacting'), false, 'display/querying keeps the closed set');
+  assert.equal(lorebook.kindGlossaryBlock().includes('- contacting '), false);
 });
 
 test('a stated tie naming one endpoint is provisional, not a keeper', async () => {

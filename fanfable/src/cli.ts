@@ -148,6 +148,8 @@ ${C.bold('SOURCE MATERIAL')}
   lore rulings replay --in path [--write] [--dry-run] [--limit n]
                            Reapply an exported ruling file to this project
   lore audit [--write] [--limit n]  Recheck accepted ties against the guard; demote failures
+  lore assess [--limit n] [--min-confidence x] [--write] [--refresh]
+                           Score existing ties against their quotes; dry run by default
   lore ties --from A --to B [--at n] [--supporting]
                            What two people are to each other now, and before
   lore merge                       Merge entries that are the same under two names
@@ -461,6 +463,48 @@ async function cmdLore(args: Args): Promise<void> {
       console.log(`  changed ${result.changed}`);
     } else {
       console.log(C.dim('  dry run: nothing written. Re-run with --write to demote failures.'));
+    }
+    return;
+  }
+
+  if (sub === 'assess') {
+    const write = args.flags.write === true;
+    const refresh = args.flags.refresh === true;
+    const limit = flagNumber(args, 'limit', 0);
+    const threshold = args.flags['min-confidence'] === undefined
+      ? 0.7
+      : flagNumber(args, 'min-confidence', 0.7);
+    heading(write ? 'Assess relations (write)' : 'Assess relations (dry run)');
+    const result = await lorebook.assessRelations(db, a.llm, project.id, {
+      write,
+      refresh,
+      limit: limit > 0 ? limit : undefined,
+      minConfidence: threshold,
+      onProgress: (message) => process.stdout.write(`  ${C.dim(message)}\n`),
+    });
+    console.log(
+      `assessed ${result.assessed}; skipped: no quote ${result.skipped['no-quote']}, ` +
+        `already assessed ${result.skipped['already-assessed']}, ` +
+        `entity unresolved ${result.skipped['entity-unresolved']}, ` +
+        `quote not verbatim ${result.skipped['quote-not-verbatim']}` +
+        (result.skipped['model-error'] ? `, model error ${result.skipped['model-error']}` : ''),
+    );
+    console.log(`\n${C.dim('band       rows')}`);
+    for (const [band, count] of Object.entries(result.bands)) {
+      console.log(`${band.padEnd(10)} ${count}`);
+    }
+    console.log(`\nat or above ${result.threshold}: ${result.aboveThreshold}`);
+    for (const [status, count] of Object.entries(result.aboveByStatus).sort()) {
+      console.log(`  ${status.padEnd(16)} ${count}`);
+    }
+    console.log(
+      `\naverage strength of user_confirmed rows: ` +
+        (result.userConfirmedAverage === null ? 'none' : result.userConfirmedAverage.toFixed(3)),
+    );
+    if (write) {
+      console.log(`wrote ${result.wrote} assessment(s); review_status untouched.`);
+    } else {
+      console.log(C.dim('dry run: nothing written. Re-run with --write to store the assessments.'));
     }
     return;
   }
