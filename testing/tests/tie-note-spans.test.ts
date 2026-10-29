@@ -78,7 +78,7 @@ test('spans from two pages resolve the note into a keeper', () => {
   const { db, project, from, to } = setup('note-promote');
   const a = chunk(db, project.id, 'Mara sided with the northern house.', 1);
   const b = chunk(db, project.id, 'Tor commanded the northern house.', 2);
-  lorebook.persistTieNote(db, project.id, from, to, 'ally of', 'unsupported', 'Mara sided with the northern house.', a.refs);
+  lorebook.persistTieNote(db, project.id, from, to, 'ally of', 'unsupported', 'Mara sided with the northern house.', a.refs, '', 'sided with');
   lorebook.persistTieNote(db, project.id, from, to, 'ally of', 'unsupported', 'Tor commanded the northern house.', b.refs);
   assert.equal(lorebook.resolveAccumulatedNotes(db, project.id), 1);
   const rel = db.get<{ evidence: string; review_status: string }>(

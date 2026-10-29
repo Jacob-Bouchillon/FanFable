@@ -196,7 +196,7 @@ const IDENTITY_CLAIM_RES: RegExp[] = [
 const COPULA_RE = /\b(?:is|was)\s+((?:the\s+)?[A-Z][\w']*(?:\s+[A-Z][\w']*)*)/;
 const RELATION_WORD_AFTER_NAME = new Set([
   'apprentice', 'master', 'ally', 'friend', 'aide', 'mentor', 'servant',
-  'enemy', 'rival', 'heir', 'successor', 'padawan', 'colleague', 'peer',
+  'enemy', 'rival', 'heir', 'successor', 'colleague', 'peer',
   'partner', 'opponent', 'teacher', 'student', 'agent',
 ]);
 

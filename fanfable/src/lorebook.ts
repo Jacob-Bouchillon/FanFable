@@ -253,8 +253,8 @@ Reply with JSON only:
   "relations": [
     {"from":"a name from the list, exactly as written",
      "to":"another name from the list, exactly as written",
-     "kind":"a defined kind from the list when one fits, otherwise a short phrase",
-     "kind_source":"the words in the quote that express this relationship, copied verbatim",
+     "kind":"one of the defined relationship concepts, exactly as written",
+     "kind_source":"the passage's own words that express the concept, copied verbatim",
      "description":"one sentence","chunk_index":0,"evidence":"a short exact quote",
      "modality":"asserted|denied|possible|suspected — only include when not asserted"}
   ]
@@ -266,6 +266,7 @@ Rules:
 - Be exhaustive, not representative: list EVERY lasting tie the passages state explicitly — most windows contain several, and a long list is good while a missed tie is bad. Do not stop after the first few entries, and do not pad the list with moments. When in doubt whether a stated tie is lasting, include it with its quote and let the gates decide.
 - evidence must be a phrase copied VERBATIM from the passage, long enough to state the tie on its own (a name plus the tie word), not your own words and not a two-word fragment.
 - One relation per entry, with one kind. If two people have several relationships, write a separate entry for each.
+- kind must be exactly one of the defined relationship concepts below; never invent a kind. kind_source must be the passage's own words that express that concept, copied verbatim from the quote.
 - The direction matters: "from" is the one who has the relationship and "to" is the one it is to. If Harry is Petunia's nephew, it is from="Harry", to="Petunia", kind="nephew of".
 - chunk_index is the number shown in front of each passage.
 - evidence must be a short phrase copied from the passage, not your own words.
@@ -3744,7 +3745,7 @@ function applyRelations(
       const firstKind = normaliseKinds(String(raw.kind ?? ''))[0] ?? 'related to';
       if (isClosedRoleKind(firstKind)) {
         stats.verification.unsupported++;
-        persistTieNote(db, projectId, fromId, toId, firstKind, 'unsupported', span.quote, toJson(refs));
+        persistTieNote(db, projectId, fromId, toId, firstKind, 'unsupported', span.quote, toJson(refs), '', kindSource);
       }
     }
     const kinds = normaliseKinds(String(raw.kind ?? ''));
@@ -3758,12 +3759,14 @@ function applyRelations(
       if (isMomentKind(kind)) {
         stats.verification.moment++;
         bankMomentEvent(db, projectId, fromId, toId, kind, String(raw.description ?? '').trim(), span, chunk);
-        persistTieNote(db, projectId, fromId, toId, kind, 'moment', span.quote, toJson(refs));
+        persistTieNote(db, projectId, fromId, toId, kind, 'moment', span.quote, toJson(refs), '', kindSource);
         continue;
       }
-      if (isUnsupportedKind(kind, span.quote)) {
+      // Without a citation the label's own word must be in the quote. With one,
+      // the cited words carry the claim even when the label does not appear.
+      if (!kindSource && isUnsupportedKind(kind, span.quote)) {
         stats.verification.unsupported++;
-        persistTieNote(db, projectId, fromId, toId, kind, 'unsupported', span.quote, toJson(refs));
+        persistTieNote(db, projectId, fromId, toId, kind, 'unsupported', span.quote, toJson(refs), '', kindSource);
         flagged = 'unsupported';
       }
       // Open vocabulary parks: the kind is no closed role noun (kinship,
@@ -3772,7 +3775,7 @@ function applyRelations(
       // encourager/acknowledger class — invisible to status until cleared.
       if (!flagged && !isClosedRoleKind(kind)) {
         stats.verification.unsupported++;
-        persistTieNote(db, projectId, fromId, toId, kind, 'open-vocab', span.quote, toJson(refs));
+        persistTieNote(db, projectId, fromId, toId, kind, 'open-vocab', span.quote, toJson(refs), '', kindSource);
         flagged = 'open-vocab';
       }
       // A generic kinship word repeats a specific one: "parent of" beside
@@ -4353,78 +4356,262 @@ export function sharedSpeakerScene(
 export const CLOSED_TIE_LABELS = [
   'sister of', 'brother of', 'sibling of', 'mother of', 'father of', 'parent of',
   'son of', 'daughter of', 'child of', 'husband of', 'wife of', 'spouse of',
-  'married to', 'uncle of', 'aunt of', 'nephew of', 'niece of', 'cousin of',
+  'uncle of', 'aunt of', 'nephew of', 'niece of', 'cousin of',
   'relative of', 'friend of', 'enemy of', 'ally of', 'teacher of', 'student of',
   'mentor of', 'leader of', 'member of', 'peer of', 'colleague of',
 ];
 
-/** Closed role-noun list for bankable tie kinds: universal kin + titled roles +
- * the human-gated peer/colleague set. Seeded from kinds banked as accepted on
- * the frozen sheet's correct answers. Anything outside it parks as
- * needs_review with reason open-vocab-kind — never banks accepted. */
+/** Closed concept list for bankable tie kinds: the allow-list the prompt and the
+ * guard share. Universal kin, titled roles, the human-gated peer/colleague set,
+ * and the affect family. Anything outside it parks as needs_review with reason
+ * open-vocab — never banks accepted. */
 export const CLOSED_ROLE_KINDS = [
   ...CLOSED_TIE_LABELS,
-  'aide of', 'apprentice of', 'assistant of', 'master of', 'operative for',
-  'partner', 'partner with',
+  'aide of', 'apprentice of', 'master of', 'operative for', 'partner',
+  'guardian of', 'employer of', 'customer of', 'owner of',
+  'rival of', 'acquaintance',
+  'disliked', 'resented', 'feared', 'admired', 'trusted', 'distrusted',
+  'bullied', 'protective of', 'jealous of', 'loyal to', 'obeyed',
 ];
 
+/** Whether a concept is asserted from one side or is the same claim in either
+ * order. This is data on the concept, not a special case in the matcher. */
+export type KindDirection = 'directional' | 'symmetric';
+
 /**
- * One line of meaning per bankable kind: what it asserts, and the phrasings
- * that express it without the label. General English only — no book's
- * vocabulary enters this table. The reader chooses a kind by meaning; the bank
- * still stores the closed label, and the quote still has to carry the claim.
+ * One description per concept: what it is, and how it differs from its nearest
+ * neighbour. The model maps a passage's wording onto one of these; no code lists
+ * the English words that express it. Direction says whether a reversed claim is
+ * refused or is the same claim stored once.
  */
-export const KIND_GLOSSES: Readonly<Record<string, { says: string; reads: string }>> = {
-  'sister of': { says: 'is a female sibling of', reads: 'sister, half-sister, adopted sister' },
-  'brother of': { says: 'is a male sibling of', reads: 'brother, half-brother, adopted brother' },
-  'sibling of': { says: 'shares at least one parent with', reads: 'sibling, brother or sister when the sex is unknown' },
-  'mother of': { says: 'is the female parent of', reads: 'mother, bore, gave birth to, raised as her own' },
-  'father of': { says: 'is the male parent of', reads: 'father, sire, begot, raised as his own' },
-  'parent of': { says: 'is a parent of, when the sex is unknown', reads: 'parent, guardian by blood' },
-  'son of': { says: 'is the male child of', reads: 'son, boy of, heir of a parent' },
-  'daughter of': { says: 'is the female child of', reads: 'daughter, girl of, heiress of a parent' },
-  'child of': { says: 'is the offspring of', reads: 'child, offspring, issue of' },
-  'husband of': { says: 'is the married man in a marriage with', reads: 'husband, wedded to' },
-  'wife of': { says: 'is the married woman in a marriage with', reads: 'wife, wedded to' },
-  'spouse of': { says: 'is the married partner of, when the sex is unknown', reads: 'spouse, wedded to' },
-  'married to': { says: 'is in a marriage with (the same tie in either direction)', reads: 'married, wed, took as a spouse' },
-  'uncle of': { says: "is a parent's brother, or the husband of a parent's sibling", reads: 'uncle' },
-  'aunt of': { says: "is a parent's sister, or the wife of a parent's sibling", reads: 'aunt' },
-  'nephew of': { says: 'is the son of a sibling', reads: 'nephew' },
-  'niece of': { says: 'is the daughter of a sibling', reads: 'niece' },
-  'cousin of': { says: 'is the child of an aunt or uncle', reads: 'cousin' },
-  'relative of': { says: 'is kin by blood or marriage when no closer word fits', reads: 'kin, relation, blood of' },
-  'friend of': { says: 'holds personal affection for, beyond a working tie', reads: 'friend, close to, fond of, companion of' },
-  'enemy of': { says: 'opposes, fights or works against', reads: 'enemy, foe, turned on, stood against, fought' },
-  'ally of': { says: 'supports or sides with in a conflict or cause', reads: 'ally, sided with, backed, stood with, came to their aid, pact with' },
-  'teacher of': { says: 'instructs in a subject or skill', reads: 'taught, instructed, tutored, trained' },
-  'student of': { says: 'is instructed by', reads: 'student, pupil, learner, studied under' },
-  'mentor of': { says: 'guides over time, beyond instruction', reads: 'mentor, protégé, took under his wing, counseled, guided' },
-  'leader of': { says: 'heads the group the other belongs to', reads: 'leads, heads, commands, rules' },
-  'member of': { says: 'belongs to a group, order or organisation', reads: 'member, joined, belongs to, sworn to' },
-  'peer of': { says: 'holds equal standing in the same body', reads: 'peer, equal, fellow' },
-  'colleague of': { says: 'works alongside in the same organisation', reads: 'colleague, coworker, served with, worked with' },
-  'aide of': { says: 'assists in a subordinate personal role', reads: 'aide, assistant to, attendant, adjutant' },
-  'apprentice of': { says: 'is learning a trade or discipline from', reads: 'apprentice, padawan, learner bound to a master' },
-  'assistant of': { says: 'assists in a working role', reads: 'assistant, helper, second to' },
-  'master of': { says: 'has an apprentice or sworn servant bound to them', reads: 'master, lord of' },
-  'operative for': { says: 'carries out tasks for a person or organisation', reads: 'operative, agent of, works for, on the payroll of' },
-  'partner': { says: 'works with another as an equal over time', reads: 'partner, partnership' },
-  'partner with': { says: 'works with another as an equal over time', reads: 'partnered with, in partnership with' },
+export const KIND_GLOSSES: Readonly<Record<string, { says: string; direction: KindDirection }>> = {
+  'sister of': {
+    says: 'Is a female sibling of the other person; differs from sibling of in naming the sex, and from cousin of in sharing a parent.',
+    direction: 'directional',
+  },
+  'brother of': {
+    says: 'Is a male sibling of the other person; differs from sibling of in naming the sex, and from cousin of in sharing a parent.',
+    direction: 'directional',
+  },
+  'sibling of': {
+    says: 'Shares at least one parent with the other person; differs from cousin of in closeness of blood, and from relative of in being a parent\'s child.',
+    direction: 'symmetric',
+  },
+  'mother of': {
+    says: 'Is the female parent of the other person; differs from father of in sex, and from guardian of in a parental bond rather than a duty of care.',
+    direction: 'directional',
+  },
+  'father of': {
+    says: 'Is the male parent of the other person; differs from mother of in sex, and from guardian of in a parental bond rather than a duty of care.',
+    direction: 'directional',
+  },
+  'parent of': {
+    says: 'Is a parent of the other person when the sex is unknown or irrelevant; differs from mother of and father of in not naming the sex, and from guardian of in a blood or adoptive parental bond.',
+    direction: 'directional',
+  },
+  'son of': {
+    says: 'Is the male child of the other person; differs from daughter of in sex, and from child of in naming it.',
+    direction: 'directional',
+  },
+  'daughter of': {
+    says: 'Is the female child of the other person; differs from son of in sex, and from child of in naming it.',
+    direction: 'directional',
+  },
+  'child of': {
+    says: 'Is the offspring of the other person when the sex is unknown or irrelevant; differs from son of and daughter of in not naming the sex.',
+    direction: 'directional',
+  },
+  'husband of': {
+    says: 'Is the married man in the marriage with the other person; differs from wife of in sex, and from spouse of in naming it.',
+    direction: 'directional',
+  },
+  'wife of': {
+    says: 'Is the married woman in the marriage with the other person; differs from husband of in sex, and from spouse of in naming it.',
+    direction: 'directional',
+  },
+  'spouse of': {
+    says: 'Is the married partner of the other person when the sex is unknown or irrelevant; differs from husband of and wife of in not naming the sex.',
+    direction: 'directional',
+  },
+  'uncle of': {
+    says: 'Is a sibling of the other person\'s parent, or the husband of such a sibling; differs from aunt of in sex, and from cousin of in generation.',
+    direction: 'directional',
+  },
+  'aunt of': {
+    says: 'Is a sibling of the other person\'s parent, or the wife of such a sibling; differs from uncle of in sex, and from cousin of in generation.',
+    direction: 'directional',
+  },
+  'nephew of': {
+    says: 'Is the son of the other person\'s sibling; differs from niece of in sex, and from cousin of in generation.',
+    direction: 'directional',
+  },
+  'niece of': {
+    says: 'Is the daughter of the other person\'s sibling; differs from nephew of in sex, and from cousin of in generation.',
+    direction: 'directional',
+  },
+  'cousin of': {
+    says: 'Is the child of the other person\'s aunt or uncle; differs from sibling of in not sharing a parent, and from relative of in naming the degree.',
+    direction: 'symmetric',
+  },
+  'relative of': {
+    says: 'Is kin by blood or marriage when no closer term fits; differs from sibling of and cousin of in leaving the degree of kinship unspecified.',
+    direction: 'directional',
+  },
+  'friend of': {
+    says: 'Holds personal affection and companionable regard for the other person beyond a working tie; differs from acquaintance in closeness, and from ally of in affection rather than a shared cause.',
+    direction: 'symmetric',
+  },
+  'enemy of': {
+    says: 'Actively opposes, fights or works against the other person with harm intended; differs from disliked in open conflict, and from rival of in seeking harm rather than only to outdo.',
+    direction: 'directional',
+  },
+  'ally of': {
+    says: 'Sides with the other person in a conflict or cause; differs from friend of in a shared cause rather than affection, and from colleague of in acting together under pressure rather than working alongside.',
+    direction: 'symmetric',
+  },
+  'teacher of': {
+    says: 'Instructs the other person in a subject or skill; differs from mentor of in teaching a discipline rather than guiding a life, and from student of in the direction of instruction.',
+    direction: 'directional',
+  },
+  'student of': {
+    says: 'Is instructed by the other person; differs from apprentice of in formal study rather than a trade bound to a master, and from teacher of in the direction of instruction.',
+    direction: 'directional',
+  },
+  'mentor of': {
+    says: 'Guides the other person over time, shaping judgment and character; differs from teacher of in guidance beyond instruction, and from guardian of in development rather than safety.',
+    direction: 'directional',
+  },
+  'leader of': {
+    says: 'Heads the group or body the other belongs to; differs from employer of in authority over a body rather than a contract, and from master of in leading free members rather than sworn servants.',
+    direction: 'directional',
+  },
+  'member of': {
+    says: 'Belongs to the group or organisation the other heads or embodies; differs from colleague of in membership of a body rather than a working peer, and from ally of in standing membership rather than a cause.',
+    direction: 'directional',
+  },
+  'peer of': {
+    says: 'Holds equal standing with the other person in the same body or rank; differs from colleague of in equality of rank rather than shared work, and from friend of in station rather than affection.',
+    direction: 'symmetric',
+  },
+  'colleague of': {
+    says: 'Works alongside the other person in the same organisation or calling; differs from peer of in shared work rather than formal rank, and from ally of in routine cooperation rather than a cause.',
+    direction: 'symmetric',
+  },
+  'aide of': {
+    says: 'Assists the other person in a subordinate personal role; differs from apprentice of in service rather than learning, and from colleague of in subordination.',
+    direction: 'directional',
+  },
+  'apprentice of': {
+    says: 'Is learning a trade or discipline from the other person under a binding arrangement; differs from student of in a trade bond, and from aide of in learning rather than service.',
+    direction: 'directional',
+  },
+  'master of': {
+    says: 'Has the other person bound as apprentice or sworn servant; differs from employer of in sworn or bound service rather than employment, and from teacher of in authority over a bond.',
+    direction: 'directional',
+  },
+  'operative for': {
+    says: 'Carries out assigned or covert tasks for the other person or organisation; differs from aide of in field work for an organisation rather than personal service, and from employee/employer in assigned operations.',
+    direction: 'directional',
+  },
+  'partner': {
+    says: 'Works with the other person as an equal over time in a chosen joint enterprise; differs from colleague of in a lasting joint bond, and from ally of in a working partnership rather than a cause.',
+    direction: 'symmetric',
+  },
+  'guardian of': {
+    says: 'Has a formal duty to care for and protect the other person; differs from protective of in a duty rather than a feeling, and from parent of in lacking a parental bond.',
+    direction: 'directional',
+  },
+  'employer of': {
+    says: 'Pays the other person for work and directs it; differs from master of in a working contract rather than sworn service, and from leader of in an employment relation rather than a body of followers.',
+    direction: 'directional',
+  },
+  'customer of': {
+    says: 'Buys goods or services from the other person; differs from employer of in receiving rather than directing work, and from acquaintance in being a commercial relation.',
+    direction: 'directional',
+  },
+  'owner of': {
+    says: 'Holds the other creature as property; differs from guardian of in ownership rather than care, and from employer of in owning rather than employing.',
+    direction: 'directional',
+  },
+  'rival of': {
+    says: 'Competes with the other person for the same goal, position or affection; differs from enemy of in seeking to outdo rather than to harm, and from peer of in contest rather than equal station.',
+    direction: 'symmetric',
+  },
+  'acquaintance': {
+    says: 'Knows the other person by name and has met them, without a close personal bond; differs from friend of in lacking affection, and from colleague of in lacking a shared working role.',
+    direction: 'symmetric',
+  },
+  'disliked': {
+    says: 'Holds a negative opinion of, or aversion toward, the other person without open conflict or harm sought; differs from enemy of in taking no side and pursuing no harm, and from distrusted in being about the person rather than their reliability.',
+    direction: 'symmetric',
+  },
+  'resented': {
+    says: 'Holds a lingering bitter grievance against the other person for a past wrong; differs from disliked in naming a specific injury, and from enemy of in seeking no active harm.',
+    direction: 'symmetric',
+  },
+  'feared': {
+    says: 'Feels threat or dread in the other person\'s presence; differs from distrusted in being about danger rather than honesty, and from bullied in being subjected to the threat rather than met with dread.',
+    direction: 'symmetric',
+  },
+  'admired': {
+    says: 'Regards the other person with approval and esteem for their qualities or deeds; differs from trusted in being an assessment of worth rather than reliance on conduct.',
+    direction: 'symmetric',
+  },
+  'trusted': {
+    says: 'Relies on the other person\'s conduct, honesty or competence; differs from loyal to in being confidence held by the truster rather than allegiance given by the other.',
+    direction: 'symmetric',
+  },
+  'distrusted': {
+    says: 'Doubts the other person\'s honesty or intentions; differs from feared in being doubt about reliability rather than dread of harm, and from disliked in being about trust rather than aversion.',
+    direction: 'symmetric',
+  },
+  'bullied': {
+    says: 'Subjects the other person to repeated intimidation or coercion from a position of greater power; differs from enemy of in being a pattern of domination rather than open opposition.',
+    direction: 'directional',
+  },
+  'protective of': {
+    says: 'Takes responsibility for shielding the other person from harm; differs from guardian of in acting from care or attachment rather than a formal duty, and from mentor of in safeguarding rather than developing.',
+    direction: 'directional',
+  },
+  'jealous of': {
+    says: 'Feels wounded or possessive envy toward the other person over attention, status or affection; differs from rival of in being a feeling rather than a competition, and from resented in centring on what the other has.',
+    direction: 'symmetric',
+  },
+  'loyal to': {
+    says: 'Gives steadfast allegiance to the other person and puts their interests first; differs from trusted in being allegiance given rather than reliance held.',
+    direction: 'directional',
+  },
+  'obeyed': {
+    says: 'Accepts the other person\'s authority and follows their commands; differs from loyal to in acting on orders rather than devotion, and from student of in obedience rather than learning.',
+    direction: 'directional',
+  },
 };
 
-/** The glossary as prompt text: one line per bankable kind. */
+/** The glossary as prompt text: one line per concept, with its direction. */
 export function kindGlossaryBlock(): string {
   const lines = CLOSED_ROLE_KINDS.map((kind) => {
     const gloss = KIND_GLOSSES[kind];
-    return `- ${kind} — ${gloss?.says ?? ''}; reads as: ${gloss?.reads ?? ''}`;
+    return `- ${kind} (${gloss?.direction ?? 'directional'}) — ${gloss?.says ?? ''}`;
   });
-  return `Defined kinds. When one fits the meaning, use its exact wording; otherwise use your own short phrase:\n${lines.join('\n')}`;
+  return (
+    'Defined relationship concepts. The kind must be exactly one of these labels; never invent a kind. ' +
+    'A directional concept reads from the person it belongs to toward the other person, and a reversed ' +
+    'claim is refused. A symmetric concept is the same claim in either order and is stored once. ' +
+    'kind_source must be the passage\'s own words that express the concept, copied verbatim.\n' +
+    lines.join('\n')
+  );
 }
 
 /** True when the kind resolves to the closed role-noun list. */
 export function isClosedRoleKind(kind: string): boolean {
   return CLOSED_ROLE_KINDS.includes((kind ?? '').trim().toLowerCase());
+}
+
+/** True when a concept's direction is enforced on promotion. A symmetric
+ * concept is the same claim in either order; an unknown stored kind has no
+ * direction claim (and cannot be promoted anyway). */
+export function isDirectionalKind(kind: string): boolean {
+  return KIND_GLOSSES[(kind ?? '').trim().toLowerCase()]?.direction === 'directional';
 }
 
 
@@ -4541,6 +4728,29 @@ function quoteDirection(
     if (to.has(base)) return 'to';
     return null;
   };
+  // Name spans for subject-verb-object direction. Possessives are stripped so
+  // a name token and the same name owning a noun align.
+  const bases = words.map((word) => word.replace(/['’]s$/, ''));
+  const spansOf = (name: string, aliases: string[]): Array<[number, number]> => {
+    const out: Array<[number, number]> = [];
+    for (const variant of explicitVariants(name, aliases, index)) {
+      const target = canonicalName(variant).split(' ').filter(Boolean);
+      if (!target.length) continue;
+      for (let i = 0; i + target.length <= bases.length; i++) {
+        if (target.every((word, k) => bases[i + k] === word)) out.push([i, i + target.length - 1]);
+      }
+    }
+    return out;
+  };
+  const fromSpans = spansOf(row.fromName, row.fromAliases ?? []);
+  const toSpans = spansOf(row.toName, row.toAliases ?? []);
+  const coordinatedBetween = (a: [number, number], b: [number, number]): boolean => {
+    const lo = a[1] <= b[0] ? a[1] : b[1] <= a[0] ? b[1] : a[0];
+    const hi = a[1] <= b[0] ? b[0] : b[1] <= a[0] ? a[0] : a[1];
+    for (let at = lo; at <= hi; at++) if (words[at] === 'and' || words[at] === 'or') return true;
+    return false;
+  };
+  const passive = new Set(['was', 'were', 'been', 'had', 'have', 'is', 'are', 'be', 'being']);
   let forward = false;
   for (let at = 0; at < words.length; at++) {
     if (words[at] !== head) continue;
@@ -4568,6 +4778,21 @@ function quoteDirection(
       const holder = ownerOf(words[holderAt]!);
       if (holder === 'to') return 'reverse';
       if (holder === 'from') forward = true;
+    }
+    // Subject-verb-object: in "Mara loathed Tor" the subject states direction.
+    // A possessive before the head ("Bram's sister is Asha") is a different
+    // construction and is not read this way.
+    if (!passive.has(words[at - 1] ?? '') && !/['’]s$/.test(words[at - 1] ?? '')) {
+      const subjectFrom = fromSpans.some(
+        ([s, e]) => e >= at - 2 && e <= at - 1 && !coordinatedBetween([s, e], [at, at]),
+      );
+      const subjectTo = toSpans.some(
+        ([s, e]) => e >= at - 2 && e <= at - 1 && !coordinatedBetween([s, e], [at, at]),
+      );
+      const otherInWindow = (spans: Array<[number, number]>): boolean =>
+        spans.some(([s, e]) => s >= at + 1 && s <= at + 3 && !coordinatedBetween([at, at], [s, e]));
+      if (subjectFrom && otherInWindow(toSpans)) forward = true;
+      if (subjectTo && otherInWindow(fromSpans)) return 'reverse';
     }
   }
   return forward ? 'forward' : 'unknown';
@@ -4657,28 +4882,52 @@ function provenQuoteReason(row: PromoteRow, chunkText?: string | null, index?: R
       return 'endpoint-unnamed';
     }
   }
-  // The tie word must appear in a span that is itself evidence: the quote, or
-  // the anchor when the reader supplied one.
-  const tieOk =
-    !isUnsupportedKind(row.kind, row.evidence) ||
-    (anchor.length > 0 && !isUnsupportedKind(row.kind, anchor));
-  if (!tieOk) {
-    const source = (row.kindSource ?? '').trim();
-    const spelled =
-      source.length > 0 &&
-      (normalise(row.evidence).includes(normalise(source)) || normalise(anchor).includes(normalise(source)));
-    if (!spelled) return 'tie-word-absent';
-  }
+  // The citation is checked, not a head word: the model's own words when it
+  // supplied them, otherwise the label's own word. No synonym list is consulted
+  // and the cited wording never substitutes for a claim it does not carry.
+  const source = (row.kindSource ?? '').trim();
+  const sourceInQuote = source.length > 0 && normalise(row.evidence).includes(normalise(source));
+  const sourceInAnchor = source.length > 0 && anchor.length > 0 && normalise(anchor).includes(normalise(source));
+  const labelInQuote = source.length === 0 && !isUnsupportedKind(row.kind, row.evidence);
+  const labelInAnchor = source.length === 0 && anchor.length > 0 && !isUnsupportedKind(row.kind, anchor);
+  if (!sourceInQuote && !sourceInAnchor && !labelInQuote && !labelInAnchor) return 'tie-word-absent';
   // The assertion must live in one span. The quote and the anchor may together
   // name both people, but neither span may borrow the other's assertion.
-  const asserted =
-    assertsRelationship(row.evidence, row.fromName, row.fromAliases ?? [], row.toName, row.toAliases ?? [], row.kind, row.kindSource ?? '', index) ||
-    (anchor.length > 0 &&
-      assertsRelationship(anchor, row.fromName, row.fromAliases ?? [], row.toName, row.toAliases ?? [], row.kind, row.kindSource ?? '', index));
-  if (!asserted) return 'assertion-missing';
-  const directionSpan = anchor.length > 0 && !isUnsupportedKind(row.kind, anchor) ? anchor : row.evidence;
-  if (quoteDirection(canonicalKind(row.kind), directionSpan, row, index) === 'reverse') {
-    return 'direction-mismatch';
+  const evidenceAsserts = assertsRelationship(
+    row.evidence,
+    row.fromName,
+    row.fromAliases ?? [],
+    row.toName,
+    row.toAliases ?? [],
+    row.kind,
+    row.kindSource ?? '',
+    index,
+  );
+  const anchorAsserts =
+    anchor.length > 0 &&
+    assertsRelationship(anchor, row.fromName, row.fromAliases ?? [], row.toName, row.toAliases ?? [], row.kind, row.kindSource ?? '', index);
+  if (!evidenceAsserts && !anchorAsserts) return 'assertion-missing';
+  // The model may quote only the positive core of a denied or hedged sentence
+  // ("Mara feared Tor" from "Perhaps Mara feared Tor"). Check the sentence that
+  // holds the assertion, not just the quoted fragment.
+  const assertionSpan = evidenceAsserts ? row.evidence : anchor;
+  const holdingSentence =
+    splitSentences(chunk).find((sentence) => normalise(sentence).includes(normalise(assertionSpan))) ?? assertionSpan;
+  if (leadingDenialOrHedge(holdingSentence, row, index)) return 'assertion-missing';
+  // Direction belongs to directional concepts only. A symmetric concept is the
+  // same claim in either order, so its reverse is never a mismatch.
+  if (isDirectionalKind(row.kind)) {
+    const citationInAnchor = source
+      ? sourceInAnchor && !sourceInQuote
+      : labelInAnchor && !labelInQuote;
+    const directionSpan = citationInAnchor ? anchor : row.evidence;
+    const phrase = source
+      ? citationWords(source, row.kind, row.fromName, row.fromAliases ?? [], row.toName, row.toAliases ?? [], index)
+          .find((word) => !CITATION_STOP.has(word)) ?? row.kind
+      : row.kind;
+    if (quoteDirection(canonicalKind(phrase), directionSpan, row, index) === 'reverse') {
+      return 'direction-mismatch';
+    }
   }
   return null;
 }
@@ -4776,29 +5025,9 @@ function mentionSpans(text: string, name: string, aliases: string[], index?: Ros
   return spans;
 }
 
-/**
- * True when the sentence links the two named endpoints through the kind's head
- * noun: a possessive ("X's aunt"), an "of" phrase ("the aunt of X"), or a
- * copula around one of those. A title that merely begins a name ("Aunt X took
- * Y to town") asserts nothing about Y.
- */
 /** Linking prepositions/conjunctions that turn a phrase into a relation
  * ("sided with", "member of", "sworn to") instead of a bare scene verb. */
 const EVIDENCE_LINK_TAIL = new Set(['to', 'with', 'for', 'of', 'from', 'in', 'on', 'as']);
-
-/** Head words (and their inflections) of the bankable kinds, computed once. */
-let evidenceRoleHeads: Set<string> | null = null;
-function roleHeadWords(): Set<string> {
-  if (evidenceRoleHeads) return evidenceRoleHeads;
-  const out = new Set<string>();
-  for (const kind of CLOSED_ROLE_KINDS) {
-    const head = kindHeadWord(kind);
-    if (!head) continue;
-    for (const form of headForms(head)) out.add(form);
-  }
-  evidenceRoleHeads = out;
-  return out;
-}
 
 /** Words only: possessives split out, punctuation to spaces, lowercased. */
 function assertionWords(text: string): string[] {
@@ -4812,21 +5041,108 @@ function assertionWords(text: string): string[] {
     .filter(Boolean);
 }
 
+/** The label's own head word and its ordinary inflections. Used only when no
+ * `kind_source` is supplied; it is morphology, never a synonym list. */
+function labelHeadForms(kind: string): Set<string> {
+  const head = kindHeadWord(kind);
+  if (!head) return new Set();
+  const forms = new Set([head, ...headForms(head)]);
+  return forms;
+}
+
+/** True when the quote word can carry the label's head: the same word, an
+ * inflection, or a noun built on it ("partnership" for partner). */
+function matchesLabelHead(word: string, head: string, forms: Set<string>): boolean {
+  if (!word) return false;
+  if (forms.has(word)) return true;
+  return head.length > 2 && word.length > head.length && word.startsWith(head);
+}
+
+/** Negation and uncertainty markers. An asserted tie cannot ride on a denied or
+ * merely possible clause. Structural, not a synonym list. */
+const NEGATORS = new Set(['not', 'never', 'no', 'nor', 'neither', 'without', 'hardly', 'barely']);
+const HEDGES = new Set([
+  'perhaps', 'possibly', 'maybe', 'might', 'may', 'could', 'probably', 'apparently',
+  'seemingly', 'seemed', 'seems', 'suspected', 'suspect', 'rumoured', 'rumored',
+]);
+
+/** Grammatical words that cannot carry a relationship on their own. */
+const CITATION_STOP = new Set([
+  'of', 'to', 'with', 'for', 'a', 'an', 'the', 'in', 'on', 'as', 'at', 'by', 'from',
+  'about', 'over', 'under', 'and', 'or', 'but', 'so', 'that', 'this', 'these', 'those',
+  'then', 'when', 'while', 'after', 'before', 'is', 'are', 'was', 'were', 'be', 'been',
+  'being', 'has', 'have', 'had', 'do', 'does', 'did', 'will', 'would', 'can', 'could',
+  'may', 'might', 'must', 'should', 'i', 'me', 'my', 'we', 'us', 'our', 'you', 'your',
+  'he', 'him', 'his', 'she', 'her', 'it', 'its', 'they', 'them', 'their', "'s",
+]);
+
+/** The cited words with the endpoints removed. A model often quotes the whole
+ * clause ("Mara loathed Tor"); the relationship words are what remains. A word
+ * that is also the kind's head stays even when it appears in a name
+ * ("Aunt Petunia" does not swallow the aunt in an aunt-of citation). */
+function citationWords(
+  source: string,
+  kind: string,
+  fromName: string,
+  fromAliases: string[],
+  toName: string,
+  toAliases: string[],
+  index?: RosterIndex,
+): string[] {
+  const head = kindHeadWord(kind);
+  const keep = labelHeadForms(kind);
+  const nameWords = new Set<string>();
+  for (const variant of [...explicitVariants(fromName, fromAliases, index), ...explicitVariants(toName, toAliases, index)]) {
+    for (const token of assertionWords(variant)) nameWords.add(token);
+  }
+  return assertionWords(source).filter((token) => !nameWords.has(token) || keep.has(token) || token === head);
+}
+
+/** Anchor phrases a citation can supply: the cleaned phrase, then each of its
+ * content words. Exact matching only; the citation is verbatim by construction. */
+function citationAnchors(tokens: string[]): { tokens: string[]; labelHead: boolean }[] {
+  const out: { tokens: string[]; labelHead: boolean }[] = [];
+  const seen = new Set<string>();
+  const push = (candidate: string[]): void => {
+    if (!candidate.length) return;
+    const key = candidate.join(' ');
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ tokens: candidate, labelHead: false });
+  };
+  push(tokens);
+  for (const token of tokens) if (!CITATION_STOP.has(token)) push([token]);
+  return out;
+}
+
 /**
- * Can these tokens anchor a tie?
- *
- * A bare single token must be a bankable role head (the kind's own head, e.g.
- * "married", "friend", "partner", or a noun built on it, e.g. "partnership").
- * A multi-token phrase must carry a linking preposition after its first token
- * ("sided with", "member of", "sworn to"). A bare action verb ("joined",
- * "backed", "leads", "taught") anchors nothing — no word list, just structure.
+ * True when the clause leading up to the assertion denies or hedges it. The
+ * model may quote only the positive core ("Mara feared Tor") from a sentence
+ * that says "Perhaps Mara feared Tor"; the quote alone shows no hedge, so the
+ * sentence in the source is checked too.
  */
-function anchorAllowed(tokens: string[], head: string): boolean {
-  if (!tokens.length) return false;
-  if (tokens.length > 1) return tokens.slice(1).some((token) => EVIDENCE_LINK_TAIL.has(token));
-  const token = tokens[0]!;
-  if (roleHeadWords().has(token)) return true;
-  return head.length > 0 && token.length > head.length && token.startsWith(head);
+function leadingDenialOrHedge(sentence: string, row: PromoteRow, index?: RosterIndex): boolean {
+  const words = assertionWords(sentence);
+  if (!words.length) return false;
+  const cited = citationWords(
+    row.kindSource ?? '',
+    row.kind,
+    row.fromName,
+    row.fromAliases ?? [],
+    row.toName,
+    row.toAliases ?? [],
+    index,
+  ).filter((word) => !CITATION_STOP.has(word));
+  const anchors = new Set<string>(cited);
+  const head = kindHeadWord(row.kind);
+  if (head) anchors.add(head);
+  if (!anchors.size) return false;
+  const at = words.findIndex((word) => anchors.has(word));
+  if (at < 0) return false;
+  // A hedge or negator just before the assertion softens or denies it. Looking
+  // back a few tokens covers "Perhaps Mara feared Tor" and "Mara did not trust
+  // Tor" without importing an unrelated clause earlier in the sentence.
+  return words.slice(Math.max(0, at - 4), at).some((word) => NEGATORS.has(word) || HEDGES.has(word));
 }
 
 /** Determiners, pronouns and the possessive marker: what may not qualify a
@@ -4867,16 +5183,6 @@ function analyseEvidence(
   const words = assertionWords(quote);
   const kindKey = (kind ?? '').trim().toLowerCase();
   const head = kindHeadWord(kind);
-  const forms = head ? headForms(head) : new Set<string>();
-  const gloss = KIND_GLOSSES[kindKey];
-  const readPhrases: string[][] = [];
-  if (gloss) {
-    for (const phrase of gloss.reads.split(',')) {
-      const tokens = assertionWords(phrase.replace(/\([^)]*\)/g, '').replace(/"/g, ''));
-      if (tokens.length) readPhrases.push(tokens);
-    }
-  }
-  const kindPhrase = assertionWords(kindKey);
   const sourcePhrase = kindSource.trim() ? assertionWords(kindSource) : [];
   const analysis: EvidenceAnalysis = { asserted: false, bothNamed: false, coordinated: false, sceneVerb: false };
   if (!words.length) return analysis;
@@ -4901,16 +5207,6 @@ function analyseEvidence(
   };
   analysis.bothNamed = fromSpans.some((a) => toSpans.some((b) => a[1] < b[0] || b[1] < a[0]));
   analysis.coordinated = analysis.bothNamed && fromSpans.some((a) => toSpans.some((b) => coordinatedBetween(a, b)));
-  // Words that mark a scene: bare readings (or a bare kind, or bare kindSource
-  // words) that cannot anchor a tie.
-  const sceneWords = new Set<string>();
-  const considerScene = (tokens: string[]): void => {
-    if (tokens.length === 1 && !anchorAllowed(tokens, head)) sceneWords.add(tokens[0]!);
-  };
-  considerScene(kindPhrase);
-  for (const tokens of readPhrases) considerScene(tokens);
-  considerScene(sourcePhrase);
-  analysis.sceneVerb = [...sceneWords].some((word) => words.includes(word));
   // A bare "partner"/"partners" with no qualifier is a pairing, not a tie.
   if (kindKey === 'partner') {
     for (let at = 0; at < words.length; at++) {
@@ -4923,25 +5219,42 @@ function analyseEvidence(
   }
   if (!head) return analysis;
 
-  // Anchors by class: the kind's own phrase, its head forms, link-tailed
-  // readings, and the reader's expressed words when they are a link.
-  const anchors: string[][] = [];
-  if (kindPhrase.length && anchorAllowed(kindPhrase, head)) anchors.push(kindPhrase);
-  for (const form of forms) if (anchorAllowed([form], head)) anchors.push([form]);
-  for (const tokens of readPhrases) if (anchorAllowed(tokens, head)) anchors.push(tokens);
-  if (sourcePhrase.length && anchorAllowed(sourcePhrase, head)) anchors.push(sourcePhrase);
+  // The anchor is the cited words when the model supplied them. Without a
+  // citation only the label's own head can anchor, so an unspelled concept
+  // never proves itself. No synonym list is consulted either way.
+  const forms = labelHeadForms(kind);
+  const anchors: { tokens: string[]; labelHead: boolean }[] = sourcePhrase.length
+    ? citationAnchors(citationWords(kindSource, kind, fromName, fromAliases, toName, toAliases, index))
+    : [{ tokens: [head], labelHead: true }];
 
   const near = (spans: Array<[number, number]>, anchorStart: number, anchorEnd: number): boolean =>
     spans.some((span) => {
       if (!(span[0] <= anchorStart + 4 && span[1] >= anchorStart - 4)) return false;
       return !coordinatedBetween(span, [anchorStart, anchorEnd]);
     });
+  // The other endpoint sits either just after the anchor noun or just before
+  // the possessive owner ("Mara was Tor's aunt"). A third name further down the
+  // sentence is not part of this phrase.
+  const besidePhrase = (spans: Array<[number, number]>, anchorStart: number, anchorEnd: number, ownerSpan: [number, number]): boolean =>
+    spans.some(([start, end]) => {
+      if (coordinatedBetween([start, end], [anchorStart, anchorEnd])) return false;
+      if (start > anchorEnd && start <= anchorEnd + 3) return true;
+      if (end < ownerSpan[0] && ownerSpan[0] - end <= 3) return true;
+      return false;
+    });
+  const disturbed = (from: number, to: number): boolean =>
+    words
+      .slice(Math.max(0, from), Math.min(words.length, to + 1))
+      .some((word) => NEGATORS.has(word) || HEDGES.has(word));
   const passive = new Set(['was', 'were', 'been', 'had', 'have', 'is', 'are', 'be', 'being']);
   const copula = new Set(['was', 'were', 'is', 'are', 'been', 'being', 'be']);
   for (const anchor of anchors) {
-    for (let i = 0; i + anchor.length <= words.length; i++) {
-      if (!anchor.every((word, k) => words[i + k] === word)) continue;
-      const end = i + anchor.length - 1;
+    for (let i = 0; i + anchor.tokens.length <= words.length; i++) {
+      const matches = anchor.labelHead
+        ? matchesLabelHead(words[i]!, head, forms)
+        : anchor.tokens.every((word, k) => words[i + k] === word);
+      if (!matches) continue;
+      const end = i + anchor.tokens.length - 1;
       // A word that sits inside an endpoint's own name is part of what that
       // person is called, not a statement about the other endpoint.
       if (
@@ -4953,22 +5266,23 @@ function analyseEvidence(
       // Bare "partner"/"partners" needs a qualifier to prove a lasting tie.
       if (
         kindKey === 'partner' &&
-        anchor.length === 1 &&
-        (anchor[0] === 'partner' || anchor[0] === 'partners') &&
+        anchor.tokens.length === 1 &&
+        (words[i] === 'partner' || words[i] === 'partners') &&
         !partnerQualified(words, i)
       ) {
         continue;
       }
+      if (disturbed(i - 3, end)) continue;
       // Possessive ("Dudley's aunt", "Dudley's best friend").
       for (const back of [1, 2]) {
         if (i <= back || words[i - back] !== "'s") continue;
         const owner = words[i - back - 1]!;
         const ownerSpan = [...fromSpans, ...toSpans].find(([start, e]) => words[start] === owner || words[e] === owner);
-        if (ownerSpan && coordinatedBetween(ownerSpan, [i, end])) continue;
+        if (!ownerSpan || coordinatedBetween(ownerSpan, [i, end])) continue;
         const ownerIsFrom = fromSpans.some(([start, e]) => words[start] === owner || words[e] === owner);
         const ownerIsTo = toSpans.some(([start, e]) => words[start] === owner || words[e] === owner);
-        if (ownerIsFrom && near(toSpans, i, end)) return { ...analysis, asserted: true };
-        if (ownerIsTo && near(fromSpans, i, end)) return { ...analysis, asserted: true };
+        if (ownerIsFrom && besidePhrase(toSpans, i, end, ownerSpan)) return { ...analysis, asserted: true };
+        if (ownerIsTo && besidePhrase(fromSpans, i, end, ownerSpan)) return { ...analysis, asserted: true };
       }
       // Of-phrase ("the aunt of X").
       if (words[end + 1] === 'of') {
@@ -4979,7 +5293,7 @@ function analyseEvidence(
         }
       }
       // Copular prepositional pair ("X was married to Y", "X was a member of Y").
-      const prepositionAt = EVIDENCE_LINK_TAIL.has(anchor[anchor.length - 1]!)
+      const prepositionAt = EVIDENCE_LINK_TAIL.has(anchor.tokens[anchor.tokens.length - 1]!)
         ? end
         : EVIDENCE_LINK_TAIL.has(words[end + 1] ?? '')
           ? end + 1
@@ -4994,16 +5308,27 @@ function analyseEvidence(
           if (toSpans.some(([start]) => start === objectAt) && near(fromSpans, i, end)) return { ...analysis, asserted: true };
         }
       }
-      // Subject-verb-object, active voice only: "Tor mentored Mara".
+      // Subject-verb-object, active voice only: "Tor mentored Mara". A negator
+      // or hedge between subject and verb denies the claim rather than making it.
       if (!passive.has(words[i - 1] ?? '')) {
         const subject = [fromSpans, toSpans].find((spans) =>
-          spans.some(([start, e]) => e >= i - 2 && e <= i - 1 && !coordinatedBetween([start, e], [i, end])),
+          spans.some(
+            ([start, e]) =>
+              e >= i - 2 &&
+              e <= i - 1 &&
+              !coordinatedBetween([start, e], [i, end]) &&
+              !disturbed(e + 1, i - 1),
+          ),
         );
         if (subject) {
           const other = subject === fromSpans ? toSpans : fromSpans;
           if (
             other.some(
-              ([start, e]) => start >= end + 1 && start <= end + 4 && !coordinatedBetween([i, end], [start, e]),
+              ([start, e]) =>
+                start >= end + 1 &&
+                start <= end + 3 &&
+                !coordinatedBetween([i, end], [start, e]) &&
+                !disturbed(end + 1, start - 1),
             )
           ) {
             return { ...analysis, asserted: true };
@@ -5069,18 +5394,10 @@ function headForms(head: string): Set<string> {
     forms.add(`${head.slice(0, -1)}ies`);
     forms.add(`${head.slice(0, -1)}ied`);
   }
+  // Irregular plurals among the closed kinship concepts.
+  if (head === 'child') forms.add('children');
+  if (head === 'wife') forms.add('wives');
   return forms;
-}
-
-/** True when the quote uses the kind's head noun at all. */
-function quoteHasKindHead(quote: string, kind: string): boolean {
-  const head = kindHeadWord(kind);
-  if (!head) return false;
-  const forms = headForms(head);
-  return canonicalName(quote)
-    .split(' ')
-    .filter(Boolean)
-    .some((word) => forms.has(word));
 }
 
 /**
@@ -5411,16 +5728,20 @@ export function auditAcceptedRelations(
     };
     const decision = canPromote(promoteRow, { db, projectId, chunkText });
     const anchor = (row.anchor_evidence ?? '').trim();
-    const directionSpan = anchor && !isUnsupportedKind(row.kind, anchor) ? anchor : row.evidence;
+    const source = (row.kind_source ?? '').trim();
+    const citationInAnchor = source
+      ? anchor.length > 0 && normalise(anchor).includes(normalise(source))
+      : anchor.length > 0 && !isUnsupportedKind(row.kind, anchor);
+    const directionSpan = citationInAnchor ? anchor : row.evidence;
     const direction = relationSentenceDirection(
-      row.kind,
+      source || row.kind,
       directionSpan,
       row.from_name,
       fromAliases,
       row.to_name,
       toAliases,
     );
-    const cannotJudge = decision.ok && direction === 'unknown';
+    const cannotJudge = decision.ok && isDirectionalKind(row.kind) && direction === 'unknown';
     if (decision.ok) result.passing++;
     else {
       const reason = decision.reason ?? 'unproven';
@@ -5786,7 +6107,22 @@ export function persistTieNote(
   evidence: string,
   sourceRefs: string,
   ruling = '',
+  kindSource = '',
 ): void {
+  // A note is a case file, not a relation. The model's citation rides along in
+  // the span JSON (no schema change) so an accumulated note can be re-proved
+  // under the same citation rule as a fresh relation.
+  const withSource = (refs: string): string => {
+    if (!kindSource) return refs;
+    try {
+      const parsed = JSON.parse(refs || '[]');
+      if (!Array.isArray(parsed)) return refs;
+      return toJson(parsed.map((ref) => ({ ...(ref as Record<string, unknown>), kind_source: kindSource })));
+    } catch {
+      return refs;
+    }
+  };
+  const firstRefs = withSource(sourceRefs);
   // One note per pair and kind, accumulating spans: evidence found in a later
   // window is added to the same note instead of being ignored, so two pages
   // can together prove one tie.
@@ -5808,14 +6144,14 @@ export function persistTieNote(
       attemptedKind,
       reason,
       evidence,
-      sourceRefs,
+      firstRefs,
       ruling,
       nowIso(),
     );
     return;
   }
   const spans = noteSpans({ evidence: existing.evidence, source_refs: existing.source_refs });
-  const incoming = noteSpans({ evidence, source_refs: sourceRefs });
+  const incoming = noteSpans({ evidence, source_refs: firstRefs });
   const seen = new Set(spans.map((span) => `${span.chunk}|${normalise(span.quote)}`));
   let added = false;
   for (const span of incoming) {
@@ -5829,17 +6165,27 @@ export function persistTieNote(
   db.run(
     'UPDATE canon_tie_note SET evidence = ?, source_refs = ? WHERE id = ?',
     spans[0]?.quote ?? existing.evidence,
-    toJson(spans.map((span) => ({ ...span, quote: span.quote }))),
+    toJson(
+      spans.map((span) => ({
+        source: span.source ?? '',
+        locator: span.locator ?? '',
+        chunk: span.chunk,
+        quote: span.quote,
+        ...(span.kindSource ? { kind_source: span.kindSource } : {}),
+      })),
+    ),
     existing.id,
   );
 }
 
-/** Spans held by a tie note: quote plus the passage it was copied from. */
+/** Spans held by a tie note: quote plus the passage it was copied from, and
+ * optionally the model's citation for the concept. */
 export interface NoteSpan {
   quote: string;
   source?: string;
   locator?: string;
   chunk?: number;
+  kindSource?: string;
 }
 
 /** Read a note's spans, accepting the old single-quote shape. */
@@ -5852,7 +6198,13 @@ export function noteSpans(note: { evidence: string; source_refs: string }): Note
         const quote = String(ref?.quote ?? '').trim();
         const chunk = Number(ref?.chunk);
         if (quote && Number.isFinite(chunk) && chunk > 0) {
-          out.push({ quote, chunk, source: String(ref?.source ?? ''), locator: String(ref?.locator ?? '') });
+          out.push({
+            quote,
+            chunk,
+            source: String(ref?.source ?? ''),
+            locator: String(ref?.locator ?? ''),
+            kindSource: String(ref?.kind_source ?? '').trim(),
+          });
         }
       }
     }
@@ -5879,13 +6231,14 @@ export function noteSpans(note: { evidence: string; source_refs: string }): Note
   return out;
 }
 
-/** Everything a sentence could use to state a relationship: the labels and the
- * phrasings the glossary lists for them. Normalised once per scan. */
+/** Everything a sentence could use to state a relationship: the concepts' own
+ * labels and their ordinary inflections. No synonym list; the model maps the
+ * passage's wording onto a concept elsewhere. */
 function tiePhrases(): string[] {
   const out = new Set<string>();
   for (const kind of CLOSED_ROLE_KINDS) {
-    const gloss = KIND_GLOSSES[kind];
-    for (const phrase of [kind, ...(gloss?.reads ?? '').split(',')]) {
+    const head = kindHeadWord(kind);
+    for (const phrase of [kind, head, ...(head ? headForms(head) : [])]) {
       const cleaned = normalise(phrase.replace(/\([^)]*\)/g, '').replace(/"/g, ''));
       if (cleaned.length > 2) out.add(cleaned);
     }
@@ -6306,9 +6659,16 @@ export function resolveAccumulatedNotes(db: Db, projectId: number): number {
 
     const joined = spans.map((span) => span.quote).join(' ');
     if (!namesBothDistinctly(joined, from.name, fromAliases, to.name, toAliases, index)) continue;
-    const tieSpan = spans.find((span) => !isUnsupportedKind(kind, span.quote));
+    const tieSpan = spans.find((span) =>
+      span.kindSource
+        ? normalise(span.quote).includes(normalise(span.kindSource))
+        : !isUnsupportedKind(kind, span.quote),
+    );
     if (!tieSpan) continue;
-    if (relationSentenceDirection(kind, tieSpan.quote, from.name, fromAliases, to.name, toAliases, index) === 'reverse') {
+    if (
+      relationSentenceDirection(tieSpan.kindSource || kind, tieSpan.quote, from.name, fromAliases, to.name, toAliases, index) ===
+      'reverse'
+    ) {
       continue;
     }
 
@@ -7489,109 +7849,32 @@ const GENERIC_KINSHIP: ReadonlyMap<string, ReadonlySet<string>> = new Map([
  * Exported for the trials counter so the gate and the measuring stick never
  * disagree. Whole words, case-insensitive. */
 export function isMomentKind(kind: string): boolean {
+  // A defined relationship concept is a tie by construction, even when its
+  // word also names a feeling or an action ("feared", "admired"). The moment
+  // gate is for labels outside the concept set.
+  if (isClosedRoleKind(kind)) return false;
   const words = (kind ?? '').toLowerCase().split(/[^a-z]+/).filter(Boolean);
   return words.some((w) => MOMENT_WORDS.has(w));
 }
 
 /**
- * Kin words that share one meaning. A noun tie banks only when the quote
- * itself says the word or one of its kin: "sister of" needs sister, sibling
- * or brother in the proving sentence, not merely nearby. Verb phrases and
- * unlisted words skip this check — the moment gate already handles verbs.
- */
-const KIN_GROUPS: ReadonlyArray<ReadonlySet<string>> = [
-  new Set(['sibling', 'brother', 'sister']),
-  new Set(['parent', 'mother', 'father']),
-  new Set(['child', 'son', 'daughter']),
-  new Set(['spouse', 'wife', 'husband', 'married', 'marriage']),
-  new Set(['grandmother', 'grandfather', 'grandson', 'granddaughter']),
-  new Set(['relative', 'relation', 'relationship', 'family', 'kin', 'uncle', 'aunt', 'cousin', 'nephew', 'niece']),
-  new Set(['friend', 'friends', 'friendly']),
-  new Set(['enemy', 'enemies', 'foe']),
-  new Set(['ally', 'allies']),
-  new Set(['teacher', 'student', 'mentor', 'master', 'servant', 'guardian', 'commander', 'captain']),
-  new Set(['peer', 'peers', 'colleague', 'colleagues', 'coworker', 'coworkers', 'co-worker']),
-];
-
-/** The kin groups a label touches, if any. Empty means no noun to check. */
-function kinGroupsOf(kind: string): ReadonlySet<string>[] {
-  const words = new Set((kind ?? '').toLowerCase().split(/[^a-z]+/).filter(Boolean));
-  return KIN_GROUPS.filter((g) => [...g].some((w) => words.has(w)));
-}
-
-/**
- * True when the quote fails to speak the tie's noun: the label names a kin
- * group no word of the quote belongs to. "Cousin of" proved by "What's his
- * name again?" is exactly this — true from knowledge, silent in the sentence.
- *
- * Closed role nouns outside the kin groups ("apprentice", "aide", "partner",
- * "operative", "member", "leader", "assistant") get the same treatment with
- * plain plural tolerance: an "apprentice of" proved by a quote that never
- * says the word banks nothing. Open vocabulary is not this rule's job.
+ * A basic label-word check, retained for diagnostics and the note-relabel
+ * pass. The promotion guard no longer uses it: it requires the model's
+ * `kind_source` instead, so a concept proved by other wording passes there.
+ * Open vocabulary is not this rule's job.
  */
 const KIND_FILLER = new Set(['of', 'to', 'with', 'for', 'a', 'the', 'an', 'in', 'on', 'as']);
 
 export function isUnsupportedKind(kind: string, quote: string): boolean {
-  const key = (kind ?? '').trim().toLowerCase();
-  // Whole words only. A substring test made "kin" match "looking" and "asking",
-  // which turned ordinary sentences into kinship proof.
-  const words = normalise(quote ?? '').split(' ').filter(Boolean);
-  // Whole words, with ordinary inflections on the last word ("mentored" for
-  // mentor, "instructed" for instruct). Substrings are not accepted.
-  const inflected = (word: string, base: string): boolean => {
-    if (word === base) return true;
-    const forms = [`${base}s`, `${base}es`, `${base}ed`, `${base}ing`, `${base}d`];
-    if (base.endsWith('e')) forms.push(`${base.slice(0, -1)}ing`);
-    if (base.endsWith('y')) forms.push(`${base.slice(0, -1)}ies`, `${base.slice(0, -1)}ied`);
-    return forms.includes(word);
-  };
-  const hasPhrase = (phrase: string): boolean => {
-    const target = normalise(phrase).split(' ').filter(Boolean);
-    if (!target.length) return false;
-    for (let i = 0; i + target.length <= words.length; i++) {
-      if (
-        target.every((word, k) =>
-          k === target.length - 1 ? inflected(words[i + k]!, word) : words[i + k] === word,
-        )
-      ) {
-        return true;
-      }
-    }
-    return false;
-  };
-  // A defined kind lists the phrasings that express the same meaning. A quote
-  // that uses one of them states the tie even without the label's own word:
-  // "sided with" is an alliance, "turned on" is enmity.
-  const gloss = KIND_GLOSSES[key];
-  if (gloss) {
-    const phrases = gloss.reads
-      .split(',')
-      .map((phrase) => phrase.replace(/\([^)]*\)/g, '').replace(/"/g, ''))
-      .filter((phrase) => normalise(phrase).length > 2);
-    if (phrases.some(hasPhrase)) return false;
-  }
-  // "Relative of" is the generic kin label: it needs the text to say relative,
-  // kin or family, not merely to mention an aunt or an uncle nearby. Otherwise
-  // any two family members in one sentence become relatives of each other.
-  if (key === 'relative of') {
-    const generic = ['relative', 'relatives', 'relation', 'kin', 'kinsman', 'kinswoman', 'related', 'family member'];
-    return !generic.some(hasPhrase);
-  }
-  const groups = kinGroupsOf(kind);
-  const quoteWords = new Set((quote ?? '').toLowerCase().split(/[^a-z]+/).filter(Boolean));
-  if (groups.length) {
-    const want = new Set<string>();
-    for (const g of groups) for (const w of g) want.add(w);
-    return ![...want].some((w) => quoteWords.has(w));
-  }
   if (!isClosedRoleKind(kind)) return false;
-  const want: string[] = [];
-  for (const w of (kind ?? '').toLowerCase().split(/[^a-z]+/).filter(Boolean)) {
-    if (KIND_FILLER.has(w)) continue;
-    want.push(w, `${w}s`, `${w}es`);
+  const quoteWords = new Set((quote ?? '').toLowerCase().split(/[^a-z]+/).filter(Boolean));
+  const want = new Set<string>();
+  for (const word of (kind ?? '').toLowerCase().split(/[^a-z]+/).filter(Boolean)) {
+    if (KIND_FILLER.has(word)) continue;
+    for (const form of headForms(word)) want.add(form);
   }
-  if (!want.length) return false;
-  return !want.some((w) => quoteWords.has(w));
+  if (!want.size) return false;
+  return ![...want].some((word) => quoteWords.has(word));
 }
 
 /**

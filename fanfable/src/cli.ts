@@ -32,6 +32,7 @@ import * as continuity from './continuity.ts';
 import { continuitySettings, filterBySeverity } from './continuity-settings.ts';
 import * as controller from './controller.ts';
 import * as retrieval from './retrieval.ts';
+import * as sweep from './sweep.ts';
 import type { PassageTrail } from './graph.ts';
 import { truncate } from './text.ts';
 import { buildTrailsHtml, trailText } from './trail-html.ts';
@@ -138,6 +139,8 @@ ${C.bold('SOURCE MATERIAL')}
                            [--web] show the association layer too (default off)
   lore hints [--limit n]           List ties whose endpoints are not in the bank
   lore scan [--max n] [--dry-run]  Judge sentences that name two people and a tie word
+  lore sweep [--name substring] [--batch 60] [--limit n]
+                           Propose ties from characters' mentions into the review queue
   lore link-facts [--dry-run] [--limit n]  Attach fact subjects to entities
   lore capacity [--dry-run] [--limit n]  Park unproven entities, funnel proven nouns
   lore names [--limit n] [--diagnostics]  List the capitalization name roster (no writes)
@@ -458,6 +461,39 @@ async function cmdLore(args: Args): Promise<void> {
       console.log(`  changed ${result.changed}`);
     } else {
       console.log(C.dim('  dry run: nothing written. Re-run with --write to demote failures.'));
+    }
+    return;
+  }
+
+  if (sub === 'sweep') {
+    const name = flagString(args, 'name');
+    const batchSize = flagNumber(args, 'batch', 60);
+    const limit = flagNumber(args, 'limit', 0);
+    heading('Name sweep');
+    const result = await sweep.runNameSweep(db, a.llm, project.id, {
+      name: name || undefined,
+      batchSize,
+      limit: limit > 0 ? limit : undefined,
+      onProgress: (message) => process.stdout.write(`  ${C.dim(message)}\n`),
+    });
+    for (const character of result.characters) {
+      console.log(
+        `${character.name}: ${character.mentions} mentions, ${character.ties} ties, ` +
+          `${character.proposals} proposals ` +
+          C.dim(
+            `(keeper skips ${character.skippedKeeper}, pending skips ${character.skippedPending})` +
+              (character.unresolvedTargets.length ? `, unknown targets ${character.unresolvedTargets.join(', ')}` : ''),
+          ),
+      );
+    }
+    console.log(
+      `\nproposals ${result.proposals} (${result.distinctPairs} distinct pairs); ` +
+        `queue ${result.queueBefore} → ${result.queueAfter}`,
+    );
+    if (result.skippedKeeper || result.skippedPending) {
+      console.log(
+        C.dim(`skipped ${result.skippedKeeper} pair(s) with a keeper, ${result.skippedPending} with a pending note`),
+      );
     }
     return;
   }

@@ -22,8 +22,8 @@ const check = (sentence: string, kind: string, kindSource = '') =>
 const POSITIVE: { sentence: string; kind: string; kindSource?: string }[] = [
   { sentence: "X's brother, Y", kind: 'brother of' },
   { sentence: 'Y, son of X', kind: 'son of' },
-  { sentence: 'X was married to Y', kind: 'married to' },
-  { sentence: 'X sided with Y', kind: 'ally of' },
+  { sentence: 'X was married to Y', kind: 'spouse of', kindSource: 'married to' },
+  { sentence: 'X sided with Y', kind: 'ally of', kindSource: 'sided with' },
   { sentence: 'X worked for Y', kind: 'operative for', kindSource: 'worked for' },
   { sentence: "X's best friend, Y", kind: 'friend of' },
 ];
@@ -36,10 +36,10 @@ for (const fixture of POSITIVE) {
 }
 
 test('link-tailed readings anchor without being the head word', () => {
-  assert.equal(check('X belongs to Y', 'member of'), true);
-  assert.equal(check('X is sworn to Y', 'member of'), true);
-  assert.equal(check('X sided with Y', 'ally of'), true);
-  assert.equal(classify('X belongs to Y', 'member of'), 'asserted');
+  assert.equal(check('X belongs to Y', 'member of', 'belongs to'), true);
+  assert.equal(check('X is sworn to Y', 'member of', 'sworn to'), true);
+  assert.equal(check('X sided with Y', 'ally of', 'sided with'), true);
+  assert.equal(classify('X belongs to Y', 'member of', 'belongs to'), 'asserted');
 });
 
 test('a noun built on the role head still anchors', () => {
@@ -78,7 +78,7 @@ test('bare action verbs never anchor a tie', () => {
   ];
   for (const fixture of verbs) {
     assert.equal(check(fixture.sentence, fixture.kind), false, fixture.sentence);
-    assert.equal(classify(fixture.sentence, fixture.kind), 'scene', fixture.sentence);
+    assert.equal(classify(fixture.sentence, fixture.kind), 'none', fixture.sentence);
   }
 });
 

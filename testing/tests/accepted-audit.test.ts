@@ -192,11 +192,11 @@ test('a quote naming both people but asserting nothing fails', () => {
 test('an unknown direction is counted separately, not passed as proof', () => {
   const { db } = tempDb();
   const project = createProject(db, 'audit-direction');
-  const chunk = addChunk(db, project.id, 'Mara mentored Tor.');
+  const chunk = addChunk(db, project.id, 'Mara was mentor to Tor.');
   const mara = addEntity(db, project.id, 'Mara');
   const tor = addEntity(db, project.id, 'Tor');
   const row = addRelation(db, project.id, mara, tor, 'mentor of', {
-    evidence: 'Mara mentored Tor.',
+    evidence: 'Mara was mentor to Tor.',
     refs: refsFor(chunk),
   });
 

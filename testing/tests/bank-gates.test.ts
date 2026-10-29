@@ -10,7 +10,7 @@ test('silent-noun rule covers closed role nouns, not just kinship', () => {
   assert.equal(isUnsupportedKind('apprentice of', 'he took her as his apprentice'), false);
   assert.equal(isUnsupportedKind('aide of', 'his aide nodded'), false);
   assert.equal(isUnsupportedKind('aide of', 'he nodded once'), true);
-  assert.equal(isUnsupportedKind('partner with', 'they worked together for years'), true);
+  assert.equal(isUnsupportedKind('partner', 'they worked together for years'), true);
   // Exact and plural morphology counts; open vocabulary is not this rule's job.
   assert.equal(isUnsupportedKind('son of', 'his son nodded'), false);
   assert.equal(isUnsupportedKind('son of', 'he nodded once'), true);
