@@ -353,6 +353,16 @@ export const MIGRATIONS: Migration[] = [
     sql: `UPDATE canon_relation SET confirmed_by_user = 1 WHERE review_status = 'user_confirmed';`,
   },
   {
+    version: 18,
+    name: 'anchor evidence for relations',
+    // The sentence that asserts the relationship, when the quote only supplies
+    // context (a pronoun, a neighbouring name). Verbatim by construction; the
+    // guard runs the assertion test on this span, never on the union.
+    columns: [
+      ['canon_relation', 'anchor_evidence', "TEXT NOT NULL DEFAULT ''"],
+    ],
+  },
+  {
     version: 17,
     name: 'quarantine reason for suspect entities',
     // A character admitted from a single mention whose name is also an ordinary

@@ -86,7 +86,7 @@ test('provisional rows are not reported as keepers', () => {
 
 test('migration v15 adds and backfills confirmed_by_user', () => {
   const { db } = tempDb();
-  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')!.user_version, 17);
+  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')!.user_version, 18);
   assert.ok(db.all<{ name: string }>('PRAGMA table_info(canon_relation)').some((row) => row.name === 'confirmed_by_user'));
 
   const project = controller.createProject(db, 'provenance');
@@ -98,7 +98,7 @@ test('migration v15 adds and backfills confirmed_by_user', () => {
     project.id, a, b, now,
   ).lastInsertRowid;
   db.raw.exec('PRAGMA user_version = 14');
-  assert.equal(runMigrations(db.raw), 17);
+  assert.equal(runMigrations(db.raw), 18);
   assert.equal(db.get<{ confirmed_by_user: number }>('SELECT confirmed_by_user FROM canon_relation WHERE id = ?', rel)!.confirmed_by_user, 1);
   db.close();
 });

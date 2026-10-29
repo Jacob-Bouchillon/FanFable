@@ -4361,6 +4361,7 @@ export type PromoteReason =
   | 'direction-mismatch'
   | 'same-identity'
   | 'quarantined-entity'
+  | 'assertion-missing'
   | 'moment';
 
 export interface PromoteRow {
@@ -4375,6 +4376,9 @@ export interface PromoteRow {
   /** Verbatim words from the quote that express the kind, when the model named
    * them ("sided with" for ally of). */
   kindSource?: string;
+  /** The sentence that asserts the relationship, when the quote only supplies
+   * context (a pronoun, a neighbouring name). */
+  anchorEvidence?: string;
 }
 
 export interface PromoteContext {
@@ -4517,19 +4521,20 @@ function provenQuoteReason(row: PromoteRow, chunkText?: string | null): PromoteR
   if (!row.evidence.trim() || !chunk || !normalise(chunk).includes(quote)) {
     return 'quote-not-verbatim';
   }
-  const named = (name: string, aliases: string[]): boolean =>
-    nameMentionedExact(name, row.evidence) ||
-    aliases.some((alias) => nameMentionedExact(alias, row.evidence));
-  if (!named(row.fromName, row.fromAliases ?? []) || !named(row.toName, row.toAliases ?? [])) {
-    return 'endpoint-unnamed';
+  const anchor = (row.anchorEvidence ?? '').trim();
+  if (anchor && !normalise(chunk).includes(normalise(anchor))) {
+    return 'quote-not-verbatim';
   }
-  // Both names, but at two different places: one shared surface string cannot
-  // prove a relationship between the two rows that carry it.
-  if (!namesBothDistinctly(row.evidence, row.fromName, row.fromAliases ?? [], row.toName, row.toAliases ?? [])) {
-    // The quote may state the tie with one name and leave the other to the
-    // sentence next to it ("his onetime rival, X"). The anchor must be in the
-    // same passage, and the quote itself must still carry the tie word.
+  const bothNamed = namesBothDistinctly(
+    anchor ? `${anchor} ${row.evidence}` : row.evidence,
+    row.fromName,
+    row.fromAliases ?? [],
+    row.toName,
+    row.toAliases ?? [],
+  );
+  if (!bothNamed) {
     if (
+      anchor ||
       !anchorNamesMissingEndpoint(
         row.evidence,
         chunk,
@@ -4542,16 +4547,27 @@ function provenQuoteReason(row: PromoteRow, chunkText?: string | null): PromoteR
       return 'endpoint-unnamed';
     }
   }
-  if (isUnsupportedKind(row.kind, row.evidence)) {
-    // The model may name the words that express the kind when the label's own
-    // word is absent ("sided with" for ally of). Those words must be verbatim
-    // in the quote, so this is a reading of the sentence, not a substitute for
-    // it.
+  // The tie word must appear in a span that is itself evidence: the quote, or
+  // the anchor when the reader supplied one.
+  const tieOk =
+    !isUnsupportedKind(row.kind, row.evidence) ||
+    (anchor.length > 0 && !isUnsupportedKind(row.kind, anchor));
+  if (!tieOk) {
     const source = (row.kindSource ?? '').trim();
-    const sourceProves = source.length > 0 && normalise(row.evidence).includes(normalise(source));
-    if (!sourceProves) return 'tie-word-absent';
+    const spelled =
+      source.length > 0 &&
+      (normalise(row.evidence).includes(normalise(source)) || normalise(anchor).includes(normalise(source)));
+    if (!spelled) return 'tie-word-absent';
   }
-  if (quoteDirection(canonicalKind(row.kind), row.evidence, row) === 'reverse') {
+  // The assertion must live in one span. The quote and the anchor may together
+  // name both people, but neither span may borrow the other's assertion.
+  const asserted =
+    assertsRelationship(row.evidence, row.fromName, row.fromAliases ?? [], row.toName, row.toAliases ?? [], row.kind, row.kindSource ?? '') ||
+    (anchor.length > 0 &&
+      assertsRelationship(anchor, row.fromName, row.fromAliases ?? [], row.toName, row.toAliases ?? [], row.kind, row.kindSource ?? ''));
+  if (!asserted) return 'assertion-missing';
+  const directionSpan = anchor.length > 0 && !isUnsupportedKind(row.kind, anchor) ? anchor : row.evidence;
+  if (quoteDirection(canonicalKind(row.kind), directionSpan, row) === 'reverse') {
     return 'direction-mismatch';
   }
   return null;
@@ -4651,6 +4667,130 @@ function mentionSpans(text: string, name: string, aliases: string[]): Array<[num
 }
 
 /**
+ * True when the sentence links the two named endpoints through the kind's head
+ * noun: a possessive ("X's aunt"), an "of" phrase ("the aunt of X"), or a
+ * copula around one of those. A title that merely begins a name ("Aunt X took
+ * Y to town") asserts nothing about Y.
+ */
+export function assertsRelationship(
+  quote: string,
+  fromName: string,
+  fromAliases: string[],
+  toName: string,
+  toAliases: string[],
+  kind: string,
+  kindSource = '',
+): boolean {
+  // Keep the possessive marker: canonicalName strips it, which would make
+  // "Dudley's aunt" look exactly like the title "Aunt Dudley".
+  const raw = (text: string): string[] =>
+    text
+      .toLowerCase()
+      .replace(/[^a-z0-9' ]+/g, ' ')
+      .replace(/'s\b/g, " 's")
+      .replace(/\s+/g, ' ')
+      .trim()
+      .split(' ')
+      .filter(Boolean);
+  const words = raw(quote);
+  const head = kindHeadWord(kind);
+  if (!head || !words.length) return false;
+  const forms = headForms(head);
+  const spansOf = (name: string, aliases: string[]): Array<[number, number]> => {
+    const out: Array<[number, number]> = [];
+    for (const variant of [name, ...aliases]) {
+      const target = raw(variant);
+      if (!target.length) continue;
+      for (let i = 0; i + target.length <= words.length; i++) {
+        if (target.every((word, k) => words[i + k] === word)) out.push([i, i + target.length - 1]);
+      }
+    }
+    return out;
+  };
+  const fromSpans = spansOf(fromName, fromAliases);
+  const toSpans = spansOf(toName, toAliases);
+  const near = (spans: Array<[number, number]>, at: number, radius: number): boolean =>
+    spans.some(([start, end]) => start <= at + radius && end >= at - radius);
+  // Anchors: the kind's head noun and the phrasings the glossary lists for it.
+  const anchors: string[][] = [];
+  if (head) for (const form of headForms(head)) anchors.push([form]);
+  const gloss = KIND_GLOSSES[(kind ?? '').trim().toLowerCase()];
+  if (gloss) {
+    for (const phrase of gloss.reads.split(',')) {
+      const tokens = raw(phrase.replace(/\([^)]*\)/g, '').replace(/"/g, ''));
+      if (tokens.length) anchors.push(tokens);
+    }
+  }
+  // The words the reader named that express the kind ("threw in with") are an
+  // anchor too: they are verbatim in the quote and were matched to the label.
+  if (kindSource.trim()) {
+    const tokens = raw(kindSource);
+    if (tokens.length) anchors.push(tokens);
+  }
+  const passive = new Set(['was', 'were', 'been', 'had', 'have', 'is', 'are', 'be', 'being']);
+  for (const anchor of anchors) {
+    for (let i = 0; i + anchor.length <= words.length; i++) {
+      if (!anchor.every((word, k) => words[i + k] === word)) continue;
+      const end = i + anchor.length - 1;
+      // Possessive ("Dudley's aunt", "Dudley's best friend").
+      for (const back of [1, 2]) {
+        if (i <= back || words[i - back] !== "'s") continue;
+        const owner = words[i - back - 1]!;
+        const ownerIsFrom = fromSpans.some(([start, e]) => words[start] === owner || words[e] === owner);
+        const ownerIsTo = toSpans.some(([start, e]) => words[start] === owner || words[e] === owner);
+        if (ownerIsFrom && near(toSpans, i, 4)) return true;
+        if (ownerIsTo && near(fromSpans, i, 4)) return true;
+      }
+      // Of-phrase ("the aunt of X").
+      if (words[end + 1] === 'of') {
+        for (let at = end + 2; at <= Math.min(end + 3, words.length - 1); at++) {
+          if (fromSpans.some(([start]) => start === at) && near(toSpans, i, 4)) return true;
+          if (toSpans.some(([start]) => start === at) && near(fromSpans, i, 4)) return true;
+        }
+      }
+      // Subject-verb-object, active voice only: "Tor mentored Mara".
+      if (!passive.has(words[i - 1] ?? '')) {
+        const subject = [fromSpans, toSpans].find((spans) => spans.some(([, e]) => e >= i - 2 && e <= i - 1));
+        if (subject) {
+          const other = subject === fromSpans ? toSpans : fromSpans;
+          if (other.some(([start]) => start >= end + 1 && start <= end + 4)) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/** The head noun of a kind: "aunt of" gives "aunt". */
+function kindHeadWord(kind: string): string {
+  for (const word of (kind ?? '').toLowerCase().split(/[^a-z]+/).filter(Boolean)) {
+    if (!KIND_FILLER.has(word)) return word;
+  }
+  return '';
+}
+
+function headForms(head: string): Set<string> {
+  const forms = new Set([head, `${head}s`, `${head}es`, `${head}ed`, `${head}ing`, `${head}d`]);
+  if (head.endsWith('e')) forms.add(`${head.slice(0, -1)}ing`);
+  if (head.endsWith('y')) {
+    forms.add(`${head.slice(0, -1)}ies`);
+    forms.add(`${head.slice(0, -1)}ied`);
+  }
+  return forms;
+}
+
+/** True when the quote uses the kind's head noun at all. */
+function quoteHasKindHead(quote: string, kind: string): boolean {
+  const head = kindHeadWord(kind);
+  if (!head) return false;
+  const forms = headForms(head);
+  return canonicalName(quote)
+    .split(' ')
+    .filter(Boolean)
+    .some((word) => forms.has(word));
+}
+
+/**
  * True when the quote names both endpoints at two different places.
  *
  * One surface string cannot stand for both sides. When two rows share an alias
@@ -4728,8 +4868,9 @@ function loadGuardRow(db: Db, projectId: number, relationId: number): GuardedRow
     to_name: string;
     to_aliases: string;
     kind_source: string;
+    anchor_evidence: string;
   }>(
-    `SELECT r.from_entity, r.to_entity, r.kind, r.evidence, r.source_refs, r.kind_source,
+    `SELECT r.from_entity, r.to_entity, r.kind, r.evidence, r.source_refs, r.kind_source, r.anchor_evidence,
             a.name AS from_name, a.aliases AS from_aliases,
             b.name AS to_name, b.aliases AS to_aliases
        FROM canon_relation r
@@ -4765,6 +4906,7 @@ function loadGuardRow(db: Db, projectId: number, relationId: number): GuardedRow
       kind: row.kind,
       evidence: row.evidence,
       kindSource: row.kind_source,
+      anchorEvidence: row.anchor_evidence,
     },
     chunkText,
   };
@@ -5028,6 +5170,8 @@ export interface RelationInsert {
   /** The words in the quote that express the kind, when the label's own word
    * is absent ("sided with" for ally of). Verbatim by construction. */
   kindSource?: string;
+  /** The sentence that asserts the relationship, when the quote is context. */
+  anchorEvidence?: string;
   modality?: string;
   reviewStatus?: string;
   confidence?: number;
@@ -5050,8 +5194,8 @@ export function insertRelation(
     throw new Error('relation insert refused: source_refs must contain a numeric chunk id');
   }
   return db.run(
-    `INSERT INTO canon_relation (project_id, from_entity, to_entity, kind, description, evidence, source_refs, confidence, modality, review_status, kind_source, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO canon_relation (project_id, from_entity, to_entity, kind, description, evidence, source_refs, confidence, modality, review_status, kind_source, anchor_evidence, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     projectId,
     row.fromEntity,
     row.toEntity,
@@ -5063,6 +5207,7 @@ export function insertRelation(
     row.modality ?? 'asserted',
     row.reviewStatus ?? 'accepted',
     row.kindSource ?? '',
+    row.anchorEvidence ?? '',
     nowIso(),
   ).lastInsertRowid;
 }
@@ -5415,13 +5560,14 @@ export async function verifySentenceCandidates(
   const result: ScanResult = { checked: 0, accepted: 0, parked: 0, refused: 0 };
   for (const candidate of list) {
     opts.onProgress?.(`${candidate.fromName} / ${candidate.toName} — ${candidate.locator}`);
-    let verdict: { tie?: unknown; kind?: unknown; from?: unknown; to?: unknown } | null = null;
+    let verdict: { tie?: unknown; kind?: unknown; from?: unknown; to?: unknown; anchor?: unknown } | null = null;
     try {
       const res = await llm.chat({
         system:
           'You judge one sentence from a novel. Reply with JSON only: ' +
           '{"tie": false} or {"tie": true, "kind": one of [' +
-          `${CLOSED_ROLE_KINDS.join(', ')}], "from": "<name>", "to": "<name>"}.`,
+          `${CLOSED_ROLE_KINDS.join(', ')}], "from": "<name>", "to": "<name>", ` +
+          '"anchor": "<the sentence from the passage that names the person a pronoun refers to>"}.',
         messages: [
           {
             role: 'user',
@@ -5431,6 +5577,7 @@ export async function verifySentenceCandidates(
               'have a lasting relationship (family, lasting role, friend or enemy)? ' +
               'If it does, give the kind, then "from" for the one who has the relationship and "to" for the other: ' +
               'for "X was Y\'s mentor", Y is the mentor and X is the one mentored. ' +
+              'If the sentence names only one of them, give in "anchor" the sentence from the passage that names the other. ' +
               'Answer {"tie":false} when the sentence states no lasting relationship.',
           },
         ],
@@ -5444,6 +5591,7 @@ export async function verifySentenceCandidates(
         kind?: unknown;
         from?: unknown;
         to?: unknown;
+        anchor?: unknown;
       };
     } catch {
       result.refused++;
@@ -5477,6 +5625,9 @@ export async function verifySentenceCandidates(
       result.refused++;
       continue;
     }
+    const anchorRaw = String(verdict.anchor ?? '').trim();
+    const anchorEvidence =
+      anchorRaw && normalise(chunk.text).includes(normalise(anchorRaw)) ? anchorRaw : '';
     const from = db.get<{ name: string; aliases: string }>('SELECT name, aliases FROM canon_entity WHERE id = ?', fromId);
     const to = db.get<{ name: string; aliases: string }>('SELECT name, aliases FROM canon_entity WHERE id = ?', toId);
     if (!from || !to) {
@@ -5493,6 +5644,7 @@ export async function verifySentenceCandidates(
         toAliases: strList(to.aliases),
         kind,
         evidence: candidate.sentence,
+        anchorEvidence,
       },
       { db, projectId, chunkText: chunk.text },
     );
@@ -5518,12 +5670,90 @@ export async function verifySentenceCandidates(
         kind,
         description: '',
         evidence: candidate.sentence,
+        anchorEvidence,
         sourceRefs: JSON.stringify([{ source: '', locator: candidate.locator, chunk: candidate.chunkId }]),
         reviewStatus,
       });
     }
   }
   return result;
+}
+
+/**
+ * Anchored candidates: a sentence that names one character and refers to
+ * another by pronoun ("his master", "my wife"), paired with a neighbouring
+ * sentence that names the other. This is the shape the prose actually uses.
+ */
+export interface AnchoredCandidate {
+  sentence: string;
+  anchor: string;
+  chunkId: number;
+  locator: string;
+  fromId: number;
+  fromName: string;
+  toId: number;
+  toName: string;
+}
+
+const PRONOUNS = new Set([
+  'he','she','him','her','his','hers','they','them','their','theirs',
+  'my','mine','our','ours','your','yours','its',
+]);
+
+export function scanAnchoredCandidates(db: Db, projectId: number): AnchoredCandidate[] {
+  const entities = db.all<{ id: number; name: string }>(
+    "SELECT id, name FROM canon_entity WHERE project_id = ? AND kind = 'character' AND review_status != 'quarantined'",
+    projectId,
+  ).map((row) => ({ id: row.id, name: row.name, tokens: canonicalName(row.name).split(' ').filter(Boolean) }))
+    .filter((row) => row.tokens.length > 0);
+  const phrases = tiePhrases().map((p) => p.split(' ').filter(Boolean));
+  const chunks = db.all<{ id: number; locator: string; text: string }>(
+    'SELECT id, locator, text FROM canon_chunk WHERE project_id = ? ORDER BY seq',
+    projectId,
+  );
+  const sentences: { text: string; chunkId: number; locator: string; words: string[]; who: { id: number; name: string }[] }[] = [];
+  for (const chunk of chunks) {
+    for (const sentence of splitSentences(chunk.text)) {
+      const words = canonicalName(sentence).split(' ').filter(Boolean);
+      const who = entities
+        .filter((e) => e.tokens.length <= words.length && words.some((_, i) => e.tokens.every((w, k) => words[i + k] === w)))
+        .map((e) => ({ id: e.id, name: e.name }));
+      sentences.push({ text: sentence.trim(), chunkId: chunk.id, locator: chunk.locator, words, who });
+    }
+  }
+  const hasPhrase = (words: string[]): boolean =>
+    phrases.some((phrase) => phrase.length > 0 && words.some((_, i) => phrase.every((w, k) => words[i + k] === w)));
+  const out: AnchoredCandidate[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < sentences.length; i++) {
+    const s = sentences[i]!;
+    if (!hasPhrase(s.words)) continue;
+    if (!s.words.some((w) => PRONOUNS.has(w))) continue;
+    const uniqueWho = [...new Map(s.who.map((x) => [x.id, x])).values()];
+    if (uniqueWho.length !== 1) continue;
+    const subject = uniqueWho[0]!;
+    for (const j of [i - 1, i + 1]) {
+      const neighbour = sentences[j];
+      if (!neighbour) continue;
+      for (const other of new Map(neighbour.who.map((x) => [x.id, x])).values()) {
+        if (other.id === subject.id) continue;
+        const key = `${subject.id}|${other.id}|${normalise(s.text)}|${normalise(neighbour.text)}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push({
+          sentence: s.text,
+          anchor: neighbour.text,
+          chunkId: s.chunkId,
+          locator: s.locator,
+          fromId: subject.id,
+          fromName: subject.name,
+          toId: other.id,
+          toName: other.name,
+        });
+      }
+    }
+  }
+  return out;
 }
 
 /**
@@ -6819,7 +7049,32 @@ const KIND_FILLER = new Set(['of', 'to', 'with', 'for', 'a', 'the', 'an', 'in', 
 
 export function isUnsupportedKind(kind: string, quote: string): boolean {
   const key = (kind ?? '').trim().toLowerCase();
-  const text = normalise(quote ?? '');
+  // Whole words only. A substring test made "kin" match "looking" and "asking",
+  // which turned ordinary sentences into kinship proof.
+  const words = normalise(quote ?? '').split(' ').filter(Boolean);
+  // Whole words, with ordinary inflections on the last word ("mentored" for
+  // mentor, "instructed" for instruct). Substrings are not accepted.
+  const inflected = (word: string, base: string): boolean => {
+    if (word === base) return true;
+    const forms = [`${base}s`, `${base}es`, `${base}ed`, `${base}ing`, `${base}d`];
+    if (base.endsWith('e')) forms.push(`${base.slice(0, -1)}ing`);
+    if (base.endsWith('y')) forms.push(`${base.slice(0, -1)}ies`, `${base.slice(0, -1)}ied`);
+    return forms.includes(word);
+  };
+  const hasPhrase = (phrase: string): boolean => {
+    const target = normalise(phrase).split(' ').filter(Boolean);
+    if (!target.length) return false;
+    for (let i = 0; i + target.length <= words.length; i++) {
+      if (
+        target.every((word, k) =>
+          k === target.length - 1 ? inflected(words[i + k]!, word) : words[i + k] === word,
+        )
+      ) {
+        return true;
+      }
+    }
+    return false;
+  };
   // A defined kind lists the phrasings that express the same meaning. A quote
   // that uses one of them states the tie even without the label's own word:
   // "sided with" is an alliance, "turned on" is enmity.
@@ -6827,16 +7082,16 @@ export function isUnsupportedKind(kind: string, quote: string): boolean {
   if (gloss) {
     const phrases = gloss.reads
       .split(',')
-      .map((phrase) => normalise(phrase.replace(/\([^)]*\)/g, '').replace(/"/g, '')))
-      .filter((phrase) => phrase.length > 2);
-    if (phrases.some((phrase) => text.includes(phrase))) return false;
+      .map((phrase) => phrase.replace(/\([^)]*\)/g, '').replace(/"/g, ''))
+      .filter((phrase) => normalise(phrase).length > 2);
+    if (phrases.some(hasPhrase)) return false;
   }
   // "Relative of" is the generic kin label: it needs the text to say relative,
   // kin or family, not merely to mention an aunt or an uncle nearby. Otherwise
   // any two family members in one sentence become relatives of each other.
   if (key === 'relative of') {
     const generic = ['relative', 'relatives', 'relation', 'kin', 'kinsman', 'kinswoman', 'related', 'family member'];
-    return !generic.some((word) => text.includes(word));
+    return !generic.some(hasPhrase);
   }
   const groups = kinGroupsOf(kind);
   const quoteWords = new Set((quote ?? '').toLowerCase().split(/[^a-z]+/).filter(Boolean));

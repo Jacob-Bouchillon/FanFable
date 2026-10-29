@@ -105,6 +105,31 @@ test('promotion accepts two separate mentions', () => {
   db.close();
 });
 
+test('a title is not an assertion', () => {
+  assert.equal(
+    lorebook.assertsRelationship('Aunt Mara took Tor to the market.', 'Mara', [], 'Tor', [], 'aunt of'),
+    false,
+  );
+  assert.equal(lorebook.assertsRelationship("Tor's aunt, Mara, took him.", 'Mara', [], 'Tor', [], 'aunt of'), true);
+  assert.equal(lorebook.assertsRelationship('Mara was Tor\'s aunt.', 'Mara', [], 'Tor', [], 'aunt of'), true);
+  assert.equal(lorebook.assertsRelationship('Mara was the aunt of Tor.', 'Mara', [], 'Tor', [], 'aunt of'), true);
+  assert.equal(lorebook.assertsRelationship('Mara and Tor came in.', 'Mara', [], 'Tor', [], 'aunt of'), false);
+});
+
+test('promotion refuses a sentence that only contains the word', () => {
+  const { db, project: p } = project('endpoint-assertion');
+  const a = entity(db, p.id, 'Mara');
+  const b = entity(db, p.id, 'Tor');
+  const evidence = 'Aunt Mara took Tor to the market.';
+  const decision = lorebook.canPromote(
+    { fromId: a, toId: b, fromName: 'Mara', toName: 'Tor', kind: 'aunt of', evidence },
+    { db, projectId: p.id, chunkText: evidence },
+  );
+  assert.equal(decision.ok, false);
+  assert.equal(decision.reason, 'assertion-missing');
+  db.close();
+});
+
 test('nested character names are one person, not a tie', () => {
   const { db, project: p } = project('endpoint-nested');
   const a = entity(db, p.id, 'Mara');

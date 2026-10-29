@@ -17,15 +17,15 @@ const REFS = [{ source: 'Probe', locator: 'p. 3', chunk: 7 }];
 
 test('migrations bring a v12 bank to v15 with hints and provenance', () => {
   const { db, path } = tempDb();
-  assert.equal((db.raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 17);
+  assert.equal((db.raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 18);
   assert.ok(tableExists(db.raw, 'canon_tie_hint'), 'fresh bank has the hint table');
   const project = controller.createProject(db, 'hint-migrate');
 
   db.raw.exec('DROP TABLE canon_tie_hint');
   db.raw.exec('PRAGMA user_version = 12');
-  assert.equal(runMigrations(db.raw), 17, 'v12 bank moves to 16');
+  assert.equal(runMigrations(db.raw), 18, 'v12 bank moves to 16');
   assert.ok(tableExists(db.raw, 'canon_tie_hint'), 'hint table is recreated');
-  assert.equal(runMigrations(db.raw), 17, 'second run is a no-op');
+  assert.equal(runMigrations(db.raw), 18, 'second run is a no-op');
   assert.ok(
     controller.listProjects(db).some((p) => p.id === project.id),
     'existing project rows survive',
@@ -33,7 +33,7 @@ test('migrations bring a v12 bank to v15 with hints and provenance', () => {
   db.close();
 
   const reopened = new Db(path);
-  assert.equal((reopened.raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 17);
+  assert.equal((reopened.raw.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 18);
   assert.ok(tableExists(reopened.raw, 'canon_tie_hint'));
   reopened.close();
 });
