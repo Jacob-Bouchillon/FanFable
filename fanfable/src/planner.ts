@@ -250,6 +250,8 @@ export interface PlanRequest {
   chapterCount?: number;
   preferences?: OutlinePreferences;
   canonBrief?: string;
+  /** Established ties among the named cast, pre-rendered one per line. */
+  castRelationships?: string;
   canonEvents?: { id: number; title: string; summary: string }[];
   /** Connected information: what the premise touches, and what it leads to. */
   graphContext?: string;
@@ -266,6 +268,9 @@ export async function draftOutline(llm: LlmClient, req: PlanRequest): Promise<Om
     req.divergence ? `PROPOSED DIVERGENCE POINT:\n${req.divergence}` : '',
     `CHAPTER COUNT: ${req.chapterCount ?? 6}`,
     req.canonBrief ? `CANON CONTEXT (from the source material, treat as evidence):\n${truncate(req.canonBrief, 4500)}` : '',
+    req.castRelationships
+      ? `CAST RELATIONSHIPS (established ties between the named cast; user-confirmed ties are the author's own rulings and are not backed by a passage):\n${req.castRelationships}`
+      : '',
     canonEvents ? `CANON EVENTS INDEX:\n${canonEvents}` : '',
     req.graphContext ? `CONNECTED CONTEXT (what the premise touches, and what leads from it):\n${truncate(req.graphContext, 3500)}` : '',
     req.preferences && Object.keys(req.preferences).length

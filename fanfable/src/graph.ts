@@ -1279,6 +1279,7 @@ export function traverse(graph: Graph, opts: TraverseOptions): TraversalResult {
 export function terms(text: string): string[] {
   return (text ?? '')
     .toLowerCase()
+    .replace(/['’]s\b/g, '')
     .replace(/[^a-z0-9'\s]/g, ' ')
     .split(/\s+/)
     .filter((w) => w.length > 2 && !GRAPH_STOPWORDS.has(w));

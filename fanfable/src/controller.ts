@@ -28,7 +28,7 @@ import * as writer from './writer.ts';
 import * as continuity from './continuity.ts';
 import { continuitySettings, filterBySeverity } from './continuity-settings.ts';
 import { truncate, wordCount } from './text.ts';
-import { nameMentionedExact } from './names.ts';
+import { nameMentioned, nameMentionedExact } from './names.ts';
 
 export interface Project {
   id: number;
@@ -935,7 +935,9 @@ export function selectCanonEvents(
   divergence = '',
   budget = 5000,
 ): lore.CanonEvent[] {
-  const all = lore.listCanonEvents(db, projectId, 200);
+  // The whole index, not the first 200 events: ordered by passage, that cut
+  // reached passage 265 of 527, so the planner never saw the second half.
+  const all = lore.listCanonEvents(db, projectId, 5000);
   const words = new Set(
     `${premise} ${divergence}`
       .toLowerCase()
@@ -961,6 +963,74 @@ export function selectCanonEvents(
   return out.sort((a, b) => a.id - b.id);
 }
 
+/**
+ * Established relationships among the cast the premise and divergence name.
+ *
+ * Deterministic: the roster names are matched with the LINK policy, then
+ * asserted, keeper-grade relation rows are collected — ties with both endpoints
+ * in the cast first, widened to ties naming at least one endpoint only when
+ * those are scarce. User-confirmed rows sort first so the author's own ruling
+ * outranks a derived pick.
+ */
+function castRelationshipBlock(db: Db, projectId: number, text: string): string {
+  const entities = lorebook.listEntities(db, projectId);
+  const cast = new Set<number>();
+  for (const entity of entities) {
+    if (nameMentioned(entity.name, text) || entity.aliases.some((alias) => nameMentioned(alias, text))) {
+      cast.add(entity.id);
+    }
+  }
+  if (!cast.size) return '';
+  const rows = db.all<{
+    id: number;
+    from_entity: number;
+    to_entity: number;
+    from_name: string;
+    to_name: string;
+    kind: string;
+    review_status: string;
+    confirmed_by_user: number | null;
+  }>(
+    `SELECT r.id, r.from_entity, r.to_entity, a.name AS from_name, b.name AS to_name,
+            r.kind, r.review_status, r.confirmed_by_user
+       FROM canon_relation r
+       JOIN canon_entity a ON a.id = r.from_entity
+       JOIN canon_entity b ON b.id = r.to_entity
+      WHERE r.project_id = ?
+        AND COALESCE(r.modality, 'asserted') = 'asserted'
+        AND (r.confirmed_by_user = 1 OR r.review_status IN ('accepted','user_confirmed'))
+        AND lower(r.kind) != 'appears with'
+      ORDER BY CASE WHEN r.confirmed_by_user = 1 THEN 0
+                    WHEN r.review_status = 'user_confirmed' THEN 1
+                    ELSE 2 END,
+               r.id`,
+    projectId,
+  );
+  const both = rows.filter((row) => cast.has(row.from_entity) && cast.has(row.to_entity));
+  const chosen = both.slice(0, 40);
+  if (chosen.length < 5) {
+    const seen = new Set(chosen.map((row) => row.id));
+    for (const row of rows) {
+      if (chosen.length >= 40) break;
+      if (seen.has(row.id)) continue;
+      if (!cast.has(row.from_entity) && !cast.has(row.to_entity)) continue;
+      chosen.push(row);
+      seen.add(row.id);
+    }
+  }
+  // Selection runs in two stages, so order the final list again: the author's
+  // confirmation first, then user-confirmed, then accepted, then by id.
+  const rank = (row: { review_status: string; confirmed_by_user: number | null }): number =>
+    row.confirmed_by_user === 1 ? 0 : row.review_status === 'user_confirmed' ? 1 : 2;
+  chosen.sort((x, y) => rank(x) - rank(y) || x.id - y.id);
+  return chosen
+    .map((row) => {
+      const confirmed = row.confirmed_by_user === 1 || row.review_status === 'user_confirmed';
+      return `- ${row.from_name} — ${row.kind} — ${row.to_name}  [${confirmed ? 'user-confirmed' : 'quoted'}]`;
+    })
+    .join('\n');
+}
+
 export async function draftPlan(
   db: Db,
   llm: LlmClient,
@@ -973,10 +1043,14 @@ export async function draftPlan(
     userNotes?: string;
   },
 ): Promise<{ outline: planner.Outline; warnings: string[] }> {
-  const passages = await lore.searchCanon(db, projectId, `${req.premise} ${req.divergence ?? ''}`, {
+  const premiseText = `${req.premise} ${req.divergence ?? ''}`;
+  const passages = await lore.searchCanon(db, projectId, premiseText, {
     limit: 8,
   });
   const brief = passages.map((p) => p.text).join('\n\n');
+  // Established ties among the cast the premise names. Deterministic, separate
+  // from the retrieved canon brief so a user-confirmed tie is never buried.
+  const castRelationships = castRelationshipBlock(db, projectId, premiseText);
 
   // The connected view of the premise: who it touches, what it connects to, and
   // what the story has already changed. The planner needs the consequences, not
@@ -1001,6 +1075,7 @@ export async function draftPlan(
     chapterCount: req.chapterCount,
     preferences: req.preferences,
     canonBrief: brief,
+    castRelationships,
     graphContext,
     canonEvents: canonEvents.map((e) => ({ id: e.id, title: e.title, summary: e.summary })),
     userNotes: req.userNotes,

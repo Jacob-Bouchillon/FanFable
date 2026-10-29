@@ -5297,6 +5297,167 @@ export function reclassifyAccepted(
   return result;
 }
 
+export interface AcceptedAuditRow {
+  id: number;
+  fromName: string;
+  kind: string;
+  toName: string;
+  guard: 'ok' | PromoteReason | 'unproven';
+  direction: 'forward' | 'reverse' | 'unknown';
+  cannotJudge: boolean;
+  action: 'keep' | 'demote';
+}
+
+export interface AcceptedAuditResult {
+  audited: number;
+  passing: number;
+  failing: Record<string, number>;
+  cannotJudge: number;
+  changed: number;
+  backupPath?: string;
+  rows: AcceptedAuditRow[];
+}
+
+/**
+ * Recheck every accepted relation against the current guard.
+ *
+ * The guard is `canPromote`, with the row's own aliases and the chunk text its
+ * source_refs cite (falling back to locating the evidence anywhere when the
+ * refs are empty or stale). Direction is reported separately: a row the guard
+ * passes while the direction check returns `unknown` is counted as one it
+ * cannot judge, never as proven direction.
+ *
+ * Dry run by default. With `write`, failing rows are demoted from `accepted`
+ * to `provisional` in one transaction after a consistent snapshot backup; no
+ * evidence, source ref or kind is touched, and `user_confirmed` is never read.
+ */
+export function auditAcceptedRelations(
+  db: Db,
+  projectId: number,
+  opts: { write?: boolean; limit?: number } = {},
+): AcceptedAuditResult {
+  const rows = db
+    .all<{
+      id: number;
+      from_entity: number;
+      to_entity: number;
+      kind: string;
+      evidence: string;
+      source_refs: string;
+      kind_source: string;
+      anchor_evidence: string;
+      from_name: string;
+      from_aliases: string;
+      to_name: string;
+      to_aliases: string;
+    }>(
+      `SELECT r.id, r.from_entity, r.to_entity, r.kind, r.evidence, r.source_refs,
+              r.kind_source, r.anchor_evidence,
+              a.name AS from_name, a.aliases AS from_aliases,
+              b.name AS to_name, b.aliases AS to_aliases
+         FROM canon_relation r
+         JOIN canon_entity a ON a.id = r.from_entity
+         JOIN canon_entity b ON b.id = r.to_entity
+        WHERE r.project_id = ? AND r.review_status = 'accepted'
+        ORDER BY r.id`,
+      projectId,
+    )
+    .slice(0, opts.limit === undefined ? undefined : Math.max(0, Math.floor(opts.limit)));
+  const needle = (evidence: string): string => normalise(evidence);
+  const chunkTextFor = (row: { evidence: string; source_refs: string }): string | null => {
+    const want = needle(row.evidence);
+    let claimed: string | null = null;
+    const refs = fromJson<{ chunk?: unknown }[]>(row.source_refs, []);
+    const chunkId = refs
+      .map((ref) => Number(ref?.chunk))
+      .find((id) => Number.isFinite(id) && id > 0);
+    if (chunkId !== undefined) {
+      claimed =
+        pageEvidenceText(db, chunkId) ??
+        db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', chunkId)?.text ??
+        null;
+    }
+    if (want && claimed && needle(claimed).includes(want)) return claimed;
+    if (!want) return claimed;
+    // Empty or stale refs: locate the evidence in any chunk, as replay does.
+    const found = loadOrderedChunks(db, projectId).find((chunk) => needle(chunk.text).includes(want));
+    return found?.text ?? claimed;
+  };
+
+  const result: AcceptedAuditResult = {
+    audited: rows.length,
+    passing: 0,
+    failing: {},
+    cannotJudge: 0,
+    changed: 0,
+    rows: [],
+  };
+  const failing: number[] = [];
+  for (const row of rows) {
+    const fromAliases = strList(row.from_aliases);
+    const toAliases = strList(row.to_aliases);
+    const chunkText = chunkTextFor(row);
+    const promoteRow: PromoteRow = {
+      fromId: row.from_entity,
+      toId: row.to_entity,
+      fromName: row.from_name,
+      toName: row.to_name,
+      fromAliases,
+      toAliases,
+      kind: row.kind,
+      evidence: row.evidence,
+      kindSource: row.kind_source,
+      anchorEvidence: row.anchor_evidence,
+    };
+    const decision = canPromote(promoteRow, { db, projectId, chunkText });
+    const anchor = (row.anchor_evidence ?? '').trim();
+    const directionSpan = anchor && !isUnsupportedKind(row.kind, anchor) ? anchor : row.evidence;
+    const direction = relationSentenceDirection(
+      row.kind,
+      directionSpan,
+      row.from_name,
+      fromAliases,
+      row.to_name,
+      toAliases,
+    );
+    const cannotJudge = decision.ok && direction === 'unknown';
+    if (decision.ok) result.passing++;
+    else {
+      const reason = decision.reason ?? 'unproven';
+      result.failing[reason] = (result.failing[reason] ?? 0) + 1;
+      failing.push(row.id);
+    }
+    if (cannotJudge) result.cannotJudge++;
+    result.rows.push({
+      id: row.id,
+      fromName: row.from_name,
+      kind: row.kind,
+      toName: row.to_name,
+      guard: decision.ok ? 'ok' : decision.reason ?? 'unproven',
+      direction,
+      cannotJudge,
+      action: decision.ok ? 'keep' : 'demote',
+    });
+  }
+
+  if (opts.write && failing.length) {
+    const stamp = nowIso().replace(/[:.]/g, '-');
+    const backupPath = `${db.path}.audit-backup-${stamp}.db`;
+    db.exec(`VACUUM INTO '${backupPath.replace(/'/g, "''")}'`);
+    result.backupPath = backupPath;
+    db.transaction(() => {
+      for (const id of failing) {
+        result.changed += db.run(
+          "UPDATE canon_relation SET review_status = 'provisional' WHERE id = ? AND project_id = ? AND review_status = 'accepted'",
+          id,
+          projectId,
+        ).changes;
+      }
+    });
+  }
+  return result;
+}
+
 export interface FindEvidenceResult extends PromoteProvisionalResult {
   returned: number;
   verified: number;

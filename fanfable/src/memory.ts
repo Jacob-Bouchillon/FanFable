@@ -1053,7 +1053,11 @@ export async function extractState(
       },
     ],
     temperature: 0.2,
-    maxTokens: 2000,
+    // Ten arrays over a 2,500-word chapter overflowed 2,000 tokens: the reply
+    // was cut mid-string, the JSON failed to parse, and approval stored no
+    // state at all. Measured on a 2,496-word chapter: 6,000 parses cleanly
+    // and yields 5 events, 2 facts and 2 relationships.
+    maxTokens: 6000,
   });
 
   const parsed = extractJson<Record<string, unknown>>(res.text) ?? {};

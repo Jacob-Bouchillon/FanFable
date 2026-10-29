@@ -144,6 +144,7 @@ ${C.bold('SOURCE MATERIAL')}
   lore rulings export [--out path]  Export keepers, note rulings and alias identities by name
   lore rulings replay --in path [--write] [--dry-run] [--limit n]
                            Reapply an exported ruling file to this project
+  lore audit [--write] [--limit n]  Recheck accepted ties against the guard; demote failures
   lore ties --from A --to B [--at n] [--supporting]
                            What two people are to each other now, and before
   lore merge                       Merge entries that are the same under two names
@@ -420,6 +421,43 @@ async function cmdLore(args: Args): Promise<void> {
     if (res.passages.length) {
       console.log(`\n${C.dim('sources:')}`);
       res.passages.forEach((p, i) => console.log(`  [S${i + 1}] ${p.sourceTitle} :: ${p.locator}`));
+    }
+    return;
+  }
+
+  if (sub === 'audit') {
+    const write = args.flags.write === true;
+    const limit = flagNumber(args, 'limit', 0);
+    const result = lorebook.auditAcceptedRelations(db, project.id, {
+      write,
+      limit: limit > 0 ? limit : undefined,
+    });
+    heading(write ? 'Accepted relation audit (write)' : 'Accepted relation audit (dry run)');
+    console.log(`${C.dim('id    from — kind — to').padEnd(64)}  ${C.dim('guard')}  ${C.dim('action')}`);
+    for (const row of result.rows) {
+      const pair = `${row.fromName} — ${row.kind} — ${row.toName}`;
+      const action = row.action === 'demote'
+        ? 'demote'
+        : row.cannotJudge
+          ? 'keep (cannot judge direction)'
+          : 'keep';
+      const guard = row.guard === 'ok' ? 'ok' : row.guard;
+      console.log(`${String(row.id).padEnd(5)} ${pair.padEnd(58)}  ${guard.padEnd(18)}  ${action}`);
+    }
+    const failed = Object.entries(result.failing).reduce((sum, [, n]) => sum + n, 0);
+    console.log(
+      `\naudited ${result.audited}, passing ${result.passing}, failing ${failed}, ` +
+        `cannot-judge ${result.cannotJudge}`,
+    );
+    if (failed) {
+      console.log(`  failing by reason: ${Object.entries(result.failing).map(([reason, n]) => `${reason} ${n}`).join(', ')}`);
+      console.log(`  direction unknown: ${result.cannotJudge} (kept, not proved)`);
+    }
+    if (write) {
+      if (result.backupPath) console.log(`  backup: ${result.backupPath}`);
+      console.log(`  changed ${result.changed}`);
+    } else {
+      console.log(C.dim('  dry run: nothing written. Re-run with --write to demote failures.'));
     }
     return;
   }
@@ -1096,10 +1134,31 @@ async function cmdLore(args: Args): Promise<void> {
   if (sub === 'events') {
     if (args.flags.extract) {
       heading('Building canon event index');
+      const chunkLimit =
+        args.flags.limit === undefined ? undefined : Math.max(0, Math.floor(flagNumber(args, 'limit', 0)));
+      const sourceId = flagNumber(args, 'source', undefined as unknown as number) || undefined;
+      // Passages that exist, not passages this run chose to read: the limited
+      // total would otherwise call an 8-passage slice of a 527-passage book
+      // "complete".
+      const available = sourceId
+        ? db.get<{ n: number }>('SELECT count(*) AS n FROM canon_chunk WHERE project_id = ? AND source_id = ?', project.id, sourceId)?.n ?? 0
+        : db.get<{ n: number }>('SELECT count(*) AS n FROM canon_chunk WHERE project_id = ?', project.id)?.n ?? 0;
+      let progress = { passagesDone: 0, passagesTotal: 0 };
       const events = await lore.extractCanonEvents(db, a.llm, project.id, {
-        sourceId: flagNumber(args, 'source', undefined as unknown as number) || undefined,
+        sourceId,
+        ...(chunkLimit === undefined ? {} : { chunkLimit }),
+        onWindow: (p) => {
+          progress = { passagesDone: p.passagesDone, passagesTotal: p.passagesTotal };
+        },
       });
-      console.log(`indexed ${events.length} canon events`);
+      // A partial index must never read like a finished one: the old line said
+      // "indexed N events" after reading half the book and looked successful.
+      const partial = progress.passagesDone < available;
+      const report = partial ? 'Truncated' : 'Complete';
+      const limitNote = partial && chunkLimit !== undefined ? ' Limit reached.' : '';
+      console.log(
+        `${report}: processed ${progress.passagesDone}/${available} passages; indexed ${events.length} events.${limitNote}`,
+      );
       return;
     }
     const events = lore.listCanonEvents(db, project.id, flagNumber(args, 'limit', 50));

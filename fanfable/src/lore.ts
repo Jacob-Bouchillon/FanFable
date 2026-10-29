@@ -218,8 +218,14 @@ export async function extractCanonEvents(
     sql += ' AND c.source_id = ?';
     params.push(opts.sourceId);
   }
-  sql += ' ORDER BY c.source_id, c.seq LIMIT ?';
-  params.push(opts.chunkLimit ?? 200);
+  sql += ' ORDER BY c.source_id, c.seq';
+  // No implicit ceiling: the whole source is the default. A caller that wants
+  // a partial index passes chunkLimit explicitly. The old default of 200 read
+  // a 527-chunk book only to passage 200 and stopped before the Sorting.
+  if (opts.chunkLimit !== undefined) {
+    sql += ' LIMIT ?';
+    params.push(opts.chunkLimit);
+  }
 
   const chunks = db.all<{
     id: number;
@@ -252,7 +258,9 @@ export async function extractCanonEvents(
       passagesDone: start + window.length,
       passagesTotal: chunks.length,
     });
-    if ((opts.maxEvents ?? 200) && created.length >= (opts.maxEvents ?? 200)) break;
+    // No implicit ceiling here either: a 527-passage book produced 200 events
+    // by passage 262 and the loop stopped, silently indexing half the book.
+    if (opts.maxEvents !== undefined && created.length >= opts.maxEvents) break;
   }
   // The lore pass may already have written timeline entries; join them to the
   // events that now exist.
@@ -303,7 +311,7 @@ async function extractEventsFromWindow(
     ? asRecordArray(Array.isArray(parsedAny) ? parsedAny : ((parsedAny as any)?.events ?? parsedAny))
     : salvageJsonArray(res.text);
   const created: CanonEvent[] = [];
-  const max = opts.maxEvents ?? 200;
+  const max = opts.maxEvents ?? Number.POSITIVE_INFINITY;
   for (const obj of objects) {
     if (created.length >= max) break;
     const idx = Number(obj.chunk_index);
@@ -311,6 +319,10 @@ async function extractEventsFromWindow(
     if (!chunk) continue;
     const title = String(obj.title ?? '').trim();
     if (!title) continue;
+    // A chapter heading is not an event. The model emits them ("... Chapter
+    // Six") and they are easy to cite for any scene, which turns a real id
+    // into false grounding.
+    if (/\bchapter\b/i.test(title)) continue;
     const participants = toStringArray(obj.participants);
     const kind = String(obj.kind ?? 'event');
     const r = db.run(
