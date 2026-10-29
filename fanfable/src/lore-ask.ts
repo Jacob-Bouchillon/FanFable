@@ -6,7 +6,7 @@
 import { Db } from './db.ts';
 import { extractJson, toStringArray } from './json.ts';
 import type { LlmClient } from './llm.ts';
-import { nameMentionedExact, buildRosterIndex, deriveNameVariants, type RosterIndex } from './names.ts';
+import { nameMentionedExact, buildRosterIndex, deriveNameVariants, canonicalName, nameRelation, type RosterIndex } from './names.ts';
 import * as lorebook from './lorebook.ts';
 import { expandQuery, searchCanon } from './lore-search.ts';
 import type { Passage } from './lore.ts';
@@ -69,9 +69,15 @@ function entityVariantsFor(
   index?: RosterIndex,
 ): { ids: number[]; variants: string[] } {
   const q = query.toLowerCase();
-  const matched = entities.filter(
-    (e) => e.name.toLowerCase() === q || e.aliases.some((al) => al.toLowerCase() === q),
-  );
+  const canonical = canonicalName(query);
+  const matched = entities.filter((e) => {
+    if (e.name.toLowerCase() === q || e.aliases.some((al) => al.toLowerCase() === q)) return true;
+    // Same person under the roster's identity rule, or a derived variant the
+    // prose actually uses. Query-time only: nothing is merged or written.
+    const relation = nameRelation(query, e.name);
+    if (relation === 'same' || relation === 'containment') return true;
+    return index ? deriveNameVariants({ name: e.name, aliases: e.aliases }, index).includes(canonical) : false;
+  });
   const pool = matched.length ? matched : [];
   const ids = pool.map((e) => e.id);
   const variants = [q];
@@ -532,6 +538,33 @@ export async function answerLoreQuestion(
   question: string,
   opts: { limit?: number; sourceId?: number; search?: Passage[] } = {},
 ): Promise<LoreAnswer> {
+  // A user's own confirmation needs no book passage. Answer it plainly and
+  // carry no citation, so it can never be mistaken for quoted canon.
+  const pair = parsePairQuestion(question);
+  if (pair) {
+    const keepers = lorebook.lookupKeeperPair(db, projectId, pair.a, pair.b);
+    const hasRefs = (keeper: lorebook.PairKeeper): boolean => {
+      try {
+        const refs = JSON.parse(keeper.sourceRefs || '[]');
+        return Array.isArray(refs) && refs.length > 0;
+      } catch {
+        return false;
+      }
+    };
+    const userConfirmed = keepers.filter((keeper) => keeper.confirmedByUser && !hasRefs(keeper));
+    const passageBacked = keepers.filter(hasRefs);
+    if (userConfirmed.length && !passageBacked.length) {
+      return {
+        answer:
+          `### Status of ${pair.a} to ${pair.b}\n\n` +
+          'Confirmed by the user. This tie is held in the bank because the user confirmed it; ' +
+          'no book passage was cited.\n\n' +
+          `Bank line: ${userConfirmed.map((keeper) => `${keeper.fromName} — ${keeper.kind} ${keeper.toName}`).join('; ')}`,
+        passages: [],
+        grounded: true,
+      };
+    }
+  }
   let passages = opts.search ?? [];
   if (passages.length) {
     // Callers may hand in their own candidate pool; rank it by the same bank

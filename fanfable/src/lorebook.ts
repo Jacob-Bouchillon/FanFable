@@ -3042,6 +3042,10 @@ export interface PairKeeper {
   evidence: string;
   modality: string;
   reviewStatus: string;
+  /** True when a human confirmed the row directly. */
+  confirmedByUser: boolean;
+  /** Raw source_refs JSON; '[]' means the row carries no passage. */
+  sourceRefs: string;
   locator?: string;
 }
 
@@ -3050,6 +3054,11 @@ export interface PairKeeper {
  * user-confirmed row between the named sides, in either direction, keeping the
  * guard's existing "any accepted tie" semantics. The answer line filters this
  * to a plain relational keeper before rendering.
+ *
+ * Names resolve at query time through the match-time naming layer: an exact
+ * stored name or alias, a derived variant, or the same person under
+ * `nameRelation`. Nothing is merged, aliased or written; the rows keep their
+ * own stored names.
  */
 export function lookupKeeperPair(
   db: Db,
@@ -3058,22 +3067,45 @@ export function lookupKeeperPair(
   b: string,
 ): PairKeeper[] {
   const entities = listEntities(db, projectId);
-  const resolve = (name: string): number[] => {
+  const roster = buildRosterIndex(
+    entities.map((entity) => ({ name: entity.name, aliases: entity.aliases })),
+    db.all<{ text: string }>('SELECT text FROM canon_chunk WHERE project_id = ?', projectId)
+      .map((row) => row.text)
+      .join(' '),
+  );
+  const exactIds = (name: string): number[] => {
     const q = (name ?? '').trim().toLowerCase();
     return entities
       .filter(
-        (e) =>
-          e.name.toLowerCase() === q ||
-          e.aliases.some((alias) => alias.toLowerCase() === q),
+        (entity) =>
+          entity.name.toLowerCase() === q ||
+          entity.aliases.some((alias) => alias.toLowerCase() === q),
       )
-      .map((e) => e.id);
+      .map((entity) => entity.id);
   };
-  const idsA = resolve(a);
-  const idsB = resolve(b);
-  if (!idsA.length || !idsB.length) return [];
-  if (idsA.some((id) => idsB.includes(id))) return [];
+  // The same person may be stored as several rows. Only when the exact names
+  // find no tie at all do we widen each side through the match-time naming
+  // layer, so an exact query keeps resolving exactly as before.
+  const wideIds = (name: string): number[] => {
+    const query = (name ?? '').trim().toLowerCase();
+    const canonical = canonicalName(name);
+    const ids = new Set<number>(exactIds(name));
+    for (const entity of entities) {
+      if (ids.has(entity.id)) continue;
+      if (!canonical) continue;
+      const relation = nameRelation(name, entity.name);
+      if (relation === 'same' || relation === 'containment') {
+        ids.add(entity.id);
+        continue;
+      }
+      if (deriveNameVariants({ name: entity.name, aliases: entity.aliases }, roster).includes(canonical)) {
+        ids.add(entity.id);
+      }
+    }
+    return [...ids];
+  };
   const placeholders = (ids: number[]): string => ids.map(() => '?').join(',');
-  const rows = db.all<{
+  const queryPair = (idsA: number[], idsB: number[]): {
     id: number;
     from_entity: number;
     to_entity: number;
@@ -3084,25 +3116,50 @@ export function lookupKeeperPair(
     modality: string | null;
     review_status: string | null;
     source_refs: string;
-  }>(
-    // Citations read only the primary evidence. supporting_evidence is
-    // display-only context and must never be quoted as proof.
-    `SELECT r.id, r.from_entity, r.to_entity, a.name AS from_name, b.name AS to_name,
-            r.kind, r.evidence, r.modality, r.review_status, r.source_refs
-     FROM canon_relation r
-     JOIN canon_entity a ON a.id = r.from_entity
-     JOIN canon_entity b ON b.id = r.to_entity
-     WHERE r.project_id = ?
-       AND r.review_status IN ('accepted','user_confirmed')
-       AND ((r.from_entity IN (${placeholders(idsA)}) AND r.to_entity IN (${placeholders(idsB)}))
-         OR (r.from_entity IN (${placeholders(idsB)}) AND r.to_entity IN (${placeholders(idsA)})))
-     ORDER BY r.id`,
-    projectId,
-    ...idsA,
-    ...idsB,
-    ...idsB,
-    ...idsA,
-  );
+    confirmed_by_user: number | null;
+  }[] => {
+    if (!idsA.length || !idsB.length) return [];
+    if (idsA.some((id) => idsB.includes(id))) return [];
+    return db.all<{
+      id: number;
+      from_entity: number;
+      to_entity: number;
+      from_name: string;
+      to_name: string;
+      kind: string;
+      evidence: string;
+      modality: string | null;
+      review_status: string | null;
+      source_refs: string;
+      confirmed_by_user: number | null;
+    }>(
+      // Citations read only the primary evidence. supporting_evidence is
+      // display-only context and must never be quoted as proof.
+      `SELECT r.id, r.from_entity, r.to_entity, a.name AS from_name, b.name AS to_name,
+              r.kind, r.evidence, r.modality, r.review_status, r.source_refs, r.confirmed_by_user
+       FROM canon_relation r
+       JOIN canon_entity a ON a.id = r.from_entity
+       JOIN canon_entity b ON b.id = r.to_entity
+       WHERE r.project_id = ?
+         AND r.review_status IN ('accepted','user_confirmed')
+         AND ((r.from_entity IN (${placeholders(idsA)}) AND r.to_entity IN (${placeholders(idsB)}))
+           OR (r.from_entity IN (${placeholders(idsB)}) AND r.to_entity IN (${placeholders(idsA)})))
+       ORDER BY r.id`,
+      projectId,
+      ...idsA,
+      ...idsB,
+      ...idsB,
+      ...idsA,
+    );
+  };
+  let idsA = exactIds(a);
+  let idsB = exactIds(b);
+  let rows = queryPair(idsA, idsB);
+  if (!rows.length) {
+    idsA = wideIds(a);
+    idsB = wideIds(b);
+    rows = queryPair(idsA, idsB);
+  }
   const chunkIds = rows.flatMap((row) =>
     fromJson<{ chunk?: unknown }[]>(row.source_refs, [])
       .map((ref) => Number(ref?.chunk))
@@ -3133,6 +3190,8 @@ export function lookupKeeperPair(
       evidence: row.evidence,
       modality: row.modality ?? 'asserted',
       reviewStatus: row.review_status ?? 'accepted',
+      confirmedByUser: row.confirmed_by_user === 1,
+      sourceRefs: row.source_refs ?? '[]',
       ...(chunk !== undefined && locators.has(chunk) ? { locator: locators.get(chunk)! } : {}),
     };
   });
@@ -3154,9 +3213,20 @@ export function bankAnswerForQuestion(
     if (!rows.length) {
       return { status: 'none', reason: 'The bank holds no keeper for this pair.' };
     }
-    const directed = directedPairStatus(db, projectId, rows[0]!.fromId, rows[0]!.toId);
-    const currentId = directed.forward.current?.id ?? directed.reverse.current?.id;
-    const row = rows.find((candidate) => candidate.id === currentId) ?? rows[0]!;
+    // A human confirmation outranks a derived pick: answer from the confirmed
+    // row itself, deterministically (lowest id), so the line matches what was
+    // confirmed. With no confirmation the directed-status path is unchanged.
+    const confirmed = rows
+      .filter((candidate) => candidate.reviewStatus === 'user_confirmed' || candidate.confirmedByUser)
+      .sort((x, y) => x.id - y.id);
+    let row: (typeof rows)[number];
+    if (confirmed.length) {
+      row = confirmed[0]!;
+    } else {
+      const directed = directedPairStatus(db, projectId, rows[0]!.fromId, rows[0]!.toId);
+      const currentId = directed.forward.current?.id ?? directed.reverse.current?.id;
+      row = rows.find((candidate) => candidate.id === currentId) ?? rows[0]!;
+    }
     return {
       status: 'keeper',
       line: `${row.fromName} — ${row.kind} ${row.toName}`,
@@ -7933,7 +8003,7 @@ export interface RulingsExport {
   identities: RulingsExportIdentity[];
 }
 
-export type RulingUnresolvedReason = 'name not found' | 'quote not found' | 'ambiguous name';
+export type RulingUnresolvedReason = 'name not found' | 'quote not found' | 'ambiguous name' | 'evidence-required';
 
 export interface RulingReplayCategory {
   total: number;
@@ -8381,7 +8451,25 @@ export function replayRulings(
       }
       continue;
     }
-    const refs = quoteRefs(keeper.evidence);
+    const evidence = (keeper.evidence ?? '').trim();
+    if (!evidence) {
+      // A user's own confirmation needs no book quotation. An accepted row
+      // still does: nothing may enter the accepted tier without evidence.
+      if (keeper.review_status !== 'user_confirmed') {
+        deficit(keeperReport, 'keeper', entry, 'evidence-required');
+        continue;
+      }
+      keeperReport.applied++;
+      writes.push({
+        sql: `INSERT INTO canon_relation
+                (project_id, from_entity, to_entity, kind, description, evidence, source_refs,
+                 confidence, review_status, confirmed_by_user, created_at)
+              VALUES (?, ?, ?, ?, '', '', '[]', 1.0, ?, 1, ?)`,
+        params: [projectId, from.id, to.id, keeper.kind, keeper.review_status, now],
+      });
+      continue;
+    }
+    const refs = quoteRefs(evidence);
     if (!refs) {
       deficit(keeperReport, 'keeper', entry, 'quote not found');
       continue;
