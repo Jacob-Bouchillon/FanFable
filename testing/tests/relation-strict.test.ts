@@ -91,8 +91,10 @@ test('the strict prompt is opt-in and its kind mapping prefers closed kinds', ()
   try {
     delete process.env.FANFABLE_REL_STRICT;
     delete process.env.FANFABLE_REL_FEWSHOT;
-    // Flag off: byte-for-byte the historical prompt.
-    assert.equal(lorebook.relationsSystemPrompt(), lorebook.EXTRACT_RELATIONS_SYSTEM);
+    // Flag off: the historical prompt plus the always-on kind glossary.
+    const plain = lorebook.relationsSystemPrompt();
+    assert.ok(plain.startsWith(lorebook.EXTRACT_RELATIONS_SYSTEM));
+    assert.ok(!plain.includes('Strict mode:'));
 
     process.env.FANFABLE_REL_STRICT = '1';
     const strict = lorebook.relationsSystemPrompt();

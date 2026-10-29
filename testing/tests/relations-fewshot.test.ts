@@ -9,10 +9,14 @@ test('the few-shot block is off by default and only FANFABLE_REL_FEWSHOT=1 appen
   const before = process.env.FANFABLE_REL_FEWSHOT;
   try {
     delete process.env.FANFABLE_REL_FEWSHOT;
-    assert.equal(lorebook.relationsSystemPrompt(), lorebook.EXTRACT_RELATIONS_SYSTEM);
+    const off = lorebook.relationsSystemPrompt();
+    assert.ok(off.startsWith(lorebook.EXTRACT_RELATIONS_SYSTEM));
+    assert.ok(!off.includes('Examples (invented names)'));
 
     process.env.FANFABLE_REL_FEWSHOT = '0';
-    assert.equal(lorebook.relationsSystemPrompt(), lorebook.EXTRACT_RELATIONS_SYSTEM);
+    const zero = lorebook.relationsSystemPrompt();
+    assert.ok(zero.startsWith(lorebook.EXTRACT_RELATIONS_SYSTEM));
+    assert.ok(!zero.includes('Examples (invented names)'));
 
     process.env.FANFABLE_REL_FEWSHOT = '1';
     const prompted = lorebook.relationsSystemPrompt();

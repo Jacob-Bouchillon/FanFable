@@ -249,7 +249,8 @@ Reply with JSON only:
   "relations": [
     {"from":"a name from the list, exactly as written",
      "to":"another name from the list, exactly as written",
-     "kind":"one short phrase, such as 'sibling of'",
+     "kind":"a defined kind from the list when one fits, otherwise a short phrase",
+     "kind_source":"the words in the quote that express this relationship, copied verbatim",
      "description":"one sentence","chunk_index":0,"evidence":"a short exact quote",
      "modality":"asserted|denied|possible|suspected — only include when not asserted"}
   ]
@@ -307,6 +308,7 @@ export function strictRelationsEnabled(): boolean {
 /** The relations system prompt; optional blocks sit behind their env switches. */
 export function relationsSystemPrompt(): string {
   let prompt = EXTRACT_RELATIONS_SYSTEM;
+  prompt += `\n\n${kindGlossaryBlock()}`;
   if (process.env.FANFABLE_REL_FEWSHOT === '1') prompt += `\n\n${EXTRACT_RELATIONS_FEWSHOT}`;
   if (strictRelationsEnabled()) prompt += `\n\n${strictRelationsPrompt()}`;
   if (process.env.FANFABLE_REL_LIBERAL === '1') prompt += `\n\n${liberalRelationsPrompt()}`;
@@ -821,10 +823,16 @@ export async function extractLore(
     touched.add(row.id);
   }
   checkEntityCapacity(db, projectId, touched, { write: true });
+  const quarantinedEntities = quarantineSuspectCharacters(db, projectId);
+  // Notes accumulated spans across windows; resolve them now that the book has
+  // been read, so evidence from two pages can prove one tie.
+  const promotedNotes = resolveAccumulatedNotes(db, projectId);
   rememberExtractionReport(db, projectId, stats);
   writeAuditNote(projectId, 'extract', [
     `windows visited: ${stats.windows}`,
     `ties banked: ${stats.relations}`,
+    `notes promoted: ${promotedNotes}`,
+    `entities quarantined: ${quarantinedEntities.quarantined}, released: ${quarantinedEntities.released}`,
     `quotes verified: ${stats.verification.verified}, repointed: ${stats.verification.repointed}, dropped: ${stats.verification.dropped}`,
     `empty windows: ${stats.emptyWindows.length}`,
     ...loopLines,
@@ -1531,8 +1539,35 @@ export function verifySpan(
   return { ...cited, quote: '', status: 'dropped' };
 }
 
-/** Parse one section of an answer, salvaging it when the answer was cut off. */
-function parseSection(text: string, key: string): Record<string, unknown>[] {
+/**
+ * The evidence area for a quote: the page the cited chunk sits on — every
+ * chunk from the same source whose page range overlaps it, joined in read
+ * order. A tie may be stated across two sentences on one page; it may not be
+ * assembled from the whole book.
+ *
+ * Returns null when the chunk carries no page numbers, so callers fall back to
+ * the single cited passage.
+ */
+export function pageEvidenceText(db: Db, chunkId: number): string | null {
+  const cited = db.get<{ source_id: number; page_start: number; page_end: number }>(
+    'SELECT source_id, page_start, page_end FROM canon_chunk WHERE id = ?',
+    chunkId,
+  );
+  if (!cited || (!cited.page_start && !cited.page_end)) return null;
+  const start = Math.min(cited.page_start, cited.page_end);
+  const end = Math.max(cited.page_start, cited.page_end);
+  const rows = db.all<{ text: string }>(
+    `SELECT text FROM canon_chunk
+      WHERE source_id = ? AND page_start <= ? AND page_end >= ?
+      ORDER BY seq`,
+    cited.source_id,
+    end,
+    start,
+  );
+  return rows.length ? rows.map((row) => row.text).join('\n') : null;
+}
+
+/** Parse one section of an answer, salvaging it when the answer was cut off. */function parseSection(text: string, key: string): Record<string, unknown>[] {
   const parsed = extractJson<unknown>(text);
   // Models sometimes return the section as a bare list instead of the asked-for
   // labelled box (e.g. `[{...}]` for relations). That is the same content and
@@ -3576,6 +3611,11 @@ function applyRelations(
     const chunk = chunkAt(window, raw.chunk_index);
     const span = spanFor(raw.evidence, chunk, neighboursOf(chunk?.id), gate, stats.verification);
     if (span.status === 'dropped') continue;
+    // The model may name the words in the quote that express the kind. Keep
+    // them only when they are verbatim in the quote the guard will check.
+    const kindSourceRaw = String(raw.kind_source ?? '').trim();
+    const kindSource =
+      kindSourceRaw && normalise(span.quote).includes(normalise(kindSourceRaw)) ? kindSourceRaw : '';
     // Hard gate (gated path only): a quote about neither endpoint names a
     // third roster person instead. Never written — an unprovable tie is
     // worse than a missing one. The pre-gate path keeps its lenient flag.
@@ -3698,9 +3738,11 @@ function applyRelations(
       let rowReview = flagged === 'open-vocab' ? 'needs_review' : flagged === 'unsupported' ? 'provisional' : review;
       if (rowReview === 'provisional' && flagged === 'unsupported') stats.provisional++;
       if (rowReview === 'accepted') {
-        const guardChunk = span.chunkId
-          ? db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', span.chunkId)
-          : chunk;
+        const guardChunkText = span.chunkId
+          ? pageEvidenceText(db, span.chunkId) ??
+            db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', span.chunkId)?.text ??
+            null
+          : chunk?.text ?? null;
         const fromAliases = db.get<{ aliases: string }>('SELECT aliases FROM canon_entity WHERE id = ?', fromId);
         const toAliases = db.get<{ aliases: string }>('SELECT aliases FROM canon_entity WHERE id = ?', toId);
         const proven = provenRelation(
@@ -3713,8 +3755,9 @@ function applyRelations(
             toAliases: strList(toAliases?.aliases),
             kind,
             evidence: span.quote,
+            kindSource,
           },
-          { chunkText: guardChunk?.text ?? null },
+          { chunkText: guardChunkText },
         );
         if (!proven.ok) {
           rowReview = 'provisional';
@@ -3788,7 +3831,7 @@ function applyRelations(
             .map((ref) => Number(ref?.chunk))
             .find((value) => Number.isFinite(value) && value > 0);
           const guardChunk = guardChunkId
-            ? db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', guardChunkId)
+            ? { text: pageEvidenceText(db, guardChunkId) ?? db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', guardChunkId)?.text ?? '' }
             : chunk;
           const fromRow = db.get<{ aliases: string }>('SELECT aliases FROM canon_entity WHERE id = ?', fromId);
           const toRow = db.get<{ aliases: string }>('SELECT aliases FROM canon_entity WHERE id = ?', toId);
@@ -3825,6 +3868,7 @@ function applyRelations(
         description: String(raw.description ?? '').trim(),
         evidence: span.quote,
         sourceRefs: toJson(refs),
+        kindSource,
         modality: normaliseModality(raw.modality),
         reviewStatus: rowReview,
       });
@@ -4239,6 +4283,60 @@ export const CLOSED_ROLE_KINDS = [
   'partner', 'partner with',
 ];
 
+/**
+ * One line of meaning per bankable kind: what it asserts, and the phrasings
+ * that express it without the label. General English only — no book's
+ * vocabulary enters this table. The reader chooses a kind by meaning; the bank
+ * still stores the closed label, and the quote still has to carry the claim.
+ */
+export const KIND_GLOSSES: Readonly<Record<string, { says: string; reads: string }>> = {
+  'sister of': { says: 'is a female sibling of', reads: 'sister, half-sister, adopted sister' },
+  'brother of': { says: 'is a male sibling of', reads: 'brother, half-brother, adopted brother' },
+  'sibling of': { says: 'shares at least one parent with', reads: 'sibling, brother or sister when the sex is unknown' },
+  'mother of': { says: 'is the female parent of', reads: 'mother, bore, gave birth to, raised as her own' },
+  'father of': { says: 'is the male parent of', reads: 'father, sire, begot, raised as his own' },
+  'parent of': { says: 'is a parent of, when the sex is unknown', reads: 'parent, guardian by blood' },
+  'son of': { says: 'is the male child of', reads: 'son, boy of, heir of a parent' },
+  'daughter of': { says: 'is the female child of', reads: 'daughter, girl of, heiress of a parent' },
+  'child of': { says: 'is the offspring of', reads: 'child, offspring, issue of' },
+  'husband of': { says: 'is the married man in a marriage with', reads: 'husband, wedded to' },
+  'wife of': { says: 'is the married woman in a marriage with', reads: 'wife, wedded to' },
+  'spouse of': { says: 'is the married partner of, when the sex is unknown', reads: 'spouse, wedded to' },
+  'married to': { says: 'is in a marriage with (the same tie in either direction)', reads: 'married, wed, took as a spouse' },
+  'uncle of': { says: "is a parent's brother, or the husband of a parent's sibling", reads: 'uncle' },
+  'aunt of': { says: "is a parent's sister, or the wife of a parent's sibling", reads: 'aunt' },
+  'nephew of': { says: 'is the son of a sibling', reads: 'nephew' },
+  'niece of': { says: 'is the daughter of a sibling', reads: 'niece' },
+  'cousin of': { says: 'is the child of an aunt or uncle', reads: 'cousin' },
+  'relative of': { says: 'is kin by blood or marriage when no closer word fits', reads: 'kin, relation, blood of' },
+  'friend of': { says: 'holds personal affection for, beyond a working tie', reads: 'friend, close to, fond of, companion of' },
+  'enemy of': { says: 'opposes, fights or works against', reads: 'enemy, foe, turned on, stood against, fought' },
+  'ally of': { says: 'supports or sides with in a conflict or cause', reads: 'ally, sided with, backed, stood with, came to their aid, pact with' },
+  'teacher of': { says: 'instructs in a subject or skill', reads: 'taught, instructed, tutored, trained' },
+  'student of': { says: 'is instructed by', reads: 'student, pupil, learner, studied under' },
+  'mentor of': { says: 'guides over time, beyond instruction', reads: 'mentor, protégé, took under his wing, counseled, guided' },
+  'leader of': { says: 'heads the group the other belongs to', reads: 'leads, heads, commands, rules' },
+  'member of': { says: 'belongs to a group, order or organisation', reads: 'member, joined, belongs to, sworn to' },
+  'peer of': { says: 'holds equal standing in the same body', reads: 'peer, equal, fellow' },
+  'colleague of': { says: 'works alongside in the same organisation', reads: 'colleague, coworker, served with, worked with' },
+  'aide of': { says: 'assists in a subordinate personal role', reads: 'aide, assistant to, attendant, adjutant' },
+  'apprentice of': { says: 'is learning a trade or discipline from', reads: 'apprentice, padawan, learner bound to a master' },
+  'assistant of': { says: 'assists in a working role', reads: 'assistant, helper, second to' },
+  'master of': { says: 'has an apprentice or sworn servant bound to them', reads: 'master, lord of' },
+  'operative for': { says: 'carries out tasks for a person or organisation', reads: 'operative, agent of, works for, on the payroll of' },
+  'partner': { says: 'works with another as an equal over time', reads: 'partner, partnership' },
+  'partner with': { says: 'works with another as an equal over time', reads: 'partnered with, in partnership with' },
+};
+
+/** The glossary as prompt text: one line per bankable kind. */
+export function kindGlossaryBlock(): string {
+  const lines = CLOSED_ROLE_KINDS.map((kind) => {
+    const gloss = KIND_GLOSSES[kind];
+    return `- ${kind} — ${gloss?.says ?? ''}; reads as: ${gloss?.reads ?? ''}`;
+  });
+  return `Defined kinds. When one fits the meaning, use its exact wording; otherwise use your own short phrase:\n${lines.join('\n')}`;
+}
+
 /** True when the kind resolves to the closed role-noun list. */
 export function isClosedRoleKind(kind: string): boolean {
   return CLOSED_ROLE_KINDS.includes((kind ?? '').trim().toLowerCase());
@@ -4261,6 +4359,8 @@ export type PromoteReason =
   | 'tie-word-absent'
   | 'endpoint-unnamed'
   | 'direction-mismatch'
+  | 'same-identity'
+  | 'quarantined-entity'
   | 'moment';
 
 export interface PromoteRow {
@@ -4272,6 +4372,9 @@ export interface PromoteRow {
   toAliases?: string[];
   kind: string;
   evidence: string;
+  /** Verbatim words from the quote that express the kind, when the model named
+   * them ("sided with" for ally of). */
+  kindSource?: string;
 }
 
 export interface PromoteContext {
@@ -4420,7 +4523,34 @@ function provenQuoteReason(row: PromoteRow, chunkText?: string | null): PromoteR
   if (!named(row.fromName, row.fromAliases ?? []) || !named(row.toName, row.toAliases ?? [])) {
     return 'endpoint-unnamed';
   }
-  if (isUnsupportedKind(row.kind, row.evidence)) return 'tie-word-absent';
+  // Both names, but at two different places: one shared surface string cannot
+  // prove a relationship between the two rows that carry it.
+  if (!namesBothDistinctly(row.evidence, row.fromName, row.fromAliases ?? [], row.toName, row.toAliases ?? [])) {
+    // The quote may state the tie with one name and leave the other to the
+    // sentence next to it ("his onetime rival, X"). The anchor must be in the
+    // same passage, and the quote itself must still carry the tie word.
+    if (
+      !anchorNamesMissingEndpoint(
+        row.evidence,
+        chunk,
+        row.fromName,
+        row.fromAliases ?? [],
+        row.toName,
+        row.toAliases ?? [],
+      )
+    ) {
+      return 'endpoint-unnamed';
+    }
+  }
+  if (isUnsupportedKind(row.kind, row.evidence)) {
+    // The model may name the words that express the kind when the label's own
+    // word is absent ("sided with" for ally of). Those words must be verbatim
+    // in the quote, so this is a reading of the sentence, not a substitute for
+    // it.
+    const source = (row.kindSource ?? '').trim();
+    const sourceProves = source.length > 0 && normalise(row.evidence).includes(normalise(source));
+    if (!sourceProves) return 'tie-word-absent';
+  }
   if (quoteDirection(canonicalKind(row.kind), row.evidence, row) === 'reverse') {
     return 'direction-mismatch';
   }
@@ -4440,7 +4570,48 @@ export function provenRelation(row: PromoteRow, context: { chunkText?: string | 
   return { ok: true };
 }
 
+/**
+ * True when two character rows have nested names — "X" inside "Captain X",
+ * "Surname" inside "Given Surname". That is one person the bank split, so a
+ * tie between the two rows is an artefact of splitting, never a fact about the
+ * book. Factions, places and items are exempt: "House X" and "X" can hold a
+ * real relationship.
+ */
+function nestedCharacterNames(
+  db: Db,
+  projectId: number,
+  fromId: number,
+  toId: number,
+  fromName: string,
+  toName: string,
+): boolean {
+  const kinds = db.all<{ kind: string }>(
+    'SELECT kind FROM canon_entity WHERE project_id = ? AND id IN (?, ?)',
+    projectId,
+    fromId,
+    toId,
+  );
+  if (kinds.length !== 2 || kinds.some((row) => row.kind !== 'character')) return false;
+  const a = canonicalName(fromName).split(' ').filter(Boolean);
+  const b = canonicalName(toName).split(' ').filter(Boolean);
+  const nests = (short: string[], long: string[]): boolean =>
+    short.length > 0 &&
+    short.length < long.length &&
+    long.some((_, start) => short.every((word, offset) => long[start + offset] === word));
+  return nests(a, b) || nests(b, a);
+}
+
 export function canPromote(row: PromoteRow, context: PromoteContext): PromoteDecision {
+  if (nestedCharacterNames(context.db, context.projectId, row.fromId, row.toId, row.fromName, row.toName)) {
+    return { ok: false, reason: 'same-identity' };
+  }
+  // A character held back as a probable common noun cannot hold a tie either.
+  const held = context.db.get<{ id: number }>(
+    "SELECT id FROM canon_entity WHERE id IN (?, ?) AND review_status = 'quarantined' LIMIT 1",
+    row.fromId,
+    row.toId,
+  );
+  if (held) return { ok: false, reason: 'quarantined-entity' };
   const kind = canonicalKind(row.kind);
   const kindReason = provenKindReason(kind);
   if (kindReason) return { ok: false, reason: kindReason };
@@ -4463,6 +4634,69 @@ export function canPromote(row: PromoteRow, context: PromoteContext): PromoteDec
   const quoteReason = provenQuoteReason(row, context.chunkText);
   if (quoteReason) return { ok: false, reason: quoteReason };
   return { ok: true };
+}
+
+/** Token spans of a name and its aliases inside a quote. */
+function mentionSpans(text: string, name: string, aliases: string[]): Array<[number, number]> {
+  const words = canonicalName(text).split(' ').filter(Boolean);
+  const spans: Array<[number, number]> = [];
+  for (const variant of [name, ...aliases]) {
+    const target = canonicalName(variant).split(' ').filter(Boolean);
+    if (!target.length) continue;
+    for (let i = 0; i + target.length <= words.length; i++) {
+      if (target.every((word, k) => words[i + k] === word)) spans.push([i, i + target.length - 1]);
+    }
+  }
+  return spans;
+}
+
+/**
+ * True when the quote names both endpoints at two different places.
+ *
+ * One surface string cannot stand for both sides. When two rows share an alias
+ * (one row carrying the other's name as an alias), a quote that says only that
+ * name would otherwise satisfy both endpoints and prove a tie between a person
+ * and themself. Requiring two disjoint mentions closes that hole without
+ * needing to know who is who, and without trusting model-written aliases.
+ */
+export function namesBothDistinctly(
+  quote: string,
+  fromName: string,
+  fromAliases: string[],
+  toName: string,
+  toAliases: string[],
+): boolean {
+  const from = mentionSpans(quote, fromName, fromAliases);
+  const to = mentionSpans(quote, toName, toAliases);
+  return from.some(([s1, e1]) => to.some(([s2, e2]) => e1 < s2 || e2 < s1));
+}
+
+/**
+ * True when the quote names one endpoint and the sentence beside it names the
+ * other — the "his onetime rival, X" case, where the tie is stated with a
+ * pronoun or a description. The anchor must sit in the same passage, and the
+ * quote itself must still carry the tie word (checked separately).
+ */
+function anchorNamesMissingEndpoint(
+  quote: string,
+  chunkText: string,
+  fromName: string,
+  fromAliases: string[],
+  toName: string,
+  toAliases: string[],
+): boolean {
+  const fromInQuote = mentionSpans(quote, fromName, fromAliases).length > 0;
+  const toInQuote = mentionSpans(quote, toName, toAliases).length > 0;
+  if (fromInQuote === toInQuote) return false; // both or neither: not this path
+  const sentences = splitSentences(chunkText);
+  const needle = normalise(quote);
+  const at = sentences.findIndex((sentence) => normalise(sentence).includes(needle));
+  if (at < 0) return false;
+  const anchor = [sentences[at - 1], sentences[at + 1]].filter(Boolean).join(' ');
+  const missing = fromInQuote
+    ? mentionSpans(anchor, toName, toAliases)
+    : mentionSpans(anchor, fromName, fromAliases);
+  return missing.length > 0;
 }
 
 
@@ -4493,8 +4727,9 @@ function loadGuardRow(db: Db, projectId: number, relationId: number): GuardedRow
     from_aliases: string;
     to_name: string;
     to_aliases: string;
+    kind_source: string;
   }>(
-    `SELECT r.from_entity, r.to_entity, r.kind, r.evidence, r.source_refs,
+    `SELECT r.from_entity, r.to_entity, r.kind, r.evidence, r.source_refs, r.kind_source,
             a.name AS from_name, a.aliases AS from_aliases,
             b.name AS to_name, b.aliases AS to_aliases
        FROM canon_relation r
@@ -4510,7 +4745,11 @@ function loadGuardRow(db: Db, projectId: number, relationId: number): GuardedRow
     const refs = JSON.parse(row.source_refs || '[]') as { chunk?: unknown }[];
     const chunkId = refs.find((ref) => Number.isFinite(Number(ref?.chunk)) && Number(ref?.chunk) > 0)?.chunk;
     if (chunkId) {
-      chunkText = db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', Number(chunkId))?.text ?? null;
+      const citedId = Number(chunkId);
+      chunkText =
+        pageEvidenceText(db, citedId) ??
+        db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', citedId)?.text ??
+        null;
     }
   } catch {
     chunkText = null;
@@ -4525,6 +4764,7 @@ function loadGuardRow(db: Db, projectId: number, relationId: number): GuardedRow
       toAliases: strList(row.to_aliases),
       kind: row.kind,
       evidence: row.evidence,
+      kindSource: row.kind_source,
     },
     chunkText,
   };
@@ -4735,8 +4975,9 @@ export function canPromoteRelation(
     from_aliases: string;
     to_name: string;
     to_aliases: string;
+    kind_source: string;
   }>(
-    `SELECT r.from_entity, r.to_entity, r.kind, r.evidence, r.source_refs,
+    `SELECT r.from_entity, r.to_entity, r.kind, r.evidence, r.source_refs, r.kind_source,
             a.name AS from_name, a.aliases AS from_aliases,
             b.name AS to_name, b.aliases AS to_aliases
        FROM canon_relation r
@@ -4752,7 +4993,11 @@ export function canPromoteRelation(
     const refs = JSON.parse(row.source_refs || '[]') as { chunk?: unknown }[];
     const chunkId = refs.find((ref) => Number.isFinite(Number(ref?.chunk)) && Number(ref?.chunk) > 0)?.chunk;
     if (chunkId) {
-      chunkText = db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', Number(chunkId))?.text ?? null;
+      const citedId = Number(chunkId);
+      chunkText =
+        pageEvidenceText(db, citedId) ??
+        db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', citedId)?.text ??
+        null;
     }
   } catch {
     chunkText = null;
@@ -4767,6 +5012,7 @@ export function canPromoteRelation(
       toAliases: strList(row.to_aliases),
       kind: row.kind,
       evidence: row.evidence,
+      kindSource: row.kind_source,
     },
     { db, projectId, chunkText },
   );
@@ -4779,6 +5025,9 @@ export interface RelationInsert {
   description?: string;
   evidence: string;
   sourceRefs: string;
+  /** The words in the quote that express the kind, when the label's own word
+   * is absent ("sided with" for ally of). Verbatim by construction. */
+  kindSource?: string;
   modality?: string;
   reviewStatus?: string;
   confidence?: number;
@@ -4801,8 +5050,8 @@ export function insertRelation(
     throw new Error('relation insert refused: source_refs must contain a numeric chunk id');
   }
   return db.run(
-    `INSERT INTO canon_relation (project_id, from_entity, to_entity, kind, description, evidence, source_refs, confidence, modality, review_status, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO canon_relation (project_id, from_entity, to_entity, kind, description, evidence, source_refs, confidence, modality, review_status, kind_source, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     projectId,
     row.fromEntity,
     row.toEntity,
@@ -4813,6 +5062,7 @@ export function insertRelation(
     row.confidence ?? 1.0,
     row.modality ?? 'asserted',
     row.reviewStatus ?? 'accepted',
+    row.kindSource ?? '',
     nowIso(),
   ).lastInsertRowid;
 }
@@ -4930,19 +5180,445 @@ export function persistTieNote(
   sourceRefs: string,
   ruling = '',
 ): void {
-  db.run(
-    `INSERT OR IGNORE INTO canon_tie_note (project_id, from_entity, to_entity, attempted_kind, reason, evidence, source_refs, status, ruling, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+  // One note per pair and kind, accumulating spans: evidence found in a later
+  // window is added to the same note instead of being ignored, so two pages
+  // can together prove one tie.
+  const existing = db.get<{ id: number; evidence: string; source_refs: string }>(
+    `SELECT id, evidence, source_refs FROM canon_tie_note
+      WHERE project_id = ? AND from_entity = ? AND to_entity = ? AND attempted_kind = ?`,
     projectId,
     fromId,
     toId,
     attemptedKind,
-    reason,
-    evidence,
-    sourceRefs,
-    ruling,
-    nowIso(),
   );
+  if (!existing) {
+    db.run(
+      `INSERT OR IGNORE INTO canon_tie_note (project_id, from_entity, to_entity, attempted_kind, reason, evidence, source_refs, status, ruling, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+      projectId,
+      fromId,
+      toId,
+      attemptedKind,
+      reason,
+      evidence,
+      sourceRefs,
+      ruling,
+      nowIso(),
+    );
+    return;
+  }
+  const spans = noteSpans({ evidence: existing.evidence, source_refs: existing.source_refs });
+  const incoming = noteSpans({ evidence, source_refs: sourceRefs });
+  const seen = new Set(spans.map((span) => `${span.chunk}|${normalise(span.quote)}`));
+  let added = false;
+  for (const span of incoming) {
+    const key = `${span.chunk}|${normalise(span.quote)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    spans.push(span);
+    added = true;
+  }
+  if (!added) return;
+  db.run(
+    'UPDATE canon_tie_note SET evidence = ?, source_refs = ? WHERE id = ?',
+    spans[0]?.quote ?? existing.evidence,
+    toJson(spans.map((span) => ({ ...span, quote: span.quote }))),
+    existing.id,
+  );
+}
+
+/** Spans held by a tie note: quote plus the passage it was copied from. */
+export interface NoteSpan {
+  quote: string;
+  source?: string;
+  locator?: string;
+  chunk?: number;
+}
+
+/** Read a note's spans, accepting the old single-quote shape. */
+export function noteSpans(note: { evidence: string; source_refs: string }): NoteSpan[] {
+  const out: NoteSpan[] = [];
+  try {
+    const refs = JSON.parse(note.source_refs || '[]');
+    if (Array.isArray(refs)) {
+      for (const ref of refs) {
+        const quote = String(ref?.quote ?? '').trim();
+        const chunk = Number(ref?.chunk);
+        if (quote && Number.isFinite(chunk) && chunk > 0) {
+          out.push({ quote, chunk, source: String(ref?.source ?? ''), locator: String(ref?.locator ?? '') });
+        }
+      }
+    }
+  } catch {
+    /* fall through to the legacy shape */
+  }
+  if (!out.length && note.evidence.trim()) {
+    try {
+      const refs = JSON.parse(note.source_refs || '[]');
+      const first = Array.isArray(refs) ? refs[0] : undefined;
+      const chunk = Number(first?.chunk);
+      if (Number.isFinite(chunk) && chunk > 0) {
+        out.push({
+          quote: note.evidence,
+          chunk,
+          source: String(first?.source ?? ''),
+          locator: String(first?.locator ?? ''),
+        });
+      }
+    } catch {
+      /* no usable span */
+    }
+  }
+  return out;
+}
+
+/** Everything a sentence could use to state a relationship: the labels and the
+ * phrasings the glossary lists for them. Normalised once per scan. */
+function tiePhrases(): string[] {
+  const out = new Set<string>();
+  for (const kind of CLOSED_ROLE_KINDS) {
+    const gloss = KIND_GLOSSES[kind];
+    for (const phrase of [kind, ...(gloss?.reads ?? '').split(',')]) {
+      const cleaned = normalise(phrase.replace(/\([^)]*\)/g, '').replace(/"/g, ''));
+      if (cleaned.length > 2) out.add(cleaned);
+    }
+  }
+  return [...out];
+}
+
+export interface SentenceCandidate {
+  sentence: string;
+  chunkId: number;
+  locator: string;
+  fromId: number;
+  fromName: string;
+  toId: number;
+  toName: string;
+}
+
+/**
+ * Find, without a model, every sentence that names two known people and uses a
+ * relationship word. This is the searchable universe for name-anchored reading:
+ * the model's job is then to judge one sentence, not to notice a tie across a
+ * window and hope it emits both names.
+ */
+export function scanSentenceCandidates(db: Db, projectId: number): SentenceCandidate[] {
+  const entities = db.all<{ id: number; name: string; aliases: string; kind: string }>(
+    "SELECT id, name, aliases, kind FROM canon_entity WHERE project_id = ? AND kind = 'character' AND review_status != 'quarantined'",
+    projectId,
+  )
+    .map((row) => ({
+      id: row.id,
+      name: row.name,
+      tokens: canonicalName(row.name).split(' ').filter(Boolean),
+    }))
+    .filter((row) => row.tokens.length > 0);
+  const phrases = tiePhrases()
+    .map((phrase) => phrase.split(' ').filter(Boolean))
+    .filter((tokens) => tokens.length > 0);
+  const out: { candidate: SentenceCandidate; distance: number }[] = [];
+  const seen = new Set<string>();
+
+  const positions = (tokens: string[], target: string[]): number[] => {
+    const at: number[] = [];
+    for (let i = 0; i + target.length <= tokens.length; i++) {
+      if (target.every((word, k) => tokens[i + k] === word)) at.push(i);
+    }
+    return at;
+  };
+
+  const chunks = db.all<{ id: number; locator: string; text: string }>(
+    'SELECT id, locator, text FROM canon_chunk WHERE project_id = ? ORDER BY seq',
+    projectId,
+  );
+  for (const chunk of chunks) {
+    for (const sentence of splitSentences(chunk.text)) {
+      const tokens = canonicalName(sentence).split(' ').filter(Boolean);
+      if (tokens.length < 3) continue;
+      const phraseAt: { start: number; end: number }[] = [];
+      for (const phrase of phrases) {
+        for (const start of positions(tokens, phrase)) {
+          phraseAt.push({ start, end: start + phrase.length - 1 });
+        }
+      }
+      if (!phraseAt.length) continue;
+      const present = entities
+        .map((entity) => ({ ...entity, at: positions(tokens, entity.tokens) }))
+        .filter((entity) => entity.at.length > 0);
+      if (present.length < 2) continue;
+      const nests = (x: string[], y: string[]): boolean =>
+        x.length > 0 && x.length < y.length && y.some((_, at) => x.every((word, k) => y[at + k] === word));
+      for (let i = 0; i < present.length; i++) {
+        for (let j = i + 1; j < present.length; j++) {
+          const a = present[i]!;
+          const b = present[j]!;
+          if (nests(a.tokens, b.tokens) || nests(b.tokens, a.tokens)) continue;
+          // The pair must sit in one clause with the tie word: 25 tokens from
+          // first name to last, and a tie phrase within 10 tokens of that run.
+          // A list of names spread across a sentence is not a statement about
+          // two of them.
+          let closest = Number.POSITIVE_INFINITY;
+          for (const startA of a.at) {
+            for (const startB of b.at) {
+              const lo = Math.min(startA, startB);
+              const hi = Math.max(startA + a.tokens.length - 1, startB + b.tokens.length - 1);
+              const span = hi - lo;
+              if (span > 25) continue;
+              const near = phraseAt.some((phrase) => phrase.start >= lo - 10 && phrase.start <= hi + 10);
+              if (!near) continue;
+              if (span < closest) closest = span;
+            }
+          }
+          if (!Number.isFinite(closest)) continue;
+          const key = `${a.id}|${b.id}|${tokens.join(' ')}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push({
+            distance: closest,
+            candidate: {
+              sentence: sentence.trim(),
+              chunkId: chunk.id,
+              locator: chunk.locator,
+              fromId: a.id,
+              fromName: a.name,
+              toId: b.id,
+              toName: b.name,
+            },
+          });
+        }
+      }
+    }
+  }
+  return out.sort((x, y) => x.distance - y.distance).map((entry) => entry.candidate);
+}
+
+export interface ScanResult {
+  checked: number;
+  accepted: number;
+  parked: number;
+  refused: number;
+}
+
+/**
+ * Judge scanned sentences one at a time. The scan already guarantees a
+ * sentence with two known names and a relationship word; the model only has to
+ * say whether it states a lasting tie and which kind it is.
+ */
+export async function verifySentenceCandidates(
+  db: Db,
+  llm: LlmClient,
+  projectId: number,
+  candidates: SentenceCandidate[],
+  opts: { max?: number; dryRun?: boolean; onProgress?: (message: string) => void } = {},
+): Promise<ScanResult> {
+  const list = candidates.slice(0, opts.max ?? candidates.length);
+  const result: ScanResult = { checked: 0, accepted: 0, parked: 0, refused: 0 };
+  for (const candidate of list) {
+    opts.onProgress?.(`${candidate.fromName} / ${candidate.toName} — ${candidate.locator}`);
+    let verdict: { tie?: unknown; kind?: unknown; from?: unknown; to?: unknown } | null = null;
+    try {
+      const res = await llm.chat({
+        system:
+          'You judge one sentence from a novel. Reply with JSON only: ' +
+          '{"tie": false} or {"tie": true, "kind": one of [' +
+          `${CLOSED_ROLE_KINDS.join(', ')}], "from": "<name>", "to": "<name>"}.`,
+        messages: [
+          {
+            role: 'user',
+            content:
+              `Sentence: ${candidate.sentence}\n` +
+              `Question: does this sentence say that ${candidate.fromName} and ${candidate.toName} ` +
+              'have a lasting relationship (family, lasting role, friend or enemy)? ' +
+              'If it does, give the kind, then "from" for the one who has the relationship and "to" for the other: ' +
+              'for "X was Y\'s mentor", Y is the mentor and X is the one mentored. ' +
+              'Answer {"tie":false} when the sentence states no lasting relationship.',
+          },
+        ],
+        format: 'json',
+        temperature: 0.1,
+        maxTokens: 160,
+      });
+      const raw = String(res.text ?? '').replace(/```json|```/g, '');
+      verdict = JSON.parse(raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1)) as {
+        tie?: unknown;
+        kind?: unknown;
+        from?: unknown;
+        to?: unknown;
+      };
+    } catch {
+      result.refused++;
+      continue;
+    }
+    result.checked++;
+    if (verdict?.tie !== true) {
+      result.refused++;
+      continue;
+    }
+    const kind = canonicalKind(String(verdict.kind ?? ''));
+    if (!isClosedRoleKind(kind)) {
+      result.refused++;
+      continue;
+    }
+    // Direction comes from the answer, not from the order the scan happened to
+    // list the pair in. If the model names neither endpoint, the row is not
+    // usable: guessing here is how a mentor becomes the mentee.
+    const saidFrom = String(verdict.from ?? '').trim().toLowerCase();
+    const saidTo = String(verdict.to ?? '').trim().toLowerCase();
+    const forward = saidFrom === candidate.fromName.toLowerCase() && saidTo === candidate.toName.toLowerCase();
+    const reverse = saidFrom === candidate.toName.toLowerCase() && saidTo === candidate.fromName.toLowerCase();
+    if (!forward && !reverse) {
+      result.refused++;
+      continue;
+    }
+    const fromId = forward ? candidate.fromId : candidate.toId;
+    const toId = forward ? candidate.toId : candidate.fromId;
+    const chunk = db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', candidate.chunkId);
+    if (!chunk || !normalise(chunk.text).includes(normalise(candidate.sentence))) {
+      result.refused++;
+      continue;
+    }
+    const from = db.get<{ name: string; aliases: string }>('SELECT name, aliases FROM canon_entity WHERE id = ?', fromId);
+    const to = db.get<{ name: string; aliases: string }>('SELECT name, aliases FROM canon_entity WHERE id = ?', toId);
+    if (!from || !to) {
+      result.refused++;
+      continue;
+    }
+    const decision = canPromote(
+      {
+        fromId,
+        toId,
+        fromName: from.name,
+        toName: to.name,
+        fromAliases: strList(from.aliases),
+        toAliases: strList(to.aliases),
+        kind,
+        evidence: candidate.sentence,
+      },
+      { db, projectId, chunkText: chunk.text },
+    );
+    const existing = db.get<{ id: number }>(
+      'SELECT id FROM canon_relation WHERE project_id = ? AND from_entity = ? AND to_entity = ? AND kind = ?',
+      projectId,
+      fromId,
+      toId,
+      kind,
+    );
+    if (existing) {
+      // Already banked for this pair and kind: the scan adds no second row.
+      result.parked++;
+      continue;
+    }
+    const reviewStatus = decision.ok ? 'accepted' : 'provisional';
+    if (decision.ok) result.accepted++;
+    else result.parked++;
+    if (!opts.dryRun) {
+      insertRelation(db, projectId, {
+        fromEntity: fromId,
+        toEntity: toId,
+        kind,
+        description: '',
+        evidence: candidate.sentence,
+        sourceRefs: JSON.stringify([{ source: '', locator: candidate.locator, chunk: candidate.chunkId }]),
+        reviewStatus,
+      });
+    }
+  }
+  return result;
+}
+
+/**
+ * Re-check pending notes once the book has been read. A note accumulates spans
+ * from every window that mentions its pair; when the spans together name both
+ * people and one of them states the tie, the note becomes a keeper.
+ *
+ * Every span must be verbatim in its own page, and the ordinary conditions
+ * still apply: closed relationship-grade kind, no PARK ruling, no reversed
+ * direction, and two different identities.
+ */
+export function resolveAccumulatedNotes(db: Db, projectId: number): number {
+  const notes = db.all<{
+    id: number;
+    from_entity: number;
+    to_entity: number;
+    attempted_kind: string;
+    evidence: string;
+    source_refs: string;
+  }>(
+    `SELECT id, from_entity, to_entity, attempted_kind, evidence, source_refs
+       FROM canon_tie_note WHERE project_id = ? AND status = 'pending'`,
+    projectId,
+  );
+  let promoted = 0;
+  for (const note of notes) {
+    const kind = canonicalKind(note.attempted_kind);
+    if (provenKindReason(kind)) continue;
+    const spans = noteSpans(note);
+    if (spans.length < 2) continue;
+    const from = db.get<{ name: string; aliases: string }>(
+      'SELECT name, aliases FROM canon_entity WHERE id = ?',
+      note.from_entity,
+    );
+    const to = db.get<{ name: string; aliases: string }>(
+      'SELECT name, aliases FROM canon_entity WHERE id = ?',
+      note.to_entity,
+    );
+    if (!from || !to) continue;
+    const fromAliases = strList(from.aliases);
+    const toAliases = strList(to.aliases);
+    if (nestedCharacterNames(db, projectId, note.from_entity, note.to_entity, from.name, to.name)) continue;
+    const parked = db.all<{ attempted_kind: string }>(
+      `SELECT attempted_kind FROM canon_tie_note
+        WHERE project_id = ? AND lower(ruling) LIKE 'park%'
+          AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))`,
+      projectId,
+      note.from_entity,
+      note.to_entity,
+      note.to_entity,
+      note.from_entity,
+    );
+    if (parked.some((row) => sameOrInverseKind(row.attempted_kind, kind))) continue;
+
+    // Every span must be verbatim in its own page.
+    let allVerbatim = true;
+    for (const span of spans) {
+      const page =
+        pageEvidenceText(db, span.chunk as number) ??
+        db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', span.chunk as number)?.text ??
+        '';
+      if (!page || !normalise(page).includes(normalise(span.quote))) {
+        allVerbatim = false;
+        break;
+      }
+    }
+    if (!allVerbatim) continue;
+
+    const joined = spans.map((span) => span.quote).join(' ');
+    if (!namesBothDistinctly(joined, from.name, fromAliases, to.name, toAliases)) continue;
+    const tieSpan = spans.find((span) => !isUnsupportedKind(kind, span.quote));
+    if (!tieSpan) continue;
+    if (relationSentenceDirection(kind, tieSpan.quote, from.name, fromAliases, to.name, toAliases) === 'reverse') {
+      continue;
+    }
+
+    insertRelation(db, projectId, {
+      fromEntity: note.from_entity,
+      toEntity: note.to_entity,
+      kind,
+      description: '',
+      evidence: tieSpan.quote,
+      sourceRefs: JSON.stringify([
+        { source: tieSpan.source ?? '', locator: tieSpan.locator ?? '', chunk: tieSpan.chunk },
+      ]),
+      reviewStatus: 'accepted',
+    });
+    db.run(
+      "UPDATE canon_tie_note SET status = 'resolved', ruling = 'promoted', ruled_at = ? WHERE id = ?",
+      nowIso(),
+      note.id,
+    );
+    promoted++;
+  }
+  return promoted;
 }
 
 export interface TieHint {
@@ -6142,6 +6818,26 @@ function kinGroupsOf(kind: string): ReadonlySet<string>[] {
 const KIND_FILLER = new Set(['of', 'to', 'with', 'for', 'a', 'the', 'an', 'in', 'on', 'as']);
 
 export function isUnsupportedKind(kind: string, quote: string): boolean {
+  const key = (kind ?? '').trim().toLowerCase();
+  const text = normalise(quote ?? '');
+  // A defined kind lists the phrasings that express the same meaning. A quote
+  // that uses one of them states the tie even without the label's own word:
+  // "sided with" is an alliance, "turned on" is enmity.
+  const gloss = KIND_GLOSSES[key];
+  if (gloss) {
+    const phrases = gloss.reads
+      .split(',')
+      .map((phrase) => normalise(phrase.replace(/\([^)]*\)/g, '').replace(/"/g, '')))
+      .filter((phrase) => phrase.length > 2);
+    if (phrases.some((phrase) => text.includes(phrase))) return false;
+  }
+  // "Relative of" is the generic kin label: it needs the text to say relative,
+  // kin or family, not merely to mention an aunt or an uncle nearby. Otherwise
+  // any two family members in one sentence become relatives of each other.
+  if (key === 'relative of') {
+    const generic = ['relative', 'relatives', 'relation', 'kin', 'kinsman', 'kinswoman', 'related', 'family member'];
+    return !generic.some((word) => text.includes(word));
+  }
   const groups = kinGroupsOf(kind);
   const quoteWords = new Set((quote ?? '').toLowerCase().split(/[^a-z]+/).filter(Boolean));
   if (groups.length) {
@@ -6400,6 +7096,58 @@ function properEntityName(name: string): boolean {
  * candidate noun and exactly one other, non-parked entity. The candidate is
  * parked in every case; nothing is deleted, renamed or re-kinded.
  */
+/**
+ * Hold back characters that look like ordinary words.
+ *
+ * A character admitted from a single mention, with no alias, whose name also
+ * occurs lowercase in the book is probably a common noun ("bill" on an
+ * invoice). It is quarantined, not deleted: ties involving it are refused and
+ * the scan ignores it, but the row and its evidence stay for review.
+ *
+ * Release requires real character evidence — a second mention, or a recognised
+ * alias — so another occurrence of the same common noun cannot release it.
+ */
+export function quarantineSuspectCharacters(
+  db: Db,
+  projectId: number,
+): { quarantined: number; released: number } {
+  const text = db
+    .all<{ text: string }>('SELECT text FROM canon_chunk WHERE project_id = ?', projectId)
+    .map((row) => row.text)
+    .join(' ');
+  const lowerOccurrences = (name: string): number => {
+    const safe = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return (text.match(new RegExp(`\\b${safe}\\b`, 'g')) ?? []).length;
+  };
+  const rows = db.all<{ id: number; name: string; aliases: string; mentions: number; review_status: string }>(
+    "SELECT id, name, aliases, mentions, review_status FROM canon_entity WHERE project_id = ? AND kind = 'character'",
+    projectId,
+  );
+  let quarantined = 0;
+  let released = 0;
+  for (const row of rows) {
+    if (row.review_status === 'quarantined') {
+      if ((row.mentions ?? 0) >= 2 || strList(row.aliases).length > 0) {
+        db.run("UPDATE canon_entity SET review_status = 'accepted', quarantine_reason = '' WHERE id = ?", row.id);
+        released++;
+      }
+      continue;
+    }
+    if ((row.mentions ?? 0) > 1) continue;
+    if (strList(row.aliases).length > 0) continue;
+    if (!/^[A-Z][a-z]{2,}$/.test(row.name)) continue;
+    const lower = lowerOccurrences(row.name.toLowerCase());
+    if (lower < 1) continue;
+    db.run(
+      "UPDATE canon_entity SET review_status = 'quarantined', quarantine_reason = ? WHERE id = ?",
+      `single mention; the name also occurs lowercase ${lower} time(s) in the book`,
+      row.id,
+    );
+    quarantined++;
+  }
+  return { quarantined, released };
+}
+
 export function checkEntityCapacity(
   db: Db,
   projectId: number,

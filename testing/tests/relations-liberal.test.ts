@@ -24,11 +24,13 @@ const EMPTY_DIAGNOSTICS: lorebook.NameRosterDiagnostics = {
   rejectedNoMidSentence: 0,
 };
 
-test('liberal discovery is off by default and byte-identical when off', () => {
+test('liberal discovery is off by default and adds nothing when off', () => {
   const before = process.env.FANFABLE_REL_LIBERAL;
   try {
     delete process.env.FANFABLE_REL_LIBERAL;
-    assert.equal(lorebook.relationsSystemPrompt(), lorebook.EXTRACT_RELATIONS_SYSTEM);
+    const off = lorebook.relationsSystemPrompt();
+    assert.ok(off.startsWith(lorebook.EXTRACT_RELATIONS_SYSTEM));
+    assert.ok(!off.includes('Liberal discovery mode'));
 
     process.env.FANFABLE_REL_LIBERAL = '1';
     const prompted = lorebook.relationsSystemPrompt();

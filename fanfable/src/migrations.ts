@@ -353,6 +353,27 @@ export const MIGRATIONS: Migration[] = [
     sql: `UPDATE canon_relation SET confirmed_by_user = 1 WHERE review_status = 'user_confirmed';`,
   },
   {
+    version: 17,
+    name: 'quarantine reason for suspect entities',
+    // A character admitted from a single mention whose name is also an ordinary
+    // word ("bill" on an invoice) is held back from tie generation, not
+    // deleted. The reason is kept so review can see why and what would release
+    // it: a second independent mention, or a recognised alias.
+    columns: [
+      ['canon_entity', 'quarantine_reason', "TEXT NOT NULL DEFAULT ''"],
+    ],
+  },
+  {
+    version: 16,
+    name: 'kind source words for relations',
+    // The words in the quote that express the kind, when the label's own word
+    // is absent ("sided with" for ally of). Verbatim by construction: the
+    // guard checks it against the quote before it counts.
+    columns: [
+      ['canon_relation', 'kind_source', "TEXT NOT NULL DEFAULT ''"],
+    ],
+  },
+  {
     version: 14,
     name: 'supporting evidence for relations',
     // One cited proving quote per relation; superseded quotes move here as

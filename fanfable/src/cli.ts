@@ -137,6 +137,7 @@ ${C.bold('SOURCE MATERIAL')}
   lore trails --query "..." [--out f]  Draw how each top passage connects to the query
                            [--web] show the association layer too (default off)
   lore hints [--limit n]           List ties whose endpoints are not in the bank
+  lore scan [--max n] [--dry-run]  Judge sentences that name two people and a tie word
   lore link-facts [--dry-run] [--limit n]  Attach fact subjects to entities
   lore capacity [--dry-run] [--limit n]  Park unproven entities, funnel proven nouns
   lore names [--limit n] [--diagnostics]  List the capitalization name roster (no writes)
@@ -764,6 +765,23 @@ async function cmdLore(args: Args): Promise<void> {
     heading(dryRun ? 'Fact subject links (dry run)' : 'Fact subject links');
     console.log(
       `scanned ${result.scanned}, linked ${result.linked}, ambiguous ${result.ambiguous}, unmatched ${result.unmatched}`,
+    );
+    return;
+  }
+
+  if (sub === 'scan') {
+    heading('Scanning sentences');
+    const candidates = lorebook.scanSentenceCandidates(db, project.id);
+    const max = Math.max(1, Math.floor(flagNumber(args, 'max', 0) || candidates.length));
+    console.log(C.dim(`  ${candidates.length} candidate sentence(s); checking ${Math.min(max, candidates.length)}`));
+    const result = await lorebook.verifySentenceCandidates(db, a.llm, project.id, candidates, {
+      max,
+      dryRun: args.flags['dry-run'] === true,
+      onProgress: (message) => process.stdout.write(`  ${C.dim(message)}\n`),
+    });
+    console.log(
+      `${C.green('scan')} checked ${result.checked}, accepted ${result.accepted}, ` +
+        `parked ${result.parked}, refused ${result.refused}`,
     );
     return;
   }
