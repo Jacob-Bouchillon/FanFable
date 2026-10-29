@@ -1175,6 +1175,37 @@ async function cmdLore(args: Args): Promise<void> {
     return;
   }
 
+  if (sub === 'relationships') {
+    const wanted = flagString(args, 'status')?.trim();
+    const pairs = lorebook.listRelationshipPairs(db, project.id).filter(
+      (pair) => !wanted || pair.status === wanted,
+    );
+    const counts = new Map<string, number>();
+    for (const pair of pairs) counts.set(pair.status, (counts.get(pair.status) ?? 0) + 1);
+    heading('Relationship pairs');
+    console.log(
+      [...counts.entries()].map(([status, n]) => `${n} ${status}`).join(' · ') || '(none)',
+    );
+    for (const pair of pairs) {
+      const locator = pair.locator ? C.dim(`  (${pair.locator})`) : '';
+      const extra = pair.rows > 1 ? C.dim(`  +${pair.rows - 1} more`) : '';
+      console.log(`  ${C.dim('[' + pair.status + ']')} ${pair.fromName} — ${pair.kind} — ${pair.toName}${locator}${extra}`);
+    }
+    return;
+  }
+
+  if (sub === 'proposals') {
+    const proposals = lorebook.listTieProposals(db, project.id);
+    heading('Tie proposals (not in the bank)');
+    console.log(`${proposals.length} pairs proposed · ${proposals.reduce((n, p) => n + p.notes, 0)} notes`);
+    for (const p of proposals.slice(0, flagNumber(args, 'limit', 40))) {
+      const locator = p.locator ? C.dim(`  (${p.locator})`) : '';
+      const extra = p.notes > 1 ? C.dim(`  +${p.notes - 1} notes`) : '';
+      console.log(`  ${p.fromName} — ${p.kind} — ${p.toName}  ${C.dim('[' + p.reason + ']')}${locator}${extra}`);
+    }
+    return;
+  }
+
   throw new Error(`unknown lore subcommand "${sub}"`);
 }
 

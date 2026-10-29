@@ -9265,3 +9265,159 @@ export function loreStats(db: Db, projectId: number): {
     rules: count("SELECT COUNT(*) AS n FROM canon_entity WHERE project_id = ? AND kind = 'rule'", projectId),
   };
 }
+
+/** One line per relationship pair, strongest row first. */
+export interface RelationshipPair {
+  fromName: string;
+  toName: string;
+  kind: string;
+  status: string;
+  locator: string;
+  confirmedByUser: boolean;
+  rows: number;
+}
+
+const RELATION_STATUS_RANK: Record<string, number> = {
+  user_confirmed: 0,
+  accepted: 1,
+  provisional: 2,
+  needs_review: 3,
+};
+
+/**
+ * Collapse the relation table to one row per pair. The same two people may be
+ * stored several times (inverse directions, repealed kinds, duplicate roster
+ * rows); the strongest status wins and the rest are counted.
+ */
+export function listRelationshipPairs(db: Db, projectId: number): RelationshipPair[] {
+  const rows = db.all<{
+    id: number;
+    from_id: number;
+    to_id: number;
+    from_name: string;
+    to_name: string;
+    kind: string;
+    review_status: string;
+    confirmed_by_user: number | null;
+    source_refs: string;
+  }>(
+    `SELECT r.id, r.from_entity AS from_id, r.to_entity AS to_id,
+            a.name AS from_name, b.name AS to_name, r.kind, r.review_status,
+            r.confirmed_by_user, coalesce(r.source_refs, '[]') AS source_refs
+       FROM canon_relation r
+       JOIN canon_entity a ON a.id = r.from_entity
+       JOIN canon_entity b ON b.id = r.to_entity
+      WHERE r.project_id = ?`,
+    projectId,
+  );
+  const groups = new Map<string, { best: (typeof rows)[number]; count: number }>();
+  for (const row of rows) {
+    const key = `${Math.min(row.from_id, row.to_id)}|${Math.max(row.from_id, row.to_id)}`;
+    const rank = row.confirmed_by_user === 1 ? 0 : RELATION_STATUS_RANK[row.review_status] ?? 4;
+    const group = groups.get(key);
+    if (!group) {
+      groups.set(key, { best: row, count: 1 });
+      continue;
+    }
+    group.count++;
+    const bestRank =
+      group.best.confirmed_by_user === 1 ? 0 : RELATION_STATUS_RANK[group.best.review_status] ?? 4;
+    if (rank < bestRank) group.best = row;
+  }
+  const locatorOf = (refs: string): string => {
+    try {
+      const list = JSON.parse(refs) as { locator?: unknown }[];
+      return list.map((r) => (typeof r.locator === 'string' ? r.locator.trim() : '')).find(Boolean) ?? '';
+    } catch {
+      return '';
+    }
+  };
+  return [...groups.values()]
+    .map(({ best, count }) => ({
+      fromName: best.from_name,
+      toName: best.to_name,
+      kind: best.kind,
+      status: best.confirmed_by_user === 1 ? 'user_confirmed' : best.review_status,
+      locator: locatorOf(best.source_refs),
+      confirmedByUser: best.confirmed_by_user === 1,
+      rows: count,
+    }))
+    .sort(
+      (a, b) =>
+        (RELATION_STATUS_RANK[a.status] ?? 4) - (RELATION_STATUS_RANK[b.status] ?? 4) ||
+        a.fromName.localeCompare(b.fromName) ||
+        a.toName.localeCompare(b.toName),
+    );
+}
+
+/** A pair the extractor proposed that never reached the bank. */
+export interface TieProposal {
+  fromName: string;
+  toName: string;
+  kind: string;
+  reason: string;
+  locator: string;
+  notes: number;
+}
+
+/**
+ * Pending tie notes, one row per pair, excluding pairs that already hold a
+ * keeper. This is the review queue: everything the extractor offered and the
+ * guard refused, with the reason it gave.
+ */
+export function listTieProposals(db: Db, projectId: number): TieProposal[] {
+  const notes = db.all<{
+    id: number;
+    from_id: number;
+    to_id: number;
+    from_name: string;
+    to_name: string;
+    attempted_kind: string;
+    reason: string;
+    source_refs: string;
+  }>(
+    `SELECT n.id, n.from_entity AS from_id, n.to_entity AS to_id,
+            a.name AS from_name, b.name AS to_name,
+            n.attempted_kind, n.reason, coalesce(n.source_refs, '[]') AS source_refs
+       FROM canon_tie_note n
+       JOIN canon_entity a ON a.id = n.from_entity
+       JOIN canon_entity b ON b.id = n.to_entity
+      WHERE n.project_id = ? AND n.status = 'pending'`,
+    projectId,
+  );
+  const keepers = new Set(
+    db
+      .all<{ a: number; b: number }>(
+        `SELECT from_entity AS a, to_entity AS b FROM canon_relation
+          WHERE project_id = ? AND (review_status = 'user_confirmed' OR confirmed_by_user = 1)`,
+        projectId,
+      )
+      .map((r) => `${Math.min(r.a, r.b)}|${Math.max(r.a, r.b)}`),
+  );
+  const locatorOf = (refs: string): string => {
+    try {
+      const list = JSON.parse(refs) as { locator?: unknown }[];
+      return list.map((r) => (typeof r.locator === 'string' ? r.locator.trim() : '')).find(Boolean) ?? '';
+    } catch {
+      return '';
+    }
+  };
+  const groups = new Map<string, { note: (typeof notes)[number]; count: number }>();
+  for (const note of notes) {
+    const key = `${Math.min(note.from_id, note.to_id)}|${Math.max(note.from_id, note.to_id)}`;
+    if (keepers.has(key)) continue;
+    const group = groups.get(key);
+    if (!group) groups.set(key, { note, count: 1 });
+    else group.count++;
+  }
+  return [...groups.values()]
+    .map(({ note, count }) => ({
+      fromName: note.from_name,
+      toName: note.to_name,
+      kind: note.attempted_kind,
+      reason: note.reason,
+      locator: locatorOf(note.source_refs),
+      notes: count,
+    }))
+    .sort((a, b) => b.notes - a.notes || a.fromName.localeCompare(b.fromName));
+}
