@@ -30,9 +30,12 @@ import {
 } from './vocab.ts';
 import { SEARCH_CANDIDATE_POOL } from './search-policy.ts';
 import {
+  buildRosterIndex,
   canonicalName,
+  deriveNameVariants,
   linkTokenMatch,
   linkTokensMatch,
+  lowerOccurrencesInText,
   nameMentionedExact,
   nameMentionedFromTokens,
   nameRelation,
@@ -40,6 +43,7 @@ import {
   NAME_DF_CAP,
   NAME_MIN_TOKEN,
   textTokenSet,
+  type RosterIndex,
 } from './names.ts';
 export { canonicalName, nameRelation, nameTokens } from './names.ts';
 
@@ -721,6 +725,8 @@ export async function extractLore(
   const entityIdByName = new Map<string, number>();
   // Names harvested from the whole book once, before any window runs.
   const roster = buildNameRoster(db, projectId, chunks);
+  // One derived-variant index per extraction command, built beside the roster.
+  const nameIndex = commandRosterIndex(db, projectId);
 
   const allWindows = sliceWindows(chunks, windowSize);
   // Bridges are recurrence across the book, so the frequencies are built over
@@ -775,6 +781,7 @@ export async function extractLore(
     onProgress: opts.onProgress,
     onWindow: opts.onWindow,
     roster,
+    index: nameIndex,
   });
 
   // Fold any duplicates left by earlier runs into one row per pair.
@@ -977,6 +984,7 @@ export async function ensureWindowsForChunks(
 
   const ctx = loadChunkContext(db, projectId);
   const roster = buildNameRoster(db, projectId, chunks);
+  const nameIndex = commandRosterIndex(db, projectId);
   await runWindowBatch(db, llm, projectId, targets, ctx, new Map<string, number>(), stats, {
     concurrency: Math.max(1, Math.min(opts.concurrency ?? 3, 4)),
     maxTokens: opts.maxTokens ?? 3000,
@@ -986,6 +994,7 @@ export async function ensureWindowsForChunks(
     onProgress: opts.onProgress,
     onWindow: opts.onWindow,
     roster,
+    index: nameIndex,
   });
 
   dedupeRelations(db, projectId);
@@ -1139,6 +1148,8 @@ interface RunBatchOpts {
   onWindow?: (progress: ExtractWindowProgress) => void;
   /** Book-wide capitalization roster, built once per extraction. */
   roster?: NameRoster;
+  /** Derived-variant index, built once per extraction command. */
+  index?: RosterIndex;
 }
 
 /** Run windows through the split (or legacy) path and mark them mined. */
@@ -1160,7 +1171,7 @@ async function runWindowBatch(
         const emptyBefore = stats.emptyWindows.length;
         try {
           if (batch.singlePrompt) {
-            await extractWindowLegacy(db, llm, projectId, window, entityIdByName, stats, ctx.neighboursOf, batch.maxTokens);
+            await extractWindowLegacy(db, llm, projectId, window, entityIdByName, stats, ctx.neighboursOf, batch.maxTokens, batch.index);
           } else {
             await extractWindowSplit(
               db,
@@ -1173,6 +1184,7 @@ async function runWindowBatch(
               batch.maxTokens,
               index,
               batch.roster,
+              batch.index,
             );
           }
         } catch (err) {
@@ -3566,6 +3578,7 @@ function applyRelations(
   stats: ExtractLoreResult,
   neighboursOf: (id: number | undefined) => ChunkRow[],
   gate: boolean,
+  index?: RosterIndex,
 ): number {
   let accepted = 0;
   // Fresh per call: entities created earlier in the same run are visible.
@@ -3757,7 +3770,7 @@ function applyRelations(
             evidence: span.quote,
             kindSource,
           },
-          { chunkText: guardChunkText },
+          { chunkText: guardChunkText, index },
         );
         if (!proven.ok) {
           rowReview = 'provisional';
@@ -3846,7 +3859,7 @@ function applyRelations(
               kind,
               evidence: quote,
             },
-            { db, projectId, chunkText: guardChunk?.text ?? null },
+            { db, projectId, chunkText: guardChunk?.text ?? null, index },
           );
           if (!promoted.ok) mergedReview = 'needs_review';
         }
@@ -3938,6 +3951,7 @@ async function extractWindowLegacy(
   stats: ExtractLoreResult,
   neighboursOf: (id: number | undefined) => ChunkRow[] = () => [],
   maxTokens = 3000,
+  nameIndex?: RosterIndex,
 ): Promise<void> {
   let parsed: {
     entities: Record<string, unknown>[];
@@ -3958,7 +3972,7 @@ async function extractWindowLegacy(
   }
 
   applyEntities(db, projectId, parsed.entities, window, entityIdByName, stats, neighboursOf, false);
-  applyRelations(db, projectId, parsed.relations, window, entityIdByName, stats, neighboursOf, false);
+  applyRelations(db, projectId, parsed.relations, window, entityIdByName, stats, neighboursOf, false, nameIndex);
   applyFacts(db, projectId, parsed.facts, window, stats, neighboursOf, false);
   applyTimeline(db, projectId, parsed.timeline, window, stats, neighboursOf, false);
   stats.passages += window.length;
@@ -3980,6 +3994,7 @@ async function extractWindowSplit(
   maxTokens: number,
   index: number,
   roster?: NameRoster,
+  nameIndex?: RosterIndex,
 ): Promise<void> {
   const passages = passageBlock(window);
   const answers: string[] = [];
@@ -4032,7 +4047,7 @@ async function extractWindowSplit(
         await retryRelationQuotes(db, llm, projectId, window, relations, entityIdByName, stats);
       }
       parsedClaims += relations.length;
-      accepted += applyRelations(db, projectId, relations, window, entityIdByName, stats, neighboursOf, true);
+      accepted += applyRelations(db, projectId, relations, window, entityIdByName, stats, neighboursOf, true, nameIndex);
     }
   }
 
@@ -4386,11 +4401,25 @@ export interface PromoteContext {
   projectId: number;
   /** Text of the passage the quote cites. */
   chunkText?: string | null;
+  /** Optional per-command roster index; when supplied, the proof matchers see
+   * derived name variants in addition to explicit names and aliases. */
+  index?: RosterIndex;
 }
 
 export interface PromoteDecision {
   ok: boolean;
   reason?: PromoteReason;
+}
+
+/** Build the per-command roster index: every entity row plus all chunk text. */
+function commandRosterIndex(db: Db, projectId: number): RosterIndex {
+  return buildRosterIndex(
+    db.all<{ name: string; aliases: string }>('SELECT name, aliases FROM canon_entity WHERE project_id = ?', projectId)
+      .map((row) => ({ name: row.name, aliases: strList(row.aliases) })),
+    db.all<{ text: string }>('SELECT text FROM canon_chunk WHERE project_id = ?', projectId)
+      .map((row) => row.text)
+      .join(' '),
+  );
 }
 
 function canonicalKind(kind: string): string {
@@ -4401,9 +4430,16 @@ function canonicalKind(kind: string): string {
     .replace(/\s+/g, ' ');
 }
 
-function endpointTokens(name: string, aliases: string[]): Set<string> {
+/** The name list a matcher receives: explicit forms, widened by derived
+ * variants when a roster index is supplied. With no index this is exactly
+ * `[name, ...aliases]`, so non-opting callers behave byte for byte as before. */
+function explicitVariants(name: string, aliases: string[], index?: RosterIndex): string[] {
+  return index ? deriveNameVariants({ name, aliases }, index) : [name, ...aliases];
+}
+
+function endpointTokens(name: string, aliases: string[], index?: RosterIndex): Set<string> {
   const out = new Set<string>();
-  for (const variant of [name, ...aliases]) {
+  for (const variant of explicitVariants(name, aliases, index)) {
     for (const token of nameTokens(variant)) if (token.length >= 2) out.add(token);
   }
   return out;
@@ -4419,6 +4455,7 @@ function quoteDirection(
   kind: string,
   evidence: string,
   row: PromoteRow,
+  index?: RosterIndex,
 ): 'forward' | 'reverse' | 'unknown' {
   const words = normalise(evidence).split(' ').filter(Boolean);
   if (!words.length) return 'unknown';
@@ -4426,8 +4463,8 @@ function quoteDirection(
     .filter((word) => !['of', 'to', 'with', 'for', 'a', 'an', 'the', 'in', 'on', 'as'].includes(word));
   const head = kindWords[0];
   if (!head) return 'unknown';
-  const from = endpointTokens(row.fromName, row.fromAliases ?? []);
-  const to = endpointTokens(row.toName, row.toAliases ?? []);
+  const from = endpointTokens(row.fromName, row.fromAliases ?? [], index);
+  const to = endpointTokens(row.toName, row.toAliases ?? [], index);
   const ownerOf = (token: string): 'from' | 'to' | null => {
     const base = token.replace(/['’]s$/, '');
     if (from.has(base)) return 'from';
@@ -4486,6 +4523,7 @@ export function relationSentenceDirection(
   fromAliases: string[],
   toName: string,
   toAliases: string[],
+  index?: RosterIndex,
 ): 'forward' | 'reverse' | 'unknown' {
   return quoteDirection(canonicalKind(kind), evidence, {
     fromId: 0,
@@ -4496,7 +4534,7 @@ export function relationSentenceDirection(
     toAliases,
     kind,
     evidence,
-  });
+  }, index);
 }
 
 /**
@@ -4515,7 +4553,7 @@ function provenKindReason(kind: string): PromoteReason | null {
   return null;
 }
 
-function provenQuoteReason(row: PromoteRow, chunkText?: string | null): PromoteReason | null {
+function provenQuoteReason(row: PromoteRow, chunkText?: string | null, index?: RosterIndex): PromoteReason | null {
   const quote = normalise(row.evidence);
   const chunk = chunkText ?? '';
   if (!row.evidence.trim() || !chunk || !normalise(chunk).includes(quote)) {
@@ -4531,6 +4569,7 @@ function provenQuoteReason(row: PromoteRow, chunkText?: string | null): PromoteR
     row.fromAliases ?? [],
     row.toName,
     row.toAliases ?? [],
+    index,
   );
   if (!bothNamed) {
     if (
@@ -4542,6 +4581,7 @@ function provenQuoteReason(row: PromoteRow, chunkText?: string | null): PromoteR
         row.fromAliases ?? [],
         row.toName,
         row.toAliases ?? [],
+        index,
       )
     ) {
       return 'endpoint-unnamed';
@@ -4562,12 +4602,12 @@ function provenQuoteReason(row: PromoteRow, chunkText?: string | null): PromoteR
   // The assertion must live in one span. The quote and the anchor may together
   // name both people, but neither span may borrow the other's assertion.
   const asserted =
-    assertsRelationship(row.evidence, row.fromName, row.fromAliases ?? [], row.toName, row.toAliases ?? [], row.kind, row.kindSource ?? '') ||
+    assertsRelationship(row.evidence, row.fromName, row.fromAliases ?? [], row.toName, row.toAliases ?? [], row.kind, row.kindSource ?? '', index) ||
     (anchor.length > 0 &&
-      assertsRelationship(anchor, row.fromName, row.fromAliases ?? [], row.toName, row.toAliases ?? [], row.kind, row.kindSource ?? ''));
+      assertsRelationship(anchor, row.fromName, row.fromAliases ?? [], row.toName, row.toAliases ?? [], row.kind, row.kindSource ?? '', index));
   if (!asserted) return 'assertion-missing';
   const directionSpan = anchor.length > 0 && !isUnsupportedKind(row.kind, anchor) ? anchor : row.evidence;
-  if (quoteDirection(canonicalKind(row.kind), directionSpan, row) === 'reverse') {
+  if (quoteDirection(canonicalKind(row.kind), directionSpan, row, index) === 'reverse') {
     return 'direction-mismatch';
   }
   return null;
@@ -4578,10 +4618,10 @@ function provenQuoteReason(row: PromoteRow, chunkText?: string | null): PromoteR
  * both-endpoints, tie-stating, correctly directed quote. No PARK lookup and no
  * database access; extraction uses it to choose accepted vs provisional.
  */
-export function provenRelation(row: PromoteRow, context: { chunkText?: string | null }): PromoteDecision {
+export function provenRelation(row: PromoteRow, context: { chunkText?: string | null; index?: RosterIndex }): PromoteDecision {
   const kindReason = provenKindReason(canonicalKind(row.kind));
   if (kindReason) return { ok: false, reason: kindReason };
-  const quoteReason = provenQuoteReason(row, context.chunkText);
+  const quoteReason = provenQuoteReason(row, context.chunkText, context.index);
   if (quoteReason) return { ok: false, reason: quoteReason };
   return { ok: true };
 }
@@ -4647,16 +4687,16 @@ export function canPromote(row: PromoteRow, context: PromoteContext): PromoteDec
   if (parked.some((note) => sameOrInverseKind(note.attempted_kind, kind))) {
     return { ok: false, reason: 'ruled-park' };
   }
-  const quoteReason = provenQuoteReason(row, context.chunkText);
+  const quoteReason = provenQuoteReason(row, context.chunkText, context.index);
   if (quoteReason) return { ok: false, reason: quoteReason };
   return { ok: true };
 }
 
-/** Token spans of a name and its aliases inside a quote. */
-function mentionSpans(text: string, name: string, aliases: string[]): Array<[number, number]> {
+/** Token spans of a name and its variants inside a quote. */
+function mentionSpans(text: string, name: string, aliases: string[], index?: RosterIndex): Array<[number, number]> {
   const words = canonicalName(text).split(' ').filter(Boolean);
   const spans: Array<[number, number]> = [];
-  for (const variant of [name, ...aliases]) {
+  for (const variant of explicitVariants(name, aliases, index)) {
     const target = canonicalName(variant).split(' ').filter(Boolean);
     if (!target.length) continue;
     for (let i = 0; i + target.length <= words.length; i++) {
@@ -4672,7 +4712,79 @@ function mentionSpans(text: string, name: string, aliases: string[]): Array<[num
  * copula around one of those. A title that merely begins a name ("Aunt X took
  * Y to town") asserts nothing about Y.
  */
-export function assertsRelationship(
+/** Linking prepositions/conjunctions that turn a phrase into a relation
+ * ("sided with", "member of", "sworn to") instead of a bare scene verb. */
+const EVIDENCE_LINK_TAIL = new Set(['to', 'with', 'for', 'of', 'from', 'in', 'on', 'as']);
+
+/** Head words (and their inflections) of the bankable kinds, computed once. */
+let evidenceRoleHeads: Set<string> | null = null;
+function roleHeadWords(): Set<string> {
+  if (evidenceRoleHeads) return evidenceRoleHeads;
+  const out = new Set<string>();
+  for (const kind of CLOSED_ROLE_KINDS) {
+    const head = kindHeadWord(kind);
+    if (!head) continue;
+    for (const form of headForms(head)) out.add(form);
+  }
+  evidenceRoleHeads = out;
+  return out;
+}
+
+/** Words only: possessives split out, punctuation to spaces, lowercased. */
+function assertionWords(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9' ]+/g, ' ')
+    .replace(/'s\b/g, " 's")
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(Boolean);
+}
+
+/**
+ * Can these tokens anchor a tie?
+ *
+ * A bare single token must be a bankable role head (the kind's own head, e.g.
+ * "married", "friend", "partner", or a noun built on it, e.g. "partnership").
+ * A multi-token phrase must carry a linking preposition after its first token
+ * ("sided with", "member of", "sworn to"). A bare action verb ("joined",
+ * "backed", "leads", "taught") anchors nothing — no word list, just structure.
+ */
+function anchorAllowed(tokens: string[], head: string): boolean {
+  if (!tokens.length) return false;
+  if (tokens.length > 1) return tokens.slice(1).some((token) => EVIDENCE_LINK_TAIL.has(token));
+  const token = tokens[0]!;
+  if (roleHeadWords().has(token)) return true;
+  return head.length > 0 && token.length > head.length && token.startsWith(head);
+}
+
+/** Determiners, pronouns and the possessive marker: what may not qualify a
+ * bare "partner" ("Harry's partner" is a pairing, not a lasting tie). */
+const PARTNER_NON_QUALIFIERS = new Set([
+  'a', 'an', 'the', 'my', 'your', 'his', 'her', 'its', 'our', 'their',
+  'this', 'that', 'these', 'those', 'some', 'any', 'no', 'every', 'each',
+  'both', 'either', 'neither', 'another', 'such', 'all', 'whose', 'which',
+  'what', 'who', 'whom', 'you', 'we', 'he', 'she', 'they', 'it', 'i', 'me',
+  'him', 'them', 'us', "'s", "'",
+]);
+
+/** Bare "partner"/"partners" needs a qualifier: a noun/adjective immediately
+ * before ("business partner"), or a following preposition ("partner in"). */
+function partnerQualified(words: string[], at: number): boolean {
+  const before = words[at - 1] ?? '';
+  if (before && !PARTNER_NON_QUALIFIERS.has(before)) return true;
+  return EVIDENCE_LINK_TAIL.has(words[at + 1] ?? '');
+}
+
+interface EvidenceAnalysis {
+  asserted: boolean;
+  bothNamed: boolean;
+  coordinated: boolean;
+  sceneVerb: boolean;
+}
+
+function analyseEvidence(
   quote: string,
   fromName: string,
   fromAliases: string[],
@@ -4680,26 +4792,28 @@ export function assertsRelationship(
   toAliases: string[],
   kind: string,
   kindSource = '',
-): boolean {
-  // Keep the possessive marker: canonicalName strips it, which would make
-  // "Dudley's aunt" look exactly like the title "Aunt Dudley".
-  const raw = (text: string): string[] =>
-    text
-      .toLowerCase()
-      .replace(/[^a-z0-9' ]+/g, ' ')
-      .replace(/'s\b/g, " 's")
-      .replace(/\s+/g, ' ')
-      .trim()
-      .split(' ')
-      .filter(Boolean);
-  const words = raw(quote);
+  index?: RosterIndex,
+): EvidenceAnalysis {
+  const words = assertionWords(quote);
+  const kindKey = (kind ?? '').trim().toLowerCase();
   const head = kindHeadWord(kind);
-  if (!head || !words.length) return false;
-  const forms = headForms(head);
+  const forms = head ? headForms(head) : new Set<string>();
+  const gloss = KIND_GLOSSES[kindKey];
+  const readPhrases: string[][] = [];
+  if (gloss) {
+    for (const phrase of gloss.reads.split(',')) {
+      const tokens = assertionWords(phrase.replace(/\([^)]*\)/g, '').replace(/"/g, ''));
+      if (tokens.length) readPhrases.push(tokens);
+    }
+  }
+  const kindPhrase = assertionWords(kindKey);
+  const sourcePhrase = kindSource.trim() ? assertionWords(kindSource) : [];
+  const analysis: EvidenceAnalysis = { asserted: false, bothNamed: false, coordinated: false, sceneVerb: false };
+  if (!words.length) return analysis;
   const spansOf = (name: string, aliases: string[]): Array<[number, number]> => {
     const out: Array<[number, number]> = [];
-    for (const variant of [name, ...aliases]) {
-      const target = raw(variant);
+    for (const variant of explicitVariants(name, aliases, index)) {
+      const target = assertionWords(variant);
       if (!target.length) continue;
       for (let i = 0; i + target.length <= words.length; i++) {
         if (target.every((word, k) => words[i + k] === word)) out.push([i, i + target.length - 1]);
@@ -4709,56 +4823,165 @@ export function assertsRelationship(
   };
   const fromSpans = spansOf(fromName, fromAliases);
   const toSpans = spansOf(toName, toAliases);
-  const near = (spans: Array<[number, number]>, at: number, radius: number): boolean =>
-    spans.some(([start, end]) => start <= at + radius && end >= at - radius);
-  // Anchors: the kind's head noun and the phrasings the glossary lists for it.
-  const anchors: string[][] = [];
-  if (head) for (const form of headForms(head)) anchors.push([form]);
-  const gloss = KIND_GLOSSES[(kind ?? '').trim().toLowerCase()];
-  if (gloss) {
-    for (const phrase of gloss.reads.split(',')) {
-      const tokens = raw(phrase.replace(/\([^)]*\)/g, '').replace(/"/g, ''));
-      if (tokens.length) anchors.push(tokens);
+  const coordinatedBetween = (a: [number, number], b: [number, number]): boolean => {
+    const lo = a[1] <= b[0] ? a[1] : b[1] <= a[0] ? b[1] : a[0];
+    const hi = a[1] <= b[0] ? b[0] : b[1] <= a[0] ? a[0] : a[1];
+    for (let at = lo; at <= hi; at++) if (words[at] === 'and' || words[at] === 'or') return true;
+    return false;
+  };
+  analysis.bothNamed = fromSpans.some((a) => toSpans.some((b) => a[1] < b[0] || b[1] < a[0]));
+  analysis.coordinated = analysis.bothNamed && fromSpans.some((a) => toSpans.some((b) => coordinatedBetween(a, b)));
+  // Words that mark a scene: bare readings (or a bare kind, or bare kindSource
+  // words) that cannot anchor a tie.
+  const sceneWords = new Set<string>();
+  const considerScene = (tokens: string[]): void => {
+    if (tokens.length === 1 && !anchorAllowed(tokens, head)) sceneWords.add(tokens[0]!);
+  };
+  considerScene(kindPhrase);
+  for (const tokens of readPhrases) considerScene(tokens);
+  considerScene(sourcePhrase);
+  analysis.sceneVerb = [...sceneWords].some((word) => words.includes(word));
+  // A bare "partner"/"partners" with no qualifier is a pairing, not a tie.
+  if (kindKey === 'partner') {
+    for (let at = 0; at < words.length; at++) {
+      if (words[at] !== 'partner' && words[at] !== 'partners') continue;
+      if (!partnerQualified(words, at)) {
+        analysis.sceneVerb = true;
+        break;
+      }
     }
   }
-  // The words the reader named that express the kind ("threw in with") are an
-  // anchor too: they are verbatim in the quote and were matched to the label.
-  if (kindSource.trim()) {
-    const tokens = raw(kindSource);
-    if (tokens.length) anchors.push(tokens);
-  }
+  if (!head) return analysis;
+
+  // Anchors by class: the kind's own phrase, its head forms, link-tailed
+  // readings, and the reader's expressed words when they are a link.
+  const anchors: string[][] = [];
+  if (kindPhrase.length && anchorAllowed(kindPhrase, head)) anchors.push(kindPhrase);
+  for (const form of forms) if (anchorAllowed([form], head)) anchors.push([form]);
+  for (const tokens of readPhrases) if (anchorAllowed(tokens, head)) anchors.push(tokens);
+  if (sourcePhrase.length && anchorAllowed(sourcePhrase, head)) anchors.push(sourcePhrase);
+
+  const near = (spans: Array<[number, number]>, anchorStart: number, anchorEnd: number): boolean =>
+    spans.some((span) => {
+      if (!(span[0] <= anchorStart + 4 && span[1] >= anchorStart - 4)) return false;
+      return !coordinatedBetween(span, [anchorStart, anchorEnd]);
+    });
   const passive = new Set(['was', 'were', 'been', 'had', 'have', 'is', 'are', 'be', 'being']);
+  const copula = new Set(['was', 'were', 'is', 'are', 'been', 'being', 'be']);
   for (const anchor of anchors) {
     for (let i = 0; i + anchor.length <= words.length; i++) {
       if (!anchor.every((word, k) => words[i + k] === word)) continue;
       const end = i + anchor.length - 1;
+      // A word that sits inside an endpoint's own name is part of what that
+      // person is called, not a statement about the other endpoint.
+      if (
+        fromSpans.some(([start, e]) => start <= end && e >= i) ||
+        toSpans.some(([start, e]) => start <= end && e >= i)
+      ) {
+        continue;
+      }
+      // Bare "partner"/"partners" needs a qualifier to prove a lasting tie.
+      if (
+        kindKey === 'partner' &&
+        anchor.length === 1 &&
+        (anchor[0] === 'partner' || anchor[0] === 'partners') &&
+        !partnerQualified(words, i)
+      ) {
+        continue;
+      }
       // Possessive ("Dudley's aunt", "Dudley's best friend").
       for (const back of [1, 2]) {
         if (i <= back || words[i - back] !== "'s") continue;
         const owner = words[i - back - 1]!;
+        const ownerSpan = [...fromSpans, ...toSpans].find(([start, e]) => words[start] === owner || words[e] === owner);
+        if (ownerSpan && coordinatedBetween(ownerSpan, [i, end])) continue;
         const ownerIsFrom = fromSpans.some(([start, e]) => words[start] === owner || words[e] === owner);
         const ownerIsTo = toSpans.some(([start, e]) => words[start] === owner || words[e] === owner);
-        if (ownerIsFrom && near(toSpans, i, 4)) return true;
-        if (ownerIsTo && near(fromSpans, i, 4)) return true;
+        if (ownerIsFrom && near(toSpans, i, end)) return { ...analysis, asserted: true };
+        if (ownerIsTo && near(fromSpans, i, end)) return { ...analysis, asserted: true };
       }
       // Of-phrase ("the aunt of X").
       if (words[end + 1] === 'of') {
         for (let at = end + 2; at <= Math.min(end + 3, words.length - 1); at++) {
-          if (fromSpans.some(([start]) => start === at) && near(toSpans, i, 4)) return true;
-          if (toSpans.some(([start]) => start === at) && near(fromSpans, i, 4)) return true;
+          if (coordinatedBetween([i, end], [at, at])) continue;
+          if (fromSpans.some(([start]) => start === at) && near(toSpans, i, end)) return { ...analysis, asserted: true };
+          if (toSpans.some(([start]) => start === at) && near(fromSpans, i, end)) return { ...analysis, asserted: true };
+        }
+      }
+      // Copular prepositional pair ("X was married to Y", "X was a member of Y").
+      const prepositionAt = EVIDENCE_LINK_TAIL.has(anchor[anchor.length - 1]!)
+        ? end
+        : EVIDENCE_LINK_TAIL.has(words[end + 1] ?? '')
+          ? end + 1
+          : -1;
+      if (prepositionAt >= 0) {
+        const objectAt = prepositionAt + 1;
+        if (
+          (copula.has(words[i - 1] ?? '') || copula.has(words[i - 2] ?? '')) &&
+          !coordinatedBetween([i, end], [objectAt, objectAt])
+        ) {
+          if (fromSpans.some(([start]) => start === objectAt) && near(toSpans, i, end)) return { ...analysis, asserted: true };
+          if (toSpans.some(([start]) => start === objectAt) && near(fromSpans, i, end)) return { ...analysis, asserted: true };
         }
       }
       // Subject-verb-object, active voice only: "Tor mentored Mara".
       if (!passive.has(words[i - 1] ?? '')) {
-        const subject = [fromSpans, toSpans].find((spans) => spans.some(([, e]) => e >= i - 2 && e <= i - 1));
+        const subject = [fromSpans, toSpans].find((spans) =>
+          spans.some(([start, e]) => e >= i - 2 && e <= i - 1 && !coordinatedBetween([start, e], [i, end])),
+        );
         if (subject) {
           const other = subject === fromSpans ? toSpans : fromSpans;
-          if (other.some(([start]) => start >= end + 1 && start <= end + 4)) return true;
+          if (
+            other.some(
+              ([start, e]) => start >= end + 1 && start <= end + 4 && !coordinatedBetween([i, end], [start, e]),
+            )
+          ) {
+            return { ...analysis, asserted: true };
+          }
         }
       }
     }
   }
-  return false;
+  return analysis;
+}
+
+export type EvidenceClass = 'asserted' | 'scene' | 'none';
+
+/**
+ * Classify a quote's link between two endpoints.
+ *
+ * `asserted` — the tightened assertion rule passes.
+ * `scene`    — both endpoints are named and a scene verb or a coordinated
+ *              list links them, but no assertion holds.
+ * `none`     — neither.
+ */
+export function classifyEvidence(
+  quote: string,
+  fromName: string,
+  fromAliases: string[],
+  toName: string,
+  toAliases: string[],
+  kind: string,
+  kindSource = '',
+  index?: RosterIndex,
+): EvidenceClass {
+  const analysis = analyseEvidence(quote, fromName, fromAliases, toName, toAliases, kind, kindSource, index);
+  if (analysis.asserted) return 'asserted';
+  if (analysis.bothNamed && (analysis.coordinated || analysis.sceneVerb)) return 'scene';
+  return 'none';
+}
+
+export function assertsRelationship(
+  quote: string,
+  fromName: string,
+  fromAliases: string[],
+  toName: string,
+  toAliases: string[],
+  kind: string,
+  kindSource = '',
+  index?: RosterIndex,
+): boolean {
+  return classifyEvidence(quote, fromName, fromAliases, toName, toAliases, kind, kindSource, index) === 'asserted';
 }
 
 /** The head noun of a kind: "aunt of" gives "aunt". */
@@ -4805,9 +5028,10 @@ export function namesBothDistinctly(
   fromAliases: string[],
   toName: string,
   toAliases: string[],
+  index?: RosterIndex,
 ): boolean {
-  const from = mentionSpans(quote, fromName, fromAliases);
-  const to = mentionSpans(quote, toName, toAliases);
+  const from = mentionSpans(quote, fromName, fromAliases, index);
+  const to = mentionSpans(quote, toName, toAliases, index);
   return from.some(([s1, e1]) => to.some(([s2, e2]) => e1 < s2 || e2 < s1));
 }
 
@@ -4824,9 +5048,10 @@ function anchorNamesMissingEndpoint(
   fromAliases: string[],
   toName: string,
   toAliases: string[],
+  index?: RosterIndex,
 ): boolean {
-  const fromInQuote = mentionSpans(quote, fromName, fromAliases).length > 0;
-  const toInQuote = mentionSpans(quote, toName, toAliases).length > 0;
+  const fromInQuote = mentionSpans(quote, fromName, fromAliases, index).length > 0;
+  const toInQuote = mentionSpans(quote, toName, toAliases, index).length > 0;
   if (fromInQuote === toInQuote) return false; // both or neither: not this path
   const sentences = splitSentences(chunkText);
   const needle = normalise(quote);
@@ -4834,8 +5059,8 @@ function anchorNamesMissingEndpoint(
   if (at < 0) return false;
   const anchor = [sentences[at - 1], sentences[at + 1]].filter(Boolean).join(' ');
   const missing = fromInQuote
-    ? mentionSpans(anchor, toName, toAliases)
-    : mentionSpans(anchor, fromName, fromAliases);
+    ? mentionSpans(anchor, toName, toAliases, index)
+    : mentionSpans(anchor, fromName, fromAliases, index);
   return missing.length > 0;
 }
 
@@ -4845,10 +5070,11 @@ export function provenRelationById(
   db: Db,
   projectId: number,
   relationId: number,
+  index?: RosterIndex,
 ): PromoteDecision {
   const guarded = loadGuardRow(db, projectId, relationId);
   if (!guarded) return { ok: false, reason: 'quote-not-verbatim' };
-  return provenRelation(guarded.row, { chunkText: guarded.chunkText });
+  return provenRelation(guarded.row, { chunkText: guarded.chunkText, index });
 }
 
 interface GuardedRow {
@@ -4940,10 +5166,12 @@ export function promoteProvisional(
     );
   }
   const result: PromoteProvisionalResult = { checked: rows.length, promoted: 0, still: [] };
+  // One index for the whole pass: the proof matchers see given/surname forms.
+  const index = commandRosterIndex(db, projectId);
   for (const row of rows) {
     // Promotion uses the full guard, PARK included: a provisional row cannot
     // walk around a human ruling that the pure proven check does not see.
-    const decision = canPromoteRelation(db, projectId, row.id);
+    const decision = canPromoteRelation(db, projectId, row.id, index);
     if (decision.ok) {
       result.promoted++;
       if (!opts.dryRun) {
@@ -4981,8 +5209,9 @@ export function reclassifyAccepted(
     projectId,
   );
   const result: ReclassifyAcceptedResult = { checked: rows.length, demoted: 0, reasons: {} };
+  const index = commandRosterIndex(db, projectId);
   for (const row of rows) {
-    const decision = provenRelationById(db, projectId, row.id);
+    const decision = provenRelationById(db, projectId, row.id, index);
     if (decision.ok) continue;
     result.demoted++;
     const reason = decision.reason ?? 'unproven';
@@ -5030,6 +5259,7 @@ export async function promoteProvisionalWithEvidence(
     verified: 0,
     failed: [],
   };
+  const index = commandRosterIndex(db, projectId);
   for (const row of rows) {
     const guarded = loadGuardRow(db, projectId, row.id);
     if (!guarded || !guarded.chunkText) {
@@ -5064,7 +5294,7 @@ If no single sentence does, reply {"sentence":"NONE"}. Never paraphrase or use o
     }
     result.returned++;
     const candidate = { ...guarded.row, evidence: sentence };
-    const decision = canPromote(candidate, { db, projectId, chunkText: guarded.chunkText });
+    const decision = canPromote(candidate, { db, projectId, chunkText: guarded.chunkText, index });
     if (!decision.ok) {
       result.failed.push({ id: row.id, reason: decision.reason ?? 'unproven' });
       result.still.push({ id: row.id, reason: decision.reason ?? 'unproven' });
@@ -5106,6 +5336,7 @@ export function canPromoteRelation(
   db: Db,
   projectId: number,
   relationId: number,
+  index?: RosterIndex,
 ): PromoteDecision {
   const row = db.get<{
     from_entity: number;
@@ -5156,7 +5387,7 @@ export function canPromoteRelation(
       evidence: row.evidence,
       kindSource: row.kind_source,
     },
-    { db, projectId, chunkText },
+    { db, projectId, chunkText, index },
   );
 }
 
@@ -5448,16 +5679,30 @@ export interface SentenceCandidate {
  * window and hope it emits both names.
  */
 export function scanSentenceCandidates(db: Db, projectId: number): SentenceCandidate[] {
-  const entities = db.all<{ id: number; name: string; aliases: string; kind: string }>(
-    "SELECT id, name, aliases, kind FROM canon_entity WHERE project_id = ? AND kind = 'character' AND review_status != 'quarantined'",
+  const chunkRows = db.all<{ id: number; locator: string; text: string }>(
+    'SELECT id, locator, text FROM canon_chunk WHERE project_id = ? ORDER BY seq',
+    projectId,
+  );
+  // One roster index per scan: collisions and title frequency span every
+  // entity in the project, not just the characters a candidate can name.
+  const allRows = db.all<{ name: string; aliases: string }>(
+    'SELECT name, aliases FROM canon_entity WHERE project_id = ?',
+    projectId,
+  ).map((row) => ({ name: row.name, aliases: strList(row.aliases) }));
+  const index = buildRosterIndex(allRows, chunkRows.map((chunk) => chunk.text).join(' '));
+  const entities = db.all<{ id: number; name: string; aliases: string }>(
+    "SELECT id, name, aliases FROM canon_entity WHERE project_id = ? AND kind = 'character' AND review_status != 'quarantined'",
     projectId,
   )
     .map((row) => ({
       id: row.id,
       name: row.name,
       tokens: canonicalName(row.name).split(' ').filter(Boolean),
+      variants: deriveNameVariants({ name: row.name, aliases: strList(row.aliases) }, index)
+        .map((variant) => canonicalName(variant).split(' ').filter(Boolean))
+        .filter((tokens) => tokens.length > 0),
     }))
-    .filter((row) => row.tokens.length > 0);
+    .filter((row) => row.variants.length > 0);
   const phrases = tiePhrases()
     .map((phrase) => phrase.split(' ').filter(Boolean))
     .filter((tokens) => tokens.length > 0);
@@ -5472,10 +5717,7 @@ export function scanSentenceCandidates(db: Db, projectId: number): SentenceCandi
     return at;
   };
 
-  const chunks = db.all<{ id: number; locator: string; text: string }>(
-    'SELECT id, locator, text FROM canon_chunk WHERE project_id = ? ORDER BY seq',
-    projectId,
-  );
+  const chunks = chunkRows;
   for (const chunk of chunks) {
     for (const sentence of splitSentences(chunk.text)) {
       const tokens = canonicalName(sentence).split(' ').filter(Boolean);
@@ -5488,7 +5730,12 @@ export function scanSentenceCandidates(db: Db, projectId: number): SentenceCandi
       }
       if (!phraseAt.length) continue;
       const present = entities
-        .map((entity) => ({ ...entity, at: positions(tokens, entity.tokens) }))
+        .map((entity) => ({
+          ...entity,
+          at: entity.variants.flatMap((variant) =>
+            positions(tokens, variant).map((start) => ({ start, end: start + variant.length - 1 })),
+          ),
+        }))
         .filter((entity) => entity.at.length > 0);
       if (present.length < 2) continue;
       const nests = (x: string[], y: string[]): boolean =>
@@ -5505,8 +5752,8 @@ export function scanSentenceCandidates(db: Db, projectId: number): SentenceCandi
           let closest = Number.POSITIVE_INFINITY;
           for (const startA of a.at) {
             for (const startB of b.at) {
-              const lo = Math.min(startA, startB);
-              const hi = Math.max(startA + a.tokens.length - 1, startB + b.tokens.length - 1);
+              const lo = Math.min(startA.start, startB.start);
+              const hi = Math.max(startA.end, startB.end);
               const span = hi - lo;
               if (span > 25) continue;
               const near = phraseAt.some((phrase) => phrase.start >= lo - 10 && phrase.start <= hi + 10);
@@ -5558,6 +5805,8 @@ export async function verifySentenceCandidates(
 ): Promise<ScanResult> {
   const list = candidates.slice(0, opts.max ?? candidates.length);
   const result: ScanResult = { checked: 0, accepted: 0, parked: 0, refused: 0 };
+  // One index for the whole verification pass.
+  const index = commandRosterIndex(db, projectId);
   for (const candidate of list) {
     opts.onProgress?.(`${candidate.fromName} / ${candidate.toName} — ${candidate.locator}`);
     let verdict: { tie?: unknown; kind?: unknown; from?: unknown; to?: unknown; anchor?: unknown } | null = null;
@@ -5646,7 +5895,7 @@ export async function verifySentenceCandidates(
         evidence: candidate.sentence,
         anchorEvidence,
       },
-      { db, projectId, chunkText: chunk.text },
+      { db, projectId, chunkText: chunk.text, index },
     );
     const existing = db.get<{ id: number }>(
       'SELECT id FROM canon_relation WHERE project_id = ? AND from_entity = ? AND to_entity = ? AND kind = ?',
@@ -5778,6 +6027,8 @@ export function resolveAccumulatedNotes(db: Db, projectId: number): number {
        FROM canon_tie_note WHERE project_id = ? AND status = 'pending'`,
     projectId,
   );
+  // One index for this pass: names may be matched by given name or surname.
+  const index = commandRosterIndex(db, projectId);
   let promoted = 0;
   for (const note of notes) {
     const kind = canonicalKind(note.attempted_kind);
@@ -5823,10 +6074,10 @@ export function resolveAccumulatedNotes(db: Db, projectId: number): number {
     if (!allVerbatim) continue;
 
     const joined = spans.map((span) => span.quote).join(' ');
-    if (!namesBothDistinctly(joined, from.name, fromAliases, to.name, toAliases)) continue;
+    if (!namesBothDistinctly(joined, from.name, fromAliases, to.name, toAliases, index)) continue;
     const tieSpan = spans.find((span) => !isUnsupportedKind(kind, span.quote));
     if (!tieSpan) continue;
-    if (relationSentenceDirection(kind, tieSpan.quote, from.name, fromAliases, to.name, toAliases) === 'reverse') {
+    if (relationSentenceDirection(kind, tieSpan.quote, from.name, fromAliases, to.name, toAliases, index) === 'reverse') {
       continue;
     }
 
@@ -6503,6 +6754,8 @@ export function prioritiseTieNotes(
     afterId,
   );
   const out: TiePriority[] = [];
+  // One index for the whole ranking pass.
+  const index = commandRosterIndex(db, projectId);
   for (const note of notes) {
     let chunkText: string | null = null;
     let locator = '';
@@ -6531,7 +6784,7 @@ export function prioritiseTieNotes(
         kind: note.attempted_kind,
         evidence: note.evidence,
       },
-      { db, projectId, chunkText },
+      { db, projectId, chunkText, index },
     );
     out.push({
       id: note.id,
@@ -7370,10 +7623,6 @@ export function quarantineSuspectCharacters(
     .all<{ text: string }>('SELECT text FROM canon_chunk WHERE project_id = ?', projectId)
     .map((row) => row.text)
     .join(' ');
-  const lowerOccurrences = (name: string): number => {
-    const safe = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return (text.match(new RegExp(`\\b${safe}\\b`, 'g')) ?? []).length;
-  };
   const rows = db.all<{ id: number; name: string; aliases: string; mentions: number; review_status: string }>(
     "SELECT id, name, aliases, mentions, review_status FROM canon_entity WHERE project_id = ? AND kind = 'character'",
     projectId,
@@ -7391,7 +7640,7 @@ export function quarantineSuspectCharacters(
     if ((row.mentions ?? 0) > 1) continue;
     if (strList(row.aliases).length > 0) continue;
     if (!/^[A-Z][a-z]{2,}$/.test(row.name)) continue;
-    const lower = lowerOccurrences(row.name.toLowerCase());
+    const lower = lowerOccurrencesInText(text, row.name.toLowerCase());
     if (lower < 1) continue;
     db.run(
       "UPDATE canon_entity SET review_status = 'quarantined', quarantine_reason = ? WHERE id = ?",

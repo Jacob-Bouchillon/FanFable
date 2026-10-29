@@ -6,7 +6,7 @@
 import { Db } from './db.ts';
 import { extractJson, toStringArray } from './json.ts';
 import type { LlmClient } from './llm.ts';
-import { nameMentionedExact } from './names.ts';
+import { nameMentionedExact, buildRosterIndex, deriveNameVariants, type RosterIndex } from './names.ts';
 import * as lorebook from './lorebook.ts';
 import { expandQuery, searchCanon } from './lore-search.ts';
 import type { Passage } from './lore.ts';
@@ -66,6 +66,7 @@ export function formatPassages(passages: Passage[]): string {
 function entityVariantsFor(
   entities: { id: number; name: string; aliases: string[] }[],
   query: string,
+  index?: RosterIndex,
 ): { ids: number[]; variants: string[] } {
   const q = query.toLowerCase();
   const matched = entities.filter(
@@ -75,8 +76,13 @@ function entityVariantsFor(
   const ids = pool.map((e) => e.id);
   const variants = [q];
   for (const e of pool) {
-    variants.push(e.name.toLowerCase());
-    for (const al of e.aliases) variants.push(al.toLowerCase());
+    if (index) {
+      // Explicit forms first, then derived given/surname/title-stripped forms.
+      variants.push(...deriveNameVariants(e, index));
+    } else {
+      variants.push(e.name.toLowerCase());
+      for (const al of e.aliases) variants.push(al.toLowerCase());
+    }
   }
   return { ids, variants: [...new Set(variants)].filter((v) => v.length > 0) };
 }
@@ -492,8 +498,21 @@ export function enforceStatusTieGuard(
   } catch {
     return draft;
   }
-  const sideA = entityVariantsFor(entities, pair.a);
-  const sideB = entityVariantsFor(entities, pair.b);
+  // One index for this guard pass: a question naming a full stored name is
+  // satisfied by the short form the passage actually uses.
+  let index: RosterIndex | undefined;
+  try {
+    index = buildRosterIndex(
+      entities,
+      db.all<{ text: string }>('SELECT text FROM canon_chunk WHERE project_id = ?', projectId)
+        .map((row) => row.text)
+        .join(' '),
+    );
+  } catch {
+    index = undefined;
+  }
+  const sideA = entityVariantsFor(entities, pair.a, index);
+  const sideB = entityVariantsFor(entities, pair.b, index);
   const claims = assertedClaims(draft, pair, sideA.variants, sideB.variants);
   if (!claims.length) return draft;
   const results = claims.map((claim) => ({ claim, result: verifyClaim(db, projectId, pair, sideA, sideB, claim) }));
