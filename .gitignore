@@ -43,7 +43,13 @@ coverage/
 
 # Trial harness scripts are committed; their data (db, json, sheets, tsv) stays local
 !testing/trials/
-testing/trials/*
+testing/trials/**
 !testing/trials/**/
 !testing/trials/**/*.ts
+!testing/trials/**/*.mjs
+!testing/trials/**/*.js
+testing/trials/**/*.json
+testing/trials/**/*.tsv
+testing/trials/**/*.md
 testing/trials/**/backup/
+testing/trials/tmp-archive*/
