@@ -300,6 +300,16 @@ Corrections welcome: anything here whose licence or figure I could not re-verify
 11. **Prompt variants on the frozen set:** schema descriptions (one plain sentence per top-ten kind +/− examples); planner self-critique (adversarial examine pass, then revise).
 12. **Measurement hygiene:** freeze the 50-row probe before the chunk fix; label every report with the bank it used; `lore integrity` after any change.
 
+### 2026-10-30: half-book funnel, backfill, attested re-measurement (plagueis-half.db)
+
+Funnel (352 distinct triples denominator; mutually exclusive single-outcome stages): endpoint-unnamed 262 (74.4%, pipeline refusal); kind-open-vocab 22 (6.3%, semantic, unclassified); no-quote 21 (6.0%, extraction failure); tie-word-absent 11 (3.1%); ruled-park 8 (2.3%); identity-contained-name 4 (1.1%); quote-not-verbatim 4 (1.1%); kind-moment 1 (0.3%); passes-all 3 (0.9%). Stored quote pipeline (overlapping, sums past claimed): verified 283, repointed 117, dropped 208, unsupported 37, unresolved 7, unrelated 10, claimed 608 over 33 windows. Assessments scored 0/336 pre-backfill (??1.0 class: 257 at 1.0, 79 at 0.7); semantic model/policy split 0/0 (all unclassified, no stored verdicts).
+
+Backfill (`assess --write`, qwen3.5:9b, disposable copy): 314/314 assessable rows scored, 22 non-verbatim skipped (unscoreable without fabrication). Bands: <0.5: 205, 0.5–0.6: 0, 0.6–0.7: 14, 0.7–0.8: 0, 0.8–0.9: 21, 0.9–1.0: 74; 95 at/above 0.7; user_confirmed average 0.624. Runs vary band-to-band (model nondeterminism across three runs).
+
+Re-measurement (committed code only, assessed copy): 262 endpoint-unnamed rows → attested 0, keeper-grade +3 accepted in-set (2 of the 3 fail strict verbatim), 24 pre-existing user_confirmed untouched, still provisional 2, still needs_review 206. Other 74 → 1 keeper-grade (fails strict), 0 attested, still provisional 5, still needs_review 58. Fallback promotions without assessment: keeper 0, attested 0 (1 fallback row remains, non-verbatim, promotion-inert). Before/after: {needs_review 291, provisional 11, user_confirmed 34} → {needs_review 264, provisional 7, user_confirmed 34, accepted 4, attested 27}. Integrity on copy: exit 1, 3 violations (accepted quote-not-verbatim). Real bank untouched throughout.
+
+E0 coverage (user-reported, not locally measured here): 64% same-concept, 71% mass in 9 labels; invention rate still open.
+
 ## 12. What this document could not verify
 
 - **Session-reported figures not re-checked against runs in this pass:** the 2.95× chunk-duplication measurement (recompute from `plagueis-half.db` before citing); the reader/judge wall-times and token counts; the 59%/25% sweep-agreement split beyond the REPORT-final table; any model-card number in §9.2–9.3 (all author-reported by construction).
