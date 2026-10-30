@@ -6967,6 +6967,103 @@ export interface TiePriority {
   evidence: string;
   locator: string;
   decision: PromoteDecision;
+  /** Neighbouring sentence naming the endpoint the quote leaves to a
+   * pronoun or role; empty when the quote stands alone. */
+  anchor: string;
+  /** One line: which pronoun-backtrack signals fired. */
+  why: string;
+  /** How many of the four fired: endpoints resolved, verbatim quote,
+   * anchor present, pronoun/role reference. */
+  score: number;
+  /** All four fired: review this first. */
+  pronounBacked: boolean;
+}
+
+/**
+ * Pronoun-backtrack signal for one pending note. Read-only and model-free:
+ * verbatim quote in the cited chunk, a neighbouring sentence naming an
+ * endpoint the quote leaves unnamed, and a pronoun or role word in the
+ * quote carrying that side. Ranking only — it never promotes or writes.
+ */
+function pronounSignal(args: {
+  fromName: string;
+  toName: string;
+  fromAliases: string[];
+  toAliases: string[];
+  evidence: string;
+  chunkText: string | null;
+}): { anchor: string; why: string; score: number; pronounBacked: boolean } {
+  const none = (why: string, score: number): { anchor: string; why: string; score: number; pronounBacked: boolean } =>
+    ({ anchor: '', why, score, pronounBacked: false });
+  if (!args.fromName.trim() || !args.toName.trim()) return none('endpoints unresolved', 0);
+  let score = 1; // endpoints resolved
+  if (!args.evidence.trim() || !args.chunkText || !normalise(args.chunkText).includes(normalise(args.evidence))) {
+    return none('quote not verbatim in cited chunk', score);
+  }
+  score++; // verbatim quote
+  const named = (name: string, aliases: string[], text: string): boolean =>
+    nameMentionedExact(name, text) || aliases.some((a) => a.trim() !== '' && nameMentionedExact(a, text));
+  const fromInQuote = named(args.fromName, args.fromAliases, args.evidence);
+  const toInQuote = named(args.toName, args.toAliases, args.evidence);
+  if (!fromInQuote && !toInQuote) {
+    return none('quote names neither endpoint; nothing to backtrack', score);
+  }
+  const missing: Array<{ name: string; aliases: string[] }> = [];
+  if (!fromInQuote) missing.push({ name: args.fromName, aliases: args.fromAliases });
+  if (!toInQuote) missing.push({ name: args.toName, aliases: args.toAliases });
+  if (missing.length === 0) {
+    return none('quote names both endpoints; no backtrack needed', score);
+  }
+  const sentences = splitSentences(args.chunkText);
+  const needle = normalise(args.evidence);
+  const quoteIdx = sentences.findIndex((s) => {
+    const n = normalise(s);
+    return n.includes(needle) || (needle.includes(n) && n.length > 20);
+  });
+  const ordered: string[] = quoteIdx < 0
+    ? sentences
+    : [
+      ...(quoteIdx > 0 ? [sentences[quoteIdx - 1]!] : []),
+      ...(quoteIdx + 1 < sentences.length ? [sentences[quoteIdx + 1]!] : []),
+      ...sentences.filter((_, i) => i !== quoteIdx && Math.abs(i - quoteIdx) > 1),
+    ];
+  let anchor = '';
+  let anchoredName = '';
+  for (const s of ordered) {
+    if (normalise(s) === needle) continue;
+    const hit = missing.find((m) => named(m.name, m.aliases, s));
+    if (hit) {
+      anchor = s.trim().replace(/\s+/g, ' ');
+      anchoredName = hit.name;
+      break;
+    }
+  }
+  if (!anchor) {
+    return none('no neighbouring sentence names the unnamed endpoint', score);
+  }
+  score++; // anchor present
+  const tokens = new Set(needle.split(' ').filter(Boolean));
+  const pronounHit = [...PRONOUNS].some((p) => tokens.has(p));
+  let roleHit = false;
+  if (!pronounHit) {
+    for (const phrase of tiePhrases()) {
+      if (!phrase.includes(' ') && tokens.has(phrase)) {
+        roleHit = true;
+        break;
+      }
+    }
+  }
+  if (!pronounHit && !roleHit) {
+    return { anchor, why: `anchor names ${anchoredName} but the quote shows no pronoun/role reference`, score, pronounBacked: false };
+  }
+  score++; // pronoun/role reference
+  const quoted = fromInQuote ? args.fromName : args.toName;
+  return {
+    anchor,
+    why: `verbatim quote names ${quoted}; anchor names ${anchoredName}; quote refers to ${anchoredName} by ${pronounHit ? 'pronoun' : 'role'}`,
+    score,
+    pronounBacked: true,
+  };
 }
 
 /**
@@ -7041,6 +7138,14 @@ export function prioritiseTieNotes(
       },
       { db, projectId, chunkText, index },
     );
+    const signal = pronounSignal({
+      fromName: note.from_name,
+      toName: note.to_name,
+      fromAliases: strList(note.from_aliases),
+      toAliases: strList(note.to_aliases),
+      evidence: note.evidence,
+      chunkText,
+    });
     out.push({
       id: note.id,
       fromName: note.from_name,
@@ -7049,10 +7154,16 @@ export function prioritiseTieNotes(
       evidence: note.evidence,
       locator,
       decision,
+      anchor: signal.anchor,
+      why: signal.why,
+      score: signal.score,
+      pronounBacked: signal.pronounBacked,
     });
   }
   return out
-    .sort((a, b) => (a.decision.ok === b.decision.ok ? 0 : a.decision.ok ? -1 : 1) || a.id - b.id)
+    .sort((a, b) =>
+      (a.pronounBacked === b.pronounBacked ? 0 : a.pronounBacked ? -1 : 1) ||
+      (a.decision.ok === b.decision.ok ? 0 : a.decision.ok ? -1 : 1) || a.id - b.id)
     .slice(0, limit);
 }
 

@@ -988,6 +988,8 @@ async function cmdLore(args: Args): Promise<void> {
           `  ${mark} ${C.bold(row.fromName)} / ${C.bold(row.toName)} — ${row.kind}` +
             (row.locator ? C.dim(` [${row.locator}]`) : ''),
         );
+        console.log(C.dim(`    anchor: ${row.anchor || '(none)'}`));
+        console.log(C.dim(`    why: ${row.why} (score ${row.score})`));
       }
       const ready = queue.filter((row) => row.decision.ok).length;
       console.log(C.dim(`${ready} promotable, ${queue.length - ready} need another look; nothing changed`));
