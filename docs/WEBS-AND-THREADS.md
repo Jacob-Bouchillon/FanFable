@@ -159,8 +159,13 @@ Design:
    evidence grows threads.
 
 Principle: guarantee investigative coverage structurally, spend model
-inference where it adds information. Exhaustive model sweep (16,471 pairs ≈
-14 GPU-hours) explicitly rejected on cost; this design replaces it.
+inference where it adds information. Exhaustive verdicts cost ≈2 hours at the
+measured rate (336 rows in 2m12s, ≈0.4s/call on qwen3.5:9b); per-pair evidence
+gathering (retrieval + context) is unmeasured, and 12,371 never-sharing pairs
+need indirect-evidence work of unknown cost. The exhaustive-sweep rejection
+rests on the unmeasured gathering cost and the never-co-occurring pairs — not
+on the earlier 14-GPU-hour figure, which was unverified arithmetic (corrected
+here, not silently). This design replaces it.
 
 ## Principles
 
