@@ -5372,15 +5372,20 @@ export interface AcceptedAuditResult {
 /**
  * Recheck every accepted relation against the current guard.
  *
- * The guard is `canPromote`, with the row's own aliases and the chunk text its
- * source_refs cite (falling back to locating the evidence anywhere when the
- * refs are empty or stale). Direction is reported separately: a row the guard
+ * Two standards, strict wins: `canPromote` uses word-level `normalise`
+ * (punctuation stripped) while keeper integrity (`findUnverifiedKeepers`)
+ * demands a contiguous verbatim span under `auditNormalize` (presentation
+ * only). A row the guard passes but strict integrity fails is still a
+ * failure with reason `quote-not-verbatim` (strict `no-ref` maps to the same
+ * audit code, matching the audit's existing missing-quote reporting).
+ * Direction is reported separately: a row the guard
  * passes while the direction check returns `unknown` is counted as one it
  * cannot judge, never as proven direction.
  *
  * Dry run by default. With `write`, failing rows are demoted from `accepted`
  * to `provisional` in one transaction after a consistent snapshot backup; no
- * evidence, source ref or kind is touched, and `user_confirmed` is never read.
+ * evidence, source ref or kind is touched, rows are never deleted, and
+ * `user_confirmed` is never read.
  */
 export function auditAcceptedRelations(
   db: Db,
@@ -5415,6 +5420,10 @@ export function auditAcceptedRelations(
       projectId,
     )
     .slice(0, opts.limit === undefined ? undefined : Math.max(0, Math.floor(opts.limit)));
+  // Strict keeper integrity wins over the word-level guard: a quoted span
+  // that normalise() forgives (extra quotes, ellipsis) still fails when the
+  // cited chunk does not contain it verbatim.
+  const strictById = new Map(findUnverifiedKeepers(db, projectId).map((r) => [r.id, r.reason]));
   const needle = (evidence: string): string => normalise(evidence);
   const chunkTextFor = (row: { evidence: string; source_refs: string }): string | null => {
     const want = needle(row.evidence);
@@ -5466,9 +5475,18 @@ export function auditAcceptedRelations(
     // Direction is the model's now, so the audit reports no grammar verdict.
     const direction = 'unknown' as const;
     const cannotJudge = false;
-    if (decision.ok) result.passing++;
+    // Strict wins: a strict integrity failure demotes even when the
+    // word-level guard passes. Strict `no-ref` reports as the audit's
+    // existing `quote-not-verbatim` code.
+    const strictHit = strictById.get(row.id);
+    const effective: { ok: boolean; reason?: string } = strictHit
+      ? { ok: false, reason: 'quote-not-verbatim' }
+      : decision.ok
+        ? { ok: true }
+        : { ok: false, reason: decision.reason ?? 'unproven' };
+    if (effective.ok) result.passing++;
     else {
-      const reason = decision.reason ?? 'unproven';
+      const reason = effective.reason ?? 'unproven';
       result.failing[reason] = (result.failing[reason] ?? 0) + 1;
       failing.push(row.id);
     }
@@ -5478,10 +5496,10 @@ export function auditAcceptedRelations(
       fromName: row.from_name,
       kind: row.kind,
       toName: row.to_name,
-      guard: decision.ok ? 'ok' : decision.reason ?? 'unproven',
+      guard: effective.ok ? 'ok' : ((effective.reason as PromoteReason | 'unproven') ?? 'unproven'),
       direction,
       cannotJudge,
-      action: decision.ok ? 'keep' : 'demote',
+      action: effective.ok ? 'keep' : 'demote',
     });
   }
 

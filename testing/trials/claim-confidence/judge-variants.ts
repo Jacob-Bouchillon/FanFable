@@ -133,7 +133,7 @@ for (const entry of goldMap) {
     if (!llm) {
       const base = JSON.parse(project?.settings || '{}');
       const seed = Number(process.env.JUDGE_SEED ?? 42);
-      llm = clientFrom({ ...base, model: 'qwen3.5:9b', temperature: 0, seed, maxTokens: 2048 });
+      llm = clientFrom({ ...base, model: process.env.JUDGE_MODEL ?? 'qwen3.5:9b', temperature: 0, seed, maxTokens: 2048 });
     }
     const chunks = new Map<number, string>();
     if (project) {

@@ -253,3 +253,54 @@ test('a second write run changes nothing', () => {
   assert.equal(second.backupPath, undefined, 'no new snapshot when nothing changes');
   db.close();
 });
+
+test('strict integrity wins: guard-passing non-verbatim quotes demote, verbatim keepers stay', () => {
+  const { db } = tempDb();
+  const project = createProject(db, 'audit-strict-wins');
+  const chunk = addChunk(db, project.id, 'Mara was the aunt of Tor. Tor asked Aunt Mara dully late that afternoon.');
+  const mara = addEntity(db, project.id, 'Mara');
+  const tor = addEntity(db, project.id, 'Tor');
+  const verbatim = addRelation(db, project.id, mara, tor, 'aunt of', {
+    evidence: 'Mara was the aunt of Tor.',
+    refs: refsFor(chunk),
+  });
+  // Each of the four passes the word-level guard (punctuation stripped) but
+  // fails strict verbatim (presentation kept): extra straight quotes, extra
+  // curly quotes, trailing ellipsis, quoted second sentence.
+  const strictCases: Array<{ kind: string; evidence: string }> = [
+    { kind: 'uncle of', evidence: '"Mara was the aunt of Tor."' },
+    { kind: 'mentor of', evidence: '“Mara was the aunt of Tor.”' },
+    { kind: 'ally of', evidence: 'Mara was the aunt of Tor...' },
+    { kind: 'friend of', evidence: '"Tor asked Aunt Mara dully late that afternoon."' },
+  ];
+  const strictFails = strictCases.map(({ kind, evidence }) =>
+    addRelation(db, project.id, mara, tor, kind, { evidence, refs: refsFor(chunk) }),
+  );
+
+  // Dry run by default: nothing written, but failures already reported.
+  const dry = lorebook.auditAcceptedRelations(db, project.id);
+  assert.equal(dry.audited, 5);
+  assert.equal(dry.passing, 1);
+  assert.deepEqual(dry.failing, { 'quote-not-verbatim': 4 });
+  assert.equal(dry.changed, 0);
+  for (const id of strictFails) {
+    assert.equal(dry.rows.find((row) => row.id === id)?.guard, 'quote-not-verbatim');
+    assert.equal(dry.rows.find((row) => row.id === id)?.action, 'demote');
+  }
+  assert.equal(dry.rows.find((row) => row.id === verbatim)?.guard, 'ok');
+  assert.equal(dry.rows.find((row) => row.id === verbatim)?.action, 'keep');
+
+  const wrote = lorebook.auditAcceptedRelations(db, project.id, { write: true });
+  assert.equal(wrote.changed, 4);
+  assert.equal(statusOf(db, verbatim), 'accepted');
+  for (const id of strictFails) assert.equal(statusOf(db, id), 'provisional');
+  // Never deletes: all five rows still exist.
+  const remaining = db.get<{ n: number }>(
+    'SELECT COUNT(*) AS n FROM canon_relation WHERE project_id = ?',
+    project.id,
+  );
+  assert.equal(remaining?.n, 5);
+  // Strict integrity now agrees: no accepted keeper is unverified.
+  assert.deepEqual(lorebook.findUnverifiedKeepers(db, project.id), []);
+  db.close();
+});
