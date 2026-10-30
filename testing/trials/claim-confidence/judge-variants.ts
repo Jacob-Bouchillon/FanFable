@@ -3,10 +3,9 @@
  *
  * usage: node judge-variants.ts <variant> [out.json]
  *
- * All variants run on gpt-oss:20b with think:"low" — the setting that stops the
- * reasoning from consuming the answer budget. Scored against the three-way
- * blind labels: "establishes" (plus "reinforces" where the variant reports it)
- * is the positive class.
+ * All variants run on qwen3.5:9b (Q4) at temperature 0, seed 42 (override with
+ * JUDGE_SEED). Scored against the three-way blind labels: "establishes" (plus
+ * "reinforces" where the variant reports it) is the positive class.
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { Db } from '../../../fanfable/src/db.ts';
@@ -66,6 +65,50 @@ const PROMPTS: Record<string, { system: string; positive: (parsed: Record<string
       'Do not use knowledge from outside the passage.',
     positive: (p) => p.lasting === true || String(p.lasting).toLowerCase() === 'true',
   },
+  fixed: {
+    system:
+      'You read a short passage from a book. Two people are named for you. ' +
+      'Decide whether this passage states or presupposes a lasting relationship between them. ' +
+      'Two names that refer to the same person are NOT a relationship — if the two names are one person, answer false. ' +
+      'A family title used in the passage (aunt, uncle, nephew, parent, and so on) establishes what it names. ' +
+      'The relationship may well be true in the book: judge only this passage. ' +
+      'If the passage merely places them together, has them speak, or describes an action, answer false. ' +
+      'Reply with JSON only: {"lasting": true|false, "why": "one sentence"}. ' +
+      'Do not use knowledge from outside the passage.',
+    positive: (p) => p.lasting === true || String(p.lasting).toLowerCase() === 'true',
+  },
+  fixed2: {
+    system:
+      'You read a short passage from a book. Two people are named for you. ' +
+      'Decide whether this passage states or presupposes a lasting relationship between them. ' +
+      'Two names that refer to the same person are NOT a relationship — if the two names are one person, answer false. ' +
+      'An epithet or role noun used in the passage for one of the two named people is IDENTITY, not a second party: ' +
+      'for example, a species or kind noun with "the" that refers to a named individual present in the passage. ' +
+      'A tie between that named person and their own epithet is not a relationship — answer false. ' +
+      'A family title plus surname used as a contiguous run in the passage (for example a kin-title such as "Aunt" ' +
+      'followed by a surname) establishes what it names, even when the surrounding sentence action involves a third person. ' +
+      'A title alone never proves a tie to whoever stands next to them, and direction stays unknown from a title alone. ' +
+      'The relationship may well be true in the book: judge only this passage. ' +
+      'If the passage merely places them together, has them speak, or describes an action, answer false. ' +
+      'Reply with JSON only: {"lasting": true|false, "why": "one sentence"}. ' +
+      'Do not use knowledge from outside the passage.',
+    positive: (p) => p.lasting === true || String(p.lasting).toLowerCase() === 'true',
+  },
+  fixed3: {
+    system:
+      'You read a short passage from a book. Two people are named for you. ' +
+      'Decide whether this passage states or presupposes a lasting relationship between them. ' +
+      'Two names that refer to the same person are NOT a relationship — if the two names are one person, answer false. ' +
+      'An epithet or role noun used in the passage for one of the two named people is IDENTITY, not a second party: ' +
+      'for example, a species or kind noun with "the" that refers to a named individual present in the passage. ' +
+      'A tie between that named person and their own epithet is not a relationship — answer false. ' +
+      'A family title used in the passage (aunt, uncle, nephew, parent, and so on) establishes what it names. ' +
+      'The relationship may well be true in the book: judge only this passage. ' +
+      'If the passage merely places them together, has them speak, or describes an action, answer false. ' +
+      'Reply with JSON only: {"lasting": true|false, "why": "one sentence"}. ' +
+      'Do not use knowledge from outside the passage.',
+    positive: (p) => p.lasting === true || String(p.lasting).toLowerCase() === 'true',
+  },
 };
 
 const spec = PROMPTS[variant];
@@ -89,7 +132,8 @@ for (const entry of goldMap) {
     const project = db.get<{ id: number; settings: string }>('SELECT id, settings FROM project LIMIT 1');
     if (!llm) {
       const base = JSON.parse(project?.settings || '{}');
-      llm = clientFrom({ ...base, model: 'gpt-oss:20b', think: 'low', maxTokens: 2048 });
+      const seed = Number(process.env.JUDGE_SEED ?? 42);
+      llm = clientFrom({ ...base, model: 'qwen3.5:9b', temperature: 0, seed, maxTokens: 2048 });
     }
     const chunks = new Map<number, string>();
     if (project) {
