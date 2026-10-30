@@ -7,7 +7,7 @@
  * the new gate blocks ("the Potters' son" pattern). Read-only, no model.
  *
  * Usage:
- *   node --no-warnings testing/trials/lasting-moment-check.ts <bank-name>
+ *   node --no-warnings testing/trials/checks/lasting-moment-check.ts <bank-name>
  */
 import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';
 import { isDescriptiveCharacterName, isMomentKind, isUnsupportedKind } from '/home/jacob/Documents/FanFable/fanfable/src/lorebook.ts';

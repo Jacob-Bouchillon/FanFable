@@ -2,7 +2,7 @@
  * Watch a walk's live log. Read-only, safe to run mid-walk.
  *
  * Usage:
- *   node --no-warnings testing/trials/watch-log.ts <run-prefix> [limit]
+ *   node --no-warnings testing/trials/chain/watch-log.ts <run-prefix> [limit]
  */
 import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';
 

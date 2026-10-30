@@ -6,7 +6,7 @@
  * precision without judging the whole bank. No model, no writes to the bank.
  *
  * Usage:
- *   node --no-warnings testing/trials/sample-sheet.ts <bank> <n> <k> <seed> <out-prefix>
+ *   node --no-warnings testing/trials/sheets/sample-sheet.ts <bank> <n> <k> <seed> <out-prefix>
  */
 import { writeFileSync } from 'node:fs';
 import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';

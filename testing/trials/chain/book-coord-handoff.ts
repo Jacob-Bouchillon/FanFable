@@ -206,13 +206,13 @@ try {
     '/home/jacob/Documents/FanFable/testing/benchmarks/data/bench.db',
     'book-coord-handoff',
     RUN,
-    '/home/jacob/Documents/FanFable/testing/trials/handoff-book-coord-handoff.json',
+    '/home/jacob/Documents/FanFable/testing/trials/chain/handoff-book-coord-handoff.json',
   );
   console.log(`HANDOFF EMITTED: ${h.windows.length} windows, ${h.thin.length} thin, ${h.pairs.length} pairs`);
   // Copy beside the database too: `lore enrich` picks up handoff.json there by default.
   try {
     copyFileSync(
-      '/home/jacob/Documents/FanFable/testing/trials/handoff-book-coord-handoff.json',
+      '/home/jacob/Documents/FanFable/testing/trials/chain/handoff-book-coord-handoff.json',
       dirname('/home/jacob/Documents/FanFable/testing/benchmarks/data/bench.db') + '/handoff.json',
     );
   } catch {

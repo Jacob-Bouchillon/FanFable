@@ -6,17 +6,17 @@
  * only (requirements arrive with planner step 5), so this script supplies the
  * seven-scene requirements fixture. Nothing is written and no model is called.
  *
- * usage: node --experimental-strip-types testing/trials/evidence-select.ts
+ * usage: node --experimental-strip-types testing/trials/evidence/evidence-select.ts
  */
 import { DatabaseSync } from 'node:sqlite';
-import type { Db } from '../../fanfable/src/db.ts';
+import type { Db } from '../../../fanfable/src/db.ts';
 import {
   selectEvidence,
   type ClaimRequirement,
   type Packet,
   type SceneRequirements,
-} from '../../fanfable/src/evidence.ts';
-import { loadEvidenceRecords, validatePacket } from '../../fanfable/src/evidence-retrieval.ts';
+} from '../../../fanfable/src/evidence.ts';
+import { loadEvidenceRecords, validatePacket } from '../../../fanfable/src/evidence-retrieval.ts';
 
 const DB_PATH = 'testing/trials/model-ab/hp3.db';
 const raw = new DatabaseSync(DB_PATH, { readOnly: true });

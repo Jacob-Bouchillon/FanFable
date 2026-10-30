@@ -8,11 +8,11 @@
  * database writes. Garbage never survives: the shared builder drops it.
  *
  * Usage:
- *   node --no-warnings testing/trials/emit-handoff.ts <bank-name> <run> <out-path>
+ *   node --no-warnings testing/trials/chain/emit-handoff.ts <bank-name> <run> <out-path>
  */
 
 import { writeFileSync } from 'node:fs';
-import { Db } from '../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/db.ts';
 import { buildHandoff, type ChainHandoff } from './chain-handoff.ts';
 
 const norm = (s: string): string =>

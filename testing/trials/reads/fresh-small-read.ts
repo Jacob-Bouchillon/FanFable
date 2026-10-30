@@ -7,7 +7,7 @@
  * counts match before and after. Count-only output.
  *
  * Usage (needs Ollama up with the local model):
- *   WINDOWS=4 PROJECT=book-fix-check node --no-warnings testing/trials/fresh-small-read.ts
+ *   WINDOWS=4 PROJECT=book-fix-check node --no-warnings testing/trials/reads/fresh-small-read.ts
  */
 import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';
 import * as controller from '/home/jacob/Documents/FanFable/fanfable/src/controller.ts';
@@ -75,7 +75,7 @@ try {
     `SOURCE ${after.chunks === before.chunks && after.entities === before.entities ? 'UNCHANGED' : 'CHANGED!'}: ` +
       `chunks ${before.chunks}->${after.chunks}, entities ${before.entities}->${after.entities}`,
   );
-  console.log(`NEXT: node --no-warnings testing/trials/lasting-moment-check.ts ${PROJECT}`);
+  console.log(`NEXT: node --no-warnings testing/trials/checks/lasting-moment-check.ts ${PROJECT}`);
 } finally {
   db.close();
 }

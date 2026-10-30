@@ -13,7 +13,7 @@ import { baselineClient } from '/home/jacob/Documents/FanFable/testing/scripts/b
 
 const DB = '/home/jacob/Documents/FanFable/testing/benchmarks/data/bench.db';
 const SRC = 'book-coord-no-notes';
-const HANDOFF = '/home/jacob/Documents/FanFable/testing/trials/handoff-test.json';
+const HANDOFF = '/home/jacob/Documents/FanFable/testing/trials/chain/handoff-test.json';
 const NAMES = 5;
 
 const db = new Db(DB);

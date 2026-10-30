@@ -2,7 +2,7 @@
  * Handoff outcome run: enrich the same thin name with vs without handoff.
  *
  * Two temp copies of the order-only bank isolate the arms: A enriches in
- * today's order, B reads thin windows first via testing/trials/handoff-test.json.
+ * today's order, B reads thin windows first via testing/trials/chain/handoff-test.json.
  * Same name, same 12-passage cap, sequential (one model job). Count-only
  * output: added relations/facts per arm. No passage prose, no gold keys.
  */
@@ -14,7 +14,7 @@ import { baselineClient } from '/home/jacob/Documents/FanFable/testing/scripts/b
 
 const DB = '/home/jacob/Documents/FanFable/testing/benchmarks/data/bench.db';
 const SRC = 'book-coord-no-notes';
-const HANDOFF = '/home/jacob/Documents/FanFable/testing/trials/handoff-test.json';
+const HANDOFF = '/home/jacob/Documents/FanFable/testing/trials/chain/handoff-test.json';
 
 function copyBank(db: Db, srcName: string, dstName: string): number {
   const src = controller.getProjectByName(db, srcName)!;

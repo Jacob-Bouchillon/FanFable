@@ -1,14 +1,14 @@
 /**
  * Regression check: does a bank still hold what we once proved?
  *
- * Loads testing/trials/regression-sheet.json (frozen triple keys with how
+ * Loads testing/trials/checks/regression-sheet.json (frozen triple keys with how
  * each was validated) and diffs a bank's triple keys against it. No model,
  * read-only database. Count-only output: still-found, missing, new.
  * Missing rows are a regression signal, never a truth verdict — the sheet
  * is our own validated history, not gold.
  *
  * Usage:
- *   node --no-warnings testing/trials/regression-check.ts <bank-name>
+ *   node --no-warnings testing/trials/checks/regression-check.ts <bank-name>
  */
 import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';
 import { readFileSync } from 'node:fs';
@@ -23,7 +23,7 @@ const key = (a: string, b: string, kind: string): string => {
 
 const bankName = process.argv[2];
 if (!bankName) throw new Error('usage: regression-check.ts <bank-name>');
-const sheet = JSON.parse(readFileSync('/home/jacob/Documents/FanFable/testing/trials/regression-sheet.json', 'utf8')) as {
+const sheet = JSON.parse(readFileSync('/home/jacob/Documents/FanFable/testing/trials/checks/regression-sheet.json', 'utf8')) as {
   version: number;
   triples: { key: string }[];
 };

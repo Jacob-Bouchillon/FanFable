@@ -51,5 +51,7 @@ testing/trials/**
 testing/trials/**/*.json
 testing/trials/**/*.tsv
 testing/trials/**/*.md
+!testing/trials/README.md
+!testing/trials/*/README.md
 testing/trials/**/backup/
 testing/trials/tmp-archive*/

@@ -12,7 +12,7 @@
  * reports totals only, so tuning stays blind to individual answers.
  *
  * Usage:
- *   node --no-warnings testing/trials/prep-sheet.ts <bank-name> <out.csv>
+ *   node --no-warnings testing/trials/sheets/prep-sheet.ts <bank-name> <out.csv>
  */
 import { writeFileSync } from 'node:fs';
 import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';

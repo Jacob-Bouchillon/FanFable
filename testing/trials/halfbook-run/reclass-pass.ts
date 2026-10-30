@@ -6,8 +6,8 @@
  */
 import { DatabaseSync } from 'node:sqlite';
 import { existsSync, statSync } from 'node:fs';
-import { listEntities, mergeEntityPair } from '../../fanfable/src/lorebook.ts';
-import type { Db } from '../../fanfable/src/db.ts';
+import { listEntities, mergeEntityPair } from '../../../fanfable/src/lorebook.ts';
+import type { Db } from '../../../fanfable/src/db.ts';
 
 const DB_PATH = process.env.FANFABLE_DB ?? 'testing/trials/halfbook-run/plagueis-half.db';
 const BACKUP = 'testing/trials/tmp-archive/reclass-backup/plagueis-half.db.bak';

@@ -9,7 +9,7 @@
  * recovers anything before any table gets built.
  *
  * Usage:
- *   NOTES=8 PROJECT=book-coord-no-notes node --no-warnings testing/trials/notes-relabel.ts
+ *   NOTES=8 PROJECT=book-coord-no-notes node --no-warnings testing/trials/checks/notes-relabel.ts
  */
 import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';
 import { CLOSED_TIE_LABELS, isMomentKind, isUnsupportedKind } from '/home/jacob/Documents/FanFable/fanfable/src/lorebook.ts';
