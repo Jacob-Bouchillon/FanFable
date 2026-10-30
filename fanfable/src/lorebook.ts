@@ -2424,7 +2424,7 @@ export interface BankRankCandidate {
  * is a reorder, never a filter: a passage with no bank backing keeps its place
  * at the text tier, and a query that names nobody in the bank keeps its order.
  */
-const BANK_RANK_TIER = { keeper: 3, parked: 2, mention: 1, text: 0 } as const;
+const BANK_RANK_TIER = { keeper: 4, attested: 3, parked: 2, mention: 1, text: 0 } as const;
 const BANK_RANK_ALIAS_WEIGHT = 0.35;
 const BANK_RANK_DIRECTION_WEIGHT = 0.35;
 const BANK_RANK_LEXICAL_WEIGHT = 0.2;
@@ -2653,15 +2653,18 @@ export function buildBankProfile(db: Db, projectId: number, query: string): Bank
 /**
  * What a relation is worth as proof.
  *
- * A keeper is confirmed (user or accepted) and states a tie. `appears_with`
- * is a mention: two names in one passage, coverage and never evidence.
- * Everything else is parked. Mirrors the answer rule: only keeper-grade ties
- * may be stated.
+ * A keeper is confirmed (user or accepted) and states a tie. Attested sits
+ * below keeper: passage-proof and citable with its passage scope, but not
+ * sentence-proven. `appears_with` is a mention: two names in one passage,
+ * coverage and never evidence. Everything else is parked. Mirrors the answer
+ * rule: only keeper-grade ties may be stated outright; attested ties are
+ * cited with their passage scope shown.
  */
 function relationTier(relation: BankRelationRow): BankProofTier {
   const kind = canonicalName(relation.kind);
   if (kind === 'appears with') return 'mention';
   if (relation.status === 'accepted' || relation.status === 'user_confirmed') return 'keeper';
+  if (relation.status === 'attested') return 'attested';
   return 'parked';
 }
 
@@ -3026,7 +3029,7 @@ export function bankLinkedChunkIds(
  * the result is `several` and the caller abstains.
  */
 export interface BankAnswerResult {
-  status: 'keeper' | 'none' | 'several';
+  status: 'keeper' | 'attested' | 'none' | 'several';
   /** "From — kind To", bank names verbatim. */
   line?: string;
   quote?: string;
@@ -3088,6 +3091,7 @@ export function lookupKeeperPair(
   projectId: number,
   a: string,
   b: string,
+  statuses: readonly string[] = ['accepted', 'user_confirmed'],
 ): PairKeeper[] {
   const entities = listEntities(db, projectId);
   const roster = buildRosterIndex(
@@ -3164,11 +3168,12 @@ export function lookupKeeperPair(
        JOIN canon_entity a ON a.id = r.from_entity
        JOIN canon_entity b ON b.id = r.to_entity
        WHERE r.project_id = ?
-         AND r.review_status IN ('accepted','user_confirmed')
+         AND r.review_status IN (${statuses.map(() => '?').join(',')})
          AND ((r.from_entity IN (${placeholders(idsA)}) AND r.to_entity IN (${placeholders(idsB)}))
            OR (r.from_entity IN (${placeholders(idsB)}) AND r.to_entity IN (${placeholders(idsA)})))
        ORDER BY r.id`,
       projectId,
+      ...statuses,
       ...idsA,
       ...idsB,
       ...idsB,
@@ -3220,6 +3225,20 @@ export function lookupKeeperPair(
   });
 }
 
+/**
+ * Passage-proof rows for an explicit pair: `attested` status only. Same
+ * resolution as the keeper lookup, but the answer shows them distinctly —
+ * quote plus passage scope, never as keeper-grade.
+ */
+export function lookupAttestedPair(
+  db: Db,
+  projectId: number,
+  a: string,
+  b: string,
+): PairKeeper[] {
+  return lookupKeeperPair(db, projectId, a, b, ['attested']);
+}
+
 export function bankAnswerForQuestion(
   db: Db,
   projectId: number,
@@ -3234,7 +3253,23 @@ export function bankAnswerForQuestion(
         (row.modality ?? 'asserted') === 'asserted',
     );
     if (!rows.length) {
-      return { status: 'none', reason: 'The bank holds no keeper for this pair.' };
+      // No keeper: an attested row may still be cited, distinctly — quote
+      // plus passage scope, never keeper-grade.
+      const attested = lookupAttestedPair(db, projectId, pair.a, pair.b).filter(
+        (row) =>
+          canonicalName(row.kind) !== 'appears with' &&
+          (row.modality ?? 'asserted') === 'asserted',
+      );
+      if (!attested.length) {
+        return { status: 'none', reason: 'The bank holds no keeper for this pair.' };
+      }
+      const cited = [...attested].sort((x, y) => x.id - y.id)[0]!;
+      return {
+        status: 'attested',
+        line: `${cited.fromName} — ${cited.kind} ${cited.toName} (attested, not keeper-grade)`,
+        quote: cited.evidence,
+        ...(cited.locator ? { locator: cited.locator } : {}),
+      };
     }
     // A human confirmation outranks a derived pick: answer from the confirmed
     // row itself, deterministically (lowest id), so the line matches what was
@@ -5521,6 +5556,254 @@ export function auditAcceptedRelations(
   return result;
 }
 
+/* ------------------------------------------------------- attested tier */
+
+/**
+ * The attested tier (audit open decision #1, 2026-10-28): a citable middle
+ * tier between keeper and provisional. A row is attested when the quote
+ * states the tie (the stored assessment's `asserted` flag) and is verbatim
+ * in its cited chunk, both endpoints are named anywhere in that chunk, the
+ * endpoints are not one identity, and no PARK ruling binds the pair. Still
+ * quoted, still checkable, never invented.
+ *
+ * Keeper-grade is frozen: `canPromote`, extraction tiers (`claimTier`) and
+ * `promoteProvisional` are untouched, so sentence-proof rows stay
+ * keeper-grade. This pass only moves provisional/needs_review rows that are
+ * passage-proof but not sentence-proof to `attested`. Direction and identity
+ * rules are the same helpers the keeper guard uses.
+ */
+
+export type AttestedReason = PromoteReason | 'keeper-track' | 'assessment-missing';
+
+export interface AttestedCheck {
+  attested: boolean;
+  reason: AttestedReason | 'ok';
+}
+
+export interface AttestedRow {
+  fromId: number;
+  toId: number;
+  fromName: string;
+  toName: string;
+  fromAliases: string[];
+  toAliases: string[];
+  kind: string;
+  evidence: string;
+  kindSource?: string;
+  anchorEvidence?: string;
+  /** Raw supporting_evidence JSON carrying the model's assessment. */
+  supportingEvidence: string;
+  fromStatus: string;
+  toStatus: string;
+}
+
+function chunkNamesEndpoint(chunkText: string, name: string, aliases: string[]): boolean {
+  return (
+    nameMentionedExact(name, chunkText) ||
+    aliases.some((a) => a.trim() !== '' && nameMentionedExact(a, chunkText))
+  );
+}
+
+/**
+ * Passage-level proof for one row. Pure and read-only: no writes, no model.
+ * `chunkText` must be the raw cited chunk: verbatim here is the strict
+ * auditNormalize standard integrity enforces, so assignment and integrity
+ * agree exactly. provenQuoteReason still runs for hedge/anchor honesty.
+ */
+export function checkAttested(
+  db: Db,
+  projectId: number,
+  row: AttestedRow,
+  chunkText: string | null,
+): AttestedCheck {
+  const canonical = canonicalKind(row.kind);
+  if (COVERAGE_KINDS.has(canonical)) return { attested: false, reason: 'coverage-only' };
+  if (!RELATIONSHIP_GRADE_KINDS.has(canonical)) return { attested: false, reason: 'open-vocab' };
+  const assessment = storedAssessment(row.supportingEvidence);
+  if (!assessment) return { attested: false, reason: 'assessment-missing' };
+  if (assessment.asserted !== true) return { attested: false, reason: 'assertion-missing' };
+  if (row.fromId === row.toId) return { attested: false, reason: 'same-identity' };
+  if (nestedCharacterNames(db, projectId, row.fromId, row.toId, row.fromName, row.toName)) {
+    return { attested: false, reason: 'same-identity' };
+  }
+  if (sharedIdentityRows(db, projectId, row.fromId, row.toId)) {
+    return { attested: false, reason: 'same-identity' };
+  }
+  if (row.fromStatus === 'quarantined' || row.toStatus === 'quarantined') {
+    return { attested: false, reason: 'quarantined-entity' };
+  }
+  // Same ruling as canPromote: an author's PARK binds the pair and its
+  // inverse class.
+  const parked = db.all<{ attempted_kind: string }>(
+    'SELECT attempted_kind FROM canon_tie_note WHERE project_id = ? AND lower(ruling) LIKE \'park%\' AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))',
+    projectId,
+    row.fromId,
+    row.toId,
+    row.toId,
+    row.fromId,
+  );
+  if (parked.some((note) => sameOrInverseKind(note.attempted_kind, row.kind))) {
+    return { attested: false, reason: 'ruled-park' };
+  }
+  if (!chunkText) return { attested: false, reason: 'quote-not-verbatim' };
+  if (!auditNormalize(chunkText).includes(auditNormalize(row.evidence))) {
+    return { attested: false, reason: 'quote-not-verbatim' };
+  }
+  const quoteReason = provenQuoteReason(
+    {
+      fromId: row.fromId,
+      toId: row.toId,
+      fromName: row.fromName,
+      toName: row.toName,
+      fromAliases: row.fromAliases,
+      toAliases: row.toAliases,
+      kind: row.kind,
+      evidence: row.evidence,
+      kindSource: row.kindSource,
+      anchorEvidence: row.anchorEvidence,
+    },
+    chunkText,
+  );
+  if (quoteReason) return { attested: false, reason: quoteReason };
+  // Sentence-proof rows belong to the keeper track (promoteProvisional), not here.
+  if (namesBothDistinctly(row.evidence, row.fromName, row.fromAliases, row.toName, row.toAliases)) {
+    return { attested: false, reason: 'keeper-track' };
+  }
+  if (!chunkNamesEndpoint(chunkText, row.fromName, row.fromAliases)) {
+    return { attested: false, reason: 'endpoint-unnamed' };
+  }
+  if (!chunkNamesEndpoint(chunkText, row.toName, row.toAliases)) {
+    return { attested: false, reason: 'endpoint-unnamed' };
+  }
+  return { attested: true, reason: 'ok' };
+}
+
+export interface AttestedAssignRow {
+  id: number;
+  fromName: string;
+  kind: string;
+  toName: string;
+  result: 'attest' | 'leave';
+  reason: AttestedReason | 'ok';
+}
+
+export interface AttestedAssignResult {
+  checked: number;
+  attested: number;
+  keeperTrack: number;
+  still: Record<string, number>;
+  changed: number;
+  backupPath?: string;
+  rows: AttestedAssignRow[];
+}
+
+/**
+ * Move passage-proof provisional/needs_review rows to `attested`.
+ *
+ * Dry run by default. With `write`, attested rows move from
+ * provisional/needs_review to `attested` in one transaction after a
+ * consistent snapshot backup; no evidence, source ref, kind or assessment is
+ * touched, rows are never deleted, and accepted/user_confirmed rows are
+ * never read.
+ */
+export function assignAttestedTiers(
+  db: Db,
+  projectId: number,
+  opts: { write?: boolean; limit?: number } = {},
+): AttestedAssignResult {
+  const rows = db
+    .all<{
+      id: number;
+      from_entity: number;
+      to_entity: number;
+      kind: string;
+      evidence: string;
+      source_refs: string;
+      kind_source: string;
+      anchor_evidence: string;
+      supporting_evidence: string;
+      from_name: string;
+      from_aliases: string;
+      from_status: string;
+      to_name: string;
+      to_aliases: string;
+      to_status: string;
+    }>(
+      'SELECT r.id, r.from_entity, r.to_entity, r.kind, r.evidence, r.source_refs, r.kind_source, r.anchor_evidence, r.supporting_evidence, a.name AS from_name, a.aliases AS from_aliases, a.review_status AS from_status, b.name AS to_name, b.aliases AS to_aliases, b.review_status AS to_status FROM canon_relation r JOIN canon_entity a ON a.id = r.from_entity JOIN canon_entity b ON b.id = r.to_entity WHERE r.project_id = ? AND r.review_status IN (\'provisional\',\'needs_review\') ORDER BY r.id',
+      projectId,
+    )
+    .slice(0, opts.limit === undefined ? undefined : Math.max(0, Math.floor(opts.limit)));
+  const result: AttestedAssignResult = {
+    checked: rows.length,
+    attested: 0,
+    keeperTrack: 0,
+    still: {},
+    changed: 0,
+    rows: [],
+  };
+  const attest: number[] = [];
+  for (const row of rows) {
+    // Passage-level means the raw cited chunk: no page-text expansion and no
+    // anywhere-fallback, so this agrees exactly with integrity.
+    let chunkText: string | null = null;
+    try {
+      const refs = JSON.parse(row.source_refs || '[]') as { chunk?: unknown }[];
+      const chunkId = refs.find((ref) => Number.isFinite(Number(ref?.chunk)) && Number(ref?.chunk) > 0)?.chunk;
+      if (chunkId !== undefined) {
+        chunkText =
+          db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', Number(chunkId))?.text ?? null;
+      }
+    } catch {
+      chunkText = null;
+    }
+    const check = checkAttested(
+      db,
+      projectId,
+      {
+        fromId: row.from_entity,
+        toId: row.to_entity,
+        fromName: row.from_name,
+        toName: row.to_name,
+        fromAliases: strList(row.from_aliases),
+        toAliases: strList(row.to_aliases),
+        kind: row.kind,
+        evidence: row.evidence,
+        kindSource: row.kind_source,
+        anchorEvidence: row.anchor_evidence,
+        supportingEvidence: row.supporting_evidence,
+        fromStatus: row.from_status,
+        toStatus: row.to_status,
+      },
+      chunkText,
+    );
+    if (check.attested) {
+      result.attested++;
+      attest.push(row.id);
+      result.rows.push({ id: row.id, fromName: row.from_name, kind: row.kind, toName: row.to_name, result: 'attest', reason: 'ok' });
+    } else {
+      if (check.reason === 'keeper-track') result.keeperTrack++;
+      else result.still[check.reason] = (result.still[check.reason] ?? 0) + 1;
+      result.rows.push({ id: row.id, fromName: row.from_name, kind: row.kind, toName: row.to_name, result: 'leave', reason: check.reason });
+    }
+  }
+  if (opts.write && attest.length) {
+    const stamp = nowIso().replace(/[:.]/g, '-');
+    const backupPath = `${db.path}.attested-backup-${stamp}.db`;
+    db.exec(`VACUUM INTO '${backupPath.replace(/'/g, "''")}'`);
+    result.backupPath = backupPath;
+    db.transaction(() => {
+      for (const id of attest) {
+        result.changed += db.run(
+          "UPDATE canon_relation SET review_status = 'attested' WHERE id = ? AND project_id = ? AND review_status IN ('provisional','needs_review')",
+          id,
+          projectId,
+        ).changes;
+      }
+    });
+  }
+  return result;
+}
+
 export interface FindEvidenceResult extends PromoteProvisionalResult {
   returned: number;
   verified: number;
@@ -5774,7 +6057,7 @@ export interface UnverifiedKeeper {
   toName: string;
   kind: string;
   reviewStatus: string;
-  reason: 'no-ref' | 'quote-not-verbatim';
+  reason: 'no-ref' | 'quote-not-verbatim' | 'endpoint-unnamed';
 }
 
 /** Normalise only presentation: quotes, dashes, case and whitespace. */
@@ -5791,7 +6074,9 @@ function auditNormalize(text: string): string {
 /**
  * Keeper rows whose evidence is not a contiguous verbatim span of a cited
  * chunk. Spliced or paraphrased text fails: normalisation never joins or
- * reorders sentences, it only flattens presentation.
+ * reorders sentences, it only flattens presentation. Attested rows are
+ * checked too: they must pass the same verbatim check plus both endpoints
+ * named in the cited chunk (the passage-level check).
  */
 export function findUnverifiedKeepers(db: Db, projectId: number): UnverifiedKeeper[] {
   const chunks = db.all<{ id: number; text: string }>(
@@ -5813,11 +6098,17 @@ export function findUnverifiedKeepers(db: Db, projectId: number): UnverifiedKeep
        FROM canon_relation r
        JOIN canon_entity a ON a.id = r.from_entity
        JOIN canon_entity b ON b.id = r.to_entity
-      WHERE r.project_id = ? AND r.review_status IN ('accepted','user_confirmed')
+      WHERE r.project_id = ? AND r.review_status IN ('accepted','user_confirmed','attested')
       ORDER BY r.id`,
     projectId,
   );
   const out: UnverifiedKeeper[] = [];
+  const aliasByName = new Map(
+    db
+      .all<{ name: string; aliases: string }>('SELECT name, aliases FROM canon_entity WHERE project_id = ?', projectId)
+      .flatMap((e) => [[e.name, e.aliases] as const, ...strList(e.aliases).map((a) => [a, e.aliases] as const)]),
+  );
+  const aka = (name: string): string[] => strList(aliasByName.get(name) ?? '[]');
   for (const row of rows) {
     let refs: { chunk?: unknown }[] = [];
     try {
@@ -5834,9 +6125,18 @@ export function findUnverifiedKeepers(db: Db, projectId: number): UnverifiedKeep
       out.push({ id: row.id, fromName: row.from_name, toName: row.to_name, kind: row.kind, reviewStatus: row.review_status, reason: 'no-ref' });
       continue;
     }
-    const found = !!needle && chunkIds.some((id) => textById.get(id)!.includes(needle));
-    if (!found) {
+    const holding = !!needle && chunkIds.find((id) => textById.get(id)!.includes(needle));
+    if (!holding) {
       out.push({ id: row.id, fromName: row.from_name, toName: row.to_name, kind: row.kind, reviewStatus: row.review_status, reason: 'quote-not-verbatim' });
+      continue;
+    }
+    if (row.review_status === 'attested') {
+      const holdingText = chunks.find((c) => c.id === holding)?.text ?? '';
+      const named = (name: string): boolean =>
+        nameMentionedExact(name, holdingText) || aka(name).some((a) => a.trim() !== '' && nameMentionedExact(a, holdingText));
+      if (!named(row.from_name) || !named(row.to_name)) {
+        out.push({ id: row.id, fromName: row.from_name, toName: row.to_name, kind: row.kind, reviewStatus: row.review_status, reason: 'endpoint-unnamed' });
+      }
     }
   }
   return out;

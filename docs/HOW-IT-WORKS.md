@@ -64,10 +64,11 @@ Per relation the model returns:
 |---|---|
 | `user_confirmed` | you checked it. Proof-grade. |
 | `model_asserted` | quote real, calibrated score cleared your threshold |
+| `attested` | passage-proof and citable with passage scope: quote states the tie, verbatim in its cited chunk, both names in that chunk; below keeper, above provisional |
 | `provisional` | below threshold, kept with score and evidence |
 | `rejected` | fabricated quote, unknown entity, same person twice |
 
-Answers show provenance: *confirmed by you*, or *the model, 0.78*, with the quote underneath.
+Answers show provenance: *confirmed by you*, *attested (passage-level)* with quote plus passage scope, or *the model, 0.78*, with the quote underneath. Keeper-grade is frozen: sentence-level proof or your word. Attested never promotes a row by itself — it only marks passage-proof rows citable.
 
 A model's confidence is an opinion until checked. Labelled rows to check against: 226 gold rows, 30 human labels, 30 delta rows, 78 shared pairs. Group by predicted band (0.5–0.6, 0.6–0.7, …), compute observed support per band, and where a band lies apply a fixed correction table — measured once, tested once, stored in one place. Same procedure judges the combination formula: independent evidence accumulates as `score = 1 − Π(1 − sᵢ)` — one thin 0.4 mention scores 0.40 (no bank); two same-scene 0.4+0.35 score 0.61 (no bank); two independent 0.4+0.8 score 0.88 (banks); one explicit 0.95 banks; three damped weak 0.2s score 0.49 (no bank). A sentence cited for more than three distinct pairs gets each contribution halved — the measured catch-all failure. If the formula doesn't beat raw confidence on the same rows, it earns nothing. **Outstanding: published calibration table, full-bank re-measurement at threshold.**
 

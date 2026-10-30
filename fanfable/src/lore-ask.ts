@@ -395,6 +395,17 @@ function verifyClaim(
     if (claim.direction === 'unknown' || direction === 'unknown') return { supported: true };
     if (inverse ? direction !== claim.direction : direction === claim.direction) return { supported: true };
   }
+  // Attested rows are citable with their passage scope shown, so they support
+  // a claim the same way — but never as keeper-grade.
+  for (const row of lorebook.lookupAttestedPair(db, projectId, pair.a, pair.b)) {
+    const rowHead = relationHead(row.kind);
+    const inverse = INVERSE_HEADS.get(claim.head)?.has(rowHead) ?? false;
+    if (rowHead !== claim.head && !inverse) continue;
+    matchedKind = true;
+    const direction = rowDirection(row.fromId, row.toId);
+    if (claim.direction === 'unknown' || direction === 'unknown') return { supported: true };
+    if (inverse ? direction !== claim.direction : direction === claim.direction) return { supported: true };
+  }
   return {
     supported: false,
     reason: matchedKind ? 'direction-mismatch' : 'unsupported-relationship',
@@ -561,6 +572,39 @@ export async function answerLoreQuestion(
           'no book passage was cited.\n\n' +
           `Bank line: ${userConfirmed.map((keeper) => `${keeper.fromName} — ${keeper.kind} ${keeper.toName}`).join('; ')}`,
         passages: [],
+        grounded: true,
+      };
+    }
+    // Attested-only pairs are answered distinctly: quote plus passage scope,
+    // marked as passage-level rather than keeper-grade. No model call.
+    const attestedOnly = lorebook.lookupAttestedPair(db, projectId, pair.a, pair.b).filter(hasRefs);
+    if (!passageBacked.length && attestedOnly.length) {
+      const cited = [...attestedOnly].sort((x, y) => x.id - y.id)[0]!;
+      let chunkId: number | undefined;
+      try {
+        chunkId = (JSON.parse(cited.sourceRefs || '[]') as { chunk?: unknown }[])
+          .map((ref) => Number(ref?.chunk))
+          .find((id) => Number.isFinite(id));
+      } catch {
+        chunkId = undefined;
+      }
+      const chunk = chunkId === undefined ? undefined : db.get<{
+        id: number; source_id: number; title: string; path: string; locator: string; heading: string; text: string;
+      }>(
+        'SELECT c.id, c.source_id, s.title, s.path, c.locator, c.heading, c.text FROM canon_chunk c JOIN canon_source s ON s.id = c.source_id WHERE c.id = ? AND c.project_id = ?',
+        chunkId,
+        projectId,
+      );
+      return {
+        answer:
+          `### Status of ${pair.a} to ${pair.b}\n\n` +
+          'Attested (passage-level, not keeper-grade). The quote states the tie and both names appear in the cited passage, but no single sentence proves it and no reviewer confirmed it.\n\n' +
+          `Bank line: ${cited.fromName} — ${cited.kind} ${cited.toName}\n` +
+          `Quote: ${cited.evidence}\n` +
+          (chunk ? `Passage: ${chunk.locator} (${chunk.title})` : 'Passage: uncited'),
+        passages: chunk
+          ? [{ chunkId: chunk.id, sourceId: chunk.source_id, sourceTitle: chunk.title, path: chunk.path, locator: chunk.locator, heading: chunk.heading, text: chunk.text, score: 1 }]
+          : [],
         grounded: true,
       };
     }
