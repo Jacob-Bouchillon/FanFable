@@ -14,6 +14,8 @@ names. Grades are proven tie, attested, held-aside.
 - **PROPOSED:** thread records, meetings, births, scoped sharing, map
   behavior and rendering fixes (crowding/zoom), review-by-richness queue,
   combination accumulation, multi-sentence evidence, evidence-thread concept.
+- **Discovery:** design approved day-1; unbuilt except sweep.ts
+  per-character ledgers (122 pairs) and the undesigned 80-row sample.
 - **OPEN:** birth triggers, idempotency edge cases, starvation caps,
   evidence-thread implementation, cost limits.
 
@@ -133,6 +135,32 @@ pending meetings, oldest ends, starved.
 
 Richest-evidence threads first, then oldest and most important; evidence
 richness — not raw confidence — orders until scores are trustworthy.
+
+## Discovery
+
+Coverage is structural, inference is spent where it informs. Measured gap on
+the trial book (182 names): 16,471 possible pairs; 3,258 sharing a passage;
+sweep.ts proposes 122 (~3.7% of co-occurring).
+
+Design:
+
+1. Thread creation — code-only pair threads for every co-occurring pair (no
+   model calls); an empty thread means investigation exists with no evidence
+   yet gathered, NEVER no-relationship.
+2. Initial evidence — run the existing 80-row stratified sample design
+   (co-occurrence depth × book position) against unproposed pairs.
+3. Yield measurement — useful evidence by stratum.
+4. Adaptive allocation — model effort to productive strata only, never uniform.
+5. Rendezvous — never-co-occurring pairs gain threads only when indirect
+   evidence (pronouns, events, context) connects them; absence of
+   co-occurrence is not absence of relationship and never becomes a negative
+   verdict.
+6. Persistence — every thread kept including empty and unresolved; new
+   evidence grows threads.
+
+Principle: guarantee investigative coverage structurally, spend model
+inference where it adds information. Exhaustive model sweep (16,471 pairs ≈
+14 GPU-hours) explicitly rejected on cost; this design replaces it.
 
 ## Principles
 
