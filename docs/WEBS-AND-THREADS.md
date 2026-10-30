@@ -8,12 +8,24 @@ names. Grades are proven tie, attested, held-aside.
 
 ## Status
 
-- **Shipped (green, built):** attested tier (7f6ad7e), pronoun-first ordering
-  (1a1b3dd), demote-with-reason (2ce169f), strict integrity + quarantine +
-  rulings replay.
-- **Unbuilt (marked below):** combination accumulation, multi-sentence
-  evidence, thread records/meetings/births, map rendering fixes
-  (crowding/zoom), review-by-richness queue.
+- **SHIPPED (verified committed behavior only):** attested tier code,
+  pronoun-first ordering, demote-with-reason path, strict integrity,
+  quarantine, rulings replay.
+- **PROPOSED:** thread records, meetings, births, scoped sharing, map
+  behavior and rendering fixes (crowding/zoom), review-by-richness queue,
+  combination accumulation, multi-sentence evidence, evidence-thread concept.
+- **OPEN:** birth triggers, idempotency edge cases, starvation caps,
+  evidence-thread implementation, cost limits.
+
+The meeting-vs-birth distinction is what prevents uncontrolled merging:
+a meeting is exchange between intact threads; only a birth makes a new
+thread, and only on a meaningful new combined purpose or knowledge state.
+Exchange never creates; birth never merges people.
+
+## Build order
+
+Evidence web first, map second — the map visualizes a correct network, never
+substitutes for it.
 
 ## Core
 
@@ -38,11 +50,15 @@ provenance and mechanics; the user alone proves.
 - **Sharing:** scoped exchange BEFORE birth, both directions; identity info ≠
   pair evidence (a Plagueis–11-4D meeting exchanges only
   Plagueis/11-4D-relevant notes).
-- **Birth:** a meeting may produce ONE child on resolved-want OR new pooled
-  pair evidence, else meeting-only; the child records both parents, references
-  (not copies) pooled knowledge, resolved + unresolved wants carried; parents
-  stay intact and readable; birth recorded with all three IDs; thread birth is
-  NEVER people-merging (merges need the user word alone).
+- **Birth:** a meeting may produce ONE child when there is a meaningful new
+  combined investigative purpose or knowledge state; resolved-want and new
+  pooled pair evidence are two examples, and the trigger policy stays OPEN
+  (two threads discovering they concern the same event qualifies with neither
+  example firing). Otherwise the outcome is meeting-only. The child records
+  both parents, references (not copies) pooled knowledge, resolved +
+  unresolved wants carried; parents stay intact and readable; birth recorded
+  with all three IDs; thread birth is NEVER people-merging (merges need the
+  user word alone).
 - **Open end:** question + origin + what would resolve it + status + age;
   resolution links, never erases.
 - **Map:** the visible web — threads, knots, births, proof grades on lines
@@ -56,9 +72,15 @@ provenance and mechanics; the user alone proves.
 - Pair threads — the centerpiece — every claim, multi-passage evidence,
   interactions, support AND contradiction, change over time, NO single
   permanent label (mentor + ally + enemy dimensions allowed; the schema already
-  carries event-scoped validity).
+  carries event-scoped validity). Temporal scope is an explicit requirement:
+  began / ended / changed dates if known, supporting passages per period,
+  current vs historical vs uncertain status — apprentice-early and enemy-later
+  must both be representable and true.
 - Evidence threads (establishes / reinforces / challenges / context per claim;
-  passages shared across threads without duplicating notes).
+  passages shared across threads without duplicating notes) stay in the
+  conceptual design; implementation is OPEN — start as a reference network
+  between notes, pair threads, and passages, and only become a full
+  independent thread type after person and pair threads validate.
 - Event / place / lore threads later, same network.
 
 ## Begin and grow
@@ -76,8 +98,12 @@ Deterministic match (shared person → person info, shared pair → pair info,
 claim-meets-evidence), no fuzzy identity, no auto-merge; at a meeting both
 sides inspect the relevant notes, wants checked immediately (a want answered
 by the other's notes resolves on the spot with linked evidence),
-contradictions stay visible, record what was learned; IDEMPOTENT — repeat
-encounters create nothing new.
+contradictions stay visible, record what was learned; IDEMPOTENT — same
+threads + same evidence + same exchange creates no duplicate meeting or
+birth; same threads + new evidence appends notes and updates the meeting or
+creates an evidence-linked revision; changed resolution preserves the earlier
+one and records the new one alongside. Idempotency must never suppress
+accumulation.
 
 ## Proof
 
@@ -86,12 +112,16 @@ identities, source linkage — never semantics. The model assesses
 assert / imply / mention / reinforce / challenge + strength + why. Grades:
 proven (user word — overrides everything, stays distinct), attested (quote
 states the tie, verbatim, both names in passage scope even across sentences,
-assessment clears the bar, citable with scope — never proven-tie grade),
-held-aside (insufficient / conflicting / identity / fabricated + reason, never
-deleted). Weak independent evidence accumulates (three independent weaks
-outscore one loud one; same-scene repeats are NOT independent; duplicates
-never inflate; contradictions visible; scores real, never default). Code
-aggregates and thresholds, invents nothing.
+assessment clears the bar, citable with scope — never proven-tie grade;
+intended rule as stated here, with honesty about what is verified: the tier
+code is shipped, but 0 of 262 passage-proof candidates moved without stored
+assessments, so passage-scope promotion at scale is intended-but-unverified
+pending live-bank application — 27 attested on the assessed disposable copy
+only, real bank untouched), held-aside (insufficient / conflicting / identity
+/ fabricated + reason, never deleted). Weak independent evidence accumulates
+(three independent weaks outscore one loud one; same-scene repeats are NOT
+independent; duplicates never inflate; contradictions visible; scores real,
+never default). Code aggregates and thresholds, invents nothing.
 
 ## Persistence and model-independence
 
