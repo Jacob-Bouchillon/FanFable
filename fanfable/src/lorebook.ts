@@ -18,6 +18,7 @@ import { asRecordArray, extractJson, salvageJsonArray, toStringArray } from './j
 import type { LlmClient } from './llm.ts';
 import { embedMissing, type EmbedFn } from './embeddings.ts';
 import { CORROBORATION_CAP, tripleKey, rankRows } from './edge-rank.ts';
+import { noteFromExtraction } from './note-ingest.ts';
 import { findHeadings, lexicalScore, splitSentences, tokenize, truncate } from './text.ts';
 import {
   ANSWER_CUE_STOPWORDS,
@@ -522,6 +523,8 @@ export interface ExtractLoreResult {
   selection?: { selected: number; total: number; skipped: number };
   /** Rival-claim rows flagged contested by this run. */
   contested?: { facts: number; relations: number };
+  /** Clue notes this run added to the evidence web, when ingestion ran. */
+  notesIngested?: number;
 }
 
 export interface ChunkRow {
@@ -1222,6 +1225,18 @@ async function runWindowBatch(
         const failed = stats.emptyWindows.slice(emptyBefore).some((e) => e.index === index && e.reason !== 'empty-answer');
         if (!failed) {
           for (const c of window) db.run('UPDATE canon_chunk SET lore_mined = 1 WHERE id = ?', c.id);
+        }
+        // Feed the evidence web from this window. Additive and fenced off: a
+        // failure here is logged and never fails the extraction.
+        try {
+          const ingested = noteFromExtraction(db, projectId, window, stats);
+          if (ingested.notes) {
+            batch.onProgress?.(`  notes: +${ingested.notes} from window ${index}`);
+          }
+        } catch (err) {
+          batch.onProgress?.(
+            `  note ingestion skipped for window ${index}: ${err instanceof Error ? err.message : String(err)}`,
+          );
         }
         done++;
         batch.onProgress?.(

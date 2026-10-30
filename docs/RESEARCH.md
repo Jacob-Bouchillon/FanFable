@@ -316,3 +316,151 @@ E0 coverage (user-reported, not locally measured here): 64% same-concept, 71% ma
 - **Licences marked "confirm"/"unstated":** PG-Fiction relations, LitTune/GenTune/MixTune mixtures, RE-DocRED, NYT11, SemEval, GIDS ("other"), `xcore` library code, ReLiK weights, RAG-Gate-4B, GLiNER2.5-base. Check the card before depending on any of them.
 - **Live-doc drift:** bank counts (164 relations etc.) and suite size (609 green at last full run) are dated 2026-10-29; re-run `lore status` and the suite rather than quoting this file.
 - **Missing from git:** adjudication keys (by design — never commit them); run databases, sheets, and logs (by `.gitignore` design); the books themselves. Every reproduction command assumes the local `testing/trials/` data and `RESOURCES/` are present.
+
+## 13. Evidence web vs the locked 20-pair sheet (2026-10-30)
+
+**Method.** `testing/trials/benchmark/validate-web.ts`, read-only against a copy of the `halfbook` trial bank
+(360 entities, 373 notes, 183 meetings, 35 births). Pair list from `BENCHMARK.md` sec. 2, stored as local data
+so no book names live in committed code. Resolution is by canonical name and derived variants only; an
+ambiguous or absent name is reported, never guessed.
+
+**Verdict: FAIL, 3 of 4 hard criteria.**
+
+| criterion | result | counts |
+|---|---|---|
+| zero births on absent controls | PASS | 0 births across 5 controls |
+| alias traps never birth; T3/T4 flagged | FAIL | 0 births across 5 traps; T3 and T4 not flagged `identity-collision` |
+| S1-S3 each hold a note at or above 0.35 | FAIL | S1, S2, S3 unresolved or 0 qualifying notes |
+| C1 holds a note at or above 0.35 on the early book | FAIL | 0 early qualifying notes |
+
+**Resolution: 13 of 20 pairs unresolved.** Ambiguous (canonical form matches more than one entity): S1 (`Kim`),
+C1/C2/C3/T3 (`Plagueis`). Not found: S3, T1, T4 (`Emperor Palpatine`), T5, A1, A3, A4, A5. Resolved: S2, S4, S5,
+C4, C5, T2, A2.
+
+**What the failures are, reported not fixed.**
+
+- The bank holds two rows for one person in several places (`Pax Teem` / `Senator Pax Teem`; `Palpatine` /
+  `Senator Palpatine`) and five `Plagueis`-named entities that are distinct people. These are same-person
+  duplicates the collision pass cannot see, because it groups canonical forms and these forms differ.
+- T3 and T4 are exactly those same-person short forms, so the identity criterion fails on the sheet as written.
+- Four absent controls have no entity at all. For a control that is the expected state and is reported as
+  `not found`, not as an error.
+- Where a pair resolved, C4 carried 15 notes (2 qualifying) and 2 `pooled_evidence` births at combined score
+  0.725; the sheet treats its direction as informative only. S4, S5 and C5 hold pair threads with no notes and
+  no births.
+
+No threshold, tier, trigger or admission rule was changed to produce this record.
+
+## 14. Identity by relationship, and the same 20-pair sheet re-run (2026-10-30)
+
+**What changed.** Collision detection now groups rows when `nameRelation` says `same` or `containment`,
+not only when two canonical strings are equal. A containment edge counts only when the shorter form could
+name someone on its own: a token of length >= 3, no title, no token carried by more than `NAME_DF_CAP`
+entities, and no form contained in more than `NAME_GROUP_CAP = 8`. Name resolution moved into
+`identity.ts`: exact name, then alias, then guarded containment, then `ambiguous` or `absent` - never a guess.
+
+**Collision pass on a fresh copy (360 entities).** 36 groups: 9 same-form edges, 52 containment edges.
+82 entities newly flagged, 12 already flagged from the earlier pass, 0 quarantined skipped, 0 pairs
+rejected by the group cap. Second `--write` flagged 0 new. Nothing merged, renamed or re-kinded.
+
+**Ingestion and meetings unchanged by the pass:** `notes-ingest` added 0 notes and 0 open ends;
+`lore meet` created 0 meetings and 0 exchanges (183 reused); `lore integrity` exit 0;
+`canon_relation` / `canon_tie_note` / `canon_tie_hint` still 336 / 98 / 0.
+
+**Benchmark re-run, same sheet and same four criteria: FAIL (3 of 4).**
+
+| criterion | result | counts |
+|---|---|---|
+| zero births on absent controls | PASS | 0 births across 5 controls |
+| alias traps never birth; T3/T4 flagged | PASS | 0 births across 5 traps; T3 and T4 flagged |
+| S1-S3 each hold a note at or above 0.35 | FAIL | S1 ambiguous, S2 and S3 resolved with 0 qualifying notes |
+| C1 holds a note at or above 0.35 on the early book | PASS | 1 early qualifying note |
+
+**Resolution moved from 7 of 20 resolved to 14 of 20.** Moved from unresolved to resolved: S3, C1, C2, C3,
+T1, T3, T4. Still ambiguous: S1 (`Kim`, two candidates - Senator Vidar Kim and Ronhar Kim). Still absent:
+T5, A1, A3, A4, A5 (no such entity in the bank; for the controls that is the expected state).
+
+**Where the remaining failure is.** The recall floor is not about names any more; it is about evidence.
+S2 and S3 resolve and own pair threads (2 and 1) but carry no note at or above 0.35. S1 cannot be judged at
+all until `Kim` is disambiguated in the bank, which is a human ruling, not a matching rule.
+
+**Informative rows.** C1/C2 (one pair, two scopes) carry 3 notes, 1 qualifying, and 2 `pooled_evidence`
+births at 0.725. C3 carries 8 notes (4 qualifying) and 30 `pooled_evidence` births at 0.821, reading
+A to B. C4 carries 15 notes (2 qualifying) and 2 births at 0.725. S4, S5, C5 and T1 own pair threads with
+no notes and no births. No threshold, tier, trigger or admission rule was changed to produce this record.
+
+## 15. Birth subject, duplicate births, and the first automated score (2026-10-30)
+
+**What changed.** A birth now takes its subject from the evidence that was pooled, not from the meeting that
+held it: the pair key with the most pair-scope contributions wins, and a person subject is used only when no
+pair contribution exists. A child that would duplicate one of its parents is refused and counted
+`child-equals-parent`, with the investigation identity including the period label so a combined child is not
+mistaken for a copy. Before creating a child the run looks for a live born thread of the same subject: if one
+exists the new evidence is attached to it as references, wants carry over, no birth row is written, and the
+event is counted `birthsEnriched`. `lore births --reconcile [--write]` marks every extra born thread of a
+subject dormant, lowest id staying live, appending `superseded-by:<id>`; dormant threads leave meeting
+candidacy. Nothing is deleted or merged and no note is touched.
+
+**Copy run** (`m10`, fresh from the pre-milestone bank): `threads --sync` 0 created; `notes-ingest` 0 notes,
+0 open ends; first `lore meet` 0 created, 183 reused, 0 births (all 35 legacy births already had meetings,
+so `one-per-meeting` 35). `births --reconcile --write`: **2 duplicate subjects, 31 extra threads, 31 marked
+dormant.** Born threads went 35 -> 4 live, born subjects 4, duplicate subjects **0**. Second `lore meet`:
+0 created, 0 births. `lore integrity` exit 0; `canon_relation` / `canon_tie_note` / `canon_tie_hint` still
+336 / 98 / 0; 373 notes unchanged.
+
+**Benchmark, same four criteria: 2 of 4, FAIL.** Precision passed (0 births on the five absent controls).
+Identity failed because this sequence does not run `identity-check`, so T3/T4 were not flagged in this copy -
+the M9 pass on that criterion came from running the collision pass, which this order omits. The recall floor
+still fails: S1 is ambiguous (two candidate rows), S2 and S3 resolve but hold no note at or above 0.35. C1
+holds one early qualifying note.
+
+**Automated score (verbatim, one line):**
+
+```json
+{"criteriaPassed":2,"criteriaTotal":4,"absentBirths":0,"trapBirths":0,"trapFlagged":0,"recallS1S3":0,"c1Evidence":1,"resolved":14,"ambiguous":1,"absent":5,"bornThreads":4,"bornSubjects":4,"duplicateBornSubjects":0}
+```
+
+Exit code 1, matching `criteriaPassed != criteriaTotal`. The line is the comparison point for later runs.
+
+**Honest notes.** The copy carries legacy births made by the old rule, so the run measures the reconciled
+state rather than a clean re-birth; the new subject rule is proven by unit tests (a pooled pair produces a
+pair child, a repeat pooling enriches instead of birthing, a parent-copy is refused). `pooled_evidence` on a
+pair whose legacy thread is a parent is now refused rather than birthing a copy, so real-data births are
+expected to come from combined investigations where pooled evidence does not fire first. No threshold,
+criterion or policy was changed.
+
+## 16. Score reproducibility: collision status read from the data (2026-10-30)
+
+**What changed.** The benchmark harness no longer reads `review_status` to decide whether two names are the
+same identity. It computes the relationship from the rows themselves - `nameRelation` over names and aliases
+with the same usability guards the collision pass uses (token of 3+ characters, not a title, token frequency
+within `NAME_DF_CAP`, group size within `NAME_GROUP_CAP`) - so the scored value cannot depend on whether
+`identity-check --write` happened to run first. The stored answer is still reported, as `trapFlaggedDb`,
+beside the computed one, `trapFlaggedData`; only the computed value enters the criteria. Nothing is written
+to any bank.
+
+**Two copies, same data lineage, different pipeline history.**
+
+Copy A - `m10`, no `identity-check` ever run:
+
+```json
+{"criteriaPassed":3,"criteriaTotal":4,"absentBirths":0,"trapBirths":0,"trapFlagged":2,"recallS1S3":0,"c1Evidence":1,"resolved":14,"ambiguous":1,"absent":5,"bornThreads":4,"bornSubjects":4,"duplicateBornSubjects":0,"trapFlaggedData":2,"trapFlaggedDb":0}
+```
+
+Copy B - `m11b`, `identity-check --write` run first (36 collision groups, 82 entities newly flagged):
+
+```json
+{"criteriaPassed":3,"criteriaTotal":4,"absentBirths":0,"trapBirths":0,"trapFlagged":2,"recallS1S3":0,"c1Evidence":1,"resolved":14,"ambiguous":1,"absent":5,"bornThreads":4,"bornSubjects":4,"duplicateBornSubjects":0,"trapFlaggedData":2,"trapFlaggedDb":2}
+```
+
+Every key that feeds the criteria is identical, including `criteriaPassed`, `trapFlagged` and
+`trapFlaggedData`. The only differing key is `trapFlaggedDb`, which is the reported stored value - 0 on A, 2
+on B - and it is precisely the quantity that varied with pipeline order before. It no longer decides anything.
+Both runs exit 1.
+
+**Criteria, identical on both copies: 3 of 4.** Precision passes (0 births on the five absent controls),
+identity passes (0 births on the five traps; T3 and T4 flagged by the computed check on both copies), C1 holds
+one early qualifying note. The recall floor still fails: S1 is ambiguous, S2 and S3 resolve with no note at or
+above 0.35.
+
+No criterion, threshold, tier, trigger or admission rule was changed. No bank was written by the harness.

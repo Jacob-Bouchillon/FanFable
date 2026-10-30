@@ -12,7 +12,12 @@ import type { LlmClient } from './llm.ts';
 import { nameRelation } from './names.ts';
 
 const norm = (text: string): string =>
-  (text ?? '').toLowerCase().replace(/[^a-z0-9' ]+/g, ' ').replace(/\s+/g, ' ').trim();
+  (text ?? '')
+    .replace(/[\u2018\u2019]/g, "'")
+    .toLowerCase()
+    .replace(/[^a-z0-9' ]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 
 interface LedgerLine {
   locator: string;

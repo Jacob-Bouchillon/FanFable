@@ -191,13 +191,19 @@ export function deriveNameVariants(
 
 /** Case, possessives, a leading article and punctuation are noise. */
 export function canonicalName(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/[’']s\b/g, '')
-    .replace(/^(the|a|an)\s+/, '')
-    .replace(/[^a-z0-9' ]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  return (
+    name
+      // The two apostrophes are one character to a reader; make them one to the
+      // matcher too, before the filter below can turn the curly form into a
+      // space and split one identity into two.
+      .replace(/[\u2018\u2019]/g, "'")
+      .toLowerCase()
+      .replace(/['\u2019]s\b/g, '')
+      .replace(/^(the|a|an)\s+/, '')
+      .replace(/[^a-z0-9' ]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+  );
 }
 
 export function nameTokens(name: string): string[] {

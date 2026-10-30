@@ -33,6 +33,11 @@ import { continuitySettings, filterBySeverity } from './continuity-settings.ts';
 import * as controller from './controller.ts';
 import * as retrieval from './retrieval.ts';
 import * as sweep from './sweep.ts';
+import * as pairThreads from './pair-threads.ts';
+import * as threadWeb from './threads.ts';
+import * as meetingWeb from './meetings.ts';
+import * as noteIngest from './note-ingest.ts';
+import * as identityCheck from './identity-check.ts';
 import type { PassageTrail } from './graph.ts';
 import { truncate } from './text.ts';
 import { buildTrailsHtml, trailText } from './trail-html.ts';
@@ -141,6 +146,18 @@ ${C.bold('SOURCE MATERIAL')}
   lore scan [--max n] [--dry-run]  Judge sentences that name two people and a tie word
   lore sweep [--name substring] [--batch 60] [--limit n]
                            Propose ties from characters' mentions into the review queue
+  lore pair-threads --build  Build code-only co-occurrence threads for every pair (no model)
+  lore pair-threads --status Count pair threads (no writes)
+  lore threads --sync              Create investigation threads for people and pairs (no model)
+  lore threads [--kind person|pair] [--status open|resolved|dormant] [--period p1|--period] [--limit n]
+                           List threads: kind, period, notes, open ends, age
+  lore thread <id>                 Show one thread: passages, notes, open ends
+  lore meet [--reconcile] [--write] Run meetings; reconcile reports or deletes refused meetings (copy only)
+  lore births --reconcile [--write] Mark duplicate born threads dormant (copy only)
+  lore notes-ingest [--dry-run]    Turn bank rows into thread notes (verbatim-checked, deduped)
+  lore identity-check [--write]     Flag entities whose canonical names collide (dry run by default)
+  lore meetings [--status] [--limit n]  List meetings, newest first
+  lore meeting <id>                Show one meeting: exchanges, resolutions, child
   lore link-facts [--dry-run] [--limit n]  Attach fact subjects to entities
   lore capacity [--dry-run] [--limit n]  Park unproven entities, funnel proven nouns
   lore names [--limit n] [--diagnostics]  List the capitalization name roster (no writes)
@@ -267,6 +284,13 @@ function flagNumber(args: Args, name: string, fallback: number): number {
 function budgetFlag(args: Args, name: string): number | undefined {
   const n = flagNumber(args, name, NaN);
   return Number.isFinite(n) ? n : undefined;
+}
+
+/** Whole days since an ISO timestamp, for thread listings. */
+function ageLabel(iso: string): string {
+  const at = Date.parse(iso);
+  if (!Number.isFinite(at)) return '?';
+  return `${Math.max(0, Math.floor((Date.now() - at) / 86400000))}d`;
 }
 
 /* ------------------------------------------------------------- commands */
@@ -538,6 +562,323 @@ async function cmdLore(args: Args): Promise<void> {
       console.log(
         C.dim(`skipped ${result.skippedKeeper} pair(s) with a keeper, ${result.skippedPending} with a pending note`),
       );
+    }
+    return;
+  }
+
+  if (sub === 'pair-threads') {
+    if (args.flags.build === true) {
+      heading('Pair threads');
+      const result = pairThreads.buildPairThreads(db, project.id);
+      console.log(
+        `people ${result.people}, co-occurring pairs ${result.cooccurringPairs}`,
+      );
+      console.log(
+        `threads ${result.pairsWithRows} ` +
+          `(${result.threadsCreated} created, ${result.threadsUpdated} updated); ` +
+          `unproposed ${result.unproposedPairs}`,
+      );
+      return;
+    }
+    if (args.flags.status === true) {
+      const counts = pairThreads.pairThreadCounts(db, project.id);
+      heading('Pair threads');
+      console.log(`threads ${counts.threads}; unproposed ${counts.unproposed}`);
+      return;
+    }
+    throw new Error('pair-threads needs --build or --status');
+  }
+
+  if (sub === 'threads') {
+    if (args.flags.sync === true) {
+      heading('Threads');
+      const result = threadWeb.syncThreads(db, project.id);
+      console.log(
+        `person threads ${result.personThreadsCreated} created, ` +
+          `pair threads ${result.pairThreadsCreated} created ` +
+          `(${result.pairPeriodsCreated} later periods)`,
+      );
+      console.log(`threads ${result.threadsTotal}; open ends ${result.openEndsTotal}`);
+      return;
+    }
+    const kind = flagString(args, 'kind');
+    const status = flagString(args, 'status');
+    const period = flagString(args, 'period');
+    const limit = flagNumber(args, 'limit', 0);
+    if (kind && kind !== 'person' && kind !== 'pair') throw new Error('--kind must be person or pair');
+    if (status && status !== 'open' && status !== 'resolved' && status !== 'dormant') {
+      throw new Error('--status must be open, resolved or dormant');
+    }
+    const rows = threadWeb.listThreads(db, project.id, {
+      kind: kind ? (kind as 'person' | 'pair') : undefined,
+      status: status ? (status as 'open' | 'resolved' | 'dormant') : undefined,
+      period: args.flags.period === true ? '' : period || undefined,
+      limit: limit > 0 ? limit : undefined,
+    });
+    heading('Threads');
+    if (!rows.length) {
+      console.log('(none — run "fanfable lore threads --sync" to create them)');
+      return;
+    }
+    console.log(C.dim('id    kind    period  notes  open  age   thread'));
+    for (const t of rows) {
+      const label = t.kind === 'pair' ? `${t.aName} / ${t.bName ?? ''}` : t.aName;
+      const periodLabel = t.period_label === '' ? '-' : t.period_label;
+      console.log(
+        `${String(t.id).padEnd(5)} ${t.kind.padEnd(7)} ${periodLabel.padEnd(7)} ` +
+          `${String(t.noteCount).padEnd(6)} ${String(t.openEndCount).padEnd(5)} ` +
+          `${ageLabel(t.created_at).padEnd(5)} ${label}`,
+      );
+    }
+    return;
+  }
+
+  if (sub === 'thread') {
+    const id = Number(args._[2]);
+    if (!Number.isInteger(id) || id <= 0) throw new Error('usage: lore thread <id>');
+    const loaded = threadWeb.loadThread(db, project.id, id);
+    if (!loaded) throw new Error(`no thread ${id}`);
+    heading(`Thread ${id}`);
+    const who = loaded.bName ? `${loaded.aName} / ${loaded.bName}` : loaded.aName;
+    console.log(`kind: ${loaded.thread.kind}; status: ${loaded.thread.status}`);
+    console.log(`people: ${who || '(unknown)'}`);
+    console.log(`created: ${loaded.thread.created_at} (age ${ageLabel(loaded.thread.created_at)})`);
+    console.log(
+      `passages ${loaded.counts.passages}, notes ${loaded.counts.notes}, ` +
+        `open ends ${loaded.counts.openEndsOpen} open of ${loaded.counts.openEnds}`,
+    );
+    if (loaded.passages.length) {
+      console.log(`\n${C.dim('passages')}`);
+      for (const p of loaded.passages) {
+        console.log(`  seq ${p.seq}: ${p.locator || '(no locator)'} ${C.dim(`[chunk ${p.chunkId}]`)}`);
+      }
+    }
+    if (loaded.notes.length) {
+      console.log(`\n${C.dim('notes')}`);
+      for (const n of loaded.notes) {
+        const flags = [
+          n.isContext ? 'context' : '',
+          n.supersedesNoteId ? `supersedes #${n.supersedesNoteId}` : '',
+        ]
+          .filter(Boolean)
+          .join(', ');
+        console.log(
+          `  #${n.id} ${n.noteKind}, strength ${n.strength.toFixed(2)}` + (flags ? C.dim(` (${flags})`) : ''),
+        );
+        console.log(`    quote: "${n.quote}" ${C.dim(`[${n.locator || 'no locator'}]`)}`);
+        if (n.claim) console.log(`    claim: ${n.claim}`);
+        if (n.why) console.log(`    why: ${n.why}`);
+        if (n.missing) console.log(`    missing: ${n.missing}`);
+      }
+    }
+    if (loaded.openEnds.length) {
+      console.log(`\n${C.dim('open ends')}`);
+      for (const o of loaded.openEnds) {
+        const carried = o.carriedFromOpenEndId ? C.dim(` (carried from #${o.carriedFromOpenEndId})`) : '';
+        console.log(`  #${o.id} [${o.status}] ${o.question}${carried}`);
+        if (o.origin) console.log(`    origin: ${o.origin}`);
+        if (o.wouldResolve) console.log(`    would resolve: ${o.wouldResolve}`);
+        if (o.resolvedByNoteId) {
+          console.log(`    resolved by note #${o.resolvedByNoteId} at ${o.resolvedAt ?? '(no time)'}`);
+        }
+      }
+    }
+    if (loaded.parents.a || loaded.parents.b) {
+      console.log(`\n${C.dim('born from')}`);
+      console.log(
+        `  #${loaded.thread.parent_a_thread ?? '?'} ${loaded.parents.a?.label ?? '(unknown)'} / ` +
+          `#${loaded.thread.parent_b_thread ?? '?'} ${loaded.parents.b?.label ?? '(unknown)'}`,
+      );
+      if (loaded.birth) {
+        console.log(
+          `  trigger: ${loaded.birth.trigger}` +
+            (loaded.birth.combinedScore ? `, combined support ${loaded.birth.combinedScore.toFixed(3)}` : ''),
+        );
+      }
+      if (loaded.thread.birth_reason) console.log(`  reason: ${loaded.thread.birth_reason}`);
+    }
+    if (loaded.noteRefs.length) {
+      console.log(`\n${C.dim('referenced notes (not copied)')}`);
+      for (const ref of loaded.noteRefs) {
+        console.log(`  #${ref.noteId} [${ref.role}] ${ref.note.claim || '(no claim)'}`);
+      }
+    }
+    if (!loaded.counts.passages && !loaded.counts.notes && !loaded.counts.openEnds) {
+      console.log(C.dim('\nempty thread: no evidence gathered yet (not a statement of no relationship)'));
+    }
+    return;
+  }
+
+  if (sub === 'identity-check') {
+    const write = args.flags.write === true;
+    const limit = flagNumber(args, 'limit', 0);
+    heading(write ? 'Identity collisions (write)' : 'Identity collisions (dry run)');
+    const result = identityCheck.flagIdentityCollisions(db, project.id, { write });
+    console.log(
+      `collisions ${result.collisions.length} ` +
+        `(same-form edges ${result.sameFormEdges}, containment edges ${result.containmentEdges})`,
+    );
+    console.log(
+      `entities flagged ${result.flagged}, already flagged ${result.alreadyFlagged}, ` +
+        `quarantined skipped ${result.quarantinedSkipped}, too-generic pairs skipped ${result.skippedByGroupCap}`,
+    );
+    const shown = limit > 0 ? result.collisions.slice(0, limit) : result.collisions.slice(0, 10);
+    for (const collision of shown) {
+      console.log(`  ${collision.edge}: ids ${collision.ids.join(',')} (${collision.kinds.join('/')})`);
+    }
+    if (result.collisions.length > shown.length) {
+      console.log(C.dim(`  … ${result.collisions.length - shown.length} more`));
+    }
+    if (write) console.log('review_status and quarantine_reason updated; nothing merged, renamed or re-kinded.');
+    else console.log(C.dim('dry run: nothing written. Re-run with --write to flag the rows.'));
+    return;
+  }
+
+  if (sub === 'notes-ingest') {
+    const dryRun = args.flags['dry-run'] === true;
+    heading(dryRun ? 'Notes ingest (dry run)' : 'Notes ingest');
+    const counts = noteIngest.backfillThreadNotes(db, project.id, { dryRun });
+    console.log(
+      `notes ${counts.notes} (pair ${counts.pairNotes}, identity ${counts.identityNotes}, ` +
+        `context ${counts.contextNotes}); open ends ${counts.openEnds}`,
+    );
+    console.log(
+      `strength source: assessed ${counts.strengthSource.assessed}, derived ${counts.strengthSource.derived}, ` +
+        `context ${counts.strengthSource.context}, default ${counts.strengthSource.default}`,
+    );
+    console.log(
+      `strength bands: ${Object.entries(counts.strengthBands)
+        .map(([band, n]) => `${band} ${n}`)
+        .join(', ')}`,
+    );
+    const skipped = Object.entries(counts.skipped).filter(([, n]) => n > 0);
+    console.log(
+      `skipped: ${skipped.length ? skipped.map(([reason, n]) => `${reason} ${n}`).join(', ') : 'none'}`,
+    );
+    if (dryRun) console.log(C.dim('dry run: nothing written. Re-run without --dry-run to store the notes.'));
+    return;
+  }
+
+  if (sub === 'births') {
+    if (args.flags.reconcile === true) {
+      const write = args.flags.write === true;
+      heading(write ? 'Born threads reconcile (write)' : 'Born threads reconcile (report)');
+      const result = meetingWeb.reconcileBornThreads(db, project.id, { write });
+      console.log(
+        `duplicate subjects ${result.duplicateSubjects}; extra born threads ${result.extraThreads}; ` +
+          `marked dormant ${result.markedDormant}`,
+      );
+      if (write) console.log('the lowest id of each group stays live; nothing deleted, notes untouched.');
+      else console.log(C.dim('report only: nothing written. Re-run with --write on a copy to mark the extras.'));
+      return;
+    }
+    throw new Error('births needs --reconcile [--write]');
+  }
+
+  if (sub === 'meet') {
+    if (args.flags.reconcile === true) {
+      const write = args.flags.write === true;
+      heading(write ? 'Meetings reconcile (write)' : 'Meetings reconcile (report)');
+      const result = meetingWeb.reconcileMeetings(db, project.id, { write });
+      console.log(`examined ${result.examined}; would refuse ${result.wouldRefuse}`);
+      console.log(
+        `by reason: ${Object.entries(result.byReason)
+          .map(([reason, n]) => `${reason} ${n}`)
+          .join(', ')}`,
+      );
+      if (write) console.log(`deleted ${result.deleted} meeting(s) and their exchanges and resolutions`);
+      else console.log(C.dim('report only: nothing deleted. Re-run with --write on a copy to delete.'));
+      return;
+    }
+    heading('Meetings');
+    const result = meetingWeb.runMeetings(db, project.id);
+    console.log(
+      `candidates ${result.candidatesConsidered} in ${result.enumerationMs}ms` +
+        (result.groupsSkippedForDepth ? ` (${result.groupsSkippedForDepth} deep branches stopped)` : '') +
+        `; meetings ${result.meetingsCreated} created, ${result.meetingsReused} reused`,
+    );
+    console.log(`refused ${result.meetingsRefused}: ` + Object.entries(result.refusedByReason)
+      .map(([reason, n]) => `${reason} ${n}`)
+      .join(', '));
+    console.log(
+      `exchanges ${result.exchangesAdded}; wants resolved ${result.wantsResolved}; ` +
+        `births ${result.birthsCreated}` +
+        (result.birthsDeferred ? `, ${result.birthsDeferred} deferred to the next run` : ''),
+    );
+    const byTrigger = Object.entries(result.birthsByTrigger).filter(([, n]) => n > 0);
+    if (byTrigger.length) {
+      console.log(`births by trigger: ${byTrigger.map(([trigger, n]) => `${trigger} ${n}`).join(', ')}`);
+    }
+    const skipped = Object.entries(result.birthsSkipped).filter(([, n]) => n > 0);
+    console.log(
+      `births skipped: ${skipped.length ? skipped.map(([reason, n]) => `${reason} ${n}`).join(', ') : 'none'}`,
+    );
+    return;
+  }
+
+  if (sub === 'meetings') {
+    const status = flagString(args, 'status');
+    const limit = flagNumber(args, 'limit', 0);
+    if (status && status !== 'open' && status !== 'resolved' && status !== 'dormant') {
+      throw new Error('--status must be open, resolved or dormant');
+    }
+    const rows = meetingWeb.listMeetings(db, project.id, {
+      status: status ? (status as 'open' | 'resolved' | 'dormant') : undefined,
+      limit: limit > 0 ? limit : undefined,
+    });
+    heading('Meetings');
+    if (!rows.length) {
+      console.log('(none — run "fanfable lore meet" to hold meetings)');
+      return;
+    }
+    console.log(C.dim('id    kind          rev  notes  wants  child  threads       subject'));
+    for (const m of rows) {
+      console.log(
+        `${String(m.id).padEnd(5)} ${m.match_kind.padEnd(13)} ${String(m.revision).padEnd(4)} ` +
+          `${String(m.notes_exchanged).padEnd(6)} ${String(m.wants_resolved).padEnd(6)} ` +
+          `${String(m.child_thread ?? '-').padEnd(6)} ${`${m.thread_a}/${m.thread_b}`.padEnd(13)} ${m.match_key}`,
+      );
+    }
+    return;
+  }
+
+  if (sub === 'meeting') {
+    const id = Number(args._[2]);
+    if (!Number.isInteger(id) || id <= 0) throw new Error('usage: lore meeting <id>');
+    const loaded = meetingWeb.loadMeeting(db, project.id, id);
+    if (!loaded) throw new Error(`no meeting ${id}`);
+    const m = loaded.meeting;
+    heading(`Meeting ${id}`);
+    console.log(`subject: ${m.match_key} (${m.match_kind})`);
+    console.log(`threads: #${m.thread_a} / #${m.thread_b}; status ${m.status}; revision ${m.revision}`);
+    console.log(
+      `exchanges ${loaded.exchanges.length}, wants resolved ${loaded.resolutions.filter((r) => !r.supersededBy).length}, ` +
+        `child ${m.child_thread ? `#${m.child_thread}` : 'none'}`,
+    );
+    if (m.remaining) console.log(C.dim(`remaining: ${m.remaining}`));
+    if (loaded.exchanges.length) {
+      console.log(`\n${C.dim('exchanges')}`);
+      for (const x of loaded.exchanges) {
+        console.log(`  note #${x.noteId} from thread #${x.threadId} (${x.direction}), scope ${x.scope}`);
+      }
+    }
+    if (loaded.resolutions.length) {
+      console.log(`\n${C.dim('resolutions')}`);
+      for (const r of loaded.resolutions) {
+        const state = r.supersededBy ? C.dim(` superseded by #${r.supersededBy}`) : '';
+        console.log(
+          `  #${r.id} open end #${r.openEndId} resolved by note #${r.resolvedByNoteId}` +
+            ` [${r.matchTokens || 'no tokens'}]${state}`,
+        );
+      }
+    }
+    if (loaded.child) {
+      console.log(`\n${C.dim('birth')}`);
+      console.log(`  child thread #${loaded.child.threadId}; trigger ${loaded.child.trigger}`);
+      if (loaded.child.combinedScore) {
+        console.log(`  combined support ${loaded.child.combinedScore.toFixed(3)}`);
+      }
+      console.log(`  reason: ${loaded.child.reason}`);
     }
     return;
   }

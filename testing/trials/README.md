@@ -34,6 +34,8 @@ node --experimental-strip-types testing/trials/chain/watch-log.ts book-coord
 | `product-loop/` | product-loop chapter outputs |
 | `gold-books/`, `bucketing/`, `discovery-cmp/`, `evidence-audit/`, `gatecheck/`, `name-probe/`, `nuextract-duel/`, `pair-probe/`, `reader-ab/`, `reader-strict/`, `refs-backfill/`, `tiers-probe/` | past experiment areas, kept as-is |
 | `audit/` | past system audit reports (local-only) |
+| `discovery/` | unproposed-pair threads, packet sampler, verdict scorer, top-yield followup allocator, and single-sentence evidence prototype (run output under `discovery/unproposed/`) |
+| `benchmark/` | web validation against the locked 20-pair sheet (`validate-web.ts`); the pair list is local data (`pairs.json`, untracked) |
 
 ## archive/ — finished or superseded runs, local data included
 

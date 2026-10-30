@@ -405,6 +405,266 @@ export const MIGRATIONS: Migration[] = [
       ['relationship', 'chapter_id', 'INTEGER REFERENCES chapter(id) ON DELETE SET NULL'],
     ],
   },
+  {
+    version: 19,
+    name: 'code-only pair threads',
+    // One row per co-occurring character pair: the structural coverage for
+    // discovery. Written only by the pair-thread builder, never by the model,
+    // and never promoted into the bank. Additive only.
+    sql: `
+      CREATE TABLE IF NOT EXISTS canon_pair_thread (
+        id            INTEGER PRIMARY KEY,
+        project_id    INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        a_entity      INTEGER NOT NULL REFERENCES canon_entity(id) ON DELETE CASCADE,
+        b_entity      INTEGER NOT NULL REFERENCES canon_entity(id) ON DELETE CASCADE,
+        cooccur_count INTEGER NOT NULL DEFAULT 0,
+        shared_chunks TEXT NOT NULL DEFAULT '[]',
+        first_seq     INTEGER NOT NULL DEFAULT 0,
+        last_seq      INTEGER NOT NULL DEFAULT 0,
+        status        TEXT NOT NULL DEFAULT 'empty',
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS canon_pair_thread_pair
+        ON canon_pair_thread(project_id, a_entity, b_entity);
+      CREATE INDEX IF NOT EXISTS canon_pair_thread_project
+        ON canon_pair_thread(project_id);
+    `,
+  },
+  {
+    version: 20,
+    name: 'thread records, immutable notes, open ends',
+    // The evidence web's first layer: a persistent investigation per person
+    // and per co-occurring pair, immutable clue notes on those threads, and
+    // the open ends that keep an investigation alive. Structure only — the
+    // model never writes here, and nothing is promoted into the bank.
+    // Additive only; no existing table is altered.
+    sql: `
+      CREATE TABLE IF NOT EXISTS canon_thread (
+        id              INTEGER PRIMARY KEY,
+        project_id      INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        kind            TEXT NOT NULL DEFAULT 'pair',  -- person | pair
+        a_entity        INTEGER NOT NULL REFERENCES canon_entity(id) ON DELETE CASCADE,
+        b_entity        INTEGER REFERENCES canon_entity(id) ON DELETE CASCADE,
+        pair_thread_id  INTEGER REFERENCES canon_pair_thread(id) ON DELETE SET NULL,
+        status          TEXT NOT NULL DEFAULT 'open',  -- open | resolved | dormant
+        parent_a_thread INTEGER REFERENCES canon_thread(id) ON DELETE SET NULL,
+        parent_b_thread INTEGER REFERENCES canon_thread(id) ON DELETE SET NULL,
+        birth_reason    TEXT NOT NULL DEFAULT '',
+        created_at      TEXT NOT NULL,
+        updated_at      TEXT NOT NULL
+      );
+      -- b_entity is null for people, so the identity key coalesces it to 0;
+      -- two person threads for one entity are therefore impossible.
+      CREATE UNIQUE INDEX IF NOT EXISTS canon_thread_identity
+        ON canon_thread(project_id, kind, a_entity, COALESCE(b_entity, 0));
+      CREATE INDEX IF NOT EXISTS canon_thread_project
+        ON canon_thread(project_id, kind, status);
+
+      -- Ordered passage history: which passages a thread has looked at.
+      CREATE TABLE IF NOT EXISTS canon_thread_passage (
+        thread_id     INTEGER NOT NULL REFERENCES canon_thread(id) ON DELETE CASCADE,
+        chunk_id      INTEGER NOT NULL REFERENCES canon_chunk(id) ON DELETE CASCADE,
+        seq           INTEGER NOT NULL DEFAULT 0,
+        first_seen_at TEXT NOT NULL,
+        PRIMARY KEY (thread_id, chunk_id)
+      );
+      CREATE INDEX IF NOT EXISTS canon_thread_passage_seq
+        ON canon_thread_passage(thread_id, seq);
+
+      -- Immutable clue notes. There is deliberately no update path: a
+      -- correction is a new row pointing at the note it supersedes.
+      CREATE TABLE IF NOT EXISTS canon_thread_note (
+        id                 INTEGER PRIMARY KEY,
+        project_id         INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        thread_id          INTEGER NOT NULL REFERENCES canon_thread(id) ON DELETE CASCADE,
+        chunk_id           INTEGER REFERENCES canon_chunk(id) ON DELETE SET NULL,
+        locator            TEXT NOT NULL DEFAULT '',
+        quote              TEXT NOT NULL,
+        claim              TEXT NOT NULL DEFAULT '',
+        note_kind          TEXT NOT NULL DEFAULT 'observation', -- observation | correction | context
+        strength           REAL NOT NULL DEFAULT 0.5,
+        why                TEXT NOT NULL DEFAULT '',
+        missing            TEXT NOT NULL DEFAULT '',
+        is_context         INTEGER NOT NULL DEFAULT 0,
+        supersedes_note_id INTEGER REFERENCES canon_thread_note(id) ON DELETE SET NULL,
+        created_at         TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS canon_thread_note_thread
+        ON canon_thread_note(thread_id, id);
+
+      -- What the investigation still needs. Resolution links, never erases.
+      CREATE TABLE IF NOT EXISTS canon_open_end (
+        id                  INTEGER PRIMARY KEY,
+        project_id          INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        thread_id           INTEGER NOT NULL REFERENCES canon_thread(id) ON DELETE CASCADE,
+        question            TEXT NOT NULL,
+        origin              TEXT NOT NULL DEFAULT '',
+        would_resolve       TEXT NOT NULL DEFAULT '',
+        status              TEXT NOT NULL DEFAULT 'open',  -- open | resolved | abandoned
+        resolved_by_note_id INTEGER REFERENCES canon_thread_note(id) ON DELETE SET NULL,
+        resolved_at         TEXT,
+        created_at          TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS canon_open_end_thread
+        ON canon_open_end(project_id, thread_id, status);
+    `,
+  },
+  {
+    version: 21,
+    name: 'meetings, scoped sharing, births',
+    // Two threads meet at a shared subject, exchange the notes relevant to
+    // that subject, resolve wants on the spot and may birth one child thread.
+    // Additive apart from one controlled index change, explained below.
+    // No model call writes any of these rows.
+    sql: `
+      -- The M1 identity key allowed exactly one thread per subject, so no
+      -- born child could ever exist: a child always shares its subject with
+      -- the parent pair or person thread. The key now governs root threads
+      -- only; every row written before this migration is a root, so their
+      -- protection is unchanged. Born threads get their own lineage key.
+      DROP INDEX IF EXISTS canon_thread_identity;
+      CREATE UNIQUE INDEX IF NOT EXISTS canon_thread_identity
+        ON canon_thread(project_id, kind, a_entity, COALESCE(b_entity, 0))
+        WHERE parent_a_thread IS NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS canon_thread_born_identity
+        ON canon_thread(project_id, parent_a_thread, parent_b_thread, kind, a_entity, COALESCE(b_entity, 0))
+        WHERE parent_a_thread IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS canon_meeting (
+        id              INTEGER PRIMARY KEY,
+        project_id      INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        thread_a        INTEGER NOT NULL REFERENCES canon_thread(id) ON DELETE CASCADE,
+        thread_b        INTEGER NOT NULL REFERENCES canon_thread(id) ON DELETE CASCADE,
+        match_key       TEXT NOT NULL,
+        match_kind      TEXT NOT NULL,          -- shared_person | shared_pair
+        revision        INTEGER NOT NULL DEFAULT 0,
+        notes_exchanged INTEGER NOT NULL DEFAULT 0,
+        wants_resolved  INTEGER NOT NULL DEFAULT 0,
+        child_thread    INTEGER REFERENCES canon_thread(id) ON DELETE SET NULL,
+        remaining       TEXT NOT NULL DEFAULT '',
+        status          TEXT NOT NULL DEFAULT 'open',  -- open | resolved | dormant
+        created_at      TEXT NOT NULL,
+        updated_at      TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS canon_meeting_subject
+        ON canon_meeting(project_id, thread_a, thread_b, match_key);
+      CREATE INDEX IF NOT EXISTS canon_meeting_project
+        ON canon_meeting(project_id, status);
+
+      -- One row per note shared in a meeting. scope is stored, not inferred
+      -- later: an identity note must never be read as pair evidence.
+      CREATE TABLE IF NOT EXISTS canon_meeting_exchange (
+        meeting_id INTEGER NOT NULL REFERENCES canon_meeting(id) ON DELETE CASCADE,
+        note_id    INTEGER NOT NULL REFERENCES canon_thread_note(id) ON DELETE CASCADE,
+        direction  TEXT NOT NULL,                       -- a_to_b | b_to_a
+        scope      TEXT NOT NULL,                       -- identity | pair
+        relevance  TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (meeting_id, note_id)
+      );
+
+      -- A want answered during the meeting. The earlier row is kept and
+      -- marked superseded, never deleted.
+      CREATE TABLE IF NOT EXISTS canon_meeting_resolution (
+        id                  INTEGER PRIMARY KEY,
+        meeting_id          INTEGER NOT NULL REFERENCES canon_meeting(id) ON DELETE CASCADE,
+        open_end_id         INTEGER NOT NULL REFERENCES canon_open_end(id) ON DELETE CASCADE,
+        resolved_by_note_id INTEGER NOT NULL REFERENCES canon_thread_note(id) ON DELETE CASCADE,
+        match_tokens        TEXT NOT NULL DEFAULT '',
+        superseded_by       INTEGER REFERENCES canon_meeting_resolution(id) ON DELETE SET NULL,
+        created_at          TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS canon_meeting_resolution_meeting
+        ON canon_meeting_resolution(meeting_id);
+
+      CREATE TABLE IF NOT EXISTS canon_birth (
+        id              INTEGER PRIMARY KEY,
+        project_id      INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        meeting_id      INTEGER NOT NULL REFERENCES canon_meeting(id) ON DELETE CASCADE,
+        parent_a_thread INTEGER NOT NULL REFERENCES canon_thread(id) ON DELETE CASCADE,
+        parent_b_thread INTEGER NOT NULL REFERENCES canon_thread(id) ON DELETE CASCADE,
+        child_thread    INTEGER NOT NULL REFERENCES canon_thread(id) ON DELETE CASCADE,
+        trigger         TEXT NOT NULL,
+        combined_score  REAL NOT NULL DEFAULT 0,
+        reason          TEXT NOT NULL DEFAULT '',
+        created_at      TEXT NOT NULL
+      );
+      -- One child per meeting, one child per thread, and the same lineage
+      -- never births twice for the same reason.
+      CREATE UNIQUE INDEX IF NOT EXISTS canon_birth_meeting ON canon_birth(meeting_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS canon_birth_child ON canon_birth(child_thread);
+      CREATE UNIQUE INDEX IF NOT EXISTS canon_birth_lineage
+        ON canon_birth(project_id, parent_a_thread, parent_b_thread, trigger);
+
+      -- The child references pooled notes; it never copies them.
+      CREATE TABLE IF NOT EXISTS canon_thread_note_ref (
+        thread_id  INTEGER NOT NULL REFERENCES canon_thread(id) ON DELETE CASCADE,
+        note_id    INTEGER NOT NULL REFERENCES canon_thread_note(id) ON DELETE CASCADE,
+        role       TEXT NOT NULL DEFAULT 'pooled',      -- pooled | carried
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (thread_id, note_id, role)
+      );
+    `,
+    columns: [
+      // A want carried onto a born child remembers where it came from.
+      [
+        'canon_open_end',
+        'carried_from_open_end_id',
+        'INTEGER REFERENCES canon_open_end(id) ON DELETE SET NULL',
+      ],
+    ],
+  },
+  {
+    version: 22,
+    name: 'note ingestion dedupe key',
+    // Notes gathered from what the bank already holds need a stable identity:
+    // re-reading one passage must add nothing, while a genuinely different
+    // claim about the same quote must still be allowed. The key is a hash of
+    // the normalised quote and claim. Rows written before this milestone (and
+    // hand-written notes) keep the empty key, so the unique index is partial —
+    // otherwise every earlier row would collide with every other on its thread.
+    sql: `
+      CREATE UNIQUE INDEX IF NOT EXISTS canon_thread_note_dedupe
+        ON canon_thread_note(thread_id, dedupe_key)
+        WHERE dedupe_key <> '';
+      CREATE INDEX IF NOT EXISTS canon_thread_note_project_time
+        ON canon_thread_note(project_id, thread_id, created_at);
+    `,
+    columns: [['canon_thread_note', 'dedupe_key', "TEXT NOT NULL DEFAULT ''"]],
+  },
+  {
+    version: 23,
+    name: 'time-scoped pair threads',
+    // A pair can be apprentice-early and enemy-later; one thread per pair could
+    // never represent that, and it also made every pair evidence one-sided.
+    // A pair's shared passages now split into periods, and each period is its
+    // own investigation. Existing rows all carry period_label = '', so the
+    // root identity key still holds them to one thread per subject.
+    sql: `
+      DROP INDEX IF EXISTS canon_thread_identity;
+      CREATE UNIQUE INDEX IF NOT EXISTS canon_thread_root_identity
+        ON canon_thread(project_id, kind, a_entity, COALESCE(b_entity, 0), period_label)
+        WHERE parent_a_thread IS NULL;
+      CREATE INDEX IF NOT EXISTS canon_thread_period
+        ON canon_thread(project_id, kind, a_entity, b_entity, period_from_seq);
+    `,
+    columns: [
+      ['canon_thread', 'period_label', "TEXT NOT NULL DEFAULT ''"],
+      ['canon_thread', 'period_from_seq', 'INTEGER'],
+      ['canon_thread', 'period_to_seq', 'INTEGER'],
+      ['canon_thread', 'temporal_status', "TEXT NOT NULL DEFAULT 'unknown'"],
+    ],
+  },
+  {
+    version: 24,
+    name: 'note strength provenance',
+    // A note's strength is either the model's stored assessment or a default
+    // carried by the row it came from. Recording which lets a later reader
+    // weigh the number honestly instead of treating every 1.0 as measured.
+    // Additive only; existing rows read as 'default'.
+    columns: [['canon_thread_note', 'strength_source', "TEXT NOT NULL DEFAULT 'default'"]],
+  },
 ];
 
 /**
