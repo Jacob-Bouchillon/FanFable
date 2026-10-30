@@ -15,7 +15,8 @@ names. Grades are proven tie, attested, held-aside.
   behavior and rendering fixes (crowding/zoom), review-by-richness queue,
   combination accumulation, multi-sentence evidence, evidence-thread concept.
 - **Discovery:** design approved day-1; unbuilt except sweep.ts
-  per-character ledgers (122 pairs) and the undesigned 80-row sample.
+  per-character ledgers (122 distinct pairs); the 80-row stratified sample is
+  DESIGNED BUT UNRUN.
 - **OPEN:** birth triggers, idempotency edge cases, starvation caps,
   evidence-thread implementation, cost limits.
 
@@ -145,7 +146,11 @@ sweep.ts proposes 122 (~3.7% of co-occurring).
 Design:
 
 1. Thread creation — code-only pair threads for every co-occurring pair (no
-   model calls); an empty thread means investigation exists with no evidence
+   model calls), generated from distinct canonical person identities sharing
+   at least one passage — resolved through the identity system first
+   (nested, shared-alias, and quarantine rules), never raw name strings, so
+   aliases and titles cannot inflate the graph and no fuzzy merging happens
+   at creation; an empty thread means investigation exists with no evidence
    yet gathered, NEVER no-relationship.
 2. Initial evidence — run the existing 80-row stratified sample design
    (co-occurrence depth × book position) against unproposed pairs.
@@ -154,12 +159,20 @@ Design:
 5. Rendezvous — never-co-occurring pairs gain threads only when indirect
    evidence (pronouns, events, context) connects them; absence of
    co-occurrence is not absence of relationship and never becomes a negative
-   verdict.
+   verdict. The build spec must specify how event, pronoun, or context
+   discoveries connect never-co-occurring pairs (the 12,371), so they cannot
+   remain invisible forever; no mechanism is prescribed yet. Co-occurrence is
+   a candidate signal per literary-network findings, never proof; coreference
+   gaps are the known miss class.
 6. Persistence — every thread kept including empty and unresolved; new
    evidence grows threads.
 
 Principle: guarantee investigative coverage structurally, spend model
-inference where it adds information. Exhaustive verdicts cost ≈2 hours at the
+inference where it adds information. Co-occurrence is not evidence: it opens
+an investigation and establishes no interaction or relationship. A shared
+passage may be incidental, contradictory, or merely referential. Threads stay
+open until evidence is gathered and assessed. Exhaustive verdicts cost ≈2
+hours at the
 measured rate (336 rows in 2m12s, ≈0.4s/call on qwen3.5:9b); per-pair evidence
 gathering (retrieval + context) is unmeasured, and 12,371 never-sharing pairs
 need indirect-evidence work of unknown cost. The exhaustive-sweep rejection
