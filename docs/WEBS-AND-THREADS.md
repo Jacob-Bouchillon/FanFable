@@ -153,7 +153,11 @@ Design:
    at creation; an empty thread means investigation exists with no evidence
    yet gathered, NEVER no-relationship.
 2. Initial evidence — run the existing 80-row stratified sample design
-   (co-occurrence depth × book position) against unproposed pairs.
+   (co-occurrence depth × book position) against unproposed co-occurring
+   pairs (the 3,258 minus the 122 already proposed): sample distinct pairs,
+   never raw rows, so duplicates collapse before sampling; strata with too
+   few candidates contribute all available rows and report the shortfall
+   rather than silently shrinking the denominator.
 3. Yield measurement — useful evidence by stratum.
 4. Adaptive allocation — model effort to productive strata only, never uniform.
 5. Rendezvous — never-co-occurring pairs gain threads only when indirect
@@ -172,10 +176,10 @@ inference where it adds information. Co-occurrence is not evidence: it opens
 an investigation and establishes no interaction or relationship. A shared
 passage may be incidental, contradictory, or merely referential. Threads stay
 open until evidence is gathered and assessed. Exhaustive verdicts cost ≈2
-hours at the
-measured rate (336 rows in 2m12s, ≈0.4s/call on qwen3.5:9b); per-pair evidence
-gathering (retrieval + context) is unmeasured, and 12,371 never-sharing pairs
-need indirect-evidence work of unknown cost. The exhaustive-sweep rejection
+hours by extrapolation from the measured rate (336 rows in 2m12s, ≈0.39s/call
+on qwen3.5:9b) to 16,471 pairs — an extrapolation, not a measured full-book
+runtime; per-pair evidence gathering (retrieval + context) is unmeasured,
+and 12,371 never-sharing pairs need indirect-evidence work of unknown cost. The exhaustive-sweep rejection
 rests on the unmeasured gathering cost and the never-co-occurring pairs — not
 on the earlier 14-GPU-hour figure, which was unverified arithmetic (corrected
 here, not silently). This design replaces it.
