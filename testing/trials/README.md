@@ -38,6 +38,8 @@ node --experimental-strip-types testing/trials/chain/watch-log.ts book-coord
 | `benchmark/` | web validation against the locked 20-pair sheet (`validate-web.ts`); the pair list is local data (`pairs.json`, untracked) |
 | `booknlp/` | one-chapter E1+E3 probe (`run-chapter.ts`) + blind-judged correctness sample (`judge-sample.ts`, re-judge `rejudge-bindings.ts`) + rel-signal test (`rel-signals.ts`) + whole-book finder stage (`book-candidates.ts`) + voice probe (`voice-print.ts`); venv, chapter text and outputs stay local (gitignored) |
 | `booknlp2/` | fork-vs-upstream rerun on the identical chapter (`run-chapter.ts`, scoring identical); own venv, outputs local (gitignored) |
+| `booknlp-drew/` | Drew fork block-41 fight outputs; own venv, local only (gitignored) |
+| `booknlp2b/` | booknlp2 block-41 fight outputs (local source); own venv, local only (gitignored) |
 | `combine/` | combination-tally measurement (`measure.ts`) + chain/action feeder (`feed.ts`); disposable copy, manifests local (gitignored) |
 
 ## archive/ — finished or superseded runs, local data included

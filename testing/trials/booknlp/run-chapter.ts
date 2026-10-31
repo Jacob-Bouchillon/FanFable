@@ -29,7 +29,7 @@ import { DatabaseSync } from 'node:sqlite';
 const TRACK = 'testing/trials/booknlp';
 const DB_PATH = 'testing/trials/halfbook-run/plagueis-half.db';
 const PROJECT = 'halfbook';
-const VENV_PY = `${TRACK}/.venv/bin/python`;
+const VENV_PY = process.env.BOOKNLP_PY ?? `${TRACK}/.venv/bin/python`;
 // Dense-chapter overrides (env): same venv, same driver/params/cap, new inputs.
 const CHAPTER_TXT = process.env.BOOKNLP_CHAPTER ?? `${TRACK}/chapter.txt`;
 const SELECT_JSON = process.env.BOOKNLP_SELECT ?? `${TRACK}/select.json`;
@@ -134,7 +134,7 @@ export function selectChapter(): { pick: BlockPick; markers: number; dbBefore: u
   }
 }
 
-const DRIVER = `
+const DRIVER_HEAD = `
 import sys
 import torch
 
@@ -159,12 +159,27 @@ def _tolerant_load(self, state_dict, strict=True, *a, **k):
         raise
 
 torch.nn.Module.load_state_dict = _tolerant_load
+`;
 
+const DRIVER_TAIL_WRAPPER = `
 from booknlp.booknlp import BookNLP
 inp, outdir, book_id = sys.argv[1], sys.argv[2], sys.argv[3]
 nlp = BookNLP("en", {"pipeline": "entity,quote,event,coref", "model": "small"})
 nlp.process(inp, outdir, book_id)
 `;
+
+// booknlp2 ships no BookNLP wrapper; its documented entry takes the same
+// params dict. Same pipeline, same model, same bridge — only the import line
+// differs (BOOKNLP_API=english).
+const DRIVER_TAIL_ENGLISH = `
+from booknlp.english.english_booknlp import EnglishBookNLP
+inp, outdir, book_id = sys.argv[1], sys.argv[2], sys.argv[3]
+nlp = EnglishBookNLP({"pipeline": "entity,quote,event,coref", "model": "small"})
+nlp.process(inp, outdir, book_id)
+`;
+
+const DRIVER =
+  DRIVER_HEAD + (process.env.BOOKNLP_API === 'english' ? DRIVER_TAIL_ENGLISH : DRIVER_TAIL_WRAPPER);
 
 export function runPipeline(): { exit: number | null; secs: number; capped: boolean } {
   if (!existsSync(VENV_PY)) fail(`no venv python at ${VENV_PY} (run setup first)`);
