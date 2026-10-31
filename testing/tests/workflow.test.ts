@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Db } from '../../fanfable/src/db.ts';
-import * as controller from '../../fanfable/src/controller.ts';
-import * as planner from '../../fanfable/src/planner.ts';
+import * as controller from '../../fanfable/src/plan/controller.ts';
+import * as planner from '../../fanfable/src/plan/planner.ts';
 import * as memory from '../../fanfable/src/memory.ts';
 import * as lore from '../../fanfable/src/lore.ts';
 import { seedProject, tempDb, mockProvider } from './helpers.ts';

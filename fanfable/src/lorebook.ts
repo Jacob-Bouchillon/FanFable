@@ -19,7 +19,7 @@ import type { LlmClient } from './llm.ts';
 import { embedMissing, type EmbedFn } from './embeddings.ts';
 import { CORROBORATION_CAP, tripleKey, rankRows } from './edge-rank.ts';
 import { noteFromExtraction, starvedWindowScores } from './web/note-ingest.ts';
-import { recordRuling } from './ruling.ts';
+import { recordRuling } from './court/ruling.ts';
 import { findHeadings, lexicalScore, normalise, splitSentences, tokenize, truncate } from './text.ts';
 import {
   ANSWER_CUE_STOPWORDS,

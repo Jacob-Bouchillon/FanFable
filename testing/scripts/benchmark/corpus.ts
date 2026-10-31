@@ -19,10 +19,10 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Db } from '../../../fanfable/src/db.ts';
-import * as controller from '../../../fanfable/src/controller.ts';
+import * as controller from '../../../fanfable/src/plan/controller.ts';
 import * as lore from '../../../fanfable/src/lore.ts';
 import * as lorebook from '../../../fanfable/src/lorebook.ts';
-import * as planner from '../../../fanfable/src/planner.ts';
+import * as planner from '../../../fanfable/src/plan/planner.ts';
 import { createClient, type LlmClient } from '../../../fanfable/src/llm.ts';
 import { isMain } from './harness.ts';
 

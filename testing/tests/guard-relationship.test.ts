@@ -1,7 +1,7 @@
 /** The guard verifies asserted relationships against keeper-grade evidence. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import * as controller from '../../fanfable/src/controller.ts';
+import * as controller from '../../fanfable/src/plan/controller.ts';
 import { enforceStatusTieGuard } from '../../fanfable/src/lore-ask.ts';
 import { tempDb } from './helpers.ts';
 

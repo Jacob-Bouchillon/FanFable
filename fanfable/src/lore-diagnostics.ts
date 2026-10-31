@@ -23,7 +23,7 @@ import type { LlmClient } from './llm.ts';
 import * as lorebook from './lorebook.ts';
 import { preferThin, readHandoff } from './chain-handoff.ts';
 import { truncate } from './text.ts';
-import { recordRuling } from './ruling.ts';
+import { recordRuling } from './court/ruling.ts';
 import { DIAGNOSTIC_RELATION_CUES } from './vocab.ts';
 
 /* ------------------------------------------------------------- diagnostics */

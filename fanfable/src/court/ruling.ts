@@ -24,7 +24,7 @@
  * record the ruling in the same transaction.
  */
 import { createHash } from 'node:crypto';
-import { Db, nowIso } from './db.ts';
+import { Db, nowIso } from '../db.ts';
 
 export type RulingRole = 'charge' | 'clue' | 'verdict' | 'appeal' | 'removal' | 'objection';
 export type RulingActor = 'bank' | 'web' | 'chain' | 'assessor' | 'guard' | 'human' | 'external';

@@ -9,7 +9,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Db } from '../../fanfable/src/db.ts';
-import { createProject } from '../../fanfable/src/controller.ts';
+import { createProject } from '../../fanfable/src/plan/controller.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 import { tempDb } from './helpers.ts';
 

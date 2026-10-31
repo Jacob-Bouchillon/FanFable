@@ -12,24 +12,24 @@
  *   - routing of dynamic context requests to the Lore Researcher / Memory Manager
  *   - generation limits (context request rounds, request counts)
  */
-import { Db, fromJson, nowIso, strList, toJson } from './db.ts';
-import { toStringArray } from './json.ts';
-import { clientFrom, createClient } from './llm.ts';
-import type { LlmClient, LlmSettings } from './llm.ts';
-import * as lore from './lore.ts';
-import * as lorebook from './lorebook.ts';
-import * as retrieval from './retrieval.ts';
-import * as graph from './graph.ts';
-import { checkPremise } from './premise-check.ts';
-import { detectConflicts, saveConflicts, listConflicts } from './state-conflicts.ts';
-import * as memory from './memory.ts';
-import * as planner from './planner.ts';
-import { buildWebBrief, renderWebBrief } from './brief.ts';
-import * as writer from './writer.ts';
-import * as continuity from './continuity.ts';
-import { continuitySettings, filterBySeverity } from './continuity-settings.ts';
-import { truncate, wordCount } from './text.ts';
-import { nameMentioned, nameMentionedExact } from './identity/names.ts';
+import { Db, fromJson, nowIso, strList, toJson } from '../db.ts';
+import { toStringArray } from '../json.ts';
+import { clientFrom, createClient } from '../llm.ts';
+import type { LlmClient, LlmSettings } from '../llm.ts';
+import * as lore from '../lore.ts';
+import * as lorebook from '../lorebook.ts';
+import * as retrieval from '../retrieval.ts';
+import * as graph from '../graph.ts';
+import { checkPremise } from '../premise-check.ts';
+import { detectConflicts, saveConflicts, listConflicts } from '../state-conflicts.ts';
+import * as memory from '../memory.ts';
+import * as planner from '../plan/planner.ts';
+import { buildWebBrief, renderWebBrief } from '../plan/brief.ts';
+import * as writer from '../writer.ts';
+import * as continuity from '../continuity.ts';
+import { continuitySettings, filterBySeverity } from '../continuity-settings.ts';
+import { truncate, wordCount } from '../text.ts';
+import { nameMentioned, nameMentionedExact } from '../identity/names.ts';
 
 export interface Project {
   id: number;

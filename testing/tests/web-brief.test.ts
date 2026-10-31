@@ -4,10 +4,10 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createProject } from '../../fanfable/src/controller.ts';
-import { buildWebBrief, renderWebBrief } from '../../fanfable/src/brief.ts';
-import * as planner from '../../fanfable/src/planner.ts';
-import * as controller from '../../fanfable/src/controller.ts';
+import { createProject } from '../../fanfable/src/plan/controller.ts';
+import { buildWebBrief, renderWebBrief } from '../../fanfable/src/plan/brief.ts';
+import * as planner from '../../fanfable/src/plan/planner.ts';
+import * as controller from '../../fanfable/src/plan/controller.ts';
 import { syncThreads } from '../../fanfable/src/web/threads.ts';
 import { mockProvider, tempDb } from './helpers.ts';
 

@@ -18,7 +18,7 @@ import { createHash } from 'node:crypto';
 import { Db, fromJson, nowIso } from '../db.ts';
 import { pickPeriodThread } from './threads.ts';
 import { isClosedRoleKind, projectMinConfidence, storedAssessment } from '../lorebook.ts';
-import { recordRuling } from '../ruling.ts';
+import { recordRuling } from '../court/ruling.ts';
 
 /** Why a candidate note was not written. */
 export type SkipReason =

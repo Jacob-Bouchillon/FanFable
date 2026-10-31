@@ -150,7 +150,7 @@ export async function buildFreshCorpus(
         ['fileImporter', resolve(here, '../../../fanfable/src/importer.ts')],
         ['llmClient', resolve(here, '../../../fanfable/src/llm.ts')],
         ['databaseSchema', resolve(here, '../../../fanfable/src/schema.ts')],
-        ['contextBuilder', resolve(here, '../../../fanfable/src/controller.ts')],
+        ['contextBuilder', resolve(here, '../../../fanfable/src/plan/controller.ts')],
         ['writerScenario', resolve(here, './scenarios/writing.ts')],
       ].map(([key, path]) => [key!, sha256File(path!)]),
     );

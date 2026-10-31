@@ -8,7 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { Db } from '../../fanfable/src/db.ts';
 import { runMigrations, tableExists } from '../../fanfable/src/migrations.ts';
-import * as controller from '../../fanfable/src/controller.ts';
+import * as controller from '../../fanfable/src/plan/controller.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 import * as loreDiag from '../../fanfable/src/lore-diagnostics.ts';
 import { mockProvider, tempDb } from './helpers.ts';

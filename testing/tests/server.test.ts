@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
 import { startServer } from '../../fanfable/src/server.ts';
-import * as controller from '../../fanfable/src/controller.ts';
+import * as controller from '../../fanfable/src/plan/controller.ts';
 import { seedProject, tempDb } from './helpers.ts';
 
 /** Start the UI server on a free port and hand the base URL to the test. */

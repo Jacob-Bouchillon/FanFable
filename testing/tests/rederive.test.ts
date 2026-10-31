@@ -1,7 +1,7 @@
 /** Deterministic evidence re-derivation for quarantined keepers. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import * as controller from '../../fanfable/src/controller.ts';
+import * as controller from '../../fanfable/src/plan/controller.ts';
 import { findUnverifiedKeepers } from '../../fanfable/src/lorebook.ts';
 import { applyPlan, checkCandidate, loadChunks, loadRows, planRow } from './rederive-lib.ts';
 import { tempDb } from './helpers.ts';

@@ -7,10 +7,10 @@
  * revised — revisions create a new version that copies approved chapters
  * forward unchanged.
  */
-import { Db, fromJson, nowIso, toJson } from './db.ts';
-import { extractJson, toStringArray } from './json.ts';
-import type { LlmClient } from './llm.ts';
-import { truncate } from './text.ts';
+import { Db, fromJson, nowIso, toJson } from '../db.ts';
+import { extractJson, toStringArray } from '../json.ts';
+import type { LlmClient } from '../llm.ts';
+import { truncate } from '../text.ts';
 
 export interface SceneOutline {
   title: string;

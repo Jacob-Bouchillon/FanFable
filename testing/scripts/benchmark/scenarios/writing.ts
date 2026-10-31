@@ -16,8 +16,8 @@
  *   invention        did it make up names
  */
 import { Db } from '../../../../fanfable/src/db.ts';
-import * as controller from '../../../../fanfable/src/controller.ts';
-import * as planner from '../../../../fanfable/src/planner.ts';
+import * as controller from '../../../../fanfable/src/plan/controller.ts';
+import * as planner from '../../../../fanfable/src/plan/planner.ts';
 import type { LlmClient } from '../../../../fanfable/src/llm.ts';
 import type { RecordingClient } from '../harness.ts';
 import { copiedRate, inventedNameRate, proseStats, repetitionRate, words } from '../measure.ts';

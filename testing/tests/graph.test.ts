@@ -5,7 +5,7 @@ import * as lorebook from '../../fanfable/src/lorebook.ts';
 import * as memory from '../../fanfable/src/memory.ts';
 import { seedProject, tempDb, mockProvider } from './helpers.ts';
 import { Db } from '../../fanfable/src/db.ts';
-import * as controller from '../../fanfable/src/controller.ts';
+import * as controller from '../../fanfable/src/plan/controller.ts';
 
 const CANON_EXTRACTION = {
   entities: [

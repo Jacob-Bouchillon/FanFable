@@ -10,8 +10,8 @@
  * provisional/needs_review stay provisional, and a row without an assessment is
  * not offered as a possibility at all.
  */
-import { Db, fromJson, strList } from './db.ts';
-import { createResolver, loadIdentityContext, type EntityResolution } from './identity/identity.ts';
+import { Db, fromJson, strList } from '../db.ts';
+import { createResolver, loadIdentityContext, type EntityResolution } from '../identity/identity.ts';
 
 export type BriefGrade = 'proven' | 'attested' | 'provisional';
 

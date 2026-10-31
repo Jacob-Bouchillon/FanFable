@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 import * as continuity from '../../fanfable/src/continuity.ts';
 import { seedProject, tempDb, mockProvider } from './helpers.ts';
-import * as controller from '../../fanfable/src/controller.ts';
+import * as controller from '../../fanfable/src/plan/controller.ts';
 import { continuitySettings, filterBySeverity } from '../../fanfable/src/continuity-settings.ts';
 
 const EXTRACTION_JSON = {

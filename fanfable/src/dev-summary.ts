@@ -6,7 +6,7 @@
 import { execFileSync } from 'node:child_process';
 import { basename } from 'node:path';
 import { Db, fromJson, strList } from './db.ts';
-import * as controller from './controller.ts';
+import * as controller from './plan/controller.ts';
 import * as loreDiag from './lore-diagnostics.ts';
 
 /** A short commit stamp for the dev page's provenance footer. */

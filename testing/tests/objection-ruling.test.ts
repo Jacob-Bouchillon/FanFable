@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { tempDb, seedProject, mockProvider } from './helpers.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
-import * as ruling from '../../fanfable/src/ruling.ts';
+import * as ruling from '../../fanfable/src/court/ruling.ts';
 
 const ENTITIES = {
   entities: [

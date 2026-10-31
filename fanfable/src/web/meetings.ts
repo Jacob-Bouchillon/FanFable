@@ -22,7 +22,7 @@
  */
 import { Db, nowIso } from '../db.ts';
 import { projectMinConfidence } from '../lorebook.ts';
-import { meetingSubject, recordRuling } from '../ruling.ts';
+import { meetingSubject, recordRuling } from '../court/ruling.ts';
 import { existsSync, readdirSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, sep } from 'node:path';

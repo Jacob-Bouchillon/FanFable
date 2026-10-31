@@ -14,7 +14,7 @@ import {
   type PairReport,
   type SheetPair,
 } from '../trials/benchmark/validate-web.ts';
-import { createProject } from '../../fanfable/src/controller.ts';
+import { createProject } from '../../fanfable/src/plan/controller.ts';
 import { tempDb } from './helpers.ts';
 
 function report(patch: Partial<PairReport> & { id: string; block: PairReport['block'] }): PairReport {

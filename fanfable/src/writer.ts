@@ -11,7 +11,7 @@
  */
 import { extractJson } from './json.ts';
 import type { LlmClient } from './llm.ts';
-import type { ChapterOutline, Outline, OutlinePreferences } from './planner.ts';
+import type { ChapterOutline, Outline, OutlinePreferences } from './plan/planner.ts';
 import { dedupeParagraphs, wordCount } from './text.ts';
 
 /* ------------------------------------------------------------ context protocol */

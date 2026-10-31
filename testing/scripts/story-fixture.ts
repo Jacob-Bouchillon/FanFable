@@ -161,7 +161,7 @@ const EXTRACTION: memory.StateExtraction = {
 /** Build the evaluation project and return its id. */
 export async function buildStoryProject(db: Db, fixturePath: string): Promise<number> {
   const project = (
-    await import( '../../fanfable/src/controller.ts')
+    await import( '../../fanfable/src/plan/controller.ts')
   ).createProject(db, 'story-eval');
   lore.importSource(db, project.id, fixturePath);
 

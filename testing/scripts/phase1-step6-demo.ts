@@ -10,7 +10,7 @@ import { mkdtempSync, copyFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Db } from '../../fanfable/src/db.ts';
-import * as controller from '../../fanfable/src/controller.ts';
+import * as controller from '../../fanfable/src/plan/controller.ts';
 import * as lore from '../../fanfable/src/lore.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 import { retrieve } from '../../fanfable/src/retrieval.ts';

@@ -4,10 +4,10 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createProject } from '../../fanfable/src/controller.ts';
+import { createProject } from '../../fanfable/src/plan/controller.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 import * as loreDiag from '../../fanfable/src/lore-diagnostics.ts';
-import * as ruling from '../../fanfable/src/ruling.ts';
+import * as ruling from '../../fanfable/src/court/ruling.ts';
 import { mockProvider, tempDb } from './helpers.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';

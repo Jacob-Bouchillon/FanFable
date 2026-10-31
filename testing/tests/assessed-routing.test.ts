@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
-import { createProject } from '../../fanfable/src/controller.ts';
+import { createProject } from '../../fanfable/src/plan/controller.ts';
 import { buildPairThreads } from '../../fanfable/src/web/pair-threads.ts';
 import { syncThreads } from '../../fanfable/src/web/threads.ts';
 import * as threadWeb from '../../fanfable/src/web/threads.ts';

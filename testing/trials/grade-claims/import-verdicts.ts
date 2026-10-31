@@ -13,7 +13,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Db } from '../../../fanfable/src/db.ts';
-import { recordRuling } from '../../../fanfable/src/ruling.ts';
+import { recordRuling } from '../../../fanfable/src/court/ruling.ts';
 
 function parseCsv(text: string): Record<string, string>[] {
   const rows: string[][] = [];

@@ -20,8 +20,8 @@
 import { resolve } from 'node:path';
 import { existsSync } from 'node:fs';
 import { Db } from '../../fanfable/src/db.ts';
-import * as controller from '../../fanfable/src/controller.ts';
-import * as planner from '../../fanfable/src/planner.ts';
+import * as controller from '../../fanfable/src/plan/controller.ts';
+import * as planner from '../../fanfable/src/plan/planner.ts';
 import { isMain, loadModels, makeClient, mean, pct, repetitionSeed, RunStore, sha256File, stdev, table, uniqueRunId, type ModelSpec, type ScenarioResult } from './benchmark/harness.ts';
 import { ProgressStore } from './benchmark/progress.ts';
 import { loadGold, runLoreWindow, verifyGold } from './benchmark/scenarios/lore.ts';
@@ -500,7 +500,7 @@ async function main(): Promise<void> {
       ['loreExtractor', resolve(import.meta.dirname, '../../fanfable/src/lorebook.ts')],
       ['llmClient', resolve(import.meta.dirname, '../../fanfable/src/llm.ts')],
       ['databaseSchema', resolve(import.meta.dirname, '../../fanfable/src/schema.ts')],
-      ['contextBuilder', resolve(import.meta.dirname, '../../fanfable/src/controller.ts')],
+      ['contextBuilder', resolve(import.meta.dirname, '../../fanfable/src/plan/controller.ts')],
       ['writerScenario', resolve(import.meta.dirname, './benchmark/scenarios/writing.ts')],
     ].map(([key, path]) => [key!, sha256File(path!)]),
   );

@@ -20,12 +20,12 @@
 import { copyFileSync, existsSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { Db } from '../../fanfable/src/db.ts';
-import * as controller from '../../fanfable/src/controller.ts';
+import * as controller from '../../fanfable/src/plan/controller.ts';
 import * as continuity from '../../fanfable/src/continuity.ts';
 import * as graph from '../../fanfable/src/graph.ts';
 import * as graphchecks from '../../fanfable/src/graph-checks.ts';
 import * as memory from '../../fanfable/src/memory.ts';
-import * as planner from '../../fanfable/src/planner.ts';
+import * as planner from '../../fanfable/src/plan/planner.ts';
 import { isMain, loadModels, makeClient, mean, RunStore, table, uniqueRunId, type ModelSpec } from './benchmark/harness.ts';
 import { loadStoryFixture, baselineClient, DEFAULT_DB } from './benchmark/corpus.ts';
 import { copiedRate, repetitionRate, words } from './benchmark/measure.ts';

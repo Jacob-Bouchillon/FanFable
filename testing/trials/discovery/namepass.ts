@@ -18,7 +18,7 @@
 import { Db } from '../../../fanfable/src/db.ts';
 import { syncThreads } from '../../../fanfable/src/web/threads.ts';
 import { runMeetings } from '../../../fanfable/src/web/meetings.ts';
-import { recordRuling } from '../../../fanfable/src/ruling.ts';
+import { recordRuling } from '../../../fanfable/src/court/ruling.ts';
 import {
   assertableClaim,
   isVerbatimInChunk,

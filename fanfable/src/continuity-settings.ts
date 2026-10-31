@@ -4,7 +4,7 @@
  * The checker is useful, but it is not the author's job to read a wall of
  * warnings. These settings decide how much it does and what it says.
  */
-import type { Project } from './controller.ts';
+import type { Project } from './plan/controller.ts';
 
 export interface ContinuitySettings {
   /** Run the checker at all. */

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import * as continuity from '../../fanfable/src/continuity.ts';
 import { seedProject, tempDb, mockProvider } from './helpers.ts';
 import * as memory from '../../fanfable/src/memory.ts';
-import * as controller from '../../fanfable/src/controller.ts';
+import * as controller from '../../fanfable/src/plan/controller.ts';
 
 function chapterRecord(over: Partial<continuity.ChapterRecord> = {}): continuity.ChapterRecord {
   return {

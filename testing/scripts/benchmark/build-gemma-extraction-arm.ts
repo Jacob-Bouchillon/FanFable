@@ -19,7 +19,7 @@ import { copyFileSync, existsSync, readFileSync, statSync, writeFileSync } from 
 import { relative, resolve } from 'node:path';
 import { Db } from '../../../fanfable/src/db.ts';
 import type { LlmClient } from '../../../fanfable/src/llm.ts';
-import * as planner from '../../../fanfable/src/planner.ts';
+import * as planner from '../../../fanfable/src/plan/planner.ts';
 import { assertFreshCorpusTarget } from './build-fresh-corpus.ts';
 import {
   BASELINE_MODEL,
@@ -243,7 +243,7 @@ export async function buildGemmaExtractionArm(
         ['loreStorage', resolve(here, '../../../fanfable/src/lore.ts')],
         ['llmClient', resolve(here, '../../../fanfable/src/llm.ts')],
         ['databaseSchema', resolve(here, '../../../fanfable/src/schema.ts')],
-        ['contextBuilder', resolve(here, '../../../fanfable/src/controller.ts')],
+        ['contextBuilder', resolve(here, '../../../fanfable/src/plan/controller.ts')],
       ].map(([key, path]) => [key!, sha256File(path!)]),
     );
 

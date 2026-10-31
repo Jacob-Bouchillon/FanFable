@@ -67,7 +67,7 @@ test('a PDF import produces passages with page references', async (t) => {
   ]);
   const path = tempFile('book.pdf', pdf);
   const { Db } = await import( '../../fanfable/src/db.ts');
-  const controller = await import( '../../fanfable/src/controller.ts');
+  const controller = await import( '../../fanfable/src/plan/controller.ts');
   const db2 = new Db(':memory:');
   const p = controller.createProject(db2, 'pdf');
   const res = await lore.importSourceAsync(db2, p.id, path);

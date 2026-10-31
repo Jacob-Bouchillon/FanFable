@@ -14,10 +14,10 @@
  *                   change one thing and then forget about it
  */
 import { Db } from '../../../../fanfable/src/db.ts';
-import * as controller from '../../../../fanfable/src/controller.ts';
+import * as controller from '../../../../fanfable/src/plan/controller.ts';
 import * as graph from '../../../../fanfable/src/graph.ts';
 import * as lore from '../../../../fanfable/src/lore.ts';
-import * as planner from '../../../../fanfable/src/planner.ts';
+import * as planner from '../../../../fanfable/src/plan/planner.ts';
 import { extractJson } from '../../../../fanfable/src/json.ts';
 import type { RecordingClient } from '../harness.ts';
 
