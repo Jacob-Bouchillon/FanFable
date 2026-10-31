@@ -358,10 +358,9 @@ test('a full matching pass leaves every stored name and alias untouched', () => 
     );
   const before = snapshot();
 
-  // The read-only matching paths: quarantine, scan, note resolution, variants.
+  // The read-only matching paths: quarantine, scan, variants.
   lorebook.quarantineSuspectCharacters(db, project.id);
   lorebook.scanSentenceCandidates(db, project.id);
-  lorebook.resolveAccumulatedNotes(db, project.id);
   const index = indexFor(db, project.id);
   for (const row of index.rows) deriveNameVariants(row, index);
 

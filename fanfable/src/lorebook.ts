@@ -917,14 +917,10 @@ export async function extractLore(
   }
   checkEntityCapacity(db, projectId, touched, { write: true });
   const quarantinedEntities = quarantineSuspectCharacters(db, projectId);
-  // Notes accumulated spans across windows; resolve them now that the book has
-  // been read, so evidence from two pages can prove one tie.
-  const promotedNotes = resolveAccumulatedNotes(db, projectId);
   rememberExtractionReport(db, projectId, stats);
   writeAuditNote(projectId, 'extract', [
     `windows visited: ${stats.windows}`,
     `ties banked: ${stats.relations}`,
-    `notes promoted: ${promotedNotes}`,
     `entities quarantined: ${quarantinedEntities.quarantined}, released: ${quarantinedEntities.released}`,
     `quotes verified: ${stats.verification.verified}, repointed: ${stats.verification.repointed}, dropped: ${stats.verification.dropped}`,
     `empty windows: ${stats.emptyWindows.length}`,
@@ -7129,24 +7125,6 @@ export function scanAnchoredCandidates(db: Db, projectId: number): AnchoredCandi
     }
   }
   return out;
-}
-
-/**
- * Re-check pending notes once the book has been read. A note accumulates spans
- * from every window that mentions its pair; when the spans together name both
- * people and one of them states the tie, the note becomes a keeper.
- *
- * Every span must be verbatim in its own page, and the ordinary conditions
- * still apply: closed relationship-grade kind, no PARK ruling, no reversed
- * direction, and two different identities.
- */
-/**
- * Notes stay in the review queue. A note carries no model confidence, so the
- * author's threshold cannot tier it; auto-promoting one would be a second
- * definition of truth. Kept as a compatibility entry point for callers.
- */
-export function resolveAccumulatedNotes(_db: Db, _projectId: number): number {
-  return 0;
 }
 
 export interface TieHint {

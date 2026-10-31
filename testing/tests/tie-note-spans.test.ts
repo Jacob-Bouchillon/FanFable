@@ -80,7 +80,6 @@ test('notes are not auto-promoted; two spans stay in the review queue', () => {
   const b = chunk(db, project.id, 'Tor commanded the northern house.', 2);
   lorebook.persistTieNote(db, project.id, from, to, 'ally of', 'unsupported', 'Mara sided with the northern house.', a.refs, '', 'sided with');
   lorebook.persistTieNote(db, project.id, from, to, 'ally of', 'unsupported', 'Tor commanded the northern house.', b.refs);
-  assert.equal(lorebook.resolveAccumulatedNotes(db, project.id), 0, 'a note has no model confidence, so it cannot be tiered');
   const rel = db.get<{ id: number }>('SELECT id FROM canon_relation WHERE project_id = ?', project.id);
   assert.equal(rel, undefined, 'nothing is banked');
   const note = db.get<{ status: string; ruling: string }>('SELECT status, ruling FROM canon_tie_note WHERE project_id = ?', project.id);
@@ -94,7 +93,6 @@ test('one span alone is not enough', () => {
   const { db, project, from, to } = setup('note-single');
   const a = chunk(db, project.id, 'Mara sided with the northern house.', 1);
   lorebook.persistTieNote(db, project.id, from, to, 'ally of', 'unsupported', 'Mara sided with the northern house.', a.refs);
-  assert.equal(lorebook.resolveAccumulatedNotes(db, project.id), 0);
   db.close();
 });
 
@@ -104,7 +102,6 @@ test('spans that never state the tie do not resolve', () => {
   const b = chunk(db, project.id, 'Tor commanded the northern house.', 2);
   lorebook.persistTieNote(db, project.id, from, to, 'ally of', 'unsupported', 'Mara met the northern house.', a.refs);
   lorebook.persistTieNote(db, project.id, from, to, 'ally of', 'unsupported', 'Tor commanded the northern house.', b.refs);
-  assert.equal(lorebook.resolveAccumulatedNotes(db, project.id), 0);
   db.close();
 });
 
@@ -115,6 +112,5 @@ test('a span that is not in its page does not count', () => {
   const invented = JSON.stringify([{ source: 'source', locator: 'p. 2', chunk: b.chunkId, quote: 'Tor ruled the northern house.' }]);
   lorebook.persistTieNote(db, project.id, from, to, 'ally of', 'unsupported', 'Mara sided with the northern house.', a.refs);
   lorebook.persistTieNote(db, project.id, from, to, 'ally of', 'unsupported', 'Tor ruled the northern house.', invented);
-  assert.equal(lorebook.resolveAccumulatedNotes(db, project.id), 0);
   db.close();
 });

@@ -572,3 +572,6 @@ threshold or period edit would have hidden a citation choice, not fixed a bug.
 
 Exit 1: 2 of 4. Missing criteria remain the recall floor (S1-S3) and the early-evidence floor (C1).
 `lore integrity` exit 0; `canon_relation` / `canon_tie_note` / `canon_tie_hint` unchanged at 336 / 98 / 0.
+
+### 2026-10-31: third-judge manifest (qwen3.5:9b, tightened gate)
+Run manifest (counts + params only; packets and verdicts live in gitignored /tmp/opencode/out-qwen35/): model qwen3.5:9b, temperature 0, seed 42, code df1cfc3, db plagueis-half.db copy with 314 assessed rows; attest 39 attested / 17 accepted; anchors 112; packets 60; verdicts 60; score 51/60 A+B (85.0%, Wilson 95% 73.9-91.9; human 27/32, assessed 24/28; C 9, D 0). Prior denominators 53/82 and 39/82 were graded under the loose policy and are not comparable (this set carries only assessed+human strata). Blind key stayed local; counts only.
