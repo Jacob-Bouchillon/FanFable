@@ -2,9 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as graph from '../../fanfable/src/graph.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
-import * as memory from '../../fanfable/src/memory.ts';
+import * as memory from '../../fanfable/src/product/memory.ts';
 import { seedProject, tempDb, mockProvider } from './helpers.ts';
-import { Db } from '../../fanfable/src/db.ts';
+import { Db } from '../../fanfable/src/core/db.ts';
 import * as controller from '../../fanfable/src/plan/controller.ts';
 
 const CANON_EXTRACTION = {

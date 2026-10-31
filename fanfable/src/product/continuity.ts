@@ -6,14 +6,14 @@
  * explanations. It never rewrites anything and it never rejects an intentional
  * AU change on its own — it points it out and lets the author decide.
  */
-import { Db, nowIso } from './db.ts';
-import { extractJson } from './json.ts';
-import type { LlmClient } from './llm.ts';
-import { similarity, splitSentences, truncate } from './text.ts';
-import { nameMentionedExact } from './identity/names.ts';
+import { Db, nowIso } from '../core/db.ts';
+import { extractJson } from '../core/json.ts';
+import type { LlmClient } from '../core/llm.ts';
+import { similarity, splitSentences, truncate } from '../core/text.ts';
+import { nameMentionedExact } from '../identity/names.ts';
 import type { ContextSlice } from './memory.ts';
-import * as lorebook from './lorebook.ts';
-import { graphContinuityChecks } from './graph-checks.ts';
+import * as lorebook from '../lorebook.ts';
+import { graphContinuityChecks } from '../graph-checks.ts';
 
 export type IssueSeverity = 'error' | 'warning' | 'note';
 

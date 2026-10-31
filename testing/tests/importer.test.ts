@@ -7,7 +7,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { execFileSync } from 'node:child_process';
 import { importFile, readTextFile } from '../../fanfable/src/importer.ts';
-import { chunkText } from '../../fanfable/src/text.ts';
+import { chunkText } from '../../fanfable/src/core/text.ts';
 import { makePdf } from './pdf-fixture.ts';
 import * as lore from '../../fanfable/src/answer/lore.ts';
 
@@ -66,7 +66,7 @@ test('a PDF import produces passages with page references', async (t) => {
     'Serena watched it from the ridge, wrapped in a coat that had belonged to her brother.',
   ]);
   const path = tempFile('book.pdf', pdf);
-  const { Db } = await import( '../../fanfable/src/db.ts');
+  const { Db } = await import( '../../fanfable/src/core/db.ts');
   const controller = await import( '../../fanfable/src/plan/controller.ts');
   const db2 = new Db(':memory:');
   const p = controller.createProject(db2, 'pdf');

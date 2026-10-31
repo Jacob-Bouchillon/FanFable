@@ -5,8 +5,8 @@
  */
 import { createHash } from 'node:crypto';
 import { statSync } from 'node:fs';
-import { Db, nowIso, strList } from './db.ts';
-import { chunkText, titleFromPath, trimFrontBackMatter, wordCount } from './text.ts';
+import { Db, nowIso, strList } from './core/db.ts';
+import { chunkText, titleFromPath, trimFrontBackMatter, wordCount } from './core/text.ts';
 import { importFile, readTextFile, type ImportedText } from './importer.ts';
 import type { SourceInfo } from './answer/lore.ts';
 

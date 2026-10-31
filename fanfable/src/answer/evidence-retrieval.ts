@@ -4,7 +4,7 @@
  * Impure: reads the project's entities and both event tables. The selector
  * stays pure.
  */
-import { Db, fromJson } from '../db.ts';
+import { Db, fromJson } from '../core/db.ts';
 import * as lorebook from '../lorebook.ts';
 import { canonicalName } from '../identity/names.ts';
 import {

@@ -9,7 +9,7 @@ import {
   stripTrailingMeta,
   writeChapter,
   type ContextRequest,
-} from '../../fanfable/src/writer.ts';
+} from '../../fanfable/src/product/writer.ts';
 import { mockProvider } from './helpers.ts';
 
 test('context requests are parsed from the writer output', () => {
@@ -214,7 +214,7 @@ test('a chapter written in parts is assembled from every part', async () => {
 });
 
 test('the beats already written are shown to the writer', async () => {
-  const { beatsSoFar } = await import( '../../fanfable/src/writer.ts');
+  const { beatsSoFar } = await import( '../../fanfable/src/product/writer.ts');
   const beats = beatsSoFar('The car turned the corner.\n\nRain lashed the glass.\n\nShe counted the lights.');
   assert.equal(beats.length, 3);
   assert.match(beats[0], /car turned the corner/);

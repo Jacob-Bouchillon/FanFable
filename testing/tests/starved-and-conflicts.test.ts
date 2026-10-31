@@ -8,7 +8,7 @@ import { createProject } from '../../fanfable/src/plan/controller.ts';
 import { buildPairThreads } from '../../fanfable/src/web/pair-threads.ts';
 import { syncThreads } from '../../fanfable/src/web/threads.ts';
 import * as threadWeb from '../../fanfable/src/web/threads.ts';
-import { runMigrations } from '../../fanfable/src/migrations.ts';
+import { runMigrations } from '../../fanfable/src/core/migrations.ts';
 import {
   kindsOppose,
   markContradictions,

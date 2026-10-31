@@ -11,7 +11,7 @@
  * Usage:
  *   NOTES=8 PROJECT=book-coord-no-notes node --no-warnings testing/trials/checks/notes-relabel.ts
  */
-import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';
+import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/core/db.ts';
 import { CLOSED_TIE_LABELS, isMomentKind, isUnsupportedKind } from '/home/jacob/Documents/FanFable/fanfable/src/lorebook.ts';
 import { baselineClient } from '/home/jacob/Documents/FanFable/testing/scripts/benchmark/corpus.ts';
 

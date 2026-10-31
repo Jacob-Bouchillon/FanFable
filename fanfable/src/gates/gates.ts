@@ -7,10 +7,10 @@
  * internals. A rule changes here or not at all; the two tiers never share
  * a mutable check.
  */
-import type { Db } from '../db.ts';
+import type { Db } from '../core/db.ts';
 import { canonicalName, deriveNameVariants, type RosterIndex } from '../identity/names.ts';
-import { normalise, splitSentences } from '../text.ts';
-import { KIND_FILLER, headForms, kindHeadWord } from '../vocab.ts';
+import { normalise, splitSentences } from '../core/text.ts';
+import { KIND_FILLER, headForms, kindHeadWord } from '../core/vocab.ts';
 
 export type PromoteReason =
   | 'open-vocab'

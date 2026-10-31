@@ -21,7 +21,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createClient, type ChatRequest, type ChatResponse, type LlmClient, type LlmSettings } from '../../../fanfable/src/llm.ts';
+import { createClient, type ChatRequest, type ChatResponse, type LlmClient, type LlmSettings } from '../../../fanfable/src/core/llm.ts';
 
 /**
  * True when this file is the one that was run.

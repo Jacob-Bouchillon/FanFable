@@ -14,10 +14,10 @@
  *
  *   node testing/scripts/evaluate-writing.ts <db> <project>
  */
-import { Db } from '../../fanfable/src/db.ts';
+import { Db } from '../../fanfable/src/core/db.ts';
 import * as controller from '../../fanfable/src/plan/controller.ts';
 import * as planner from '../../fanfable/src/plan/planner.ts';
-import { createClient } from '../../fanfable/src/llm.ts';
+import { createClient } from '../../fanfable/src/core/llm.ts';
 import { copiedRate, inventedNameRate, repetitionRate, words } from './benchmark/measure.ts';
 
 interface Measurement {

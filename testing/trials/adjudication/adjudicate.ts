@@ -8,7 +8,7 @@
  *
  * usage: node adjudicate.ts <db...> [perGroup]
  */
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 import { scanSentenceCandidates } from '../../../fanfable/src/lorebook.ts';
 
 const args = process.argv.slice(2);

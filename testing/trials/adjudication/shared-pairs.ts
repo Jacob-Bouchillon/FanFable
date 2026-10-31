@@ -10,7 +10,7 @@
  * The key holds all of that, separately, and must not be opened until every
  * judgment is written.
  */
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { foldPeople } from './person-fold.ts';
 

@@ -14,8 +14,8 @@
  *   CONTAM_MODEL=qwen3.5:9b node --no-warnings testing/trials/checks/contamination-probe.ts
  */
 import { writeFileSync } from 'node:fs';
-import { Db } from '../../../fanfable/src/db.ts';
-import { clientFrom } from '../../../fanfable/src/llm.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
+import { clientFrom } from '../../../fanfable/src/core/llm.ts';
 
 const outPath = process.argv[2] ?? 'testing/trials/checks/contamination-qwen3.5-9b.json';
 const model = process.env.CONTAM_MODEL ?? 'qwen3.5:9b';

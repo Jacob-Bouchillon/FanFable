@@ -17,7 +17,7 @@
  *
  * Meetings, births, sharing and the map are not built here (Milestone 2).
  */
-import { Db, fromJson, nowIso } from '../db.ts';
+import { Db, fromJson, nowIso } from '../core/db.ts';
 
 export type ThreadKind = 'person' | 'pair';
 export type ThreadStatus = 'open' | 'resolved' | 'dormant';

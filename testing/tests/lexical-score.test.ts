@@ -4,7 +4,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { lexicalScore } from '../../fanfable/src/text.ts';
+import { lexicalScore } from '../../fanfable/src/core/text.ts';
 
 test('lexical score is monotonic in FTS strength', () => {
   const strong = lexicalScore(-8);

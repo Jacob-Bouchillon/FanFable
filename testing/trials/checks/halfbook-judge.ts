@@ -12,8 +12,8 @@
  */
 import { writeFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
-import { clientFrom } from '../../../fanfable/src/llm.ts';
-import { extractJson } from '../../../fanfable/src/json.ts';
+import { clientFrom } from '../../../fanfable/src/core/llm.ts';
+import { extractJson } from '../../../fanfable/src/core/json.ts';
 
 const outPath = process.argv[2] ?? '/tmp/opencode/halfbook-judge.json';
 const DB = 'testing/trials/halfbook-run/plagueis-half.db';

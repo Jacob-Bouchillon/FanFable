@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { detectConflicts, saveConflicts, listConflicts, resolveConflict } from '../../fanfable/src/state-conflicts.ts';
-import * as memory from '../../fanfable/src/memory.ts';
+import { detectConflicts, saveConflicts, listConflicts, resolveConflict } from '../../fanfable/src/product/state-conflicts.ts';
+import * as memory from '../../fanfable/src/product/memory.ts';
 import { seedProject, tempDb } from './helpers.ts';
 
 const BASE_EXTRACTION: memory.StateExtraction = {

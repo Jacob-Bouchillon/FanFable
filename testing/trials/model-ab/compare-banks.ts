@@ -8,7 +8,7 @@
  *
  * usage: node compare-banks.ts <dbA> <dbB>
  */
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 import { CLOSED_ROLE_KINDS } from '../../../fanfable/src/lorebook.ts';
 
 const [aPath, bPath] = process.argv.slice(2);

@@ -3,11 +3,11 @@
  *
  * Moved mechanically from lore.ts; imports only, no logic change.
  */
-import { Db } from '../db.ts';
-import type { LlmClient } from '../llm.ts';
-import { extractJson, toStringArray } from '../json.ts';
-import { lexicalScore } from '../text.ts';
-import { STOPWORDS } from '../vocab.ts';
+import { Db } from '../core/db.ts';
+import type { LlmClient } from '../core/llm.ts';
+import { extractJson, toStringArray } from '../core/json.ts';
+import { lexicalScore } from '../core/text.ts';
+import { STOPWORDS } from '../core/vocab.ts';
 import { SEARCH_CANDIDATE_POOL, SEARCH_CANDIDATE_POOL_MAX } from '../search-policy.ts';
 import * as lorebook from '../lorebook.ts';
 import type { Passage } from './lore.ts';

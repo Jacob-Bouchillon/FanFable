@@ -11,7 +11,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Db } from '../../fanfable/src/db.ts';
+import { Db } from '../../fanfable/src/core/db.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 import { seedProject, tempDb } from './helpers.ts';
 

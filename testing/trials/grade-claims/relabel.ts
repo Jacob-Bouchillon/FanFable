@@ -10,8 +10,8 @@
  */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { Db } from '../../../fanfable/src/db.ts';
-import { clientFrom } from '../../../fanfable/src/llm.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
+import { clientFrom } from '../../../fanfable/src/core/llm.ts';
 import { relabelRelations } from '../../../fanfable/src/lorebook.ts';
 
 function parseCsv(text: string): Record<string, string>[] {

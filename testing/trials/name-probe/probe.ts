@@ -8,7 +8,7 @@
  *
  * usage: node probe.ts <db> <model> [maxPassages]
  */
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 import { buildNameRoster } from '../../../fanfable/src/lorebook.ts';
 
 const dbPath = process.argv[2];

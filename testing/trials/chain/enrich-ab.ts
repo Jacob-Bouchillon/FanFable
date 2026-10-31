@@ -6,7 +6,7 @@
  * Same name, same 12-passage cap, sequential (one model job). Count-only
  * output: added relations/facts per arm. No passage prose, no gold keys.
  */
-import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';
+import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/core/db.ts';
 import * as controller from '/home/jacob/Documents/FanFable/fanfable/src/plan/controller.ts';
 import * as loreDiag from '/home/jacob/Documents/FanFable/fanfable/src/answer/lore-diagnostics.ts';
 import { readHandoff } from './chain-handoff.ts';

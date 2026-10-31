@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as controller from '../../fanfable/src/plan/controller.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
-import * as devSummary from '../../fanfable/src/dev-summary.ts';
+import * as devSummary from '../../fanfable/src/product/dev-summary.ts';
 import { mockProvider, tempDb } from './helpers.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';

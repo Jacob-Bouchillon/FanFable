@@ -1,4 +1,4 @@
-import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';
+import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/core/db.ts';
 
 // One mention edge per ghost: kind exactly 'appears_with' (the codebase's
 // native web-kind word, so markerFor reads REPEATED_CO_OCCURRENCE).

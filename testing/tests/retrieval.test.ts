@@ -1,9 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { retrieve, retrieveForScene } from '../../fanfable/src/answer/retrieval.ts';
-import { checkPremise } from '../../fanfable/src/premise-check.ts';
+import { checkPremise } from '../../fanfable/src/product/premise-check.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
-import * as memory from '../../fanfable/src/memory.ts';
+import * as memory from '../../fanfable/src/product/memory.ts';
 import { seedProject, tempDb, mockProvider } from './helpers.ts';
 
 const CANON = {

@@ -19,7 +19,7 @@
  *   - a flashback in chapter 4 that happens before chapter 1
  *   - a motivation recorded in chapter 1 that chapter 3 depends on
  */
-import type { StateExtraction } from '../../../fanfable/src/memory.ts';
+import type { StateExtraction } from '../../../fanfable/src/product/memory.ts';
 
 export interface StoryChapter {
   number: number;

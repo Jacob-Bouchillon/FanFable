@@ -8,9 +8,9 @@
  * "reinforces" where the variant reports it) is the positive class.
  */
 import { readFileSync, writeFileSync } from 'node:fs';
-import { Db } from '../../../fanfable/src/db.ts';
-import { clientFrom } from '../../../fanfable/src/llm.ts';
-import { extractJson } from '../../../fanfable/src/json.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
+import { clientFrom } from '../../../fanfable/src/core/llm.ts';
+import { extractJson } from '../../../fanfable/src/core/json.ts';
 
 const variant = process.argv[2] ?? 'base';
 const outPath = process.argv[3] ?? `testing/trials/claim-confidence/judge-${variant}.json`;

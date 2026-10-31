@@ -14,11 +14,11 @@
  * text contradicts or ignores, never one the model is unsure about, and any
  * error keeps every seed (fail-open).
  */
-import { Db } from './db.ts';
-import { extractJson } from './json.ts';
-import type { LlmClient } from './llm.ts';
-import { truncate } from './text.ts';
-import type { DenseSeed, Graph } from './graph.ts';
+import { Db } from '../core/db.ts';
+import { extractJson } from '../core/json.ts';
+import type { LlmClient } from '../core/llm.ts';
+import { truncate } from '../core/text.ts';
+import type { DenseSeed, Graph } from '../graph.ts';
 
 export interface RecognitionOptions {
   /** The query the seeds serve: the model judges support for this. */

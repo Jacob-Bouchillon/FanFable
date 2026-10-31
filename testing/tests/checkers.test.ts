@@ -21,7 +21,7 @@ import { join } from 'node:path';
 import * as graph from '../../fanfable/src/graph.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 import { quarantineReport } from '../../fanfable/src/answer/lore-diagnostics.ts';
-import { Db } from '../../fanfable/src/db.ts';
+import { Db } from '../../fanfable/src/core/db.ts';
 import { seedProject, tempDb, mockProvider } from './helpers.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';

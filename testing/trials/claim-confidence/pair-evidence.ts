@@ -9,9 +9,9 @@
  * writes a blind sheet so the pairs can be labelled independently.
  */
 import { writeFileSync } from 'node:fs';
-import { Db } from '../../../fanfable/src/db.ts';
-import { clientFrom } from '../../../fanfable/src/llm.ts';
-import { extractJson } from '../../../fanfable/src/json.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
+import { clientFrom } from '../../../fanfable/src/core/llm.ts';
+import { extractJson } from '../../../fanfable/src/core/json.ts';
 import { buildRosterIndex, canonicalName, deriveNameVariants } from '../../../fanfable/src/identity/names.ts';
 import { scanSentenceCandidates } from '../../../fanfable/src/lorebook.ts';
 

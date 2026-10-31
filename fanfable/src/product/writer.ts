@@ -9,10 +9,10 @@
  * resolves (through the Lore Researcher or the Story Memory Manager) and feeds
  * back in. Requests are de-duplicated and capped so a model cannot loop.
  */
-import { extractJson } from './json.ts';
-import type { LlmClient } from './llm.ts';
-import type { ChapterOutline, Outline, OutlinePreferences } from './plan/planner.ts';
-import { dedupeParagraphs, wordCount } from './text.ts';
+import { extractJson } from '../core/json.ts';
+import type { LlmClient } from '../core/llm.ts';
+import type { ChapterOutline, Outline, OutlinePreferences } from '../plan/planner.ts';
+import { dedupeParagraphs, wordCount } from '../core/text.ts';
 
 /* ------------------------------------------------------------ context protocol */
 

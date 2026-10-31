@@ -1,4 +1,4 @@
-import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';
+import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/core/db.ts';
 
 // Confirmation-round application (Gemini blind + user final word).
 // DEMOTE: keeper -> parked (quote doesn't prove the row as banked).

@@ -9,7 +9,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { Db } from './db.ts';
+import { Db } from './core/db.ts';
 import {
   DEFAULT_LLM_SETTINGS,
   LlmError,
@@ -17,19 +17,19 @@ import {
   loadGlobalConfig,
   resolveSettings,
   saveGlobalConfig,
-} from './llm.ts';
-import { clientFrom } from './llm.ts';
-import type { LlmSettings } from './llm.ts';
+} from './core/llm.ts';
+import { clientFrom } from './core/llm.ts';
+import type { LlmSettings } from './core/llm.ts';
 import * as lore from './answer/lore.ts';
 import * as lorebook from './lorebook.ts';
 import * as embeddings from './embeddings.ts';
 import * as graph from './graph.ts';
 import * as loreDiag from './answer/lore-diagnostics.ts';
-import { listConflicts, resolveConflict } from './state-conflicts.ts';
-import * as memory from './memory.ts';
+import { listConflicts, resolveConflict } from './product/state-conflicts.ts';
+import * as memory from './product/memory.ts';
 import * as planner from './plan/planner.ts';
-import * as continuity from './continuity.ts';
-import { continuitySettings, filterBySeverity } from './continuity-settings.ts';
+import * as continuity from './product/continuity.ts';
+import { continuitySettings, filterBySeverity } from './product/continuity-settings.ts';
 import * as controller from './plan/controller.ts';
 import * as retrieval from './answer/retrieval.ts';
 import * as sweep from './extract/sweep.ts';
@@ -41,8 +41,8 @@ import * as noteIngest from './web/note-ingest.ts';
 import * as briefWeb from './plan/brief.ts';
 import * as identityCheck from './identity/identity-check.ts';
 import type { PassageTrail } from './graph.ts';
-import { truncate } from './text.ts';
-import { buildTrailsHtml, trailText } from './trail-html.ts';
+import { truncate } from './core/text.ts';
+import { buildTrailsHtml, trailText } from './product/trail-html.ts';
 
 /* ------------------------------------------------------------------- args */
 
@@ -2672,7 +2672,7 @@ async function main(): Promise<void> {
           }
         }
         const port = flagNumber(args, 'port', 8123);
-        const { startServer } = await import('./server.ts');
+        const { startServer } = await import('./product/server.ts');
         const server = startServer({ db, projectId: project?.id ?? null, port });
         // Keep the process (and the database) alive until interrupted.
         await new Promise<void>((resolve) => {

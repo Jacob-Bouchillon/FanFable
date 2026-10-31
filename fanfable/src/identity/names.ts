@@ -13,7 +13,7 @@
  *
  * No book-specific strings; names come from the caller.
  */
-import { tokenize } from '../text.ts';
+import { tokenize } from '../core/text.ts';
 
 /** Shortest token that can identify a name. */
 export const NAME_MIN_TOKEN = 3;

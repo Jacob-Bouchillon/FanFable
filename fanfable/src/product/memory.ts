@@ -10,10 +10,10 @@
  * The important property is retrieval: the writer gets the *relevant subset* of
  * story history, not the whole story in every prompt.
  */
-import { Db, nowIso, strList, toJson } from './db.ts';
-import { extractJson, toStringArray } from './json.ts';
-import type { LlmClient } from './llm.ts';
-import { truncate } from './text.ts';
+import { Db, nowIso, strList, toJson } from '../core/db.ts';
+import { extractJson, toStringArray } from '../core/json.ts';
+import type { LlmClient } from '../core/llm.ts';
+import { truncate } from '../core/text.ts';
 
 /* ------------------------------------------------------------------ models */
 

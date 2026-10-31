@@ -10,17 +10,17 @@
  * the UI can show the evidence, and the writer can be grounded in facts rather
  * than in a wall of retrieved text.
  */
-import { Db, fromJson, nowIso, strList, toJson } from './db.ts';
+import { Db, fromJson, nowIso, strList, toJson } from './core/db.ts';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { asRecordArray, extractJson, salvageJsonArray, toStringArray } from './json.ts';
-import type { LlmClient } from './llm.ts';
+import { asRecordArray, extractJson, salvageJsonArray, toStringArray } from './core/json.ts';
+import type { LlmClient } from './core/llm.ts';
 import { embedMissing, type EmbedFn } from './embeddings.ts';
 import { CORROBORATION_CAP, tripleKey, rankRows } from './edge-rank.ts';
 import { noteFromExtraction, starvedWindowScores } from './web/note-ingest.ts';
 import { recordRuling } from './court/ruling.ts';
-import { findHeadings, lexicalScore, normalise, splitSentences, tokenize, truncate } from './text.ts';
+import { findHeadings, lexicalScore, normalise, splitSentences, tokenize, truncate } from './core/text.ts';
 import {
   ANSWER_CUE_STOPWORDS,
   KIND_FILLER,
@@ -32,7 +32,7 @@ import {
   STOPWORDS,
   headForms,
   kindHeadWord,
-} from './vocab.ts';
+} from './core/vocab.ts';
 import { SEARCH_CANDIDATE_POOL } from './search-policy.ts';
 import {
   buildRosterIndex,

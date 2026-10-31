@@ -23,13 +23,13 @@
  * index later: `RetrievalPackage` is what the rest of the program consumes,
  * not a particular search backend.
  */
-import { Db } from '../db.ts';
-import type { LlmClient } from '../llm.ts';
+import { Db } from '../core/db.ts';
+import type { LlmClient } from '../core/llm.ts';
 import * as lore from './lore.ts';
 import * as lorebook from '../lorebook.ts';
 import * as embeddings from '../embeddings.ts';
 import * as graph from '../graph.ts';
-import { RELATION_CUES } from '../vocab.ts';
+import { RELATION_CUES } from '../core/vocab.ts';
 import { nameMentioned } from '../identity/names.ts';
 
 export interface RetrievalRequest {

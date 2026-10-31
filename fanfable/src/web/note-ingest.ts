@@ -15,7 +15,7 @@
  * ever raises a birth's evidence score (see meetings.ts).
  */
 import { createHash } from 'node:crypto';
-import { Db, fromJson, nowIso } from '../db.ts';
+import { Db, fromJson, nowIso } from '../core/db.ts';
 import { pickPeriodThread } from './threads.ts';
 import { isClosedRoleKind, projectMinConfidence, storedAssessment } from '../lorebook.ts';
 import { recordRuling } from '../court/ruling.ts';

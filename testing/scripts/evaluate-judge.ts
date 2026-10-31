@@ -15,7 +15,7 @@
  */
 import { RunStore, isMain, loadModels, makeClient, mean, table } from './benchmark/harness.ts';
 import { CRITERIA } from './evaluate-blind.ts';
-import { extractJson } from '../../fanfable/src/json.ts';
+import { extractJson } from '../../fanfable/src/core/json.ts';
 
 interface Judgement {
   code: string;

@@ -15,7 +15,7 @@
  *   cp testing/trials/halfbook-run/plagueis-half.db testing/trials/discovery/namepass-copy.db
  *   node --no-warnings testing/trials/discovery/namepass.ts [dbPath] [limit]
  */
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 import { syncThreads } from '../../../fanfable/src/web/threads.ts';
 import { runMeetings } from '../../../fanfable/src/web/meetings.ts';
 import { recordRuling } from '../../../fanfable/src/court/ruling.ts';
@@ -24,8 +24,8 @@ import {
   isVerbatimInChunk,
   noteDedupeKey,
 } from '../../../fanfable/src/web/note-ingest.ts';
-import { explicitVariants } from '../../../fanfable/src/gates.ts';
-import { extractJson } from '../../../fanfable/src/json.ts';
+import { explicitVariants } from '../../../fanfable/src/gates/gates.ts';
+import { extractJson } from '../../../fanfable/src/core/json.ts';
 
 const DB = process.argv[2] ?? 'testing/trials/discovery/namepass-copy.db';
 const LIMIT = process.argv[3] === undefined ? Infinity : Math.max(0, Number(process.argv[3]));

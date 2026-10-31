@@ -5,7 +5,7 @@
  * Records are supplied by retrieval; validation is a separate, impure step.
  */
 import { canonicalName, nameRelation } from '../identity/names.ts';
-import { STOPWORDS } from '../vocab.ts';
+import { STOPWORDS } from '../core/vocab.ts';
 
 export type ClaimKind = 'canon' | 'au';
 

@@ -13,7 +13,7 @@
  *                nowhere in the source material
  *   length       the chapter's word count against the target it was given
  */
-import { similarity } from '../../../fanfable/src/text.ts';
+import { similarity } from '../../../fanfable/src/core/text.ts';
 
 /** Eight-word sequences, lower-cased, ignoring punctuation. */
 export function shingles(text: string, n = 8): Set<string> {

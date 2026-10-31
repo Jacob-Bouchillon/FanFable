@@ -4,7 +4,7 @@
  *
  * usage: node full-sheet.ts <db...>
  */
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 import { scanSentenceCandidates } from '../../../fanfable/src/lorebook.ts';
 import { writeFileSync } from 'node:fs';
 

@@ -22,12 +22,12 @@
  */
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { Db } from '../../fanfable/src/db.ts';
+import { Db } from '../../fanfable/src/core/db.ts';
 import * as lore from '../../fanfable/src/answer/lore.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 import * as graph from '../../fanfable/src/graph.ts';
 import * as retrieval from '../../fanfable/src/answer/retrieval.ts';
-import { MockProvider } from '../../fanfable/src/llm.ts';
+import { MockProvider } from '../../fanfable/src/core/llm.ts';
 
 interface Question {
   q: string;

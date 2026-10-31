@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chunkText, dedupeParagraphs, findHeadings, similarity, splitSentences, trimFrontBackMatter, wordCount } from '../../fanfable/src/text.ts';
-import { extractJson, extractJsonList, toStringArray } from '../../fanfable/src/json.ts';
+import { chunkText, dedupeParagraphs, findHeadings, similarity, splitSentences, trimFrontBackMatter, wordCount } from '../../fanfable/src/core/text.ts';
+import { extractJson, extractJsonList, toStringArray } from '../../fanfable/src/core/json.ts';
 
 const SAMPLE = `CHAPTER ONE: THE BRIDGE
 

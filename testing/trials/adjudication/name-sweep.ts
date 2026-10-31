@@ -7,7 +7,7 @@
  *
  * usage: node name-sweep.ts <db> [model] [maxNames] [batch] [onlyName] [out]
  */
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 import { writeFileSync } from 'node:fs';
 
 const dbPath = process.argv[2];

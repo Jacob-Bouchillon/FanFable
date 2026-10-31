@@ -6,11 +6,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createProject } from '../../fanfable/src/plan/controller.ts';
 import { buildPairThreads } from '../../fanfable/src/web/pair-threads.ts';
-import { runMigrations, tableExists } from '../../fanfable/src/migrations.ts';
+import { runMigrations, tableExists } from '../../fanfable/src/core/migrations.ts';
 import * as threadWeb from '../../fanfable/src/web/threads.ts';
 import * as meetingWeb from '../../fanfable/src/web/meetings.ts';
 import { tempDb } from './helpers.ts';
-import { Db as SqliteDb } from '../../fanfable/src/db.ts';
+import { Db as SqliteDb } from '../../fanfable/src/core/db.ts';
 import { resolve } from 'node:path';
 
 const AT = '2026-01-01T00:00:00.000Z';

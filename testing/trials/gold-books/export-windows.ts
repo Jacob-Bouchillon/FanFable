@@ -4,7 +4,7 @@
  * usage: node export-windows.ts <db> <out.md> [count]
  * Picks windows spread across the book and prints their passages with ids.
  */
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 import { writeFileSync } from 'node:fs';
 
 const dbPath = process.argv[2];

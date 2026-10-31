@@ -7,11 +7,11 @@
  */
 import { createHash } from 'node:crypto';
 import { statSync } from 'node:fs';
-import { Db, nowIso, strList } from '../db.ts';
-import { asRecordArray, extractJson, salvageJsonArray, toStringArray } from '../json.ts';
-import type { LlmClient } from '../llm.ts';
-import { chunkText, lexicalScore, titleFromPath, trimFrontBackMatter, truncate, wordCount } from '../text.ts';
-import { STOPWORDS } from '../vocab.ts';
+import { Db, nowIso, strList } from '../core/db.ts';
+import { asRecordArray, extractJson, salvageJsonArray, toStringArray } from '../core/json.ts';
+import type { LlmClient } from '../core/llm.ts';
+import { chunkText, lexicalScore, titleFromPath, trimFrontBackMatter, truncate, wordCount } from '../core/text.ts';
+import { STOPWORDS } from '../core/vocab.ts';
 import { SEARCH_CANDIDATE_POOL, SEARCH_CANDIDATE_POOL_MAX } from '../search-policy.ts';
 import { nameMentioned } from '../identity/names.ts';
 import { importFile, readTextFile, type ImportedText } from '../importer.ts';

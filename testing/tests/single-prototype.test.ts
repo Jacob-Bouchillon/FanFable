@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
 import { realpathSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { splitSentences } from '../../fanfable/src/text.ts';
+import { splitSentences } from '../../fanfable/src/core/text.ts';
 import {
   JUDGE_BLOCK,
   findLeakage,

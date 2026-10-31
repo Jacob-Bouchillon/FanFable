@@ -9,10 +9,10 @@
  * simply never proposes anything.
  */
 import { writeFileSync } from 'node:fs';
-import { clientFrom } from '../../../fanfable/src/llm.ts';
+import { clientFrom } from '../../../fanfable/src/core/llm.ts';
 import { relationsSystemPrompt } from '../../../fanfable/src/lorebook.ts';
-import { extractJson } from '../../../fanfable/src/json.ts';
-import { Db } from '../../../fanfable/src/db.ts';
+import { extractJson } from '../../../fanfable/src/core/json.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 
 const NEG = Number(process.argv[2] ?? 50);
 const POS = Number(process.argv[3] ?? 50);

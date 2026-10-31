@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import * as prompts from '../../fanfable/src/extract-prompts.ts';
+import * as prompts from '../../fanfable/src/extract/extract-prompts.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 
 const sha = (s: string): string => createHash('sha256').update(s, 'utf8').digest('hex');

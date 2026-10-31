@@ -15,9 +15,9 @@
  */
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 import { buildRosterIndex, canonicalName, deriveNameVariants } from '../../../fanfable/src/identity/names.ts';
-import { splitSentences } from '../../../fanfable/src/text.ts';
+import { splitSentences } from '../../../fanfable/src/core/text.ts';
 
 const SAMPLE_N = 80;
 const SEED = 42;
@@ -330,7 +330,7 @@ try {
   console.log(`project: ${projectName}`);
   console.log(`people: ${people}, threads: ${threads}, unproposed population: ${popTotal}`);
   console.log(
-    `chunker: fanfable/src/text.ts chunkText (maxWords 220, overlapWords 40); ` +
+    `chunker: fanfable/src/core/text.ts chunkText (maxWords 220, overlapWords 40); ` +
       `${chunks.length} chunks, avg ${(chunks.length ? words / chunks.length : 0).toFixed(1)} words`,
   );
   console.log('stratum pop sampled weight shortfall');

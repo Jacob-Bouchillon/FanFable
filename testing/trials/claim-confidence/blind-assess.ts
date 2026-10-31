@@ -9,9 +9,9 @@
  * answer can be compared with the claim it was previously asked to endorse.
  */
 import { writeFileSync } from 'node:fs';
-import { Db } from '../../../fanfable/src/db.ts';
-import { clientFrom } from '../../../fanfable/src/llm.ts';
-import { extractJson } from '../../../fanfable/src/json.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
+import { clientFrom } from '../../../fanfable/src/core/llm.ts';
+import { extractJson } from '../../../fanfable/src/core/json.ts';
 
 const dbPath = process.argv[2];
 const limit = Number(process.argv[3] ?? 0);

@@ -1,4 +1,4 @@
-import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';
+import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/core/db.ts';
 import { readFileSync, writeFileSync } from 'node:fs';
 
 const DB = '/home/jacob/Documents/FanFable/testing/trials/halfbook-run/plagueis-half.db';

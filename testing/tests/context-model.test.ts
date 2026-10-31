@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { createClient } from '../../fanfable/src/llm.ts';
+import { createClient } from '../../fanfable/src/core/llm.ts';
 import * as controller from '../../fanfable/src/plan/controller.ts';
 import * as planner from '../../fanfable/src/plan/planner.ts';
 import { seedProject, tempDb, mockProvider } from './helpers.ts';

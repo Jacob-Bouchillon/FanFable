@@ -10,7 +10,7 @@
  * Usage:
  *   node --no-warnings testing/trials/checks/regression-check.ts <bank-name>
  */
-import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';
+import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/core/db.ts';
 import { readFileSync } from 'node:fs';
 
 const norm = (n: string): string[] =>

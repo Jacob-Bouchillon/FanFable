@@ -9,7 +9,7 @@
  * Usage:
  *   node --no-warnings testing/trials/checks/lasting-moment-check.ts <bank-name>
  */
-import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';
+import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/core/db.ts';
 import { isDescriptiveCharacterName, isMomentKind, isUnsupportedKind } from '/home/jacob/Documents/FanFable/fanfable/src/lorebook.ts';
 
 const bank = process.argv[2];

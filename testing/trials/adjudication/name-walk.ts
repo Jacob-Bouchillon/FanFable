@@ -7,7 +7,7 @@
  *
  * usage: node name-walk.ts <db> [model] [maxNames]
  */
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 import { canonicalName } from '../../../fanfable/src/identity/names.ts';
 import { CLOSED_ROLE_KINDS } from '../../../fanfable/src/lorebook.ts';
 

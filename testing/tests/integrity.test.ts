@@ -1,10 +1,10 @@
 /** Standing keeper-evidence integrity audit and confirmed_by_user migration. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Db } from '../../fanfable/src/db.ts';
+import { Db } from '../../fanfable/src/core/db.ts';
 import * as controller from '../../fanfable/src/plan/controller.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
-import { runMigrations } from '../../fanfable/src/migrations.ts';
+import { runMigrations } from '../../fanfable/src/core/migrations.ts';
 import { tempDb } from './helpers.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';

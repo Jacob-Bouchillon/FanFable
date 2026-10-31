@@ -5,9 +5,9 @@
  * Usage: node testing/trials/refs-backfill/run.ts [--apply]
  */
 import { writeFileSync } from 'node:fs';
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 import { nameMentionedExact } from '../../../fanfable/src/identity/names.ts';
-import { strList } from '../../../fanfable/src/db.ts';
+import { strList } from '../../../fanfable/src/core/db.ts';
 
 const APPLY = process.argv.includes('--apply');
 const DB = 'testing/trials/halfbook-run/plagueis-half.db';

@@ -10,7 +10,7 @@
  *
  * usage: node verify-compare.ts <db...>
  */
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 
 const dbs = process.argv.slice(2);
 if (!dbs.length) {

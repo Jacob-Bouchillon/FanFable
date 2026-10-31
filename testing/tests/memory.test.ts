@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import * as memory from '../../fanfable/src/memory.ts';
-import { Db } from '../../fanfable/src/db.ts';
+import * as memory from '../../fanfable/src/product/memory.ts';
+import { Db } from '../../fanfable/src/core/db.ts';
 import { seedProject, tempDb } from './helpers.ts';
 
 test('characters, states and knowledge are stored and retrieved', () => {

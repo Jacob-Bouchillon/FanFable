@@ -12,7 +12,7 @@
  */
 
 import { writeFileSync } from 'node:fs';
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 import { buildHandoff, type ChainHandoff } from './chain-handoff.ts';
 
 const norm = (s: string): string =>

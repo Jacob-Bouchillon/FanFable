@@ -1,8 +1,8 @@
 /** Keeper-tie denials, verified model evidence, and uncertain dead findings. */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import * as continuity from '../../fanfable/src/continuity.ts';
-import * as memory from '../../fanfable/src/memory.ts';
+import * as continuity from '../../fanfable/src/product/continuity.ts';
+import * as memory from '../../fanfable/src/product/memory.ts';
 import * as controller from '../../fanfable/src/plan/controller.ts';
 import { mockProvider, tempDb } from './helpers.ts';
 

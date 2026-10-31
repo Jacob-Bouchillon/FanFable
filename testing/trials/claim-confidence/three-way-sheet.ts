@@ -8,7 +8,7 @@
  * written separately so predictions stay hidden until the labels are locked.
  */
 import { readFileSync, writeFileSync } from 'node:fs';
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 
 const sheetPath = process.argv[2] ?? 'testing/trials/adjudication/gold-three-way-sheet.md';
 const keyPath = process.argv[3] ?? 'testing/trials/adjudication/gold-three-way-key.json';

@@ -3,9 +3,9 @@
  *
  * Moved mechanically from lore.ts; imports only, no logic change.
  */
-import { Db } from '../db.ts';
-import { extractJson, toStringArray } from '../json.ts';
-import type { LlmClient } from '../llm.ts';
+import { Db } from '../core/db.ts';
+import { extractJson, toStringArray } from '../core/json.ts';
+import type { LlmClient } from '../core/llm.ts';
 import { nameMentionedExact, buildRosterIndex, deriveNameVariants, canonicalName, nameRelation, type RosterIndex } from '../identity/names.ts';
 import * as lorebook from '../lorebook.ts';
 import { expandQuery, searchCanon } from './lore-search.ts';

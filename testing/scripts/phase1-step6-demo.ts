@@ -9,12 +9,12 @@
 import { mkdtempSync, copyFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Db } from '../../fanfable/src/db.ts';
+import { Db } from '../../fanfable/src/core/db.ts';
 import * as controller from '../../fanfable/src/plan/controller.ts';
 import * as lore from '../../fanfable/src/answer/lore.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 import { retrieve } from '../../fanfable/src/answer/retrieval.ts';
-import { MockProvider } from '../../fanfable/src/llm.ts';
+import { MockProvider } from '../../fanfable/src/core/llm.ts';
 
 const SERENA_QUOTE = 'Serena Marsh watched it from the ridge';
 const KADE_QUOTE = 'said Kade behind her';

@@ -4,7 +4,7 @@ import http from 'node:http';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createClient, LlmError, resolveSettings, saveGlobalConfig } from '../../fanfable/src/llm.ts';
+import { createClient, LlmError, resolveSettings, saveGlobalConfig } from '../../fanfable/src/core/llm.ts';
 
 async function drainBody(req: http.IncomingMessage): Promise<void> {
   for await (const _ of req) {

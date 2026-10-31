@@ -8,15 +8,15 @@
  *
  *   node testing/scripts/evaluate-continuity.ts
  */
-import { Db } from '../../fanfable/src/db.ts';
+import { Db } from '../../fanfable/src/core/db.ts';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import * as graph from '../../fanfable/src/graph.ts';
-import * as memory from '../../fanfable/src/memory.ts';
+import * as memory from '../../fanfable/src/product/memory.ts';
 import * as lore from '../../fanfable/src/answer/lore.ts';
 import { graphContinuityChecks } from '../../fanfable/src/graph-checks.ts';
-import { checkChapter, deterministicChecks } from '../../fanfable/src/continuity.ts';
+import { checkChapter, deterministicChecks } from '../../fanfable/src/product/continuity.ts';
 
 interface Planted {
   name: string;

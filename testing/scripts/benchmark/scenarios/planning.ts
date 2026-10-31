@@ -13,12 +13,12 @@
  *   consequence     does the plan carry the divergence forward, or does it
  *                   change one thing and then forget about it
  */
-import { Db } from '../../../../fanfable/src/db.ts';
+import { Db } from '../../../../fanfable/src/core/db.ts';
 import * as controller from '../../../../fanfable/src/plan/controller.ts';
 import * as graph from '../../../../fanfable/src/graph.ts';
 import * as lore from '../../../../fanfable/src/answer/lore.ts';
 import * as planner from '../../../../fanfable/src/plan/planner.ts';
-import { extractJson } from '../../../../fanfable/src/json.ts';
+import { extractJson } from '../../../../fanfable/src/core/json.ts';
 import type { RecordingClient } from '../harness.ts';
 
 export interface PlanningResult {

@@ -8,7 +8,7 @@
 import { existsSync, writeFileSync } from 'node:fs';
 import { relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 import { isMain, sha256File } from './harness.ts';
 import { extractionStageFor, ProgressStore } from './progress.ts';
 import {
@@ -148,8 +148,8 @@ export async function buildFreshCorpus(
         ['loreExtractor', resolve(here, '../../../fanfable/src/lorebook.ts')],
         ['loreStorage', resolve(here, '../../../fanfable/src/answer/lore.ts')],
         ['fileImporter', resolve(here, '../../../fanfable/src/importer.ts')],
-        ['llmClient', resolve(here, '../../../fanfable/src/llm.ts')],
-        ['databaseSchema', resolve(here, '../../../fanfable/src/schema.ts')],
+        ['llmClient', resolve(here, '../../../fanfable/src/core/llm.ts')],
+        ['databaseSchema', resolve(here, '../../../fanfable/src/core/schema.ts')],
         ['contextBuilder', resolve(here, '../../../fanfable/src/plan/controller.ts')],
         ['writerScenario', resolve(here, './scenarios/writing.ts')],
       ].map(([key, path]) => [key!, sha256File(path!)]),

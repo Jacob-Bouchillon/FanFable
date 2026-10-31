@@ -10,7 +10,7 @@
  * versus a right one.
  */
 import { readFileSync, writeFileSync } from 'node:fs';
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 import { canonicalName } from '../../../fanfable/src/identity/names.ts';
 
 const resultsPath = process.argv[2];

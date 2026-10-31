@@ -12,9 +12,9 @@
  * concept set (which the guard can only park, never bank).
  */
 import { writeFileSync } from 'node:fs';
-import { clientFrom } from '../../../fanfable/src/llm.ts';
+import { clientFrom } from '../../../fanfable/src/core/llm.ts';
 import { CLOSED_ROLE_KINDS, provenRelation, relationsSystemPrompt } from '../../../fanfable/src/lorebook.ts';
-import { extractJson } from '../../../fanfable/src/json.ts';
+import { extractJson } from '../../../fanfable/src/core/json.ts';
 
 const MODEL = process.argv[2] ?? 'qwen3.5:9b';
 const OUT = process.argv[3] ?? '/tmp/opencode/kind-labels-eval.json';

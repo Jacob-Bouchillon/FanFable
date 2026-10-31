@@ -1,6 +1,6 @@
 /** Quarantine the ten audited keepers. Data-only; evidence and endpoints untouched. */
 import { writeFileSync } from 'node:fs';
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 
 const IDS = [15, 24, 118, 247, 257, 299, 313, 321, 339, 372];
 const db = new Db('testing/trials/halfbook-run/plagueis-half.db');

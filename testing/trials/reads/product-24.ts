@@ -7,7 +7,7 @@
  * near trial-ordered (5 unique) means the product path is accurate.
  * Count-only output. Temp project only.
  */
-import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';
+import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/core/db.ts';
 import * as controller from '/home/jacob/Documents/FanFable/fanfable/src/plan/controller.ts';
 import * as lorebook from '/home/jacob/Documents/FanFable/fanfable/src/lorebook.ts';
 import { baselineClient } from '/home/jacob/Documents/FanFable/testing/scripts/benchmark/corpus.ts';

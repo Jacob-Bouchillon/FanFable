@@ -4,7 +4,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import * as gates from '../../fanfable/src/gates.ts';
+import * as gates from '../../fanfable/src/gates/gates.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 
 test('lorebook re-exports the gates surface identically (same function identity)', () => {

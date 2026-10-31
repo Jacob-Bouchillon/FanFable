@@ -9,9 +9,9 @@
  * claim is measured separately.
  */
 import { readFileSync, writeFileSync } from 'node:fs';
-import { Db } from '../../../fanfable/src/db.ts';
-import { clientFrom } from '../../../fanfable/src/llm.ts';
-import { extractJson } from '../../../fanfable/src/json.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
+import { clientFrom } from '../../../fanfable/src/core/llm.ts';
+import { extractJson } from '../../../fanfable/src/core/json.ts';
 import { canonicalName } from '../../../fanfable/src/identity/names.ts';
 
 const outPath = process.argv[2] ?? 'testing/trials/claim-confidence/blind-gold-cite.json';

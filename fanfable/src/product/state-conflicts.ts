@@ -10,7 +10,7 @@
  * issue is a problem inside the prose; a state conflict is a problem between
  * the prose and the story's own history.
  */
-import { Db, nowIso, strList } from './db.ts';
+import { Db, nowIso, strList } from '../core/db.ts';
 import type { StateExtraction } from './memory.ts';
 
 export type ConflictKind =

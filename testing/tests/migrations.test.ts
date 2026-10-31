@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Db } from '../../fanfable/src/db.ts';
-import { runMigrations, hasColumn, tableExists } from '../../fanfable/src/migrations.ts';
+import { Db } from '../../fanfable/src/core/db.ts';
+import { runMigrations, hasColumn, tableExists } from '../../fanfable/src/core/migrations.ts';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

@@ -1,6 +1,6 @@
 /** Dry run or apply deterministic evidence re-derivation. */
 import { readFileSync, writeFileSync } from 'node:fs';
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 import { applyPlan, loadChunks, loadRows, planRow } from './rederive-lib.ts';
 
 const APPLY = process.argv.includes('--apply');

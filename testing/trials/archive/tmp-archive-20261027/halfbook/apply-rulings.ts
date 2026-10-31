@@ -1,4 +1,4 @@
-import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';
+import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/core/db.ts';
 
 const DB = '/tmp/opencode/halfbook/plagueis-half.db';
 // note id -> ruled kind (user's word; default = Gemini closed kind)

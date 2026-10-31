@@ -4,8 +4,8 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { authHeadersFor, createClient, isLocalEndpoint, saveGlobalConfig } from '../../fanfable/src/llm.ts';
-import { maskSettingsForOutput } from '../../fanfable/src/server.ts';
+import { authHeadersFor, createClient, isLocalEndpoint, saveGlobalConfig } from '../../fanfable/src/core/llm.ts';
+import { maskSettingsForOutput } from '../../fanfable/src/product/server.ts';
 
 const KEY = 'sk-test-SECRET-key';
 const LOCAL = [

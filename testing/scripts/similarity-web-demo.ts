@@ -11,7 +11,7 @@
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Db } from '../../fanfable/src/db.ts';
+import { Db } from '../../fanfable/src/core/db.ts';
 import * as controller from '../../fanfable/src/plan/controller.ts';
 import * as lore from '../../fanfable/src/answer/lore.ts';
 import * as graph from '../../fanfable/src/graph.ts';

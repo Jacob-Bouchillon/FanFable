@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Db, nowIso } from '../../fanfable/src/db.ts';
-import { MockProvider } from '../../fanfable/src/llm.ts';
+import { Db, nowIso } from '../../fanfable/src/core/db.ts';
+import { MockProvider } from '../../fanfable/src/core/llm.ts';
 import {
   GEMMA_EXTRACTOR_MODEL,
   buildGemmaExtractionArm,

@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Server } from 'node:http';
-import { startServer } from '../../fanfable/src/server.ts';
+import { startServer } from '../../fanfable/src/product/server.ts';
 import * as controller from '../../fanfable/src/plan/controller.ts';
 import { seedProject, tempDb } from './helpers.ts';
 

@@ -32,9 +32,9 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFi
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { Db, strList } from '../../../fanfable/src/db.ts';
+import { Db, strList } from '../../../fanfable/src/core/db.ts';
 import { buildRosterIndex, canonicalName, deriveNameVariants } from '../../../fanfable/src/identity/names.ts';
-import { splitSentences } from '../../../fanfable/src/text.ts';
+import { splitSentences } from '../../../fanfable/src/core/text.ts';
 import { csvCell, parseCsv } from './allocate-followup.ts';
 import { JUDGE_BLOCK, findLeakage } from './sample-followup.ts';
 

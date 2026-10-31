@@ -13,7 +13,7 @@
  *     recover, and it is invisible to the current candidate generator.
  */
 import { writeFileSync } from 'node:fs';
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 import {
   CLOSED_ROLE_KINDS,
   KIND_GLOSSES,

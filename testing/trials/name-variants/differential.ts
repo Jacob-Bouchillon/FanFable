@@ -9,7 +9,7 @@
  * and once without. The delta is what the index alone admits. Nothing is
  * written to the database and no model is called.
  */
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 import {
   CLOSED_ROLE_KINDS,
   KIND_GLOSSES,

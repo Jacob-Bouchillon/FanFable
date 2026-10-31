@@ -4,7 +4,7 @@
  * Usage:
  *   node --no-warnings testing/trials/chain/watch-log.ts <run-prefix> [limit]
  */
-import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';
+import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/core/db.ts';
 
 const [prefix, limitRaw] = process.argv.slice(2);
 if (!prefix) throw new Error('usage: watch-log.ts <run-prefix> [limit]');

@@ -1,4 +1,4 @@
-import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';
+import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/core/db.ts';
 import { baselineClient } from '/home/jacob/Documents/FanFable/testing/scripts/benchmark/corpus.ts';
 const db = new Db('/home/jacob/Documents/FanFable/testing/benchmarks/data/bench.db');
 const srcId = db.get<{ id: number }>("SELECT id FROM project WHERE name='bench-hp'")!.id;

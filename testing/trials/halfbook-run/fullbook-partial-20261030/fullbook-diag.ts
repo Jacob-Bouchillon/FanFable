@@ -3,7 +3,7 @@
  * Usage: node --no-warnings /tmp/opencode/fullbook-diag.ts <db> [project]
  * No model calls. Never prints names, quotes, or passages — counts only.
  */
-import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';
+import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/core/db.ts';
 
 const dbPath = process.argv[2];
 const projectName = process.argv[3] ?? 'fullbook';

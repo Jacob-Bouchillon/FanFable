@@ -1,4 +1,4 @@
-import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';
+import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/core/db.ts';
 import { baselineClient } from '/home/jacob/Documents/FanFable/testing/scripts/benchmark/corpus.ts';
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 const db = new Db('/home/jacob/Documents/FanFable/testing/benchmarks/data/bench.db');

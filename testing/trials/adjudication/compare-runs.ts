@@ -11,7 +11,7 @@
  * Direction is reported separately rather than folded into the key, because a
  * reversed claim is a disagreement, not a miss.
  */
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 import { readFileSync } from 'node:fs';
 import { foldPeople } from './person-fold.ts';
 

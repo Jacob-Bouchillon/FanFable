@@ -4,8 +4,8 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resolveEmbedConfig } from '../../fanfable/src/embeddings.ts';
-import type { Db } from '../../fanfable/src/db.ts';
-import { saveGlobalConfig } from '../../fanfable/src/llm.ts';
+import type { Db } from '../../fanfable/src/core/db.ts';
+import { saveGlobalConfig } from '../../fanfable/src/core/llm.ts';
 
 /** resolveEmbedConfig only reads one settings blob. */
 function fakeDb(settings: Record<string, unknown>): Db {

@@ -14,7 +14,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 import { NAME_DF_CAP, nameRelation } from '../../../fanfable/src/identity/names.ts';
 import {
   NAME_GROUP_CAP,

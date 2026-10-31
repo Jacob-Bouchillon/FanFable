@@ -15,10 +15,10 @@
  *   canon/au         did it keep the divergence, or drift back to the canon
  *   invention        did it make up names
  */
-import { Db } from '../../../../fanfable/src/db.ts';
+import { Db } from '../../../../fanfable/src/core/db.ts';
 import * as controller from '../../../../fanfable/src/plan/controller.ts';
 import * as planner from '../../../../fanfable/src/plan/planner.ts';
-import type { LlmClient } from '../../../../fanfable/src/llm.ts';
+import type { LlmClient } from '../../../../fanfable/src/core/llm.ts';
 import type { RecordingClient } from '../harness.ts';
 import { copiedRate, inventedNameRate, proseStats, repetitionRate, words } from '../measure.ts';
 

@@ -22,9 +22,9 @@
 import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 import { buildRosterIndex, canonicalName, deriveNameVariants } from '../../../fanfable/src/identity/names.ts';
-import { splitSentences } from '../../../fanfable/src/text.ts';
+import { splitSentences } from '../../../fanfable/src/core/text.ts';
 import { csvCell, parseCsv } from './allocate-followup.ts';
 
 const PACKET_CAP = 6;

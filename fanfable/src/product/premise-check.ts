@@ -7,8 +7,8 @@
  * premise that names someone who does not exist in the source is usually a
  * mistake rather than a choice.
  */
-import { Db } from './db.ts';
-import * as lorebook from './lorebook.ts';
+import { Db } from '../core/db.ts';
+import * as lorebook from '../lorebook.ts';
 
 export interface PremiseWarning {
   severity: 'error' | 'warning' | 'note';

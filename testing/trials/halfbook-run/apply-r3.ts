@@ -1,4 +1,4 @@
-import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';
+import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/core/db.ts';
 
 // Round-3 apply (user-approved: "i guess sure" -> approved-as-listed).
 // BANK list = relation ids + note ids. Direction/kind corrections where the

@@ -4,7 +4,7 @@
  * Self-contained inline-SVG page plus the same trails as a text list. No
  * network, no dependencies; used by the CLI and tests.
  */
-import type { PassageTrail } from './graph.ts';
+import type { PassageTrail } from '../graph.ts';
 
 export function escapeHtml(text: string): string {
   return (text ?? '')

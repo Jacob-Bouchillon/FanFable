@@ -8,7 +8,7 @@
  * The sheet carries no run label, no model kind, no direction and no statement
  * of which mechanism admitted the row.
  */
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 import { readFileSync, writeFileSync } from 'node:fs';
 
 const dbPath = process.argv[2];

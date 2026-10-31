@@ -11,12 +11,12 @@
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Db } from '../../fanfable/src/db.ts';
+import { Db } from '../../fanfable/src/core/db.ts';
 import * as controller from '../../fanfable/src/plan/controller.ts';
 import * as lore from '../../fanfable/src/answer/lore.ts';
 import * as graph from '../../fanfable/src/graph.ts';
 import * as embeddings from '../../fanfable/src/embeddings.ts';
-import { MockProvider } from '../../fanfable/src/llm.ts';
+import { MockProvider } from '../../fanfable/src/core/llm.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';
 const MODEL = 'demo-fake';

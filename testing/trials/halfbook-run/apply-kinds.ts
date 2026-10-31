@@ -1,4 +1,4 @@
-import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';
+import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/core/db.ts';
 import { readFileSync } from 'node:fs';
 
 // Set each ruled keeper's kind to the ruled closed kind (round-1 notes +

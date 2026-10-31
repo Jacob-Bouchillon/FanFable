@@ -5,9 +5,9 @@
  */
 import { execFileSync } from 'node:child_process';
 import { basename } from 'node:path';
-import { Db, fromJson, strList } from './db.ts';
-import * as controller from './plan/controller.ts';
-import * as loreDiag from './answer/lore-diagnostics.ts';
+import { Db, fromJson, strList } from '../core/db.ts';
+import * as controller from '../plan/controller.ts';
+import * as loreDiag from '../answer/lore-diagnostics.ts';
 
 /** A short commit stamp for the dev page's provenance footer. */
 const DEV_COMMIT = (() => {

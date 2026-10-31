@@ -8,7 +8,7 @@
  *
  * usage: node human-sheet.ts <db...>
  */
-import { Db } from '../../../fanfable/src/db.ts';
+import { Db } from '../../../fanfable/src/core/db.ts';
 import { writeFileSync } from 'node:fs';
 
 const dbs = process.argv.slice(2);

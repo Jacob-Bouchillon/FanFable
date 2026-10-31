@@ -10,8 +10,8 @@
  * intentional change from canon as a mistake — the divergence is the point of
  * the story.
  */
-import { Db } from './db.ts';
-import type { ContinuityIssue } from './continuity.ts';
+import { Db } from './core/db.ts';
+import type { ContinuityIssue } from './product/continuity.ts';
 import { terms } from './graph.ts';
 
 export interface GraphCheckInput {

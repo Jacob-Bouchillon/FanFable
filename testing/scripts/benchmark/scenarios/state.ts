@@ -10,8 +10,8 @@
  * chapter establishes is written by hand, and the extraction is scored
  * against it.
  */
-import { Db } from '../../../../fanfable/src/db.ts';
-import * as memory from '../../../../fanfable/src/memory.ts';
+import { Db } from '../../../../fanfable/src/core/db.ts';
+import * as memory from '../../../../fanfable/src/product/memory.ts';
 import type { RecordingClient } from '../harness.ts';
 
 /** What the chapter establishes, written by hand. */

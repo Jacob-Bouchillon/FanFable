@@ -9,7 +9,7 @@
  * usage: node --experimental-strip-types testing/trials/evidence/evidence-select.ts
  */
 import { DatabaseSync } from 'node:sqlite';
-import type { Db } from '../../../fanfable/src/db.ts';
+import type { Db } from '../../../fanfable/src/core/db.ts';
 import {
   selectEvidence,
   type ClaimRequirement,

@@ -10,10 +10,10 @@
  * matched to a planted item by category and by word overlap. A finding that
  * matches nothing planted is a false positive, and is counted as one.
  */
-import { Db } from '../../../../fanfable/src/db.ts';
-import * as continuity from '../../../../fanfable/src/continuity.ts';
+import { Db } from '../../../../fanfable/src/core/db.ts';
+import * as continuity from '../../../../fanfable/src/product/continuity.ts';
 import * as graph from '../../../../fanfable/src/graph.ts';
-import * as memory from '../../../../fanfable/src/memory.ts';
+import * as memory from '../../../../fanfable/src/product/memory.ts';
 import type { RecordingClient } from '../harness.ts';
 
 export interface Planted {
