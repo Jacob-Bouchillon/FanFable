@@ -30,10 +30,11 @@ const TRACK = 'testing/trials/booknlp';
 const DB_PATH = 'testing/trials/halfbook-run/plagueis-half.db';
 const PROJECT = 'halfbook';
 const VENV_PY = `${TRACK}/.venv/bin/python`;
-const CHAPTER_TXT = `${TRACK}/chapter.txt`;
-const SELECT_JSON = `${TRACK}/select.json`;
-const OUT_DIR = `${TRACK}/out`;
-const BOOK_ID = 'chapter';
+// Dense-chapter overrides (env): same venv, same driver/params/cap, new inputs.
+const CHAPTER_TXT = process.env.BOOKNLP_CHAPTER ?? `${TRACK}/chapter.txt`;
+const SELECT_JSON = process.env.BOOKNLP_SELECT ?? `${TRACK}/select.json`;
+const OUT_DIR = process.env.BOOKNLP_OUT ?? `${TRACK}/out`;
+const BOOK_ID = process.env.BOOKNLP_ID ?? 'chapter';
 const BLOCK = 25; // chunks per proxy block; every full block clears the >= 20 floor
 const RUN_CAP_SECS = 3600;
 

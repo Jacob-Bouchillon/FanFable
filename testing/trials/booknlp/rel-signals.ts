@@ -26,12 +26,15 @@ import type { Db } from '../../../fanfable/src/core/db.ts';
 import { loadIdentityContext, createResolver } from '../../../fanfable/src/identity/identity.ts';
 
 const TRACK = 'testing/trials/booknlp';
-const OUT_DIR = `${TRACK}/out`;
-const REL_DIR = `${TRACK}/out-rel`;
-const BOOK_ID = 'chapter';
+// Dense-fight overrides (env): same scoring code, new inputs.
+const OUT_DIR = process.env.BOOKNLP_OUT ?? `${TRACK}/out`;
+const REL_DIR = process.env.BOOKNLP_REL ?? `${TRACK}/out-rel`;
+const BOOK_ID = process.env.BOOKNLP_ID ?? 'chapter';
 const DB_PATH = 'testing/trials/halfbook-run/plagueis-half.db';
 const PROJECT = 'halfbook';
-const SELECT_JSON = `${TRACK}/select.json`;
+const SELECT_JSON = process.env.BOOKNLP_SELECT ?? `${TRACK}/select.json`;
+const RESCORE_MANIFEST = process.env.BOOKNLP_MANIFEST ?? 'manifest2.json';
+const RESCORE_FULL = process.env.BOOKNLP_FULL === '1';
 
 function fail(message: string): never {
   throw new Error(`rel-signals: ${message}`);
@@ -95,6 +98,148 @@ function mentionedPersons(text: string, forms: { id: number; forms: string[] }[]
 
 const pairKey = (a: number, b: number): string => `${Math.min(a, b)}:${Math.max(a, b)}`;
 
+interface BookChar {
+  id: number;
+  mentions?: { proper?: { c: number; n: string }[] };
+  agent?: { w: string; i: number }[];
+  patient?: { w: string; i: number }[];
+}
+
+/**
+ * Chain -> banked persons under one rule. Strict (unanimous): every proper
+ * name resolves cleanly to one person, else the chain feeds nothing. Loose
+ * (feeder grade): every resolved person counts. Shared by the voided run and
+ * every rescore so the mapping — never the scoring — is what differs.
+ */
+function buildPersonMaps(
+  chars: BookChar[],
+  resolver: ReturnType<typeof createResolver>,
+  characters: { id: number }[],
+): {
+  strict: Map<number, number[]>;
+  loose: Map<number, number[]>;
+  droppedUnmapped: number;
+  droppedAmbiguous: number;
+  cleanChains: number;
+  voidChains: number;
+} {
+  const strict = new Map<number, number[]>();
+  const loose = new Map<number, number[]>();
+  let droppedUnmapped = 0;
+  let droppedAmbiguous = 0;
+  let cleanChains = 0;
+  let voidChains = 0;
+  for (const c of chars) {
+    const persons = new Set<number>();
+    let bad = false;
+    for (const m of c.mentions?.proper ?? []) {
+      const r = resolver.resolve(String(m.n));
+      if (r.status === 'resolved' && r.id !== null && characters.some((e) => e.id === r.id)) {
+        persons.add(r.id);
+      } else {
+        bad = true;
+        if (r.status === 'ambiguous') droppedAmbiguous++;
+        else droppedUnmapped++;
+      }
+    }
+    const id = Number(c.id);
+    if (!bad && persons.size === 1) {
+      cleanChains++;
+      strict.set(id, [...persons]);
+    } else {
+      voidChains++;
+      strict.set(id, []);
+    }
+    loose.set(id, [...persons]);
+  }
+  return { strict, loose, droppedUnmapped, droppedAmbiguous, cleanChains, voidChains };
+}
+
+/** Set 1: agent→patient pairs sharing one verb token. */
+function buildActionPairs(chars: BookChar[], personsOf: Map<number, number[]>): { pairs: Set<string>; sharedVerbs: number } {
+  const agents = new Map<number, Set<number>>();
+  const patients = new Map<number, Set<number>>();
+  for (const c of chars) {
+    for (const person of personsOf.get(Number(c.id)) ?? []) {
+      for (const a of c.agent ?? []) {
+        const set = agents.get(a.i) ?? new Set<number>();
+        set.add(person);
+        agents.set(a.i, set);
+      }
+      for (const p of c.patient ?? []) {
+        const set = patients.get(p.i) ?? new Set<number>();
+        set.add(person);
+        patients.set(p.i, set);
+      }
+    }
+  }
+  const pairs = new Set<string>();
+  let sharedVerbs = 0;
+  for (const [verb, aSet] of agents) {
+    const pSet = patients.get(verb) ?? new Set<number>();
+    for (const a of aSet) {
+      for (const p of pSet) {
+        if (a !== p) {
+          sharedVerbs++;
+          pairs.add(pairKey(a, p));
+        }
+      }
+    }
+  }
+  return { pairs, sharedVerbs };
+}
+
+/** Set 2: quote-exchange pairs (speaker → roster person named in the quote). */
+function buildExchangePairs(
+  quoteRows: string[][],
+  personsOf: Map<number, number[]>,
+  forms: { id: number; forms: string[] }[],
+): Set<string> {
+  const pairs = new Set<string>();
+  for (const r of quoteRows) {
+    for (const speaker of personsOf.get(Number(r[5])) ?? []) {
+      const quote = String(r[6] ?? '');
+      for (const mentioned of mentionedPersons(quote, forms)) {
+        if (mentioned !== speaker) pairs.add(pairKey(speaker, mentioned));
+      }
+    }
+  }
+  return pairs;
+}
+
+/** Set 3: coref co-mention pairs (chains sharing one passage, any mention). */
+function buildCorefPairs(
+  entRows: string[][],
+  personsOf: Map<number, number[]>,
+  keyOfDoc: Map<number, string>,
+): Set<string> {
+  const pairs = new Set<string>();
+  const sentPersons = new Map<string, Set<number>>();
+  for (const r of entRows) {
+    for (const person of personsOf.get(Number(r[0])) ?? []) {
+      const start = Number(r[1]);
+      const end = Number(r[2]);
+      const keys = new Set<string>();
+      for (let doc = start; doc <= end; doc++) {
+        const key = keyOfDoc.get(doc);
+        if (key !== undefined) keys.add(key);
+      }
+      for (const key of keys) {
+        const set = sentPersons.get(key) ?? new Set<number>();
+        set.add(person);
+        sentPersons.set(key, set);
+      }
+    }
+  }
+  for (const persons of sentPersons.values()) {
+    const ids = [...persons].sort((a, b) => a - b);
+    for (let i = 0; i < ids.length; i++) {
+      for (let j = i + 1; j < ids.length; j++) pairs.add(pairKey(ids[i]!, ids[j]!));
+    }
+  }
+  return pairs;
+}
+
 export function run(): Record<string, unknown> {
   const before = dbStat();
   const ro = new DatabaseSync(resolve(DB_PATH), { readOnly: true });
@@ -128,31 +273,9 @@ export function run(): Record<string, unknown> {
       }[];
     };
     const chars = book.characters ?? [];
-    // Chain -> single banked person, or null when unmapped/ambiguous/merged.
-    const personOf = new Map<number, number | null>();
-    let droppedUnmapped = 0;
-    let droppedAmbiguous = 0;
-    for (const c of chars) {
-      const persons = new Set<number>();
-      let bad = false;
-      for (const m of c.mentions?.proper ?? []) {
-        const r = resolver.resolve(String(m.n));
-        if (r.status === 'resolved' && r.id !== null && characters.some((e) => e.id === r.id)) {
-          persons.add(r.id);
-        } else {
-          bad = true;
-          if (r.status === 'ambiguous') droppedAmbiguous++;
-          else droppedUnmapped++;
-        }
-      }
-      personOf.set(Number(c.id), !bad && persons.size === 1 ? [...persons][0]! : null);
-    }
-    const topName = new Map<number, string>();
-    for (const c of chars) {
-      const proper = [...(c.mentions?.proper ?? [])].sort((a, b) => b.c - a.c);
-      topName.set(Number(c.id), proper.length ? String(proper[0]!.n) : '');
-    }
-    void topName;
+    const maps = buildPersonMaps(chars, resolver, characters);
+    const { droppedUnmapped, droppedAmbiguous } = maps;
+    const strict = maps.strict;
 
     // Token -> sentence text (+ key for grouping chains per passage).
     const tokRows = bodyRows(`${OUT_DIR}/${BOOK_ID}.tokens`);
@@ -175,78 +298,11 @@ export function run(): Record<string, unknown> {
       }
     }
 
-    // Set 1: agent→patient pairs sharing one verb token.
-    const set1 = new Set<string>();
-    {
-      const agents = new Map<number, Set<number>>();
-      const patients = new Map<number, Set<number>>();
-      for (const c of chars) {
-        const person = personOf.get(Number(c.id));
-        if (person === null || person === undefined) continue;
-        for (const a of c.agent ?? []) {
-          const set = agents.get(a.i) ?? new Set<number>();
-          set.add(person);
-          agents.set(a.i, set);
-        }
-        for (const p of c.patient ?? []) {
-          const set = patients.get(p.i) ?? new Set<number>();
-          set.add(person);
-          patients.set(p.i, set);
-        }
-      }
-      for (const [verb, aSet] of agents) {
-        const pSet = patients.get(verb) ?? new Set<number>();
-        for (const a of aSet) {
-          for (const p of pSet) {
-            if (a !== p) set1.add(pairKey(a, p));
-          }
-        }
-      }
-    }
-
-    // Set 2: quote-exchange pairs (speaker → roster person named in the quote).
-    const set2 = new Set<string>();
-    {
-      const quoteRows = bodyRows(`${OUT_DIR}/${BOOK_ID}.quotes`);
-      for (const r of quoteRows) {
-        const speaker = personOf.get(Number(r[5]));
-        if (speaker === null || speaker === undefined) continue;
-        const quote = String(r[6] ?? '');
-        for (const mentioned of mentionedPersons(quote, forms)) {
-          if (mentioned !== speaker) set2.add(pairKey(speaker, mentioned));
-        }
-      }
-    }
-
-    // Set 3: coref co-mention pairs (chains sharing one passage, any mention
-    // kind — proper, common, or pronoun; the weakest signal, recorded as is).
-    const set3 = new Set<string>();
-    {
-      const entRows = bodyRows(`${OUT_DIR}/${BOOK_ID}.entities`);
-      const sentPersons = new Map<string, Set<number>>();
-      for (const r of entRows) {
-        const person = personOf.get(Number(r[0]));
-        if (person === null || person === undefined) continue;
-        const start = Number(r[1]);
-        const end = Number(r[2]);
-        const keys = new Set<string>();
-        for (let doc = start; doc <= end; doc++) {
-          const key = keyOfDoc.get(doc);
-          if (key !== undefined) keys.add(key);
-        }
-        for (const key of keys) {
-          const set = sentPersons.get(key) ?? new Set<number>();
-          set.add(person);
-          sentPersons.set(key, set);
-        }
-      }
-      for (const persons of sentPersons.values()) {
-        const ids = [...persons].sort((a, b) => a - b);
-        for (let i = 0; i < ids.length; i++) {
-          for (let j = i + 1; j < ids.length; j++) set3.add(pairKey(ids[i]!, ids[j]!));
-        }
-      }
-    }
+    // The three sets share builders with every rescore; only the person map
+    // differs between identity rules.
+    const set1 = buildActionPairs(chars, strict).pairs;
+    const set2 = buildExchangePairs(bodyRows(`${OUT_DIR}/${BOOK_ID}.quotes`), strict, forms);
+    const set3 = buildCorefPairs(bodyRows(`${OUT_DIR}/${BOOK_ID}.entities`), strict, keyOfDoc);
 
     // Bank side, same chapter range, read-only.
     const chunkSeq = new Map<number, number>();
@@ -542,6 +598,41 @@ export function rescoreActions(): Record<string, unknown> {
     const strictLocked = locked(strict.pairs);
     const looseLocked = locked(loose.pairs);
 
+    // Full three-signal columns (dense fight): the voided run's builders,
+    // both identity rules. Null on the plain rescore path.
+    let fullCols: Record<string, unknown> | null = null;
+    if (RESCORE_FULL) {
+      const quoteRows = bodyRows(`${OUT_DIR}/${BOOK_ID}.quotes`);
+      const entRows = bodyRows(`${OUT_DIR}/${BOOK_ID}.entities`);
+      const keyOfDoc = new Map<number, string>();
+      for (const r of bodyRows(`${OUT_DIR}/${BOOK_ID}.tokens`)) {
+        const doc = Number(r[3]);
+        if (Number.isFinite(doc)) keyOfDoc.set(doc, `${r[0]}\t${r[1]}`);
+      }
+      const forms = characters.map((e) => {
+        const aliases = Array.isArray(e.aliases) ? e.aliases.map(String) : [];
+        return { id: e.id, forms: [e.name, ...aliases].map(normName).filter(Boolean) };
+      });
+      const modeCols = (personsOf: Map<number, number[]>) => {
+        const action = buildActionPairs(chars, personsOf).pairs;
+        const exchange = buildExchangePairs(quoteRows, personsOf, forms);
+        const coref = buildCorefPairs(entRows, personsOf, keyOfDoc);
+        const combined = new Set([...action, ...exchange, ...coref]);
+        const col = (pairs: Set<string>) => {
+          const s = scorePairs(pairs);
+          const lock = locked(pairs);
+          return {
+            ...s,
+            recallTotal: bankedInRange.size,
+            lockedResolved: lock.resolved,
+            lockedHits: lock.byBlock,
+          };
+        };
+        return { action: col(action), exchange: col(exchange), coref: col(coref), combined: col(combined) };
+      };
+      fullCols = { unanimous: modeCols(strictPersons), loose: modeCols(loosePersons) };
+    }
+
     const manifest = {
       correction:
         'the voided 0 was identity strictness, not a schema mismatch: this harness always read agent[]/patient[] and the file holds no other keys',
@@ -564,12 +655,13 @@ export function rescoreActions(): Record<string, unknown> {
       },
       bankedPairsInRange: bankedInRange.size,
       bankedPairsTotal: bankedAll.size,
+      ...(fullCols ? { modes: fullCols } : {}),
       reviewStatus: 'Nothing banks — candidates for review, verbatim',
       dbUntouched: dbStat(),
       dbBefore: before,
     };
     mkdirSync(REL_DIR, { recursive: true });
-    writeFileSync(`${REL_DIR}/manifest2.json`, JSON.stringify(manifest, null, 1));
+    writeFileSync(`${REL_DIR}/${RESCORE_MANIFEST}`, JSON.stringify(manifest, null, 1));
     const after = dbStat();
     if (!sameStats(after, before)) fail('bank changed during rescore (content moved)');
     console.log(
@@ -583,7 +675,15 @@ export function rescoreActions(): Record<string, unknown> {
         `locked ${JSON.stringify(looseLocked.byBlock)}`,
     );
     console.log(`gap: void ${voidChains} of ${chars.length} chains`);
-    console.log(`bank untouched (main ${before.main}); manifest ${REL_DIR}/manifest2.json`);
+    if (fullCols) {
+      for (const [mode, cols] of Object.entries(fullCols) as [string, Record<string, { n: number; hits: number; precision: number; recallHit: number }>][]) {
+        console.log(
+          `${mode}: action ${cols.action!.n}/${cols.action!.hits} exchange ${cols.exchange!.n}/${cols.exchange!.hits} ` +
+            `coref ${cols.coref!.n}/${cols.coref!.hits} combined ${cols.combined!.n}/${cols.combined!.hits}`,
+        );
+      }
+    }
+    console.log(`bank untouched (main ${before.main}); manifest ${REL_DIR}/${RESCORE_MANIFEST}`);
     console.log('Nothing banks — candidates for review, verbatim');
     return manifest;
   } finally {
