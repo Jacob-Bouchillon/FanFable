@@ -8,7 +8,7 @@ import { createProject } from '../../fanfable/src/controller.ts';
 import { buildWebBrief, renderWebBrief } from '../../fanfable/src/brief.ts';
 import * as planner from '../../fanfable/src/planner.ts';
 import * as controller from '../../fanfable/src/controller.ts';
-import { syncThreads } from '../../fanfable/src/threads.ts';
+import { syncThreads } from '../../fanfable/src/web/threads.ts';
 import { mockProvider, tempDb } from './helpers.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';

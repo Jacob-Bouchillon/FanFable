@@ -13,8 +13,8 @@
  * contiguous token-sequence match, and nested names (one entity's canonical
  * tokens inside the other's) are refused as one person the bank split.
  */
-import { Db, nowIso, strList, toJson } from './db.ts';
-import { buildRosterIndex, canonicalName, deriveNameVariants } from './names.ts';
+import { Db, nowIso, strList, toJson } from '../db.ts';
+import { buildRosterIndex, canonicalName, deriveNameVariants } from '../names.ts';
 
 export interface PairThreadBuild {
   /** Non-quarantined characters considered. */

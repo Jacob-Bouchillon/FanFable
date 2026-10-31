@@ -5,11 +5,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createProject } from '../../fanfable/src/controller.ts';
-import { buildPairThreads } from '../../fanfable/src/pair-threads.ts';
+import { buildPairThreads } from '../../fanfable/src/web/pair-threads.ts';
 import { runMigrations, tableExists } from '../../fanfable/src/migrations.ts';
-import { syncThreads } from '../../fanfable/src/threads.ts';
-import { runMeetings, combineSupport } from '../../fanfable/src/meetings.ts';
-import * as ingest from '../../fanfable/src/note-ingest.ts';
+import { syncThreads } from '../../fanfable/src/web/threads.ts';
+import { runMeetings, combineSupport } from '../../fanfable/src/web/meetings.ts';
+import * as ingest from '../../fanfable/src/web/note-ingest.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 import { mockProvider, tempDb } from './helpers.ts';
 

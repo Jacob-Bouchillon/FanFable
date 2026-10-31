@@ -20,9 +20,9 @@
  * Everything in this module is code-only: no model call, and nothing is
  * written to `canon_relation`, `canon_tie_note` or `canon_tie_hint`.
  */
-import { Db, nowIso } from './db.ts';
-import { projectMinConfidence } from './lorebook.ts';
-import { meetingSubject, recordRuling } from './ruling.ts';
+import { Db, nowIso } from '../db.ts';
+import { projectMinConfidence } from '../lorebook.ts';
+import { meetingSubject, recordRuling } from '../ruling.ts';
 import { existsSync, readdirSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, sep } from 'node:path';

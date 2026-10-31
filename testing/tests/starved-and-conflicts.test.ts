@@ -5,9 +5,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createProject } from '../../fanfable/src/controller.ts';
-import { buildPairThreads } from '../../fanfable/src/pair-threads.ts';
-import { syncThreads } from '../../fanfable/src/threads.ts';
-import * as threadWeb from '../../fanfable/src/threads.ts';
+import { buildPairThreads } from '../../fanfable/src/web/pair-threads.ts';
+import { syncThreads } from '../../fanfable/src/web/threads.ts';
+import * as threadWeb from '../../fanfable/src/web/threads.ts';
 import { runMigrations } from '../../fanfable/src/migrations.ts';
 import {
   kindsOppose,
@@ -15,7 +15,7 @@ import {
   dismissConflict,
   starvedThreads,
   starvedWindowScores,
-} from '../../fanfable/src/note-ingest.ts';
+} from '../../fanfable/src/web/note-ingest.ts';
 import { selectWindows, starvedCandidateIndices } from '../../fanfable/src/lorebook.ts';
 import { tempDb } from './helpers.ts';
 

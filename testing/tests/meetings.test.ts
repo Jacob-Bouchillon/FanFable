@@ -5,10 +5,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createProject } from '../../fanfable/src/controller.ts';
-import { buildPairThreads } from '../../fanfable/src/pair-threads.ts';
+import { buildPairThreads } from '../../fanfable/src/web/pair-threads.ts';
 import { runMigrations, tableExists } from '../../fanfable/src/migrations.ts';
-import * as threadWeb from '../../fanfable/src/threads.ts';
-import * as meetingWeb from '../../fanfable/src/meetings.ts';
+import * as threadWeb from '../../fanfable/src/web/threads.ts';
+import * as meetingWeb from '../../fanfable/src/web/meetings.ts';
 import { tempDb } from './helpers.ts';
 import { Db as SqliteDb } from '../../fanfable/src/db.ts';
 import { resolve } from 'node:path';

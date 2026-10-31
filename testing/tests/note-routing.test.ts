@@ -5,9 +5,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createProject } from '../../fanfable/src/controller.ts';
-import { buildPairThreads } from '../../fanfable/src/pair-threads.ts';
-import { syncThreads } from '../../fanfable/src/threads.ts';
-import * as ingest from '../../fanfable/src/note-ingest.ts';
+import { buildPairThreads } from '../../fanfable/src/web/pair-threads.ts';
+import { syncThreads } from '../../fanfable/src/web/threads.ts';
+import * as ingest from '../../fanfable/src/web/note-ingest.ts';
 import { tempDb } from './helpers.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';

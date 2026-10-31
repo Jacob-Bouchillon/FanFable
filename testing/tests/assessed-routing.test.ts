@@ -7,11 +7,11 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { createProject } from '../../fanfable/src/controller.ts';
-import { buildPairThreads } from '../../fanfable/src/pair-threads.ts';
-import { syncThreads } from '../../fanfable/src/threads.ts';
-import * as threadWeb from '../../fanfable/src/threads.ts';
-import * as meetingWeb from '../../fanfable/src/meetings.ts';
-import { deriveStrength } from '../../fanfable/src/note-ingest.ts';
+import { buildPairThreads } from '../../fanfable/src/web/pair-threads.ts';
+import { syncThreads } from '../../fanfable/src/web/threads.ts';
+import * as threadWeb from '../../fanfable/src/web/threads.ts';
+import * as meetingWeb from '../../fanfable/src/web/meetings.ts';
+import { deriveStrength } from '../../fanfable/src/web/note-ingest.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 import { tempDb } from './helpers.ts';
 

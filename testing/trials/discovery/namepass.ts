@@ -16,14 +16,14 @@
  *   node --no-warnings testing/trials/discovery/namepass.ts [dbPath] [limit]
  */
 import { Db } from '../../../fanfable/src/db.ts';
-import { syncThreads } from '../../../fanfable/src/threads.ts';
-import { runMeetings } from '../../../fanfable/src/meetings.ts';
+import { syncThreads } from '../../../fanfable/src/web/threads.ts';
+import { runMeetings } from '../../../fanfable/src/web/meetings.ts';
 import { recordRuling } from '../../../fanfable/src/ruling.ts';
 import {
   assertableClaim,
   isVerbatimInChunk,
   noteDedupeKey,
-} from '../../../fanfable/src/note-ingest.ts';
+} from '../../../fanfable/src/web/note-ingest.ts';
 import { explicitVariants } from '../../../fanfable/src/gates.ts';
 import { extractJson } from '../../../fanfable/src/json.ts';
 
