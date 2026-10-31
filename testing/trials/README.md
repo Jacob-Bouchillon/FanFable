@@ -42,6 +42,7 @@ node --experimental-strip-types testing/trials/chain/watch-log.ts book-coord
 | `booknlp2b/` | booknlp2 block-41 fight outputs (local source); own venv, local only (gitignored) |
 | `combine/` | combination-tally measurement (`measure.ts`) + chain/action feeder (`feed.ts`) + factory slate (`slate.ts`, `label-assess.ts`); disposable copies, manifests local (gitignored) |
 | `fp-audit/` | false-positive audit harness (`audit.ts`: mechanical + blind judge + scorecard); outputs local (gitignored) |
+| `fp-audit2/` | second FP audit on newer proof rows (coverage impact included); outputs local (gitignored) |
 
 ## archive/ — finished or superseded runs, local data included
 
