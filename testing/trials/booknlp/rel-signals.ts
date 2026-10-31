@@ -59,7 +59,7 @@ function sameStats(a: ReturnType<typeof dbStat>, b: ReturnType<typeof dbStat>): 
   return a.main === b.main;
 }
 
-function detok(words: string[]): string {
+export function detok(words: string[]): string {
   return words
     .join(' ')
     .replace(/\s+([.,!?;:…%‰'’"”)\]}»])/g, '$1')
@@ -67,14 +67,14 @@ function detok(words: string[]): string {
     .trim();
 }
 
-function bodyRows(path: string): string[][] {
+export function bodyRows(path: string): string[][] {
   const lines = readFileSync(path, 'utf8').split('\n').filter((line) => line.length > 0);
   const rows = lines.map((line) => line.split('\t'));
   if (rows.length && !/^-?\d+$/.test((rows[0]![0] ?? '').trim())) rows.shift();
   return rows;
 }
 
-const normName = (s: string): string =>
+export const normName = (s: string): string =>
   String(s ?? '')
     .toLowerCase()
     .replace(/[^a-z0-9 ]+/g, ' ')
@@ -82,7 +82,7 @@ const normName = (s: string): string =>
     .trim();
 
 /** Roster person named in text: token-boundary match on full name or alias. */
-function mentionedPersons(text: string, forms: { id: number; forms: string[] }[]): Set<number> {
+export function mentionedPersons(text: string, forms: { id: number; forms: string[] }[]): Set<number> {
   const padded = ` ${normName(text)} `;
   const found = new Set<number>();
   for (const entry of forms) {
@@ -96,9 +96,9 @@ function mentionedPersons(text: string, forms: { id: number; forms: string[] }[]
   return found;
 }
 
-const pairKey = (a: number, b: number): string => `${Math.min(a, b)}:${Math.max(a, b)}`;
+export const pairKey = (a: number, b: number): string => `${Math.min(a, b)}:${Math.max(a, b)}`;
 
-interface BookChar {
+export interface BookChar {
   id: number;
   mentions?: { proper?: { c: number; n: string }[] };
   agent?: { w: string; i: number }[];
@@ -111,7 +111,7 @@ interface BookChar {
  * (feeder grade): every resolved person counts. Shared by the voided run and
  * every rescore so the mapping — never the scoring — is what differs.
  */
-function buildPersonMaps(
+export function buildPersonMaps(
   chars: BookChar[],
   resolver: ReturnType<typeof createResolver>,
   characters: { id: number }[],
@@ -156,7 +156,7 @@ function buildPersonMaps(
 }
 
 /** Set 1: agent→patient pairs sharing one verb token. */
-function buildActionPairs(chars: BookChar[], personsOf: Map<number, number[]>): { pairs: Set<string>; sharedVerbs: number } {
+export function buildActionPairs(chars: BookChar[], personsOf: Map<number, number[]>): { pairs: Set<string>; sharedVerbs: number } {
   const agents = new Map<number, Set<number>>();
   const patients = new Map<number, Set<number>>();
   for (const c of chars) {
@@ -190,7 +190,7 @@ function buildActionPairs(chars: BookChar[], personsOf: Map<number, number[]>): 
 }
 
 /** Set 2: quote-exchange pairs (speaker → roster person named in the quote). */
-function buildExchangePairs(
+export function buildExchangePairs(
   quoteRows: string[][],
   personsOf: Map<number, number[]>,
   forms: { id: number; forms: string[] }[],
@@ -208,7 +208,7 @@ function buildExchangePairs(
 }
 
 /** Set 3: coref co-mention pairs (chains sharing one passage, any mention). */
-function buildCorefPairs(
+export function buildCorefPairs(
   entRows: string[][],
   personsOf: Map<number, number[]>,
   keyOfDoc: Map<number, string>,
@@ -691,9 +691,12 @@ export function rescoreActions(): Record<string, unknown> {
   }
 }
 
+const entry = process.argv[1] ?? '';
 const step = process.argv[2] ?? 'run';
-if (step === 'rescore') {
-  rescoreActions();
-} else {
-  run();
+if (entry.endsWith('rel-signals.ts')) {
+  if (step === 'rescore') {
+    rescoreActions();
+  } else {
+    run();
+  }
 }
