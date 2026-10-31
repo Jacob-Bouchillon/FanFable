@@ -84,6 +84,24 @@ import {
   type PromoteRow,
 } from './gates.ts';
 
+// Prompt text lives in extract-prompts.ts (single owner); lorebook re-exports
+// the full prior public surface so existing importers keep working. No other
+// module may import prompt internals except through here or extract-prompts.
+export {
+  ASSESSMENT_QUESTIONS,
+  EXTRACT_ENTITIES_SYSTEM,
+  EXTRACT_EVENTS_SYSTEM,
+  EXTRACT_RELATIONS_SYSTEM,
+  formatKnownEntities,
+} from './extract-prompts.ts';
+import {
+  ASSESSMENT_QUESTIONS,
+  EXTRACT_ENTITIES_SYSTEM,
+  EXTRACT_EVENTS_SYSTEM,
+  EXTRACT_RELATIONS_SYSTEM,
+  formatKnownEntities,
+} from './extract-prompts.ts';
+
 /* ------------------------------------------------------------------ models */
 
 export type EntityKind = 'character' | 'species' | 'location' | 'item' | 'rule' | 'faction' | 'creature';
@@ -234,106 +252,8 @@ Rules:
  * and the plan's three-call split otherwise leaves them without a home.
  */
 
-export const EXTRACT_ENTITIES_SYSTEM = `You read passages from a book and record the people, peoples, places, things, groups, creatures and rules they establish, and the facts the passages state.
 
-Reply with JSON only:
-{
-  "entities": [
-    {"kind":"character|species|faction|location|item|rule|creature",
-     "name":"the name as the book gives it",
-     "aliases":["other names or titles used here"],
-     "summary":"one or two sentences on who or what this is",
-     "attributes":{"any":"kind specific detail"},
-     "role":"their role in the story, if it is a person",
-     "status":"alive, dead, missing, ruined, unknown — if the book says",
-     "chunk_index": 0,
-     "evidence":"a short exact quote from the passage"}
-  ],
-  "facts": [
-    {"topic":"the subject of the fact","statement":"what the book establishes",
-     "kind":"rule|fact|background","certainty":"confirmed|inferred","subject":"name it concerns",
-     "chunk_index":0,"evidence":"a short exact quote",
-     "modality":"asserted|denied|possible|suspected — only include when not asserted"}
-  ]
-}
 
-Entity kinds (choose exactly one):
-- character — one named individual.
-- species — a people or kind with members (a species, race, folk, lineage or bloodline).
-- faction — an organisation, order, house, company, government, army or cult.
-- location — a place, region, world, or building used as a setting.
-- item — a named object, weapon, ship, artefact or substance.
-- rule — a law, magic or system rule, custom or prophecy.
-- creature — a non-people animal or monster: a named beast, or a kind of beast the book treats as wildlife.
-
-Entity funnels:
-- Common nouns are not entities. An unadorned common noun (a bat, a chair, a tree) never becomes an entity. Record what the passage says as a fact instead: subject = the named person or place it appeared with, topic = the noun, statement = exactly what the passage says, evidence = a verbatim quote. Never drop the information.
-- One-scene props are not entities. A named thing that appears once and holds no role or tie stays a fact about the scene. It earns a row only when a later passage makes it matter.
-- People get one species row. A people or kind with members gets one species entry; its individual members stay character and tie to it. An individual never gets a species row.
-- Organisations are faction. A company, order, cult, senate, army or security force is faction, never character and never creature.
-- Occupations are not entities. A job, rank or title (senator, captain, apprentice) is the person's role or attribute, never its own entity.
-- Named individuals are character. A properly named person is character even when they appear once; proper names are not props.
-- Resolve ambiguity by role. A creature or item is decided by whether the book treats it as alive; a faction or species by whether it is an organisation (faction) or a people (species). If it is still unclear, keep it a fact instead of an entity.
-
-Rules:
-- Only record what these passages support. Never fill gaps with general knowledge.
-- Record people by the proper name the passages give. A description is never a new person: "the Potters' son" points at a named Potter when one is known, otherwise it is skipped. A thing or place is never a character.
-- One person per entry. Never bank "A and B" as a single person: "Lily and James Potter" is two entries, not one. A family group ("the Potters") is never a character.
-- chunk_index is the number shown in front of each passage. Use it for every entry.
-- evidence must be a short phrase copied from the passage, not your own words.
-- If the passages contain no new people, places or facts, return empty arrays.
-- If the passage denies, doubts, or frames something as merely possible, record the claim normally but set modality to denied/possible/suspected with the denying quote as evidence; never store a denial as a plain fact.
-- No prose outside the JSON.`;
-
-/** The shared rating questions: extraction and the assess pass use the same block. */
-export const ASSESSMENT_QUESTIONS = `Before you rate, answer these questions about the quote.
-Judge each one yourself; do not look for a rule to follow.
-
-- Does the quote identify both people? A nickname or title counts if a reader
-  would connect it. A pronoun counts if the passage makes the referent clear.
-- Does the sentence state the relationship, or only imply it? Implication is
-  fine if a careful reader would agree it is there.
-- Where one person is referred to indirectly, how clear is the reference in
-  the surrounding text?
-- Is the kind right for what the sentence says? A correct pair does not rescue
-  a wrong kind.
-- Does the author sound certain, or is this hedged, doubted or denied?
-- Given your answers, how strongly does this quote support the claim? Give a
-  number from 0 to 1 and one sentence saying why.`;
-
-export const EXTRACT_RELATIONS_SYSTEM = `You read passages from a book and record relationships between the known entities listed below.
-
-Reply with JSON only:
-{
-  "relations": [
-    {"from":"a name from the list, exactly as written",
-     "to":"another name from the list, exactly as written",
-     "kind":"one of the defined relationship concepts, exactly as written",
-     "kind_source":"the passage's own words that express the concept, copied verbatim",
-     "description":"one sentence","chunk_index":0,"evidence":"a short exact quote",
-     "anchor":"the sentence naming the other person when the quote names only one, copied verbatim; empty when the quote names both",
-     "names_both": false, "other_person": "named|pronoun|role|absent",
-     "asserted": true, "hedge": "certain|hedged|doubted|denied",
-     "kind_fit": "yes|partly|no", "strength": 0.7,
-     "why":"one sentence of reasoning",
-     "modality":"asserted|denied|possible|suspected — only include when not asserted"}
-  ]
-}
-
-Rules:
-- "from" and "to" must both be names from the KNOWN ENTITIES list. Do not invent a name, and do not use a name that is not listed, even if it appears in the passage.
-- Record only a lasting tie the passages state or clearly imply. A tie stays true pages later (family, lasting roles, friend or enemy). A moment happens once (met, gave, told, saw, wished, refused) and is never a tie: moments belong to events.
-- Be exhaustive, not representative: list EVERY lasting tie the passages support — most windows contain several, and a long list is good while a missed tie is bad. When in doubt, include it with its quote and let the strength answer decide.
-- evidence must be a phrase copied VERBATIM from the passage, not your own words. It may name one endpoint or both.
-- When the quote names only one endpoint, put in "anchor" one contiguous sentence from the same passage, copied VERBATIM, that names the other person. Leave "anchor" empty when the quote names both.
-- One relation per entry, with one kind. If two people have several relationships, write a separate entry for each.
-- kind must be exactly one of the defined relationship concepts below; never invent a kind. kind_source must be the passage's own words that express that concept, copied verbatim from the quote.
-- The direction matters: "from" is the one who has the relationship and "to" is the one it is to. If Harry is Petunia's nephew, it is from="Harry", to="Petunia", kind="nephew of".
-- chunk_index is the number shown in front of each passage.
-- names_both is true when the quote itself names both people; other_person says how the other side is named (named, pronoun, role, absent). asserted is true when the quote states the tie rather than only implying it. hedge is certain, hedged, doubted or denied. kind_fit is yes, partly or no. strength is your answer to the last question, from 0 to 1. why is one sentence of reasoning, stored for audit and never parsed.
-- If the passage denies, doubts, or frames something as merely possible, set asserted=false, hedge to doubted or denied, and the low strength that follows; also set modality.
-${ASSESSMENT_QUESTIONS}
-- No prose outside the JSON.`;
 
 /**
  * Three invented examples for the relations call, off by default.
@@ -401,27 +321,6 @@ Reply with JSON only: {"quote":"..."}
 You are given a PASSAGE, a PAIR of names and a KIND. Return ONE contiguous sentence copied VERBATIM from the passage that contains a form of BOTH names. If no single sentence names both names, reply {"quote":"NONE"}.
 Never paraphrase, never join sentences, and never use any text that is not in the passage.`;
 
-export const EXTRACT_EVENTS_SYSTEM = `You read passages from a book and record what happens in them, in order.
-
-Reply with JSON only:
-{
-  "timeline": [
-    {"title":"what happens","summary":"one or two sentences",
-     "when":"when it happens, in the book's words",
-     "participants":["names as they appear in the passages"],
-     "location":"where","chunk_index":0,"evidence":"a short exact quote"}
-  ]
-}
-
-Rules:
-- Only record events these passages actually narrate. Never fill gaps with general knowledge.
-- One entry per distinct thing that happens; do not split one scene into many entries.
-- participants are the people or creatures who take part, named as the passages name them.
-- chunk_index is the number shown in front of each passage.
-- evidence must be a short phrase copied from the passage, not your own words.
-- If the passages narrate no event, return an empty array.
-- If the passage denies, doubts, or frames something as merely possible, record the claim normally but set modality to denied/possible/suspected with the denying quote as evidence; never store a denial as a plain fact.
-- No prose outside the JSON.`;
 
 export interface ExtractWindowProgress {
   phase: 'lore';
@@ -4360,7 +4259,7 @@ async function extractWindowSplit(
     ? windowRosterNames(window, roster)
     : windowEntityNames(db, projectId, window, roster);
   if (names.length) {
-    const system = `${relationsSystemPrompt()}\n\nKNOWN ENTITIES:\n${names.map((n) => `- ${n}`).join('\n')}`;
+    const system = `${relationsSystemPrompt()}\n\n${formatKnownEntities(names)}`;
     const second = await ask(system, Math.min(3000, maxTokens), 0);
     if (second !== null) {
       let relations = parseSection(second, 'relations');
