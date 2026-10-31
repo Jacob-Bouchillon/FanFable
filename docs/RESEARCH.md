@@ -90,7 +90,7 @@ Unresolved names are reported, never guessed. Fabrications bank as `unsupported-
 2. **The assertion matcher** (both names + tie word + possessive/of-phrase/SVO): rejected scenes correctly and most real relationships too — only 9.1% of sweep quotes name both people. Measured on 1,111 rejected candidates, 66% were two names in a list.
 3. **The open-vocabulary gate**: owned 5 of 258 queue notes. Never the bottleneck; the most visible one.
 
-Common failure: code asked to hold a definition of a relationship. Any definition specific enough to reject "Harry and Ron stood in the hall" also rejects "he already felt like his best friend." Resolution (2026-10-29): **the model judges, the code measures.** The model's assessment (`names_both`, `asserted`, `other_person`, `directness`, `strength`, `why`) is stored in `supporting_evidence`; the code certifies only verbatim quote, entity existence, non-identity, and the calibrated threshold (default 0.7, project setting `minConfidence`). Deleted, not disabled: assertion matcher, `KIN_GROUPS`, synonym lists, `open-vocab` refusal, reverse-direction-as-promotion-condition, concept-as-promotion-gate (the concept set stays for labelling and querying), the `kind_source` substitution loophole. One survivor: a quote hiding a preceding "perhaps"/"not" is still refused — misquotation, not grammar.
+Common failure: code asked to hold a definition of a relationship. Any definition specific enough to reject "Harry and Ron stood in the hall" also rejects "he already felt like his best friend." Resolution (2026-10-29): **the model judges, the code measures.** The model's assessment (`names_both`, `asserted`, `other_person`, `strength`, `why`) is stored in `supporting_evidence`; the code certifies only verbatim quote, entity existence, non-identity, and the calibrated threshold (default 0.7, project setting `minConfidence`). Deleted, not disabled: assertion matcher, `KIN_GROUPS`, synonym lists, `open-vocab` refusal, reverse-direction-as-promotion-condition, concept-as-promotion-gate (the concept set stays for labelling and querying), the `kind_source` substitution loophole. One survivor: a quote hiding a preceding "perhaps"/"not" is still refused — misquotation, not grammar.
 
 ### 2.2 Name variants at match time (shipped)
 
@@ -464,3 +464,111 @@ one early qualifying note. The recall floor still fails: S1 is ambiguous, S2 and
 above 0.35.
 
 No criterion, threshold, tier, trigger or admission rule was changed. No bank was written by the harness.
+
+## 17. Never-cold reads and visible contradictions (2026-10-30)
+
+**What changed.** Window selection now reserves windows for starved threads before the priority pass: threads
+with no notes first, then the oldest unresolved question, then the fewest notes, then the lowest id. Each
+starved thread is mapped to the windows its passages fall in, a window scores the number of distinct starved
+threads it covers, already-mined windows are dropped, and up to `starvedFirst` windows are taken in descending
+score then ascending index. The default reserves a quarter of the budget (1-4), or 4 when no budget is set;
+`--starved-first 0` restores the previous selection exactly. Notes now remember the concept they asserted
+(`claim_kind`), and opposition between two notes on one thread is recorded as a visible conflict, never as a
+ruling. The opposition set is closed and small (enemy of/ally of, enemy of/friend, trusted/distrusted,
+feared/protected by, loved/hated, loyal to/betrayed); across threads the same opposition is change over time
+and is left alone.
+
+**Copy run** (fresh from the pre-milestone bank, 360 entities): `threads --sync` created 182 person and 6,267
+pair threads (4,200 later periods); `notes-ingest` wrote 373 notes (pair 151, identity 222, context 103), 103
+of them context, with 6,370 open ends; `lore meet` created 183 meetings, 678 exchanges and 2 births
+(`pooled_evidence` 1, `combined_investigation` 1), 116 below-threshold skips. Second `notes-ingest`: 0 notes,
+0 open ends.
+
+**claim_kind populated:** 171 of 373 notes carry a kind (29 `ally of`, 12 `master of`, 7 `opponent of`, 6
+`enemy of`, and a long tail); 202 are empty (identity and context notes). **Conflicts created: 0.** Nine
+threads hold two or more distinct claim kinds, but none of them is one of the six opposed pairs, so the
+detector correctly wrote nothing. A second run also wrote nothing.
+
+`lore integrity` exit 0; `canon_relation` / `canon_tie_note` / `canon_tie_hint` unchanged at 336 / 98 / 0;
+373 notes. No extraction was run, so the starved reservation is measured by unit tests only (ranking, window
+mapping with gaps, mined exclusion, budget respected, `starvedFirst 0` equivalence).
+
+**Honest note.** The 0-conflict result is a property of this bank and this narrow opposition set, not evidence
+that contradictions cannot occur: the closed pairs are the only comparison, and same-thread opposition across
+them did not appear in this data.
+
+## 18. Assessment-aware routing, attested CLI, enumeration filter (2026-10-30)
+
+**What changed.** Note routing now follows what the assessment says a quote is, not only its number: a scene
+(no both names, not asserted, or hedged) is context whatever its strength, a one-sided assertion stays an
+observation, and unassessed rows behave exactly as before. `lore attest [--write]` wires the existing
+`assignAttestedTiers` (temp-path guard on write, dry run by default). Meeting enumeration now drops candidates
+whose two threads both hold no note, reporting `candidatesSkippedNoNotes`. `lore ties --assessment` prints the
+stored assessment per supporting item and falls back to the relation evidence when the item has no quote. The
+unused `directness` field was removed from the two docs that described it.
+
+**Copy run** (`m15b`, from the assessed `m13` copy; note rows cleared on the copy so they regenerate under the
+current routing): 373 notes (pair 151, identity 222, context 12), strength sources assessed 171 / derived 202,
+open ends 0 after the rebuild. **Context notes 12 - non-zero, where the regression produced 0.** Meetings
+1,039 created with 3,558 exchanges and 13 births (`pooled_evidence` 3, `combined_investigation` 10);
+**candidates 56,978** against 1,168,644 before the filter. `lore integrity` exit 0; `canon_relation` /
+`canon_tie_note` / `canon_tie_hint` unchanged at 336 / 98 / 0.
+
+**`lore attest` on the same copy.** Dry run: checked 302, would attest 26, keeper-track 6, blocked by
+`open-vocab` 146, `coverage-only` 75, `endpoint-unnamed` 15, `quote-not-verbatim` 11, `assessment-missing` 11,
+`assertion-missing` 9, `ruled-park` 2, `same-identity` 1; status counts unchanged. `--write`: attested 26,
+status `needs_review` 291 -> 265 with `attested` 26 (provisional 11, user_confirmed 34 unchanged). Second
+`--write`: checked 276, attested **0**.
+
+**Benchmark score (verbatim):**
+
+```json
+{"criteriaPassed":2,"criteriaTotal":4,"absentBirths":0,"trapBirths":0,"trapFlagged":2,"recallS1S3":0,"c1Evidence":0,"resolved":14,"ambiguous":1,"absent":5,"bornThreads":15,"bornSubjects":15,"duplicateBornSubjects":0,"trapFlaggedData":2,"trapFlaggedDb":0}
+```
+
+Exit 1. Precision and identity pass; the recall floor and the early-evidence floor both fail on this rebuilt
+copy (C1 early qualifying notes went from 1 to 0 because the regenerated notes landed on different threads).
+
+**Deviations reported, not smoothed over.** Meetings are 1,039, not the ~183 the task expected: clearing note
+rows on the copy invalidated the prior meeting evidence, so the mesh was rebuilt from scratch rather than
+compared like-for-like. The 26 attested rows are more than the 6 the audit measured, because this copy
+regenerated its notes and assessments layout differs. The 222 promotable `needs_review` rows were noted and
+not actioned, as instructed.
+
+## 19. Admission strength floor, swept; C1 evidence traced (2026-10-30)
+
+**Part A.** `MIN_ADMISSION_STRENGTH = 0.45` now gates the pair-scope crossing test and the resolved-want
+path; `lore meet --min-admission n` sweeps it. Four fresh copies from one assessed base, notes regenerated,
+meeting and birth rows cleared so nothing carried over:
+
+| min | meetings | exchanges | births | triggers | criteria |
+|---|---|---|---|---|---|
+| 0.35 | 443 | 1501 | 11 | pooled 3, combined 8 | 2 of 4 |
+| 0.45 | 424 | 1462 | 9 | pooled 1, combined 8 | 2 of 4 |
+| 0.60 | 405 | 1403 | 9 | pooled 1, combined 8 | 2 of 4 |
+| 0.70 | 353 | 1268 | 8 | combined 8 | 2 of 4 |
+
+Every point holds the same two criteria, so the stated rule is: the lowest value that keeps every criterion
+and refuses the 0.2-0.4 tier. That is **0.45**. A pure "lowest value, more meetings" rule would pick 0.35,
+which is the defect being fixed, and 0.6/0.7 only lose meetings.
+
+**Part B, C1 (`Darth Plagueis` / `Darth Tenebrous`).** Relation 87: `apprentice of`, confidence 0.9,
+`user_confirmed`, assessment present with `strength 0.9`, `asserted true`, `names_both false`. Its note is id
+59: strength 0.9, source `assessed`, `is_context 0`, claim kind `apprentice of`, chunk seq **1208**, on thread
+253 (`p12`, seq 1207-1221). The pair owns 13 period threads; the book runs to seq 1447 and the harness defines
+"early" as seq <= ceil(1447/3) = **483**.
+
+**Cause: none of (a), (b) or (c) as posed.** The note was written, is not context, and clears 0.35 - it is
+excluded only by the early-window test. It sits on the period that contains its own cited passage (seq 1208 in
+1207-1221), so period selection is correct; the banked row simply cites a late passage. Relation 73 (`master
+of`, 0.1) does cite an early passage (seq 288) but is far below the evidence floor. No code was changed: a
+threshold or period edit would have hidden a citation choice, not fixed a bug.
+
+**Post-fix benchmark (0.45 copy), verbatim:**
+
+```json
+{"criteriaPassed":2,"criteriaTotal":4,"absentBirths":0,"trapBirths":0,"trapFlagged":2,"recallS1S3":0,"c1Evidence":0,"resolved":14,"ambiguous":1,"absent":5,"bornThreads":9,"bornSubjects":9,"duplicateBornSubjects":0,"trapFlaggedData":2,"trapFlaggedDb":0}
+```
+
+Exit 1: 2 of 4. Missing criteria remain the recall floor (S1-S3) and the early-evidence floor (C1).
+`lore integrity` exit 0; `canon_relation` / `canon_tie_note` / `canon_tie_hint` unchanged at 336 / 98 / 0.

@@ -18,6 +18,7 @@ import { createHash } from 'node:crypto';
 import { Db, fromJson, nowIso } from './db.ts';
 import { pickPeriodThread } from './threads.ts';
 import { isClosedRoleKind, projectMinConfidence, storedAssessment } from './lorebook.ts';
+import { recordRuling } from './ruling.ts';
 
 /** Why a candidate note was not written. */
 export type SkipReason =
@@ -52,6 +53,8 @@ export interface IngestCounts {
   strengthSource: Record<StrengthSource, number>;
   /** How many notes landed in each strength band. */
   strengthBands: { '0.0-0.2': number; '0.2-0.5': number; '0.5-0.8': number; '0.8-1.0': number };
+  /** Notes that recorded which concept they asserted. */
+  claimKinds: Record<string, number>;
   /** True when nothing was inserted. */
   dryRun: boolean;
 }
@@ -77,6 +80,7 @@ export function blankIngestCounts(dryRun = false): IngestCounts {
     },
     strengthSource: { assessed: 0, derived: 0, context: 0, default: 0 },
     strengthBands: { '0.0-0.2': 0, '0.2-0.5': 0, '0.5-0.8': 0, '0.8-1.0': 0 },
+    claimKinds: {},
     dryRun,
   };
 }
@@ -210,6 +214,10 @@ interface NoteInput {
   isContext: boolean;
   kind: 'observation' | 'context';
   strengthSource?: StrengthSource;
+  /** The concept the note asserts, when it comes from a relation. */
+  claimKind?: string;
+  /** The relation this note came from, when it came from one. */
+  relationId?: number | null;
 }
 
 /**
@@ -249,8 +257,8 @@ function writeNote(db: Db, projectId: number, input: NoteInput, counts: IngestCo
     db.run(
       `INSERT INTO canon_thread_note
          (project_id, thread_id, chunk_id, locator, quote, claim, note_kind, strength,
-          why, missing, is_context, supersedes_note_id, dedupe_key, strength_source, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
+          why, missing, is_context, supersedes_note_id, dedupe_key, strength_source, claim_kind, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)`,
       projectId,
       input.threadId,
       input.chunkId,
@@ -264,13 +272,25 @@ function writeNote(db: Db, projectId: number, input: NoteInput, counts: IngestCo
       input.isContext ? 1 : 0,
       key,
       input.strengthSource ?? 'default',
+      input.claimKind ?? '',
       nowIso(),
     ).lastInsertRowid,
   );
+  counts.claimKinds[input.claimKind ?? ''] = (counts.claimKinds[input.claimKind ?? ''] ?? 0) + 1;
   counts.notes++;
   if (input.isContext) counts.contextNotes++;
   counts.strengthSource[input.strengthSource ?? 'default']++;
   counts.strengthBands[strengthBand(input.strength)]++;
+  recordRuling(db, projectId, {
+    relationId: input.relationId ?? null,
+    threadId: input.threadId,
+    role: 'clue',
+    actor: 'chain',
+    standard: 'verbatim-quote',
+    toStatus: 'note',
+    basis: `note ${id} quote verbatim in chunk ${input.chunkId}`,
+    quote: input.quote,
+  });
   return id;
 }
 
@@ -502,18 +522,27 @@ export function deriveStrength(rel: RelationRow, quote: string): DerivedStrength
   const assessment = storedAssessment(rel.supporting_evidence);
   if (assessment) {
     const value = Number(assessment.strength);
-    if (Number.isFinite(value) && value >= 0 && value <= 1) {
-      return { strength: value, strengthSource: 'assessed', isContext: false };
+    const strength =
+      Number.isFinite(value) && value >= 0 && value <= 1 ? value : 0.2;
+    // The note kind follows what the assessment says the quote is, not just
+    // its number: a scene is context however strong the model rated it, and a
+    // one-sided assertion is still an observation.
+    const namesBoth = assessment.names_both === true;
+    const asserted = assessment.asserted === true;
+    const otherPerson = String((assessment as { other_person?: string }).other_person ?? '');
+    const namedOther = otherPerson === 'named' || otherPerson === 'role';
+    const uncertain = assessment.hedge === 'hedged' || assessment.hedge === 'doubted' || assessment.hedge === 'denied';
+    if (!namesBoth && (!asserted || uncertain)) {
+      return { strength, strengthSource: 'assessed', isContext: true };
     }
+    if (asserted && (namesBoth || namedOther)) {
+      return { strength, strengthSource: 'assessed', isContext: false };
+    }
+    return { strength, strengthSource: 'assessed', isContext: false };
   }
-  const namesBoth = assessment
-    ? assessment.names_both === true
-    : bothNamesSentence(quote, rel.from_name, rel.to_name) !== null;
+  const namesBoth = bothNamesSentence(quote, rel.from_name, rel.to_name) !== null;
   const namesOne = quoteMentions(quote, rel.from_name) || quoteMentions(quote, rel.to_name);
   const cls = classifyEvidence({ quote, namesBoth, namesOne });
-  if (assessment && String((assessment as { other_person?: string }).other_person ?? '') === 'absent' && !namesBoth) {
-    return { strength: 0.2, strengthSource: 'context', isContext: true };
-  }
   if (cls === 'asserted') {
     return { strength: namesBoth ? 0.9 : 0.6, strengthSource: 'derived', isContext: false };
   }
@@ -588,6 +617,8 @@ function ingestRelation(db: Db, projectId: number, rel: RelationRow, counts: Ing
         isContext: derived.isContext,
         kind: derived.isContext ? 'context' : 'observation',
         strengthSource,
+        claimKind: kindLower,
+        relationId: rel.id,
       },
       counts,
     );
@@ -668,6 +699,8 @@ function ingestRelation(db: Db, projectId: number, rel: RelationRow, counts: Ing
       isContext: derived.isContext,
       kind: derived.isContext ? 'context' : 'observation',
       strengthSource,
+      claimKind: kindLower,
+      relationId: rel.id,
     },
     counts,
   );
@@ -816,6 +849,8 @@ export function backfillThreadNotes(db: Db, projectId: number, opts: { dryRun?: 
       ingestEntity(db, projectId, entity, counts);
     }
     openEndsForEmptyThreads(db, projectId, counts);
+    // Opposition between notes on one thread is recorded, never judged.
+    if (!counts.dryRun) markContradictions(db, projectId);
   });
   return counts;
 }
@@ -958,7 +993,7 @@ export interface StarvedThread {
 export function starvedThreads(
   db: Db,
   projectId: number,
-  limit: number,
+  limit = 400,
   opts: { olderThanDays?: number } = {},
 ): StarvedThread[] {
   const days = opts.olderThanDays ?? 7;
@@ -988,7 +1023,7 @@ export function starvedThreads(
              WHERE o.thread_id = t.id AND o.status = 'open' AND o.created_at <= ?
           )
         )
-      ORDER BY t.created_at ASC, t.id ASC
+      ORDER BY (note_count = 0) DESC, oldest_open_end IS NULL, oldest_open_end ASC, note_count ASC, t.id ASC
       ${limit > 0 ? 'LIMIT ?' : ''}`,
     projectId,
     cutoff,
@@ -1003,4 +1038,212 @@ export function starvedThreads(
     oldestOpenEnd: row.oldest_open_end,
     createdAt: row.created_at,
   }));
+}
+
+/* --------------------------------------------- starved windows and conflicts */
+
+export interface StarvedWindow {
+  /** Index into the full window list, in reading order. */
+  index: number;
+  /** Distinct starved threads this window covers. */
+  score: number;
+}
+
+/**
+ * Which windows a starved thread lives in.
+ *
+ * A window is `windowSize` consecutive passages in `seq` order. Each starved
+ * thread's passages are mapped to windows and a window's score is the number
+ * of distinct starved threads it covers; windows that are already mined are
+ * dropped, because re-reading them would teach nothing.
+ */
+export function starvedWindowScores(
+  db: Db,
+  projectId: number,
+  opts: { windowSize?: number; limit?: number; olderThanDays?: number } = {},
+): { windows: StarvedWindow[]; threadsCovered: number; threadsConsidered: number } {
+  const windowSize = Math.max(1, opts.windowSize ?? 8);
+  const chunks = db.all<{ id: number; seq: number; lore_mined: number }>(
+    'SELECT id, seq, lore_mined FROM canon_chunk WHERE project_id = ? ORDER BY seq, id',
+    projectId,
+  );
+  if (!chunks.length) return { windows: [], threadsCovered: 0, threadsConsidered: 0 };
+  const windowOf = new Map<number, number>();
+  chunks.forEach((chunk, position) => windowOf.set(chunk.id, Math.floor(position / windowSize)));
+
+  const threads = starvedThreads(db, projectId, opts.limit ?? 400, {
+    olderThanDays: opts.olderThanDays,
+  });
+  const coveredBy = new Map<number, Set<number>>();
+  let threadsCovered = 0;
+  for (const thread of threads) {
+    const passages = db.all<{ chunk_id: number }>(
+      'SELECT chunk_id FROM canon_thread_passage WHERE thread_id = ?',
+      thread.id,
+    );
+    let chunkIds = passages.map((row) => row.chunk_id);
+    if (!chunkIds.length) {
+      const shared = db.get<{ shared_chunks: string }>(
+        `SELECT p.shared_chunks FROM canon_thread t JOIN canon_pair_thread p ON p.id = t.pair_thread_id
+          WHERE t.id = ?`,
+        thread.id,
+      );
+      chunkIds = shared ? fromJson<number[]>(shared.shared_chunks, []).map(Number) : [];
+    }
+    const windows = new Set<number>();
+    for (const chunkId of chunkIds) {
+      const index = windowOf.get(chunkId);
+      if (index !== undefined) windows.add(index);
+    }
+    if (!windows.size) continue;
+    threadsCovered++;
+    for (const index of windows) {
+      const set = coveredBy.get(index) ?? new Set<number>();
+      set.add(thread.id);
+      coveredBy.set(index, set);
+    }
+  }
+
+  const mined = new Map<number, boolean>();
+  for (const [index] of coveredBy) {
+    const start = index * windowSize;
+    const slice = chunks.slice(start, start + windowSize);
+    mined.set(index, slice.every((chunk) => chunk.lore_mined === 1));
+  }
+  const windows: StarvedWindow[] = [...coveredBy.entries()]
+    .filter(([index]) => !mined.get(index))
+    .map(([index, set]) => ({ index, score: set.size }))
+    .sort((a, b) => b.score - a.score || a.index - b.index);
+  return { windows, threadsCovered, threadsConsidered: threads.length };
+}
+
+/**
+ * Concepts that oppose one another, as a closed symmetric set.
+ *
+ * This is not a synonym list: it names only pairs that cannot both be true of
+ * one pair at one time. Anything outside it is simply not compared.
+ */
+export const OPPOSED_KINDS: ReadonlyArray<readonly [string, string]> = [
+  ['enemy of', 'ally of'],
+  ['enemy of', 'friend'],
+  ['trusted', 'distrusted'],
+  ['feared', 'protected by'],
+  ['loved', 'hated'],
+  ['loyal to', 'betrayed'],
+];
+
+const OPPOSED = (() => {
+  const map = new Map<string, Set<string>>();
+  for (const [a, b] of OPPOSED_KINDS) {
+    for (const [x, y] of [
+      [a, b],
+      [b, a],
+    ] as const) {
+      const set = map.get(x) ?? new Set<string>();
+      set.add(y);
+      map.set(x, set);
+    }
+  }
+  return map;
+})();
+
+/** Are two claim kinds opposed? Symmetric; unknown kinds are never opposed. */
+export function kindsOppose(a: string, b: string): boolean {
+  return OPPOSED.get(a.trim().toLowerCase())?.has(b.trim().toLowerCase()) ?? false;
+}
+
+export interface ContradictionCounts {
+  considered: number;
+  created: number;
+  alreadyPresent: number;
+  dismissedSkipped: number;
+}
+
+/**
+ * Record opposition between notes on one thread.
+ *
+ * Only non-context notes at or above the evidence floor, with a claim kind, are
+ * compared, and only within a thread: one thread is one period, so opposite
+ * stances there are a contradiction. Across periods the same opposition is
+ * change over time and is left alone. A conflict is visibility only � nothing
+ * is resolved or judged � and a dismissed row is never recreated.
+ */
+export function markContradictions(
+  db: Db,
+  projectId: number,
+  opts: { minStrength?: number } = {},
+): ContradictionCounts {
+  const floor = opts.minStrength ?? 0.35;
+  const counts: ContradictionCounts = { considered: 0, created: 0, alreadyPresent: 0, dismissedSkipped: 0 };
+  const notes = db.all<{ id: number; thread_id: number; claim_kind: string; strength: number }>(
+    `SELECT id, thread_id, claim_kind, strength FROM canon_thread_note
+      WHERE project_id = ? AND is_context = 0 AND claim_kind <> '' AND strength >= ?
+      ORDER BY thread_id, id`,
+    projectId,
+    floor,
+  );
+  counts.considered = notes.length;
+  const byThread = new Map<number, typeof notes>();
+  for (const note of notes) {
+    const list = byThread.get(note.thread_id) ?? [];
+    list.push(note);
+    byThread.set(note.thread_id, list);
+  }
+  const at = new Date().toISOString();
+  db.transaction(() => {
+    for (const threadId of [...byThread.keys()].sort((a, b) => a - b)) {
+      const list = byThread.get(threadId)!;
+      for (let i = 0; i < list.length; i++) {
+        for (let j = i + 1; j < list.length; j++) {
+          const left = list[i]!;
+          const right = list[j]!;
+          if (left.claim_kind === right.claim_kind) continue;
+          if (!kindsOppose(left.claim_kind, right.claim_kind)) continue;
+          const low = Math.min(left.id, right.id);
+          const high = Math.max(left.id, right.id);
+          const kindLow = low === left.id ? left.claim_kind : right.claim_kind;
+          const kindHigh = high === left.id ? left.claim_kind : right.claim_kind;
+          const existing = db.get<{ id: number; status: string }>(
+            'SELECT id, status FROM canon_thread_conflict WHERE project_id = ? AND thread_id = ? AND note_low = ? AND note_high = ?',
+            projectId,
+            threadId,
+            low,
+            high,
+          );
+          if (existing) {
+            if (existing.status === 'dismissed') counts.dismissedSkipped++;
+            else counts.alreadyPresent++;
+            continue;
+          }
+          db.run(
+            `INSERT INTO canon_thread_conflict
+               (project_id, thread_id, note_low, note_high, kind_low, kind_high, basis, status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'visible', ?)`,
+            projectId,
+            threadId,
+            low,
+            high,
+            kindLow,
+            kindHigh,
+            `opposed-kind:${kindLow}|${kindHigh}`,
+            at,
+          );
+          counts.created++;
+        }
+      }
+    }
+  });
+  return counts;
+}
+
+/** Mark one conflict dismissed. Never deletes, never re-opens another one. */
+export function dismissConflict(db: Db, conflictId: number): boolean {
+  const row = db.get<{ id: number; status: string }>(
+    'SELECT id, status FROM canon_thread_conflict WHERE id = ?',
+    conflictId,
+  );
+  if (!row) throw new Error(`no conflict ${conflictId}`);
+  if (row.status === 'dismissed') return false;
+  db.run("UPDATE canon_thread_conflict SET status = 'dismissed' WHERE id = ?", conflictId);
+  return true;
 }

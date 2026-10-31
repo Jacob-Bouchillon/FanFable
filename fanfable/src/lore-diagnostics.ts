@@ -23,6 +23,7 @@ import type { LlmClient } from './llm.ts';
 import * as lorebook from './lorebook.ts';
 import { preferThin, readHandoff } from './chain-handoff.ts';
 import { truncate } from './text.ts';
+import { recordRuling } from './ruling.ts';
 import { DIAGNOSTIC_RELATION_CUES } from './vocab.ts';
 
 /* ------------------------------------------------------------- diagnostics */
@@ -633,27 +634,55 @@ export function correctRelation(
     review_status: string;
   }>('SELECT id, kind, description, evidence, review_status FROM canon_relation WHERE id = ? AND project_id = ?', id, projectId);
   if (!existing) return false;
-  db.run(
-    `UPDATE canon_relation SET kind = ?, description = ?, evidence = ?, review_status = ?, confidence = ? WHERE id = ? AND project_id = ?`,
-    patch.kind ?? existing.kind,
-    patch.description ?? existing.description,
-    patch.evidence ?? existing.evidence,
-    patch.confirm === false ? existing.review_status : 'user_confirmed',
-    patch.confirm === false ? undefined : 1,
-    id,
-    projectId,
-  );
-  if (patch.confirm !== false) {
-    db.run('UPDATE canon_relation SET confirmed_by_user = 1 WHERE id = ? AND project_id = ?', id, projectId);
-  }
+  db.transaction(() => {
+    db.run(
+      `UPDATE canon_relation SET kind = ?, description = ?, evidence = ?, review_status = ?, confidence = ? WHERE id = ? AND project_id = ?`,
+      patch.kind ?? existing.kind,
+      patch.description ?? existing.description,
+      patch.evidence ?? existing.evidence,
+      patch.confirm === false ? existing.review_status : 'user_confirmed',
+      patch.confirm === false ? undefined : 1,
+      id,
+      projectId,
+    );
+    if (patch.confirm !== false) {
+      db.run('UPDATE canon_relation SET confirmed_by_user = 1 WHERE id = ? AND project_id = ?', id, projectId);
+    }
+    recordRuling(db, projectId, {
+      relationId: id,
+      role: 'appeal',
+      actor: 'human',
+      standard: 'manual',
+      fromStatus: existing.review_status,
+      toStatus: patch.confirm === false ? existing.review_status : 'user_confirmed',
+      basis: 'manual correction',
+      quote: patch.evidence ?? existing.evidence,
+    });
+  });
   return true;
 }
 
-/** Remove a relation the author does not believe. */
+/** Remove a relation the author does not believe. The ruling keeps the case. */
 export function removeRelation(db: Db, projectId: number, id: number): boolean {
-  const row = db.get<{ id: number }>('SELECT id FROM canon_relation WHERE id = ? AND project_id = ?', id, projectId);
+  const row = db.get<{ id: number; kind: string; evidence: string; review_status: string }>(
+    'SELECT id, kind, evidence, review_status FROM canon_relation WHERE id = ? AND project_id = ?',
+    id,
+    projectId,
+  );
   if (!row) return false;
-  db.run('DELETE FROM canon_relation WHERE id = ? AND project_id = ?', id, projectId);
+  db.transaction(() => {
+    recordRuling(db, projectId, {
+      relationId: id,
+      role: 'removal',
+      actor: 'human',
+      standard: 'manual',
+      fromStatus: row.review_status,
+      toStatus: 'removed',
+      basis: `removed ${row.kind}`,
+      quote: row.evidence,
+    });
+    db.run('DELETE FROM canon_relation WHERE id = ? AND project_id = ?', id, projectId);
+  });
   return true;
 }
 

@@ -33,10 +33,12 @@ import { continuitySettings, filterBySeverity } from './continuity-settings.ts';
 import * as controller from './controller.ts';
 import * as retrieval from './retrieval.ts';
 import * as sweep from './sweep.ts';
+import * as ruling from './ruling.ts';
 import * as pairThreads from './pair-threads.ts';
 import * as threadWeb from './threads.ts';
 import * as meetingWeb from './meetings.ts';
 import * as noteIngest from './note-ingest.ts';
+import * as briefWeb from './brief.ts';
 import * as identityCheck from './identity-check.ts';
 import type { PassageTrail } from './graph.ts';
 import { truncate } from './text.ts';
@@ -135,7 +137,7 @@ ${C.bold('SOURCE MATERIAL')}
   sources                          List imported sources
   lore search <query>              Search canon, show passages with references
   lore ask <question>              Answer a lore question with citations
-  lore extract [--model m] [--max-windows n] [--priority-first n] [--random-floor f] [--seed n] [--full]
+  lore extract [--model m] [--max-windows n] [--starved-first n] [--priority-first n] [--random-floor f] [--seed n] [--full]
                            Extract the book's lore: people, places, rules, facts.
                            No budget flags mines everything; --max-windows caps it (top priority
                            first, seeded sample of the rest); --full ignores the budget.
@@ -152,8 +154,10 @@ ${C.bold('SOURCE MATERIAL')}
   lore threads [--kind person|pair] [--status open|resolved|dormant] [--period p1|--period] [--limit n]
                            List threads: kind, period, notes, open ends, age
   lore thread <id>                 Show one thread: passages, notes, open ends
-  lore meet [--reconcile] [--write] Run meetings; reconcile reports or deletes refused meetings (copy only)
+  lore meet [--reconcile] [--write] [--min-admission n] Run meetings; reconcile reports or deletes refused meetings (copy only)
   lore births --reconcile [--write] Mark duplicate born threads dormant (copy only)
+  lore conflicts [--thread id] [--dismiss id] [--all]  Show or dismiss visible contradictions
+  lore brief --for "Name, Name" [--limit n]  Print the evidence web brief for a cast
   lore notes-ingest [--dry-run]    Turn bank rows into thread notes (verbatim-checked, deduped)
   lore identity-check [--write]     Flag entities whose canonical names collide (dry run by default)
   lore meetings [--status] [--limit n]  List meetings, newest first
@@ -165,9 +169,14 @@ ${C.bold('SOURCE MATERIAL')}
   lore rulings replay --in path [--write] [--dry-run] [--limit n]
                            Reapply an exported ruling file to this project
   lore audit [--write] [--limit n]  Recheck accepted ties against the guard; demote failures
+  lore attest [--write] [--limit n] [--no-keeper] [--no-repair]
+                           Move passage-proof rows to the attested tier (dry run by default)
+  lore docket [--role r] [--actor a] [--limit n] [--backfill]
+                           Who decided what, on which standard, and what overruled what
+  lore anchors [--write] [--limit n]  Fill the sentence naming the other person (dry run by default)
   lore assess [--limit n] [--min-confidence x] [--write] [--refresh]
                            Score existing ties against their quotes; dry run by default
-  lore ties --from A --to B [--at n] [--supporting]
+  lore ties --from A --to B [--at n] [--supporting] [--assessment] [--brief]
                            What two people are to each other now, and before
   lore merge                       Merge entries that are the same under two names
   lore judge-aliases [--max n]     Rule on quarantined nickname pairs (one model call)
@@ -703,6 +712,32 @@ async function cmdLore(args: Args): Promise<void> {
         console.log(`  #${ref.noteId} [${ref.role}] ${ref.note.claim || '(no claim)'}`);
       }
     }
+    {
+      const conflicts = db.all<{
+        id: number;
+        note_low: number;
+        note_high: number;
+        kind_low: string;
+        kind_high: string;
+        status: string;
+      }>(
+        `SELECT id, note_low, note_high, kind_low, kind_high, status
+           FROM canon_thread_conflict WHERE thread_id = ? ORDER BY id`,
+        id,
+      );
+      if (conflicts.length) {
+        console.log(`\n${C.dim('conflicts (both stances stay visible)')}`);
+        for (const conflict of conflicts) {
+          const low = loaded.notes.find((note) => note.id === conflict.note_low);
+          const high = loaded.notes.find((note) => note.id === conflict.note_high);
+          console.log(
+            `  #${conflict.id} [${conflict.status}] ${conflict.kind_low} vs ${conflict.kind_high}`,
+          );
+          if (low) console.log(`    #${low.id} (${low.strength.toFixed(2)}): ${low.claim}`);
+          if (high) console.log(`    #${high.id} (${high.strength.toFixed(2)}): ${high.claim}`);
+        }
+      }
+    }
     if (!loaded.counts.passages && !loaded.counts.notes && !loaded.counts.openEnds) {
       console.log(C.dim('\nempty thread: no evidence gathered yet (not a statement of no relationship)'));
     }
@@ -775,6 +810,189 @@ async function cmdLore(args: Args): Promise<void> {
     throw new Error('births needs --reconcile [--write]');
   }
 
+  if (sub === 'brief') {
+    const forRaw = flagString(args, 'for');
+    const names = forRaw.split(',').map((name) => name.trim()).filter(Boolean);
+    if (!names.length) throw new Error('usage: lore brief --for "Name, Name" [--limit n]');
+    const limit = flagNumber(args, 'limit', 12);
+    const brief = briefWeb.buildWebBrief(db, project.id, { entities: names, limitPerSection: limit });
+    heading('Evidence web brief');
+    console.log(
+      `proven ${brief.proven.length}, attested ${brief.attested.length}, provisional ${brief.provisional.length}, ` +
+        `open questions ${brief.openQuestions.length}, conflicts ${brief.conflicts.length}, ` +
+        `threads ${brief.threads.length}, unresolved ${brief.unresolved.length}`,
+    );
+    if (Object.keys(brief.truncated).length) {
+      console.log(C.dim(`truncated: ${Object.entries(brief.truncated).map(([k, n]) => `${k} ${n}`).join(', ')}`));
+    }
+    for (const tie of brief.proven) {
+      console.log(`  proven   #${tie.id} ${tie.from} ${tie.kind} ${tie.to} ${tie.citation ? `[${tie.citation.locator}]` : '(uncited)'}`);
+    }
+    for (const tie of brief.attested) {
+      console.log(`  attested #${tie.id} ${tie.from} ${tie.kind} ${tie.to} ${tie.citation ? `[${tie.citation.locator}]` : '(uncited)'}`);
+    }
+    for (const tie of brief.provisional) {
+      console.log(
+        `  provisional #${tie.id} ${tie.from} ${tie.kind} ${tie.to} strength ${(tie.strength ?? 0).toFixed(2)}` +
+          (tie.uncited ? ' (uncited)' : ''),
+      );
+    }
+    for (const question of brief.openQuestions) {
+      console.log(`  question #${question.id} thread ${question.threadId}`);
+    }
+    for (const conflict of brief.conflicts) {
+      console.log(`  conflict #${conflict.id} ${conflict.kindLow} vs ${conflict.kindHigh}`);
+    }
+    for (const unresolved of brief.unresolved) {
+      console.log(
+        `  unresolved ${unresolved.status}: ${unresolved.name}` +
+          (unresolved.candidates.length ? ` (${unresolved.candidates.map((c) => `${c.id}:${c.name}`).join(', ')})` : ''),
+      );
+    }
+    return;
+  }
+
+  if (sub === 'attest') {
+    const write = args.flags.write === true;
+    const limit = flagNumber(args, 'limit', 0);
+    const promoteKeeper = args.flags['no-keeper'] !== true;
+    const repairQuotes = args.flags['no-repair'] !== true;
+    if (write && !meetingWeb.isTempDatabasePath(db.path)) {
+      throw new Error(
+        `refusing --write outside the temp directory (${db.path}): attest moves relation status and must run on a copy`,
+      );
+    }
+    heading(write ? 'Attested tier assignment (write)' : 'Attested tier assignment (dry run)');
+    const before = db.all<{ status: string; n: number }>(
+      'SELECT review_status AS status, COUNT(*) AS n FROM canon_relation WHERE project_id = ? GROUP BY review_status ORDER BY review_status',
+      project.id,
+    );
+    const result = lorebook.assignAttestedTiers(db, project.id, {
+      write,
+      limit: limit > 0 ? limit : undefined,
+      promoteKeeper,
+      repairQuotes,
+    });
+    console.log(
+      `checked ${result.checked}; attested ${result.attested}; keeper-track ${result.keeperTrack}` +
+        ` (accepted ${result.keeperPromoted}); quotes repaired ${result.repaired}`,
+    );
+    const blocked = Object.entries(result.still).filter(([, n]) => n > 0);
+    console.log(
+      `blocked: ${blocked.length ? blocked.map(([reason, n]) => `${reason} ${n}`).join(', ') : 'none'}`,
+    );
+    if (write) {
+      console.log(
+        C.dim('a snapshot backup is written beside the database before any row moves.'),
+      );
+      console.log(`changed ${result.changed}`);
+    } else {
+      console.log(C.dim('dry run: nothing written. Re-run with --write on a copy to move the rows.'));
+    }
+    const after = db.all<{ status: string; n: number }>(
+      'SELECT review_status AS status, COUNT(*) AS n FROM canon_relation WHERE project_id = ? GROUP BY review_status ORDER BY review_status',
+      project.id,
+    );
+    const tally = (rows: { status: string; n: number }[]): string =>
+      rows.length ? rows.map((row) => `${row.status} ${row.n}`).join(', ') : 'none';
+    console.log(`status before: ${tally(before)}`);
+    console.log(`status after:  ${tally(after)}`);
+    return;
+  }
+
+  if (sub === 'docket') {
+    const role = flagString(args, 'role') || undefined;
+    const actor = flagString(args, 'actor') || undefined;
+    const limit = Math.max(1, Math.floor(flagNumber(args, 'limit', 40)));
+    if (args.flags.backfill === true) {
+      const written = ruling.backfillCharges(db, project.id);
+      console.log(C.dim(`backfilled ${written} opening charge(s)`));
+    }
+    const rows = ruling.docket(db, project.id, { limit, role, actor });
+    heading('Court docket');
+    if (!rows.length) {
+      console.log(C.dim('(no rulings recorded)'));
+      return;
+    }
+    for (const row of rows) {
+      const pair = row.pair || row.subject;
+      const status = row.status ? C.dim(` [${row.status}]`) : '';
+      console.log(`${C.bold(pair)}${status} — ${row.role} by ${row.actor}${row.standard ? ` (${row.standard})` : ''}`);
+      const marks: string[] = [];
+      if (row.objections) marks.push(`${row.objections} objection${row.objections === 1 ? '' : 's'}`);
+      if (row.openEnds) marks.push(`${row.openEnds} open want${row.openEnds === 1 ? '' : 's'}`);
+      if (row.contested) marks.push('contested');
+      console.log(
+        `  ${row.kind ? C.dim(`${row.kind}: `) : ''}${row.basis || '(no basis)'} ` +
+          C.dim(`(${row.rulings} ruling${row.rulings === 1 ? '' : 's'}, ${row.at})`) +
+          (marks.length ? ` ${C.yellow(`[${marks.join(', ')}]`)}` : ''),
+      );
+    }
+    return;
+  }
+
+  if (sub === 'anchors') {
+    const write = args.flags.write === true;
+    const limit = args.flags.limit === undefined
+      ? undefined
+      : Math.max(1, Math.floor(flagNumber(args, 'limit', 0)));
+    heading(write ? 'Anchor sentences (write)' : 'Anchor sentences (dry run)');
+    const result = lorebook.populateAnchors(db, project.id, { write, limit });
+    console.log(`checked ${result.checked}, filled ${result.filled}, changed ${result.changed}`);
+    const skipped = Object.entries(result.skipped).filter(([, n]) => n > 0);
+    if (skipped.length) {
+      console.log(`skipped: ${skipped.map(([reason, n]) => `${reason} ${n}`).join(', ')}`);
+    }
+    if (write) {
+      if (result.backupPath) console.log(`backup: ${result.backupPath}`);
+    } else {
+      console.log(C.dim('dry run: nothing written. Re-run with --write to store the anchors.'));
+    }
+    return;
+  }
+
+  if (sub === 'conflicts') {
+    const dismiss = flagNumber(args, 'dismiss', 0);
+    if (dismiss > 0) {
+      const changed = noteIngest.dismissConflict(db, dismiss);
+      console.log(changed ? `dismissed conflict ${dismiss}` : `conflict ${dismiss} was already dismissed`);
+      return;
+    }
+    const threadId = flagNumber(args, 'thread', 0);
+    const all = args.flags.all === true;
+    const where = [`project_id = ?`];
+    const params: unknown[] = [project.id];
+    if (threadId > 0) {
+      where.push('thread_id = ?');
+      params.push(threadId);
+    }
+    const rows = db.all<{
+      id: number;
+      thread_id: number;
+      note_low: number;
+      note_high: number;
+      kind_low: string;
+      kind_high: string;
+      status: string;
+    }>(
+      `SELECT id, thread_id, note_low, note_high, kind_low, kind_high, status
+         FROM canon_thread_conflict WHERE ${where.join(' AND ')} ORDER BY thread_id, id`,
+      ...params,
+    );
+    heading('Thread conflicts');
+    const visible = rows.filter((row) => row.status === 'visible').length;
+    console.log(`${rows.length} conflict(s): visible ${visible}, dismissed ${rows.length - visible}`);
+    if (all) {
+      for (const row of rows) {
+        console.log(
+          `  #${row.id} thread ${row.thread_id}: notes ${row.note_low}/${row.note_high} ` +
+            `${row.kind_low} vs ${row.kind_high} [${row.status}]`,
+        );
+      }
+    }
+    return;
+  }
+
   if (sub === 'meet') {
     if (args.flags.reconcile === true) {
       const write = args.flags.write === true;
@@ -791,7 +1009,8 @@ async function cmdLore(args: Args): Promise<void> {
       return;
     }
     heading('Meetings');
-    const result = meetingWeb.runMeetings(db, project.id);
+    const minAdmission = budgetFlag(args, 'min-admission');
+    const result = meetingWeb.runMeetings(db, project.id, { minAdmissionStrength: minAdmission });
     console.log(
       `candidates ${result.candidatesConsidered} in ${result.enumerationMs}ms` +
         (result.groupsSkippedForDepth ? ` (${result.groupsSkippedForDepth} deep branches stopped)` : '') +
@@ -894,6 +1113,7 @@ async function cmdLore(args: Args): Promise<void> {
       windowSize: flagNumber(args, 'window', 8),
       concurrency: flagNumber(args, 'concurrency', 3),
       maxWindows: budgetFlag(args, 'max-windows'),
+      starvedFirst: budgetFlag(args, 'starved-first'),
       priorityFirst: budgetFlag(args, 'priority-first'),
       randomFloor: budgetFlag(args, 'random-floor'),
       seed: budgetFlag(args, 'seed'),
@@ -912,6 +1132,14 @@ async function cmdLore(args: Args): Promise<void> {
             `${stats.selection.skipped} left unmined (re-run with --full for the rest)`,
         ),
       );
+      if (stats.starvedReserved) {
+        console.log(
+          C.dim(
+            `  starved: ${stats.starvedReserved} window(s) reserved, ${stats.starvedUsed} used, ` +
+              `${stats.threadsCovered ?? 0} starved thread(s) covered`,
+          ),
+        );
+      }
     }
     const v = stats.verification;
     if (v.claimed) {
@@ -1021,11 +1249,42 @@ async function cmdLore(args: Args): Promise<void> {
     if (!from) throw new Error(`no one called "${fromName}" (the --from side)`);
     const to = lorebook.findEntity(db, project.id, toName);
     if (!to) throw new Error(`no one called "${toName}" (the --to side)`);
-    const showSupporting = args.flags.supporting === true;
+    const showSupporting = args.flags.supporting === true || args.flags.assessment === true;
+    const showAssessment = args.flags.assessment === true;
     const atRaw = flagNumber(args, 'at', NaN);
     const atSeq = Number.isFinite(atRaw) ? atRaw : undefined;
     const directed = lorebook.directedPairStatus(db, project.id, from.id, to.id, atSeq);
     const corroborated = lorebook.relationCorroboration(db, project.id);
+    if (args.flags.brief === true) {
+      const plain = (status: string): string =>
+        status === 'user_confirmed'
+          ? 'confirmed by you'
+          : status === 'accepted'
+            ? 'confirmed'
+            : status === 'attested'
+              ? 'attested'
+              : status === 'provisional'
+                ? 'uncertain'
+                : status === 'needs_review'
+                  ? 'uncertain (held for review)'
+                  : status;
+      const one = (r: lorebook.StatusRow): string =>
+        `${r.fromName} — ${r.kind} — ${r.toName}  [${plain(r.reviewStatus)}]` +
+        (r.locator ? `  (${r.locator})` : '');
+      const lines: string[] = [];
+      if (directed.forward.current) lines.push(one(directed.forward.current));
+      if (directed.reverse.current) lines.push(one(directed.reverse.current));
+      if (!lines.length) {
+        const earlier = directed.forward.history.length + directed.reverse.history.length;
+        console.log(
+          `no current tie banked between ${from.name} and ${to.name}` +
+            (earlier ? ` (${earlier} earlier claim${earlier === 1 ? '' : 's'})` : ''),
+        );
+      } else {
+        for (const line of lines) console.log(line);
+      }
+      return;
+    }
     heading(
       `Ties: ${from.name} ↔ ${to.name}` + (atSeq !== undefined ? C.dim(` (at passage ${atSeq})`) : ''),
     );
@@ -1050,7 +1309,24 @@ async function cmdLore(args: Args): Promise<void> {
       if (supporting.length) {
         console.log(C.dim(`  supporting: ${supporting.length}${showSupporting ? '' : ' (use --supporting for quotes)'}`));
         if (showSupporting) {
-          for (const item of supporting) console.log(C.dim(`    "${item.quote}"${item.reason ? ` (${item.reason})` : ''}`));
+          for (const item of supporting) {
+            const quote = item.quote || r.evidence;
+            console.log(C.dim(`    "${quote}"${item.reason ? ` (${item.reason})` : ''}`));
+            if (showAssessment) {
+              const a = item.assessment;
+              if (a) {
+                console.log(
+                  C.dim(
+                    `      assessed: names_both ${a.names_both} · other ${a.other_person || '-'} · ` +
+                      `asserted ${a.asserted} · hedge ${a.hedge || '-'} · kind_fit ${a.kind_fit || '-'} · ` +
+                      `strength ${Number(a.strength).toFixed(2)}${a.why ? ` · ${a.why}` : ''}`,
+                  ),
+                );
+              } else {
+                console.log(C.dim('      (no assessment)'));
+              }
+            }
+          }
         }
       }
       if (r.modality !== 'asserted') console.log(`  ${C.dim(`framed as: ${r.modality}`)}`);

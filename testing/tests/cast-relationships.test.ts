@@ -124,7 +124,7 @@ function castSection(prompt: string): string {
   const start = prompt.indexOf('CAST RELATIONSHIPS');
   assert.ok(start >= 0, 'cast section present');
   const rest = prompt.slice(start);
-  const end = rest.search(/\n\n(?:CANON EVENTS INDEX|CONNECTED CONTEXT|AUTHOR PREFERENCES|AUTHOR NOTES)/);
+  const end = rest.search(/\n\n(?:EVIDENCE WEB|CANON EVENTS INDEX|CONNECTED CONTEXT|AUTHOR PREFERENCES|AUTHOR NOTES)/);
   return (end >= 0 ? rest.slice(0, end) : rest).trim();
 }
 

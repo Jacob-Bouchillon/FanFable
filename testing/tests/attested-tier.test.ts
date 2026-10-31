@@ -160,11 +160,11 @@ test('single-name quotes without chunk support stay parked; invented quotes stay
   db.close();
 });
 
-test('denied assertions, missing assessments, identity and PARK rules are unchanged', () => {
+test('denied assertions, identity and PARK rules still refuse; a missing assessment does not', () => {
   const { db, project, mara, tor } = setup();
   const chunk = addChunk(db, project.id, 'Mara feared him. Tor arrived with the guard at dawn.');
   addRelation(db, project.id, mara, tor, 'aunt of', 'Mara feared him.', chunk, { asserted: false });
-  addRelation(db, project.id, mara, tor, 'friend of', 'Mara feared him.', chunk, { asserted: null });
+  const unassessed = addRelation(db, project.id, mara, tor, 'friend of', 'Mara feared him.', chunk, { asserted: null });
   addRelation(db, project.id, mara, mara, 'ally of', 'Mara feared him.', chunk);
   const parked = addRelation(db, project.id, mara, tor, 'mentor of', 'Mara feared him.', chunk);
   db.run(
@@ -177,16 +177,92 @@ test('denied assertions, missing assessments, identity and PARK rules are unchan
     AT,
   );
   const dry = lorebook.assignAttestedTiers(db, project.id);
-  assert.equal(dry.attested, 0);
+  assert.equal(dry.attested, 1, 'no stored assessment is not a refusal');
   assert.deepEqual(dry.still, {
-    'assessment-missing': 1,
     'assertion-missing': 1,
     'same-identity': 1,
     'ruled-park': 1,
   });
+  const wrote = lorebook.assignAttestedTiers(db, project.id, { write: true });
+  assert.equal(wrote.changed, 1);
+  assert.equal(
+    db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', unassessed)!.review_status,
+    'attested',
+  );
   assert.equal(
     db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', parked)!.review_status,
     'provisional',
+  );
+  db.close();
+});
+
+test('an open-vocabulary label is proved by its passage, not refused by a word list', () => {
+  const { db, project, mara, tor } = setup();
+  const chunk = addChunk(db, project.id, 'Mara feared him. Tor arrived with the guard at dawn.');
+  const row = addRelation(db, project.id, mara, tor, 'guide to parity with', 'Mara feared him.', chunk, { asserted: null });
+  const dry = lorebook.assignAttestedTiers(db, project.id);
+  assert.equal(dry.attested, 1);
+  assert.equal(dry.still['open-vocab'], undefined, 'the concept vocabulary is no longer a gate');
+  const wrote = lorebook.assignAttestedTiers(db, project.id, { write: true });
+  assert.equal(wrote.changed, 1);
+  assert.equal(
+    db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', row)!.review_status,
+    'attested',
+  );
+  db.close();
+});
+
+test('co-presence and one-off actions never attest', () => {
+  const { db, project, mara, tor } = setup();
+  const chunk = addChunk(db, project.id, 'Mara feared him. Tor arrived with the guard at dawn.');
+  addRelation(db, project.id, mara, tor, 'appears with', 'Mara feared him.', chunk, { asserted: null });
+  addRelation(db, project.id, mara, tor, 'met with', 'Mara feared him.', chunk, { asserted: null });
+  const dry = lorebook.assignAttestedTiers(db, project.id);
+  assert.equal(dry.attested, 0);
+  assert.equal(dry.still['coverage-only'], 1);
+  assert.equal(dry.still['moment'], 1);
+  db.close();
+});
+
+test('a quote whose words are right but punctuation is not is repaired to the chunk', () => {
+  const { db, project, mara, tor } = setup();
+  const chunk = addChunk(db, project.id, 'Mara feared him at once. Tor arrived with the guard at dawn.');
+  const row = addRelation(db, project.id, mara, tor, 'guide to parity with', 'Mara feared him, at once', chunk, { asserted: null });
+  const off = lorebook.assignAttestedTiers(db, project.id, { write: true });
+  assert.equal(off.attested, 0);
+  assert.equal(off.still['quote-not-verbatim'], 1, 'presentation mismatch stays refused unless repair is asked for');
+  const dry = lorebook.assignAttestedTiers(db, project.id, { repairQuotes: true });
+  assert.equal(dry.attested, 1);
+  assert.equal(dry.repaired, 1);
+  const wrote = lorebook.assignAttestedTiers(db, project.id, { write: true, repairQuotes: true });
+  assert.equal(wrote.changed, 1);
+  const saved = db.get<{ evidence: string; review_status: string }>(
+    'SELECT evidence, review_status FROM canon_relation WHERE id = ?',
+    row,
+  )!;
+  assert.equal(saved.evidence, 'Mara feared him at once');
+  assert.equal(saved.review_status, 'attested');
+  assert.deepEqual(lorebook.findUnverifiedKeepers(db, project.id), []);
+  db.close();
+});
+
+test('promoteKeeper moves sentence-proof rows to accepted; off by default', () => {
+  const { db, project, mara, tor } = setup();
+  const chunk = addChunk(db, project.id, 'Mara is the aunt of Tor. The gate was cold.');
+  const row = addRelation(db, project.id, mara, tor, 'aunt of', 'Mara is the aunt of Tor.', chunk);
+  const kept = lorebook.assignAttestedTiers(db, project.id, { write: true });
+  assert.equal(kept.keeperTrack, 1);
+  assert.equal(kept.keeperPromoted, 0);
+  assert.equal(
+    db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', row)!.review_status,
+    'provisional',
+  );
+  const promoted = lorebook.assignAttestedTiers(db, project.id, { write: true, promoteKeeper: true });
+  assert.equal(promoted.keeperPromoted, 1);
+  assert.equal(promoted.changed, 1);
+  assert.equal(
+    db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', row)!.review_status,
+    'accepted',
   );
   db.close();
 });

@@ -386,7 +386,7 @@ test('loadThread is scoped to its project and reports unknown ids as null', () =
 
 test('migration 20 is additive on a v19 database and reruns as a no-op', () => {
   const { db } = tempDb();
-  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')!.user_version, 24);
+  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')!.user_version, 26);
   for (const table of ['canon_thread', 'canon_thread_passage', 'canon_thread_note', 'canon_open_end']) {
     assert.ok(tableExists(db.raw, table), `fresh bank has ${table}`);
   }
@@ -416,7 +416,7 @@ test('migration 20 is additive on a v19 database and reruns as a no-op', () => {
   db.raw.exec('PRAGMA foreign_keys = ON');
   assert.equal(tableExists(db.raw, 'canon_thread'), false);
 
-  assert.equal(runMigrations(db.raw), 24);
+  assert.equal(runMigrations(db.raw), 26);
   for (const table of ['canon_thread', 'canon_thread_passage', 'canon_thread_note', 'canon_open_end']) {
     assert.ok(tableExists(db.raw, table), `${table} is recreated additively`);
   }
@@ -431,7 +431,7 @@ test('migration 20 is additive on a v19 database and reruns as a no-op', () => {
   assert.ok(db.get<{ id: number }>('SELECT id FROM canon_entity WHERE id = ?', person));
   assert.ok(db.get<{ id: number }>('SELECT id FROM canon_entity WHERE id = ?', other));
 
-  assert.equal(runMigrations(db.raw), 24, 'second run stays at 24');
+  assert.equal(runMigrations(db.raw), 26, 'second run stays at 25');
   db.close();
 });
 

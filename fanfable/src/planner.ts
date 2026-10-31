@@ -250,6 +250,8 @@ export interface PlanRequest {
   chapterCount?: number;
   preferences?: OutlinePreferences;
   canonBrief?: string;
+  /** Rendered evidence web: graded ties, open questions, contradictions. */
+  webBrief?: string;
   /** Established ties among the named cast, pre-rendered one per line. */
   castRelationships?: string;
   canonEvents?: { id: number; title: string; summary: string }[];
@@ -271,6 +273,7 @@ export async function draftOutline(llm: LlmClient, req: PlanRequest): Promise<Om
     req.castRelationships
       ? `CAST RELATIONSHIPS (established ties between the named cast; user-confirmed ties are the author's own rulings and are not backed by a passage):\n${req.castRelationships}`
       : '',
+    req.webBrief ? req.webBrief : '',
     canonEvents ? `CANON EVENTS INDEX:\n${canonEvents}` : '',
     req.graphContext ? `CONNECTED CONTEXT (what the premise touches, and what leads from it):\n${truncate(req.graphContext, 3500)}` : '',
     req.preferences && Object.keys(req.preferences).length

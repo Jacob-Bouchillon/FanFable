@@ -665,6 +665,64 @@ export const MIGRATIONS: Migration[] = [
     // Additive only; existing rows read as 'default'.
     columns: [['canon_thread_note', 'strength_source', "TEXT NOT NULL DEFAULT 'default'"]],
   },
+  {
+    version: 25,
+    name: 'claim kinds and visible contradictions',
+    // Two additions. A note remembers which concept it asserted, so two notes
+    // on one thread can be compared; and opposition between them is recorded
+    // as a visible conflict, never as a ruling. Additive only.
+    columns: [['canon_thread_note', 'claim_kind', "TEXT NOT NULL DEFAULT ''"]],
+    sql: `
+      CREATE TABLE IF NOT EXISTS canon_thread_conflict (
+        id          INTEGER PRIMARY KEY,
+        project_id  INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        thread_id   INTEGER NOT NULL REFERENCES canon_thread(id) ON DELETE CASCADE,
+        note_low    INTEGER NOT NULL REFERENCES canon_thread_note(id) ON DELETE CASCADE,
+        note_high   INTEGER NOT NULL REFERENCES canon_thread_note(id) ON DELETE CASCADE,
+        kind_low    TEXT NOT NULL DEFAULT '',
+        kind_high   TEXT NOT NULL DEFAULT '',
+        basis       TEXT NOT NULL DEFAULT '',
+        status      TEXT NOT NULL DEFAULT 'visible',   -- visible | dismissed
+        created_at  TEXT NOT NULL
+      );
+      -- One row per opposed pair of notes on one thread, whichever way round
+      -- they were seen.
+      CREATE UNIQUE INDEX IF NOT EXISTS canon_thread_conflict_pair
+        ON canon_thread_conflict(project_id, thread_id, note_low, note_high);
+      CREATE INDEX IF NOT EXISTS canon_thread_conflict_thread
+        ON canon_thread_conflict(thread_id, status);
+    `,
+  },
+  {
+    version: 26,
+    name: 'court record: rulings and docket',
+    // Every status change writes one row here, whoever made it: the bank on
+    // insert, the web when it gathers a clue, the chain when it verifies a
+    // quote, the assessor when it scores, the guard on appeal, a human when
+    // they rule. The relation's status is the current verdict; this table is
+    // the record of how it got there. Additive only.
+    sql: `
+      CREATE TABLE IF NOT EXISTS canon_ruling (
+        id          INTEGER PRIMARY KEY,
+        project_id  INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        relation_id INTEGER REFERENCES canon_relation(id) ON DELETE SET NULL,
+        thread_id   INTEGER REFERENCES canon_thread(id) ON DELETE SET NULL,
+        subject     TEXT NOT NULL DEFAULT '',
+        role        TEXT NOT NULL,                 -- charge | clue | verdict | appeal | removal
+        actor       TEXT NOT NULL,                 -- bank | web | chain | assessor | guard | human | external
+        standard    TEXT NOT NULL DEFAULT '',
+        from_status TEXT NOT NULL DEFAULT '',
+        to_status   TEXT NOT NULL DEFAULT '',
+        basis       TEXT NOT NULL DEFAULT '',
+        quote_hash  TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS canon_ruling_relation
+        ON canon_ruling(project_id, relation_id, id);
+      CREATE INDEX IF NOT EXISTS canon_ruling_subject
+        ON canon_ruling(project_id, subject, id);
+    `,
+  },
 ];
 
 /**

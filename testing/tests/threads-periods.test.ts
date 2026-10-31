@@ -251,7 +251,7 @@ test('pickPeriodThread prefers a containing period, then the narrowest', () => {
 
 test('migration 23 is additive on a v22 database and reruns as a no-op', () => {
   const { db } = tempDb();
-  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')!.user_version, 24);
+  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')!.user_version, 26);
   const columns = db.all<{ name: string }>('PRAGMA table_info(canon_thread)').map((row) => row.name);
   for (const column of ['period_label', 'period_from_seq', 'period_to_seq', 'temporal_status']) {
     assert.ok(columns.includes(column), `${column} exists`);
@@ -281,7 +281,7 @@ test('migration 23 is additive on a v22 database and reruns as a no-op', () => {
   db.raw.exec('PRAGMA foreign_keys = ON');
   assert.equal(tableExists(db.raw, 'canon_thread'), true);
 
-  assert.equal(runMigrations(db.raw), 24);
+  assert.equal(runMigrations(db.raw), 26);
   const after = db.all<{ name: string }>('PRAGMA table_info(canon_thread)').map((row) => row.name);
   for (const column of ['period_label', 'period_from_seq', 'period_to_seq', 'temporal_status']) {
     assert.ok(after.includes(column), `${column} is recreated`);
@@ -296,6 +296,6 @@ test('migration 23 is additive on a v22 database and reruns as a no-op', () => {
     'existing data survives',
   );
   assert.ok(db.get<{ id: number }>('SELECT id FROM canon_entity WHERE id = ?', mara));
-  assert.equal(runMigrations(db.raw), 24, 'second run stays at 24');
+  assert.equal(runMigrations(db.raw), 26, 'second run stays at 25');
   db.close();
 });

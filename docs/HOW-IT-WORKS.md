@@ -53,12 +53,12 @@ Per relation the model returns:
   "evidence": "the sentence",
   "anchor": "the sentence naming the other person, when the quote names only one",
   "names_both": false, "asserted": true,
-  "other_person": "pronoun", "directness": "implied",
+  "other_person": "pronoun",
   "confidence": 0.7, "why": "one sentence of reasoning"
 }
 ```
 
-`other_person`: named | pronoun | role | absent. `directness`: stated | implied. `strength`/`confidence`: how strongly this quote supports *this concept* for *these two people* — "shared a dormitory" is 0.9 for `dormmate`, 0.4 for `friend`. `why` is stored for audit, never parsed. *(shipped)*
+`other_person`: named | pronoun | role | absent. `strength`/`confidence`: how strongly this quote supports *this concept* for *these two people* — "shared a dormitory" is 0.9 for `dormmate`, 0.4 for `friend`. `why` is stored for audit, never parsed. *(shipped)*
 
 | tier | meaning |
 |---|---|
@@ -164,3 +164,12 @@ A note's strength now comes from its evidence, never from a default of one: an a
 | judge (42 blind rows) | 0.83 precision / 0.68 recall counting reinforcement; 14% run-to-run flip |
 | bank (trial book) | 164 relations: 23 user_confirmed, 1 accepted, 122 provisional, 18 needs_review; queue 258 notes; 392 canon events |
 | extraction (9B, partial 31/66 windows) | 91 relations, 48 facts |
+
+### Evidence web brief *(shipped)*
+
+`buildWebBrief` turns the web into a deterministic, read-only brief: proven ties (`user_confirmed`), attested
+ties, provisional rows that carry an assessment, open questions oldest first, visible contradictions,
+per-entity and per-pair thread lines, and unresolved names with candidates. Every item carries a citation or
+is marked `uncited`, and a provisional or uncited row is never presented as fact. `renderWebBrief` prints the
+five planning headings; `draftOutline` shows the block only when `webBrief` is supplied, so an empty cast
+leaves planning exactly as before. `lore brief --for "A, B" [--limit n]` prints it. No model call, no writes.

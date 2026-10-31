@@ -18,7 +18,8 @@ import { asRecordArray, extractJson, salvageJsonArray, toStringArray } from './j
 import type { LlmClient } from './llm.ts';
 import { embedMissing, type EmbedFn } from './embeddings.ts';
 import { CORROBORATION_CAP, tripleKey, rankRows } from './edge-rank.ts';
-import { noteFromExtraction } from './note-ingest.ts';
+import { noteFromExtraction, starvedWindowScores } from './note-ingest.ts';
+import { recordRuling } from './ruling.ts';
 import { findHeadings, lexicalScore, splitSentences, tokenize, truncate } from './text.ts';
 import {
   ANSWER_CUE_STOPWORDS,
@@ -73,6 +74,8 @@ export interface SupportingEvidence {
   sourceRefs: { source?: string; locator?: string; chunk?: number }[];
   reason: string;
   movedAt: string;
+  /** The model's assessment, when this item carries one. */
+  assessment: ClaimAssessment | null;
 }
 
 export interface CanonRelation {
@@ -425,6 +428,13 @@ export interface ExtractOptions {
    */
   maxWindows?: number;
   /**
+   * Windows reserved for starved threads before priority selection.
+   *
+   * Default: a quarter of the budget (1 to 4), or 4 when no budget is set.
+   * `0` restores pure priority selection.
+   */
+  starvedFirst?: number;
+  /**
    * How many of the budget always go to the highest-scoring windows.
    * Defaults to the whole budget (pure priority order, no sampling).
    */
@@ -525,6 +535,10 @@ export interface ExtractLoreResult {
   contested?: { facts: number; relations: number };
   /** Clue notes this run added to the evidence web, when ingestion ran. */
   notesIngested?: number;
+  /** Windows reserved for starved threads, and the threads they covered. */
+  starvedReserved?: number;
+  starvedUsed?: number;
+  threadsCovered?: number;
 }
 
 export interface ChunkRow {
@@ -768,11 +782,57 @@ export async function extractLore(
     return stats;
   }
 
-  const selection = selectWindows(
+  // Starved first: a few windows are reserved for threads that have nothing
+  // yet, so a budgeted run never reads only the same rich passages. The
+  // reservation is capped and ordered deterministically; 0 disables it.
+  const budgeted = opts.full !== true && opts.maxWindows !== undefined && opts.maxWindows < candidates.length;
+  const starvedFirst =
+    opts.starvedFirst ??
+    (opts.maxWindows !== undefined ? Math.min(4, Math.max(1, Math.ceil(opts.maxWindows / 4))) : 4);
+  let selection = selectWindows(
     candidates.map(({ window }) => scoreWindow(window, docFreq)),
     opts,
   );
-  const chosen = new Set(selection.selected);
+  let chosen = new Set(selection.selected);
+  if (budgeted && starvedFirst > 0) {
+    const starved = starvedWindowScores(db, projectId, { windowSize });
+    const candidateByFirstChunk = new Map<number, number>();
+    candidates.forEach(({ window }, index) => {
+      const first = window[0];
+      if (first) candidateByFirstChunk.set(first.id, index);
+    });
+    const reserved: number[] = [];
+    for (const entry of starved.windows) {
+      const first = chunks[entry.index * windowSize];
+      if (!first) continue;
+      const candidateIndex = candidateByFirstChunk.get(first.id);
+      if (candidateIndex === undefined) continue;
+      reserved.push(candidateIndex);
+      if (reserved.length >= starvedFirst) break;
+    }
+    if (reserved.length) {
+      const reservedSet = new Set(reserved);
+      const pool = candidates
+        .map((_, index) => index)
+        .filter((index) => !reservedSet.has(index));
+      const remaining = Math.max(0, (opts.maxWindows ?? 0) - reserved.length);
+      const rest = selectWindows(
+        pool.map((index) => scoreWindow(candidates[index]!.window, docFreq)),
+        { ...opts, maxWindows: remaining, full: false },
+      );
+      const reasons = new Map<number, string[]>();
+      for (const index of reserved) reasons.set(index, ['starved']);
+      for (const index of rest.selected) {
+        const mapped = pool[index]!;
+        reasons.set(mapped, [...(rest.reasons.get(index) ?? []), 'starved-fill']);
+      }
+      selection = { selected: [...new Set([...reserved, ...rest.selected.map((i) => pool[i]!)])].sort((a, b) => a - b), skipped: [], reasons };
+      chosen = new Set(selection.selected);
+      stats.starvedReserved = reserved.length;
+      stats.starvedUsed = reserved.length;
+      stats.threadsCovered = starved.threadsCovered;
+    }
+  }
   const runList = candidates.filter((_, i) => chosen.has(i));
   if (runList.length < candidates.length) {
     const kinds = new Map<string, number>();
@@ -1451,7 +1511,7 @@ function earliestRefs(db: Db, a: string, b: string): string {
  * sentence and quote, the earliest place, and needs_review if either side had
  * it. Different labels on the same pair stay separate.
  */
-function dedupeRelations(db: Db, projectId: number): void {
+export function dedupeRelations(db: Db, projectId: number): void {
   type Row = { id: number; from_entity: number; to_entity: number; kind: string; description: string; evidence: string; source_refs: string; review_status: string };
   const rows = db.all<Row>(
     'SELECT id, from_entity, to_entity, kind, description, evidence, source_refs, review_status FROM canon_relation WHERE project_id = ? ORDER BY id',
@@ -1471,15 +1531,40 @@ function dedupeRelations(db: Db, projectId: number): void {
     const evidence = row.evidence.length > first.evidence.length ? row.evidence : first.evidence;
     const sourceRefs = earliestRefs(db, first.source_refs, row.source_refs);
     const review = maxTrust(first.review_status, row.review_status);
-    db.run(
-      'UPDATE canon_relation SET description = ?, evidence = ?, source_refs = ?, review_status = ? WHERE id = ?',
-      description,
-      evidence,
-      sourceRefs,
-      review,
-      first.id,
-    );
-    db.run('DELETE FROM canon_relation WHERE id = ?', row.id);
+    db.transaction(() => {
+      const survivorBefore = first.review_status;
+      db.run(
+        'UPDATE canon_relation SET description = ?, evidence = ?, source_refs = ?, review_status = ? WHERE id = ?',
+        description,
+        evidence,
+        sourceRefs,
+        review,
+        first.id,
+      );
+      if (review !== survivorBefore) {
+        recordRuling(db, projectId, {
+          relationId: first.id,
+          role: 'appeal',
+          actor: 'guard',
+          standard: 'merge',
+          fromStatus: survivorBefore,
+          toStatus: review,
+          basis: `merge trust from relation ${row.id}`,
+          quote: evidence,
+        });
+      }
+      recordRuling(db, projectId, {
+        relationId: row.id,
+        role: 'appeal',
+        actor: 'guard',
+        standard: 'merge',
+        fromStatus: row.review_status,
+        toStatus: 'merged',
+        basis: `merged into relation ${first.id}`,
+        quote: row.evidence,
+      });
+      db.run('DELETE FROM canon_relation WHERE id = ?', row.id);
+    });
     first.description = description;
     first.evidence = evidence;
     first.source_refs = sourceRefs;
@@ -3922,26 +4007,40 @@ function applyRelations(
         const sourceRefs = earliestRefs(db, toJson(refs), twin.source_refs);
         const twinReview = maxTrust(rowReview, twin.review_status);
         const twinConfidence = Math.max(Number(twin.confidence) || 0, confidence);
-        db.run(
-          `UPDATE canon_relation
-              SET kind = ?, description = ?, evidence = ?, source_refs = ?, review_status = ?,
-                  confidence = ?, supporting_evidence = ?,
-                  kind_source = CASE WHEN ? <> '' THEN ? ELSE kind_source END,
-                  anchor_evidence = CASE WHEN ? <> '' THEN ? ELSE anchor_evidence END
-            WHERE id = ?`,
-          twin.kind,
-          sentence,
-          quote,
-          sourceRefs,
-          twinReview,
-          twinConfidence,
-          appendAssessment(twin.supporting_evidence, assessment),
-          kindSource,
-          kindSource,
-          anchorEvidence,
-          anchorEvidence,
-          twin.id,
-        );
+        db.transaction(() => {
+          db.run(
+            `UPDATE canon_relation
+                SET kind = ?, description = ?, evidence = ?, source_refs = ?, review_status = ?,
+                    confidence = ?, supporting_evidence = ?,
+                    kind_source = CASE WHEN ? <> '' THEN ? ELSE kind_source END,
+                    anchor_evidence = CASE WHEN ? <> '' THEN ? ELSE anchor_evidence END
+              WHERE id = ?`,
+            twin.kind,
+            sentence,
+            quote,
+            sourceRefs,
+            twinReview,
+            twinConfidence,
+            appendAssessment(twin.supporting_evidence, assessment),
+            kindSource,
+            kindSource,
+            anchorEvidence,
+            anchorEvidence,
+            twin.id,
+          );
+          if (twinReview !== twin.review_status) {
+            recordRuling(db, projectId, {
+              relationId: twin.id,
+              role: 'appeal',
+              actor: 'guard',
+              standard: 'merge',
+              fromStatus: twin.review_status,
+              toStatus: twinReview,
+              basis: 'same quote merged into the rival claim',
+              quote,
+            });
+          }
+        });
         accepted++;
         continue;
       }
@@ -3976,25 +4075,39 @@ function applyRelations(
         const sourceRefs = earliestRefs(db, toJson(refs), existing.source_refs);
         const mergedReview = maxTrust(rowReview, existing.review_status);
         const mergedConfidence = Math.max(Number(existing.confidence) || 0, confidence);
-        db.run(
-          `UPDATE canon_relation
-              SET description = ?, evidence = ?, source_refs = ?, review_status = ?,
-                  confidence = ?, supporting_evidence = ?,
-                  kind_source = CASE WHEN ? <> '' THEN ? ELSE kind_source END,
-                  anchor_evidence = CASE WHEN ? <> '' THEN ? ELSE anchor_evidence END
-            WHERE id = ?`,
-          sentence,
-          quote,
-          sourceRefs,
-          mergedReview,
-          mergedConfidence,
-          appendAssessment(existing.supporting_evidence, assessment),
-          kindSource,
-          kindSource,
-          anchorEvidence,
-          anchorEvidence,
-          existing.id,
-        );
+        db.transaction(() => {
+          db.run(
+            `UPDATE canon_relation
+                SET description = ?, evidence = ?, source_refs = ?, review_status = ?,
+                    confidence = ?, supporting_evidence = ?,
+                    kind_source = CASE WHEN ? <> '' THEN ? ELSE kind_source END,
+                    anchor_evidence = CASE WHEN ? <> '' THEN ? ELSE anchor_evidence END
+              WHERE id = ?`,
+            sentence,
+            quote,
+            sourceRefs,
+            mergedReview,
+            mergedConfidence,
+            appendAssessment(existing.supporting_evidence, assessment),
+            kindSource,
+            kindSource,
+            anchorEvidence,
+            anchorEvidence,
+            existing.id,
+          );
+          if (mergedReview !== existing.review_status) {
+            recordRuling(db, projectId, {
+              relationId: existing.id,
+              role: 'appeal',
+              actor: 'guard',
+              standard: 'merge',
+              fromStatus: existing.review_status,
+              toStatus: mergedReview,
+              basis: 'duplicate claim merged',
+              quote,
+            });
+          }
+        });
         accepted++;
         continue;
       }
@@ -5346,11 +5459,24 @@ export function promoteProvisional(
     if (decision.ok) {
       result.promoted++;
       if (!opts.dryRun) {
-        db.run(
-          "UPDATE canon_relation SET review_status = 'accepted' WHERE id = ? AND project_id = ? AND review_status = 'provisional'",
-          row.id,
-          projectId,
-        );
+        db.transaction(() => {
+          const changed = db.run(
+            "UPDATE canon_relation SET review_status = 'accepted' WHERE id = ? AND project_id = ? AND review_status = 'provisional'",
+            row.id,
+            projectId,
+          ).changes;
+          if (changed) {
+            recordRuling(db, projectId, {
+              relationId: row.id,
+              role: 'appeal',
+              actor: 'guard',
+              standard: 'sentence-proof',
+              fromStatus: 'provisional',
+              toStatus: 'accepted',
+              basis: 'proven quote and threshold',
+            });
+          }
+        });
       }
     } else {
       result.still.push({ id: row.id, reason: decision.reason ?? 'unproven' });
@@ -5388,11 +5514,24 @@ export function reclassifyAccepted(
     const reason = decision.reason ?? 'unproven';
     result.reasons[reason] = (result.reasons[reason] ?? 0) + 1;
     if (!opts.dryRun) {
-      db.run(
-        "UPDATE canon_relation SET review_status = 'provisional' WHERE id = ? AND project_id = ? AND review_status = 'accepted'",
-        row.id,
-        projectId,
-      );
+      db.transaction(() => {
+        const changed = db.run(
+          "UPDATE canon_relation SET review_status = 'provisional' WHERE id = ? AND project_id = ? AND review_status = 'accepted'",
+          row.id,
+          projectId,
+        ).changes;
+        if (changed) {
+          recordRuling(db, projectId, {
+            relationId: row.id,
+            role: 'appeal',
+            actor: 'guard',
+            standard: 'strict-verbatim',
+            fromStatus: 'accepted',
+            toStatus: 'provisional',
+            basis: `reclassify: ${reason}`,
+          });
+        }
+      });
     }
   }
   return result;
@@ -5504,6 +5643,7 @@ export function auditAcceptedRelations(
     rows: [],
   };
   const failing: number[] = [];
+  const failReason = new Map<number, string>();
   for (const row of rows) {
     const fromAliases = strList(row.from_aliases);
     const toAliases = strList(row.to_aliases);
@@ -5538,6 +5678,7 @@ export function auditAcceptedRelations(
     else {
       const reason = effective.reason ?? 'unproven';
       result.failing[reason] = (result.failing[reason] ?? 0) + 1;
+      failReason.set(row.id, reason);
       failing.push(row.id);
     }
     if (cannotJudge) result.cannotJudge++;
@@ -5560,11 +5701,23 @@ export function auditAcceptedRelations(
     result.backupPath = backupPath;
     db.transaction(() => {
       for (const id of failing) {
-        result.changed += db.run(
+        const changed = db.run(
           "UPDATE canon_relation SET review_status = 'provisional' WHERE id = ? AND project_id = ? AND review_status = 'accepted'",
           id,
           projectId,
         ).changes;
+        result.changed += changed;
+        if (changed) {
+          recordRuling(db, projectId, {
+            relationId: id,
+            role: 'appeal',
+            actor: 'guard',
+            standard: 'strict-verbatim',
+            fromStatus: 'accepted',
+            toStatus: 'provisional',
+            basis: `audit: ${failReason.get(id) ?? 'unproven'}`,
+          });
+        }
       }
     });
   }
@@ -5575,11 +5728,16 @@ export function auditAcceptedRelations(
 
 /**
  * The attested tier (audit open decision #1, 2026-10-28): a citable middle
- * tier between keeper and provisional. A row is attested when the quote
- * states the tie (the stored assessment's `asserted` flag) and is verbatim
- * in its cited chunk, both endpoints are named anywhere in that chunk, the
- * endpoints are not one identity, and no PARK ruling binds the pair. Still
- * quoted, still checkable, never invented.
+ * tier between keeper and provisional. A row is attested when its quote is
+ * verbatim in its cited chunk, both endpoints are named anywhere in that
+ * chunk, the endpoints are not one identity, and no PARK ruling binds the
+ * pair. Still quoted, still checkable, never invented.
+ *
+ * The label is not a gate. The concept vocabulary names and queries claims;
+ * it no longer decides whether a passage proves one, because a correct claim
+ * worded as "his master" was being refused for the author's phrasing rather
+ * than for its evidence. Co-presence and one-off moments are still excluded:
+ * they are not relationships at all.
  *
  * Keeper-grade is frozen: `canPromote`, extraction tiers (`claimTier`) and
  * `promoteProvisional` are untouched, so sentence-proof rows stay
@@ -5588,7 +5746,7 @@ export function auditAcceptedRelations(
  * rules are the same helpers the keeper guard uses.
  */
 
-export type AttestedReason = PromoteReason | 'keeper-track' | 'assessment-missing';
+export type AttestedReason = PromoteReason | 'keeper-track' | 'assessment-missing' | 'moment';
 
 export interface AttestedCheck {
   attested: boolean;
@@ -5632,11 +5790,18 @@ export function checkAttested(
   chunkText: string | null,
 ): AttestedCheck {
   const canonical = canonicalKind(row.kind);
+  // Co-presence and one-off actions are not relationship evidence, whatever
+  // the quote says. Every other label is the model's call: the concept
+  // vocabulary is for naming and querying, never a promotion gate.
   if (COVERAGE_KINDS.has(canonical)) return { attested: false, reason: 'coverage-only' };
-  if (!RELATIONSHIP_GRADE_KINDS.has(canonical)) return { attested: false, reason: 'open-vocab' };
+  if (isMomentKind(canonical)) return { attested: false, reason: 'moment' };
+  // A stored assessment is evidence about the claim, not a requirement: a
+  // row without one is judged by its quote and its chunk. An assessment that
+  // denies the claim still refuses it.
   const assessment = storedAssessment(row.supportingEvidence);
-  if (!assessment) return { attested: false, reason: 'assessment-missing' };
-  if (assessment.asserted !== true) return { attested: false, reason: 'assertion-missing' };
+  if (assessment && (assessment.asserted === false || assessment.hedge === 'denied' || assessment.hedge === 'doubted')) {
+    return { attested: false, reason: 'assertion-missing' };
+  }
   if (row.fromId === row.toId) return { attested: false, reason: 'same-identity' };
   if (nestedCharacterNames(db, projectId, row.fromId, row.toId, row.fromName, row.toName)) {
     return { attested: false, reason: 'same-identity' };
@@ -5693,12 +5858,156 @@ export function checkAttested(
   return { attested: true, reason: 'ok' };
 }
 
+export interface AnchorFillResult {
+  checked: number;
+  filled: number;
+  changed: number;
+  skipped: Record<'both-named' | 'neither-named' | 'no-chunk' | 'no-sentence' | 'ambiguous', number>;
+  backupPath?: string;
+}
+
+/**
+ * Fill `anchor_evidence` for claims whose quote names one person.
+ *
+ * The quote states the tie; the anchor is the sentence in the same chunk that
+ * names the other person. Code-only and deterministic: exactly one candidate
+ * sentence, or the nearest one to the quote, or nothing. This is the missing
+ * half of a one-name citation, not a new judgement about the claim.
+ */
+export function populateAnchors(
+  db: Db,
+  projectId: number,
+  opts: { write?: boolean; limit?: number } = {},
+): AnchorFillResult {
+  const rows = db
+    .all<{
+      id: number;
+      evidence: string;
+      source_refs: string;
+      review_status: string;
+      a_name: string;
+      a_aliases: string;
+      b_name: string;
+      b_aliases: string;
+    }>(
+      `SELECT r.id, r.evidence, r.source_refs, r.review_status,
+              a.name AS a_name, a.aliases AS a_aliases,
+              b.name AS b_name, b.aliases AS b_aliases
+         FROM canon_relation r
+         JOIN canon_entity a ON a.id = r.from_entity
+         JOIN canon_entity b ON b.id = r.to_entity
+        WHERE r.project_id = ? AND r.anchor_evidence = '' AND trim(r.evidence) <> ''
+        ORDER BY r.id`,
+      projectId,
+    )
+    .slice(0, opts.limit === undefined ? undefined : Math.max(0, Math.floor(opts.limit)));
+  const result: AnchorFillResult = {
+    checked: rows.length,
+    filled: 0,
+    changed: 0,
+    skipped: { 'both-named': 0, 'neither-named': 0, 'no-chunk': 0, 'no-sentence': 0, ambiguous: 0 },
+  };
+  const picks: { id: number; anchor: string; basis: string }[] = [];
+  for (const row of rows) {
+    const quote = normalise(row.evidence);
+    const formsA = [row.a_name, ...strList(row.a_aliases)].map((f) => f.toLowerCase()).filter(Boolean);
+    const formsB = [row.b_name, ...strList(row.b_aliases)].map((f) => f.toLowerCase()).filter(Boolean);
+    const names = (forms: string[]): boolean => forms.some((form) => quote.includes(form));
+    const inA = names(formsA);
+    const inB = names(formsB);
+    if (inA && inB) {
+      result.skipped['both-named']++;
+      continue;
+    }
+    let chunkText: string | null = null;
+    try {
+      const refs = JSON.parse(row.source_refs || '[]') as { chunk?: unknown }[];
+      const chunkId = refs.find((ref) => Number.isFinite(Number(ref?.chunk)) && Number(ref?.chunk) > 0)?.chunk;
+      if (chunkId !== undefined) {
+        chunkText = db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', Number(chunkId))?.text ?? null;
+      }
+    } catch {
+      chunkText = null;
+    }
+    if (!chunkText) {
+      result.skipped['no-chunk']++;
+      continue;
+    }
+    const sentences = splitSentences(chunkText);
+    const quoteAt = sentences.findIndex((sentence) => normalise(sentence).includes(quote));
+    if (quoteAt < 0) {
+      result.skipped['no-sentence']++;
+      continue;
+    }
+    const wanted = inA ? formsB : formsA;
+    const candidates = !inA && !inB
+      ? sentences
+          .map((sentence, index) => ({ sentence, index }))
+          .filter(
+            ({ sentence }) =>
+              formsA.some((form) => sentence.toLowerCase().includes(form)) &&
+              formsB.some((form) => sentence.toLowerCase().includes(form)),
+          )
+      : sentences
+          .map((sentence, index) => ({ sentence, index }))
+          .filter(({ sentence, index }) => index !== quoteAt && wanted.some((form) => sentence.toLowerCase().includes(form)));
+    if (!candidates.length) {
+      result.skipped['no-sentence']++;
+      continue;
+    }
+    const nearest = candidates.reduce((best, current) =>
+      Math.abs(current.index - quoteAt) < Math.abs(best.index - quoteAt) ? current : best,
+    );
+    const tied = candidates.filter(
+      (candidate) => Math.abs(candidate.index - quoteAt) === Math.abs(nearest.index - quoteAt) && candidate.index !== nearest.index,
+    );
+    if (tied.length) {
+      result.skipped.ambiguous++;
+      continue;
+    }
+    result.filled++;
+    picks.push({
+      id: row.id,
+      anchor: nearest.sentence,
+      basis: !inA && !inB ? 'anchor names both' : `anchor names ${inA ? row.b_name : row.a_name}`,
+    });
+  }
+  if (opts.write && picks.length) {
+    const stamp = nowIso().replace(/[:.]/g, '-');
+    const backupPath = `${db.path}.anchor-backup-${stamp}.db`;
+    db.exec(`VACUUM INTO '${backupPath.replace(/'/g, "''")}'`);
+    result.backupPath = backupPath;
+    db.transaction(() => {
+      for (const pick of picks) {
+        const changed = db.run(
+          'UPDATE canon_relation SET anchor_evidence = ? WHERE id = ? AND project_id = ? AND anchor_evidence = ?',
+          pick.anchor,
+          pick.id,
+          projectId,
+          '',
+        ).changes;
+        if (!changed) continue;
+        result.changed++;
+        recordRuling(db, projectId, {
+          relationId: pick.id,
+          role: 'clue',
+          actor: 'chain',
+          standard: 'anchor',
+          basis: pick.basis,
+          quote: pick.anchor,
+        });
+      }
+    });
+  }
+  return result;
+}
+
 export interface AttestedAssignRow {
   id: number;
   fromName: string;
   kind: string;
   toName: string;
-  result: 'attest' | 'leave';
+  result: 'attest' | 'accept' | 'leave';
   reason: AttestedReason | 'ok';
 }
 
@@ -5706,6 +6015,10 @@ export interface AttestedAssignResult {
   checked: number;
   attested: number;
   keeperTrack: number;
+  /** Of the keeper-track rows, those the proven check passed and moved to `accepted`. */
+  keeperPromoted: number;
+  /** Rows whose quote was replaced by the cited chunk's own bytes before grading. */
+  repaired: number;
   still: Record<string, number>;
   changed: number;
   backupPath?: string;
@@ -5713,18 +6026,48 @@ export interface AttestedAssignResult {
 }
 
 /**
+ * The cited chunk's own bytes for a quote that differs only in presentation.
+ *
+ * Word-level match: the quote's words, in order, separated by any run of
+ * punctuation or space. Used only to repair a citation whose words are
+ * already right, so integrity and the attested tier can agree on one string.
+ * Returns null when the words are not there, so a paraphrase is still refused.
+ */
+function exactSpanInChunk(chunkText: string, quote: string): string | null {
+  const words = String(quote ?? '').match(/[A-Za-z0-9']+/g) ?? [];
+  if (words.length < 2) return null;
+  const pattern = words
+    .map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join("[^A-Za-z0-9']+");
+  const match = new RegExp(pattern, 'i').exec(chunkText);
+  return match ? match[0] : null;
+}
+
+/**
  * Move passage-proof provisional/needs_review rows to `attested`.
  *
  * Dry run by default. With `write`, attested rows move from
  * provisional/needs_review to `attested` in one transaction after a
- * consistent snapshot backup; no evidence, source ref, kind or assessment is
- * touched, rows are never deleted, and accepted/user_confirmed rows are
- * never read.
+ * consistent snapshot backup; no source ref, kind or assessment is touched,
+ * rows are never deleted, and accepted/user_confirmed rows are never read.
+ * Evidence is only replaced by the cited chunk's own bytes for the same
+ * words, and only when `repairQuotes` asks for it.
+ *
+ * `promoteKeeper` also sends sentence-proof rows (both names in the quote)
+ * through the existing proven guard to `accepted` instead of leaving them for
+ * a `promote` pass that only reads `provisional`. Off by default, so the
+ * library's keeper-track contract is unchanged.
+ *
+ * `repairQuotes` fixes a quote whose words are in the chunk but whose
+ * punctuation is not (a straight vs curly apostrophe, a dropped full stop).
+ * Integrity kept refusing those as not verbatim while the bank had already
+ * accepted them under the word-level guard; repairing to the chunk's bytes
+ * makes both agree without weakening the check.
  */
 export function assignAttestedTiers(
   db: Db,
   projectId: number,
-  opts: { write?: boolean; limit?: number } = {},
+  opts: { write?: boolean; limit?: number; promoteKeeper?: boolean; repairQuotes?: boolean } = {},
 ): AttestedAssignResult {
   const rows = db
     .all<{
@@ -5737,6 +6080,8 @@ export function assignAttestedTiers(
       kind_source: string;
       anchor_evidence: string;
       supporting_evidence: string;
+      confidence: number;
+      review_status: string;
       from_name: string;
       from_aliases: string;
       from_status: string;
@@ -5744,7 +6089,7 @@ export function assignAttestedTiers(
       to_aliases: string;
       to_status: string;
     }>(
-      'SELECT r.id, r.from_entity, r.to_entity, r.kind, r.evidence, r.source_refs, r.kind_source, r.anchor_evidence, r.supporting_evidence, a.name AS from_name, a.aliases AS from_aliases, a.review_status AS from_status, b.name AS to_name, b.aliases AS to_aliases, b.review_status AS to_status FROM canon_relation r JOIN canon_entity a ON a.id = r.from_entity JOIN canon_entity b ON b.id = r.to_entity WHERE r.project_id = ? AND r.review_status IN (\'provisional\',\'needs_review\') ORDER BY r.id',
+      'SELECT r.id, r.from_entity, r.to_entity, r.kind, r.evidence, r.source_refs, r.kind_source, r.anchor_evidence, r.supporting_evidence, r.confidence, r.review_status, a.name AS from_name, a.aliases AS from_aliases, a.review_status AS from_status, b.name AS to_name, b.aliases AS to_aliases, b.review_status AS to_status FROM canon_relation r JOIN canon_entity a ON a.id = r.from_entity JOIN canon_entity b ON b.id = r.to_entity WHERE r.project_id = ? AND r.review_status IN (\'provisional\',\'needs_review\') ORDER BY r.id',
       projectId,
     )
     .slice(0, opts.limit === undefined ? undefined : Math.max(0, Math.floor(opts.limit)));
@@ -5752,12 +6097,18 @@ export function assignAttestedTiers(
     checked: rows.length,
     attested: 0,
     keeperTrack: 0,
+    keeperPromoted: 0,
+    repaired: 0,
     still: {},
     changed: 0,
     rows: [],
   };
   const attest: number[] = [];
+  const promote: number[] = [];
+  const repairs = new Map<number, string>();
+  const priorStatus = new Map<number, string>();
   for (const row of rows) {
+    priorStatus.set(row.id, row.review_status);
     // Passage-level means the raw cited chunk: no page-text expansion and no
     // anywhere-fallback, so this agrees exactly with integrity.
     let chunkText: string | null = null;
@@ -5771,6 +6122,14 @@ export function assignAttestedTiers(
     } catch {
       chunkText = null;
     }
+    let evidence = row.evidence;
+    if (opts.repairQuotes && chunkText && !auditNormalize(chunkText).includes(auditNormalize(evidence))) {
+      const exact = exactSpanInChunk(chunkText, evidence);
+      if (exact) {
+        evidence = exact;
+        repairs.set(row.id, exact);
+      }
+    }
     const check = checkAttested(
       db,
       projectId,
@@ -5782,7 +6141,7 @@ export function assignAttestedTiers(
         fromAliases: strList(row.from_aliases),
         toAliases: strList(row.to_aliases),
         kind: row.kind,
-        evidence: row.evidence,
+        evidence,
         kindSource: row.kind_source,
         anchorEvidence: row.anchor_evidence,
         supportingEvidence: row.supporting_evidence,
@@ -5793,26 +6152,99 @@ export function assignAttestedTiers(
     );
     if (check.attested) {
       result.attested++;
+      if (repairs.has(row.id)) result.repaired++;
       attest.push(row.id);
       result.rows.push({ id: row.id, fromName: row.from_name, kind: row.kind, toName: row.to_name, result: 'attest', reason: 'ok' });
+    } else if (check.reason === 'keeper-track') {
+      result.keeperTrack++;
+      // Sentence-proof rows belong to the keeper track. When the caller asks
+      // for it, the same proven guard that `promote` uses decides, and a pass
+      // moves the row to `accepted` instead of stranding it at needs_review.
+      const decision = opts.promoteKeeper
+        ? canPromote(
+            {
+              fromId: row.from_entity,
+              toId: row.to_entity,
+              fromName: row.from_name,
+              toName: row.to_name,
+              fromAliases: strList(row.from_aliases),
+              toAliases: strList(row.to_aliases),
+              kind: row.kind,
+              evidence,
+              kindSource: row.kind_source,
+              anchorEvidence: row.anchor_evidence,
+              confidence: row.confidence,
+            },
+            { db, projectId, chunkText },
+          )
+        : null;
+      if (decision?.ok) {
+        result.keeperPromoted++;
+        if (repairs.has(row.id)) result.repaired++;
+        promote.push(row.id);
+        result.rows.push({ id: row.id, fromName: row.from_name, kind: row.kind, toName: row.to_name, result: 'accept', reason: 'ok' });
+      } else {
+        const reason = decision?.reason ?? 'keeper-track';
+        result.still[reason] = (result.still[reason] ?? 0) + 1;
+        result.rows.push({ id: row.id, fromName: row.from_name, kind: row.kind, toName: row.to_name, result: 'leave', reason });
+      }
     } else {
-      if (check.reason === 'keeper-track') result.keeperTrack++;
-      else result.still[check.reason] = (result.still[check.reason] ?? 0) + 1;
+      result.still[check.reason] = (result.still[check.reason] ?? 0) + 1;
       result.rows.push({ id: row.id, fromName: row.from_name, kind: row.kind, toName: row.to_name, result: 'leave', reason: check.reason });
     }
   }
-  if (opts.write && attest.length) {
+  if (opts.write && (attest.length || promote.length)) {
     const stamp = nowIso().replace(/[:.]/g, '-');
     const backupPath = `${db.path}.attested-backup-${stamp}.db`;
     db.exec(`VACUUM INTO '${backupPath.replace(/'/g, "''")}'`);
     result.backupPath = backupPath;
     db.transaction(() => {
       for (const id of attest) {
-        result.changed += db.run(
+        const fixed = repairs.get(id);
+        if (fixed !== undefined) {
+          db.run('UPDATE canon_relation SET evidence = ? WHERE id = ? AND project_id = ?', fixed, id, projectId);
+        }
+        const changed = db.run(
           "UPDATE canon_relation SET review_status = 'attested' WHERE id = ? AND project_id = ? AND review_status IN ('provisional','needs_review')",
           id,
           projectId,
         ).changes;
+        result.changed += changed;
+        if (changed) {
+          recordRuling(db, projectId, {
+            relationId: id,
+            role: 'appeal',
+            actor: 'guard',
+            standard: 'passage-proof',
+            fromStatus: priorStatus.get(id) ?? '',
+            toStatus: 'attested',
+            basis: fixed !== undefined ? 'passage proof, quote repaired to chunk' : 'passage proof',
+          });
+        }
+      }
+      for (const id of promote) {
+        const fixed = repairs.get(id);
+        if (fixed !== undefined) {
+          db.run('UPDATE canon_relation SET evidence = ? WHERE id = ? AND project_id = ?', fixed, id, projectId);
+        }
+        const changed = db.run(
+          "UPDATE canon_relation SET review_status = 'accepted' WHERE id = ? AND project_id = ? AND review_status IN ('provisional','needs_review')",
+          id,
+          projectId,
+        ).changes;
+        result.changed += changed;
+        if (changed) {
+          recordRuling(db, projectId, {
+            relationId: id,
+            role: 'appeal',
+            actor: 'guard',
+            standard: 'sentence-proof',
+            fromStatus: priorStatus.get(id) ?? '',
+            toStatus: 'accepted',
+            basis: 'proven quote and threshold',
+          });
+        }
+
       }
     });
   }
@@ -6020,24 +6452,38 @@ export function insertRelation(
   })) {
     throw new Error('relation insert refused: source_refs must contain a numeric chunk id');
   }
-  return db.run(
-    `INSERT INTO canon_relation (project_id, from_entity, to_entity, kind, description, evidence, source_refs, confidence, modality, review_status, kind_source, anchor_evidence, supporting_evidence, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    projectId,
-    row.fromEntity,
-    row.toEntity,
-    row.kind,
-    row.description ?? '',
-    row.evidence,
-    row.sourceRefs,
-    row.confidence ?? 1.0,
-    row.modality ?? 'asserted',
-    row.reviewStatus ?? 'accepted',
-    row.kindSource ?? '',
-    row.anchorEvidence ?? '',
-    row.supportingEvidence ?? '[]',
-    nowIso(),
-  ).lastInsertRowid;
+  return db.transaction(() => {
+    const id = Number(
+      db.run(
+        `INSERT INTO canon_relation (project_id, from_entity, to_entity, kind, description, evidence, source_refs, confidence, modality, review_status, kind_source, anchor_evidence, supporting_evidence, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        projectId,
+        row.fromEntity,
+        row.toEntity,
+        row.kind,
+        row.description ?? '',
+        row.evidence,
+        row.sourceRefs,
+        row.confidence ?? 1.0,
+        row.modality ?? 'asserted',
+        row.reviewStatus ?? 'accepted',
+        row.kindSource ?? '',
+        row.anchorEvidence ?? '',
+        row.supportingEvidence ?? '[]',
+        nowIso(),
+      ).lastInsertRowid,
+    );
+    recordRuling(db, projectId, {
+      relationId: id,
+      role: 'charge',
+      actor: 'bank',
+      standard: 'claim',
+      toStatus: row.reviewStatus ?? 'accepted',
+      basis: `inserted ${row.kind}`,
+      quote: row.evidence,
+    });
+    return id;
+  });
 }
 
 /** Read-only audit: relations whose refs name a source/locator but no chunk. */
@@ -6185,6 +6631,32 @@ export function persistTieNote(
     }
   };
   const firstRefs = withSource(sourceRefs);
+  const courtFor = (basis: string, quote: string): void => {
+    const relation = db.get<{ id: number }>(
+      `SELECT id FROM canon_relation
+        WHERE project_id = ? AND lower(kind) = lower(?)
+          AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))
+        ORDER BY id LIMIT 1`,
+      projectId,
+      attemptedKind,
+      fromId,
+      toId,
+      toId,
+      fromId,
+    );
+    recordRuling(db, projectId, {
+      relationId: relation?.id ?? null,
+      subject: relation
+        ? undefined
+        : `pair:${Math.min(fromId, toId)}:${Math.max(fromId, toId)}`,
+      role: 'objection',
+      actor: reason === 'evaluation' ? 'assessor' : 'guard',
+      standard: 'tie-note',
+      toStatus: 'pending',
+      basis,
+      quote,
+    });
+  };
   // One note per pair and kind, accumulating spans: evidence found in a later
   // window is added to the same note instead of being ignored, so two pages
   // can together prove one tie.
@@ -6210,6 +6682,7 @@ export function persistTieNote(
       ruling,
       nowIso(),
     );
+    courtFor(`objection ${reason}`, evidence);
     return;
   }
   const spans = noteSpans({ evidence: existing.evidence, source_refs: existing.source_refs });
@@ -6238,6 +6711,7 @@ export function persistTieNote(
     ),
     existing.id,
   );
+  courtFor(`objection ${reason} evidence appended (note ${existing.id})`, spans[0]?.quote ?? evidence);
 }
 
 /** Spans held by a tie note: quote plus the passage it was copied from, and
@@ -6892,8 +7366,28 @@ export function mergeEntityPair(
         // A tie to self proves merging went too far for this row, but a
         // human-confirmed row is parked for review, never silently dropped.
         if (r.review_status === 'user_confirmed') {
+          recordRuling(db, projectId, {
+            relationId: r.id,
+            role: 'appeal',
+            actor: 'guard',
+            standard: 'merge',
+            fromStatus: 'user_confirmed',
+            toStatus: 'needs_review',
+            basis: 'merge collapsed the pair to one entity',
+            quote: r.evidence,
+          });
           db.run("UPDATE canon_relation SET review_status = 'needs_review' WHERE id = ?", r.id);
         } else {
+          recordRuling(db, projectId, {
+            relationId: r.id,
+            role: 'removal',
+            actor: 'guard',
+            standard: 'merge',
+            fromStatus: r.review_status,
+            toStatus: 'merged',
+            basis: 'merge collapsed the pair to one entity',
+            quote: r.evidence,
+          });
           db.run('DELETE FROM canon_relation WHERE id = ?', r.id);
         }
         continue;
@@ -7516,11 +8010,12 @@ export async function evaluateTies(
     description: string;
     evidence: string;
     source_refs: string;
+    review_status: string;
     from_name: string;
     to_name: string;
   }>(
     `SELECT r.id, r.from_entity, r.to_entity, r.kind, r.description, r.evidence,
-            r.source_refs, fe.name AS from_name, te.name AS to_name
+            r.source_refs, r.review_status, fe.name AS from_name, te.name AS to_name
        FROM canon_relation r
        JOIN canon_entity fe ON fe.id = r.from_entity
        JOIN canon_entity te ON te.id = r.to_entity
@@ -7620,12 +8115,24 @@ export async function evaluateTies(
     }
     // Flag, don't delete: the row stays visible with its badge until a human
     // or the relabeling pass rules. The parked note carries the case.
-    db.run(
-      "UPDATE canon_relation SET review_status = 'needs_review' WHERE id = ? AND project_id = ?",
-      row.id,
-      projectId,
-    );
-    persistTieNote(db, projectId, row.from_entity, row.to_entity, row.kind, 'evaluation', row.evidence, row.source_refs, reason || 'drop');
+    db.transaction(() => {
+      db.run(
+        "UPDATE canon_relation SET review_status = 'needs_review' WHERE id = ? AND project_id = ?",
+        row.id,
+        projectId,
+      );
+      recordRuling(db, projectId, {
+        relationId: row.id,
+        role: 'appeal',
+        actor: 'assessor',
+        standard: 'dossier',
+        fromStatus: row.review_status,
+        toStatus: 'needs_review',
+        basis: `evaluate: ${reason || 'drop'}`,
+        quote: row.evidence,
+      });
+      persistTieNote(db, projectId, row.from_entity, row.to_entity, row.kind, 'evaluation', row.evidence, row.source_refs, reason || 'drop');
+    });
     parked++;
   }
   const out = { kept, parked, unproven, checked: rows.length };
@@ -7846,13 +8353,25 @@ export async function assessRelations(
       : '0.0-0.5'
     ]++;
     if (opts.write) {
-      db.run(
-        'UPDATE canon_relation SET confidence = ?, supporting_evidence = ? WHERE id = ? AND project_id = ?',
-        strength,
-        appendAssessment(row.supporting_evidence, assessment),
-        row.id,
-        projectId,
-      );
+      db.transaction(() => {
+        db.run(
+          'UPDATE canon_relation SET confidence = ?, supporting_evidence = ? WHERE id = ? AND project_id = ?',
+          strength,
+          appendAssessment(row.supporting_evidence, assessment),
+          row.id,
+          projectId,
+        );
+        recordRuling(db, projectId, {
+          relationId: row.id,
+          role: 'verdict',
+          actor: 'assessor',
+          standard: 'assessment',
+          fromStatus: row.review_status,
+          toStatus: row.review_status,
+          basis: `strength ${strength.toFixed(2)}: ${assessment.why}`,
+          quote: row.evidence,
+        });
+      });
       result.wrote++;
     }
   }
@@ -7861,6 +8380,153 @@ export async function assessRelations(
   result.userConfirmedAverage = confirmed.length
     ? Number((confirmed.reduce((sum, value) => sum + value, 0) / confirmed.length).toFixed(3))
     : null;
+  return result;
+}
+
+/* ------------------------------------------------------- relabel claims */
+
+export interface RelabelResult {
+  checked: number;
+  changed: number;
+  skipped: Record<'none' | 'invalid' | 'duplicate' | 'same' | 'no-chunk' | 'model-error', number>;
+}
+
+/**
+ * Ask the model for the relationship a claim's own quote states, and replace a
+ * wrong label. The pair is fixed; only the label moves. Code checks the answer
+ * is a closed kind that does not already exist for the pair. Writes a relabel
+ * ruling in the same transaction as the update.
+ */
+export async function relabelRelations(
+  db: Db,
+  llm: LlmClient,
+  projectId: number,
+  opts: { ids?: number[]; limit?: number; write?: boolean; onProgress?: (message: string) => void } = {},
+): Promise<RelabelResult> {
+  const ids = opts.ids?.length ? opts.ids : null;
+  const rows = db.all<{
+    id: number;
+    kind: string;
+    evidence: string;
+    source_refs: string;
+    review_status: string;
+    from_entity: number;
+    to_entity: number;
+    from_name: string;
+    to_name: string;
+  }>(
+    `SELECT r.id, r.kind, r.evidence, r.source_refs, r.review_status, r.from_entity, r.to_entity,
+            a.name AS from_name, b.name AS to_name
+       FROM canon_relation r
+       JOIN canon_entity a ON a.id = r.from_entity
+       JOIN canon_entity b ON b.id = r.to_entity
+      WHERE r.project_id = ? AND trim(r.evidence) <> ''
+        AND r.review_status IN ('attested','accepted','needs_review')
+        ${ids ? `AND r.id IN (${ids.map(() => '?').join(',')})` : ''}
+      ORDER BY r.id
+      ${opts.limit && ids === null ? 'LIMIT ?' : ''}`,
+    projectId,
+    ...(ids ?? []),
+    ...(opts.limit && ids === null ? [Math.max(1, Math.floor(opts.limit))] : []),
+  );
+  const result: RelabelResult = {
+    checked: rows.length,
+    changed: 0,
+    skipped: { none: 0, invalid: 0, duplicate: 0, same: 0, 'no-chunk': 0, 'model-error': 0 },
+  };
+  for (const row of rows) {
+    opts.onProgress?.(`${row.from_name} / ${row.to_name} (${row.kind})`);
+    let chunkText: string | null = null;
+    try {
+      const refs = JSON.parse(row.source_refs || '[]') as { chunk?: unknown }[];
+      const chunkId = refs.find((ref) => Number.isFinite(Number(ref?.chunk)) && Number(ref?.chunk) > 0)?.chunk;
+      if (chunkId !== undefined) {
+        chunkText =
+          pageEvidenceText(db, Number(chunkId)) ??
+          db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', Number(chunkId))?.text ??
+          null;
+      }
+    } catch {
+      chunkText = null;
+    }
+    if (!chunkText) {
+      result.skipped['no-chunk']++;
+      continue;
+    }
+    let parsed: { kind?: unknown; why?: unknown } = {};
+    try {
+      const res = await llm.chat({
+        system:
+          'You name one relationship between two people from a novel. The pair is fixed. ' +
+          'Read the quote and the passage, then reply with JSON only: ' +
+          `{"kind": one of [${CLOSED_ROLE_KINDS.join(', ')}]} or {"kind":"none"}. ` +
+          'If the passage states a relationship between them, choose the closest kind; ' +
+          'if it states none, reply none. No prose outside the JSON.',
+        messages: [
+          {
+            role: 'user',
+            content:
+              `PAIR: ${row.from_name} / ${row.to_name}\n` +
+              `CURRENT LABEL: ${row.kind}\n` +
+              `QUOTE: ${row.evidence}\n` +
+              `PASSAGE: ${truncate(chunkText, 900)}`,
+          },
+        ],
+        format: 'json',
+        temperature: 0.1,
+        maxTokens: 120,
+      });
+      parsed = extractJson<{ kind?: unknown; why?: unknown }>(res.text ?? '') ?? {};
+    } catch {
+      result.skipped['model-error']++;
+      continue;
+    }
+    const answer = String(parsed.kind ?? '').trim().toLowerCase();
+    if (answer === 'none' || answer === '') {
+      result.skipped.none++;
+      continue;
+    }
+    const kind = canonicalKind(answer);
+    if (!isClosedRoleKind(kind)) {
+      result.skipped.invalid++;
+      continue;
+    }
+    if (kind === canonicalKind(row.kind)) {
+      result.skipped.same++;
+      continue;
+    }
+    const duplicate = db.get<{ id: number }>(
+      `SELECT id FROM canon_relation
+        WHERE project_id = ? AND id != ? AND lower(kind) = ?
+          AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?)) LIMIT 1`,
+      projectId,
+      row.id,
+      kind,
+      row.from_entity,
+      row.to_entity,
+      row.to_entity,
+      row.from_entity,
+    );
+    if (duplicate) {
+      result.skipped.duplicate++;
+      continue;
+    }
+    result.changed++;
+    if (!opts.write) continue;
+    db.transaction(() => {
+      db.run('UPDATE canon_relation SET kind = ? WHERE id = ? AND project_id = ?', kind, row.id, projectId);
+      recordRuling(db, projectId, {
+        relationId: row.id,
+        role: 'appeal',
+        actor: 'assessor',
+        standard: 'relabel',
+        fromStatus: row.review_status,
+        toStatus: row.review_status,
+        basis: `relabel ${row.kind} -> ${kind}${parsed.why ? `: ${String(parsed.why).slice(0, 120)}` : ''}`,
+        quote: row.evidence,
+      });
+    });
+  }
   return result;
 }
 
@@ -9145,7 +9811,21 @@ export function replayRulings(
   const identities = take(exported.identities);
 
   const issues: RulingReplayIssue[] = [];
-  const writes: { sql: string; params: unknown[] }[] = [];
+  const writes: {
+    sql: string;
+    params: unknown[];
+    /** The ruling this write must produce in the same transaction. */
+    court?: {
+      relationId: number | null;
+      insert?: boolean;
+      role?: 'appeal' | 'objection';
+      subject?: string;
+      fromStatus: string;
+      toStatus: string;
+      reference: string;
+      quote: string;
+    };
+  }[] = [];
   let chunks: ChunkRow[] | null = null;
   const quoteRefs = (evidence: string): { source: string; locator: string; chunk: number }[] | undefined => {
     const needle = normalise(evidence);
@@ -9209,6 +9889,13 @@ export function replayRulings(
                        confirmed_by_user = CASE WHEN ? = 'user_confirmed' THEN 1 ELSE confirmed_by_user END
                  WHERE id = ? AND project_id = ?`,
           params: [keeper.review_status, keeper.review_status, existing.id, projectId],
+          court: {
+            relationId: existing.id,
+            fromStatus: existing.review_status,
+            toStatus: keeper.review_status,
+            reference: `${keeper.kind}`,
+            quote: keeper.evidence ?? '',
+          },
         });
       }
       continue;
@@ -9228,6 +9915,14 @@ export function replayRulings(
                  confidence, review_status, confirmed_by_user, created_at)
               VALUES (?, ?, ?, ?, '', '', '[]', 1.0, ?, 1, ?)`,
         params: [projectId, from.id, to.id, keeper.kind, keeper.review_status, now],
+        court: {
+          relationId: null,
+          insert: true,
+          fromStatus: '',
+          toStatus: keeper.review_status,
+          reference: keeper.kind,
+          quote: '',
+        },
       });
       continue;
     }
@@ -9253,6 +9948,14 @@ export function replayRulings(
         keeper.review_status === 'user_confirmed' ? 1 : 0,
         now,
       ],
+      court: {
+        relationId: null,
+        insert: true,
+        fromStatus: '',
+        toStatus: keeper.review_status,
+        reference: keeper.kind,
+        quote: keeper.evidence,
+      },
     });
   }
 
@@ -9294,6 +9997,15 @@ export function replayRulings(
           sql: `UPDATE canon_tie_note SET status = ?, ruling = ?, ruled_at = ?
                  WHERE id = ? AND project_id = ?`,
           params: [note.status, note.ruling, now, existing.id, projectId],
+          court: {
+            relationId: null,
+            role: 'objection',
+            subject: `pair:${Math.min(from.id, to.id)}:${Math.max(from.id, to.id)}`,
+            fromStatus: existing.status,
+            toStatus: note.status,
+            reference: note.attempted_kind,
+            quote: note.evidence,
+          },
         });
       }
       continue;
@@ -9321,6 +10033,15 @@ export function replayRulings(
         now,
         now,
       ],
+      court: {
+        relationId: null,
+        role: 'objection',
+        subject: `pair:${Math.min(from.id, to.id)}:${Math.max(from.id, to.id)}`,
+        fromStatus: '',
+        toStatus: note.status,
+        reference: note.attempted_kind,
+        quote: note.evidence,
+      },
     });
   }
 
@@ -9341,7 +10062,22 @@ export function replayRulings(
     for (let start = 0; start < writes.length; start += batchSize) {
       const batch = writes.slice(start, start + batchSize);
       db.transaction(() => {
-        for (const write of batch) db.run(write.sql, ...write.params);
+        for (const write of batch) {
+          const result = db.run(write.sql, ...write.params);
+          if (write.court) {
+            recordRuling(db, projectId, {
+              relationId: write.court.insert ? Number(result.lastInsertRowid) : write.court.relationId,
+              subject: write.court.subject,
+              role: write.court.role ?? 'appeal',
+              actor: 'human',
+              standard: 'replay',
+              fromStatus: write.court.fromStatus,
+              toStatus: write.court.toStatus,
+              basis: `replay ${write.court.role === 'objection' ? 'objection' : 'keeper'}: ${write.court.reference}`,
+              quote: write.court.quote,
+            });
+          }
+        }
       });
     }
   }
@@ -9458,6 +10194,7 @@ export function listRelations(
       sourceRefs: Array.isArray(item.source_refs) ? item.source_refs : [],
       reason: String(item.reason ?? ''),
       movedAt: String(item.moved_at ?? ''),
+      assessment: item.assessment ? readClaimAssessment(item.assessment as Record<string, unknown>) : null,
     })),
     modality: r.modality ?? 'asserted',
     conflictStatus: r.conflict_status ?? 'none',
@@ -9551,6 +10288,7 @@ export function pairHistory(
         sourceRefs: Array.isArray(item.source_refs) ? item.source_refs : [],
         reason: String(item.reason ?? ''),
         movedAt: String(item.moved_at ?? ''),
+        assessment: item.assessment ? readClaimAssessment(item.assessment as Record<string, unknown>) : null,
       })),
       modality: r.modality ?? 'asserted',
       conflictStatus: r.conflict_status ?? 'none',

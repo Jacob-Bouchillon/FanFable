@@ -377,7 +377,7 @@ test('below-threshold evidence on one passage is refused, not combined', () => {
     strength: 0.2,
   });
 
-  const result = meetingWeb.runMeetings(db, project, { minConfidence: 0.7 });
+  const result = meetingWeb.runMeetings(db, project, { minConfidence: 0.7, minAdmissionStrength: 0 });
   // 1 - (0.8 * 0.8) = 0.36, well under the bar, and only one independent note.
   assert.equal(result.birthsCreated, 0);
   assert.ok(result.birthsSkipped['below-threshold'] > 0);
@@ -404,7 +404,7 @@ test('pooled_evidence refuses a child that would copy its parent', () => {
     strength: 0.6,
   });
 
-  const result = meetingWeb.runMeetings(db, project, { minConfidence: 0.7 });
+  const result = meetingWeb.runMeetings(db, project, { minConfidence: 0.7, minAdmissionStrength: 0 });
   // 1 - (0.45 * 0.4) = 0.82 clears the bar, but the only subject the evidence
   // identifies is the pair already under investigation.
   assert.equal(result.birthsCreated, 0);
@@ -448,7 +448,7 @@ test('shared_event births when both parents cite the same event', () => {
     strength: 0.1,
   });
 
-  const result = meetingWeb.runMeetings(db, project);
+  const result = meetingWeb.runMeetings(db, project, { minAdmissionStrength: 0 });
   // The event trigger fires, but its evidence identifies the pair that is
   // already a parent, so no copy is created.
   assert.equal(result.birthsCreated, 0);
@@ -473,12 +473,12 @@ test('one child per meeting and one birth per lineage', () => {
     claim: 'they meet again later',
     strength: 0.5,
   });
-  meetingWeb.runMeetings(db, project);
+  meetingWeb.runMeetings(db, project, { minAdmissionStrength: 0 });
   const firstBirths = db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_birth WHERE project_id = ?', project)!.n;
   assert.equal(firstBirths, 1);
 
   // A second run must not birth again.
-  meetingWeb.runMeetings(db, project);
+  meetingWeb.runMeetings(db, project, { minAdmissionStrength: 0 });
   assert.equal(db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_birth WHERE project_id = ?', project)!.n, 1);
 
   // The meeting row holds exactly one child.
@@ -529,7 +529,7 @@ test('a birth references pooled notes and copies nothing', () => {
   const notesBefore = db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_thread_note WHERE project_id = ?', project)!.n;
   const relationsBefore = db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_relation WHERE project_id = ?', project)!.n;
 
-  meetingWeb.runMeetings(db, project);
+  meetingWeb.runMeetings(db, project, { minAdmissionStrength: 0 });
   const child = db.get<{ child_thread: number }>('SELECT child_thread FROM canon_birth WHERE project_id = ?', project)!.child_thread;
 
   assert.deepEqual(
@@ -581,7 +581,7 @@ test('a changed resolution appends and marks the earlier one superseded', () => 
     claim: 'gate keys with mara',
     strength: 0.5,
   });
-  meetingWeb.runMeetings(db, project);
+  meetingWeb.runMeetings(db, project, { minAdmissionStrength: 0 });
   const first = db.get<{ id: number; resolved_by_note_id: number }>(
     'SELECT id, resolved_by_note_id FROM canon_meeting_resolution WHERE open_end_id = ?',
     want,
@@ -595,7 +595,7 @@ test('a changed resolution appends and marks the earlier one superseded', () => 
     claim: 'the gate keys and the ledger belong to mara',
     strength: 0.6,
   });
-  meetingWeb.runMeetings(db, project);
+  meetingWeb.runMeetings(db, project, { minAdmissionStrength: 0 });
 
   const rows = db.all<{ id: number; superseded_by: number | null; resolved_by_note_id: number }>(
     'SELECT id, superseded_by, resolved_by_note_id FROM canon_meeting_resolution WHERE open_end_id = ? ORDER BY id',
@@ -613,7 +613,7 @@ test('a changed resolution appends and marks the earlier one superseded', () => 
 
 test('migration 21 is additive on a v20 database and reruns as a no-op', () => {
   const { db } = tempDb();
-  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')!.user_version, 24);
+  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')!.user_version, 26);
   for (const table of ['canon_meeting', 'canon_meeting_exchange', 'canon_meeting_resolution', 'canon_birth', 'canon_thread_note_ref']) {
     assert.ok(tableExists(db.raw, table), `fresh bank has ${table}`);
   }
@@ -652,7 +652,7 @@ test('migration 21 is additive on a v20 database and reruns as a no-op', () => {
   db.raw.exec('PRAGMA foreign_keys = ON');
   assert.equal(tableExists(db.raw, 'canon_meeting'), false);
 
-  assert.equal(runMigrations(db.raw), 24);
+  assert.equal(runMigrations(db.raw), 26);
   for (const table of ['canon_meeting', 'canon_meeting_exchange', 'canon_meeting_resolution', 'canon_birth', 'canon_thread_note_ref']) {
     assert.ok(tableExists(db.raw, table), `${table} is recreated additively`);
   }
@@ -666,7 +666,7 @@ test('migration 21 is additive on a v20 database and reruns as a no-op', () => {
   );
   assert.ok(db.get<{ id: number }>('SELECT id FROM canon_entity WHERE id = ?', mara));
   assert.ok(db.get<{ id: number }>('SELECT id FROM canon_entity WHERE id = ?', corin));
-  assert.equal(runMigrations(db.raw), 24, 'second run stays at 24');
+  assert.equal(runMigrations(db.raw), 26, 'second run stays at 25');
   db.close();
 });
 
@@ -717,7 +717,7 @@ test('admission needs pair evidence from both sides; one side is refused', () =>
     strength: 0.5,
   });
 
-  const first = meetingWeb.runMeetings(db, project);
+  const first = meetingWeb.runMeetings(db, project, { minAdmissionStrength: 0 });
   assert.equal(first.meetingsCreated, 0, 'one side alone is not a meeting');
   assert.ok(first.refusedByReason['one-sided'] >= 1);
   assert.equal(db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_meeting WHERE project_id = ?', project)!.n, 0);
@@ -735,9 +735,9 @@ test('admission needs pair evidence from both sides; one side is refused', () =>
     claim: 'they meet again later',
     strength: 0.5,
   });
-  const second = meetingWeb.runMeetings(db, project);
+  const second = meetingWeb.runMeetings(db, project, { minAdmissionStrength: 0 });
   assert.equal(second.meetingsCreated, 1);
-  const third = meetingWeb.runMeetings(db, project);
+  const third = meetingWeb.runMeetings(db, project, { minAdmissionStrength: 0 });
   assert.equal(third.meetingsCreated, 0, 'admission happens once');
   assert.equal(third.exchangesAdded, 0);
   assert.equal(db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_meeting WHERE project_id = ?', project)!.n, 1);
@@ -764,7 +764,7 @@ test('identity-only meetings are refused unless the flag is set', () => {
     noteKind: 'context',
   });
 
-  const refused = meetingWeb.runMeetings(db, project);
+  const refused = meetingWeb.runMeetings(db, project, { minAdmissionStrength: 0 });
   assert.equal(refused.meetingsCreated, 0);
   assert.ok(refused.refusedByReason['identity-only'] >= 1);
 
@@ -775,9 +775,10 @@ test('identity-only meetings are refused unless the flag is set', () => {
 
 test('a candidate with no shared notes at all leaves nothing behind', () => {
   const { db, project } = setup('admit-empty');
-  const result = meetingWeb.runMeetings(db, project);
+  const result = meetingWeb.runMeetings(db, project, { minAdmissionStrength: 0 });
   assert.equal(result.meetingsCreated, 0);
-  assert.ok(result.refusedByReason['no-crossing-notes'] >= 1);
+  // With the note filter, such a candidate never reaches admission at all.
+  assert.ok(result.candidatesSkippedNoNotes >= 1);
   assert.equal(db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_meeting WHERE project_id = ?', project)!.n, 0);
   db.close();
 });

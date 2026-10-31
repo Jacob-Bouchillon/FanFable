@@ -22,6 +22,7 @@
  */
 import { Db, nowIso } from './db.ts';
 import { projectMinConfidence } from './lorebook.ts';
+import { meetingSubject, recordRuling } from './ruling.ts';
 import { existsSync, readdirSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, sep } from 'node:path';
@@ -87,6 +88,8 @@ export interface Enumeration {
   candidates: CandidateMeeting[];
   /** Parent walks that hit the depth cap and were stopped. */
   groupsSkippedForDepth: number;
+  /** Candidates dropped because neither side holds a note. */
+  skippedNoNotes: number;
 }
 
 /** How far a parent chain may be walked before the branch is abandoned. */
@@ -180,8 +183,13 @@ function makeAncestry(nodes: ThreadNode[]): {
  * it. Deterministic throughout: subjects in key order, threads in id order, and
  * every pair normalized so `threadA < threadB`.
  */
-export function enumerateCandidates(db: Db, projectId: number): Enumeration {
+export function enumerateCandidates(
+  db: Db,
+  projectId: number,
+  opts: { withNotes?: Set<number> } = {},
+): Enumeration {
   const nodes = loadThreadNodes(db, projectId);
+  const skippedNoNotes = { count: 0 };
   const subjectById = new Map(nodes.map((node) => [node.id, node.subject]));
   const { ancestorsOf, depthCuts } = makeAncestry(nodes);
   const byPerson = new Map<number, Set<number>>();
@@ -213,6 +221,12 @@ export function enumerateCandidates(db: Db, projectId: number): Enumeration {
     if (ancestorsOf(a).has(b) || ancestorsOf(b).has(a)) return;
     const id = `${matchKey}|${a}|${b}`;
     if (seen.has(id)) return;
+    // A thread with no note can never cross anything, so a candidate with no
+    // notes on either side can never be admitted: drop it before scoring.
+    if (opts.withNotes && !opts.withNotes.has(a) && !opts.withNotes.has(b)) {
+      skippedNoNotes.count++;
+      return;
+    }
     seen.add(id);
     out.push({ matchKey, matchKind, threadA: a, threadB: b });
   };
@@ -250,6 +264,7 @@ export function enumerateCandidates(db: Db, projectId: number): Enumeration {
         x.threadB - y.threadB,
     ),
     groupsSkippedForDepth: depthCuts(),
+    skippedNoNotes: skippedNoNotes.count,
   };
 }
 
@@ -454,6 +469,8 @@ export interface RunMeetingsOptions {
   includeIdentityOnly?: boolean;
   /** Override the per-run birth cap (tests only; the default is the ceiling). */
   maxBirthsPerRun?: number;
+  /** Override the weakest note that may admit a meeting. */
+  minAdmissionStrength?: number;
 }
 
 /** Why a candidate meeting was not recorded at all. */
@@ -468,6 +485,8 @@ export interface RunMeetingsResult {
   enumerationMs: number;
   /** Parent walks abandoned at the depth cap. */
   groupsSkippedForDepth: number;
+  /** Candidates dropped because neither side holds a note. */
+  candidatesSkippedNoNotes: number;
   meetingsCreated: number;
   meetingsReused: number;
   /** Candidates that crossed nothing and left no rows. */
@@ -488,6 +507,22 @@ export interface RunMeetingsResult {
 
 /** Births one run may create, so a crowded bank cannot stall a command. */
 export const MAX_BIRTHS_PER_RUN = 500;
+
+/**
+ * Weakest pair-scope note that can admit a meeting.
+ *
+ * Admission asks whether something crossed, and a 0.2 co-presence note is not
+ * a crossing. Measured on four fresh copies with the locked benchmark:
+ *   0.35 -> 443 meetings, 1501 exchanges, 11 births, 2 of 4 criteria
+ *   0.45 -> 424 meetings, 1462 exchanges,  9 births, 2 of 4
+ *   0.60 -> 405 meetings, 1403 exchanges,  9 births, 2 of 4
+ *   0.70 -> 353 meetings, 1268 exchanges,  8 births, 2 of 4
+ * Every point holds the same criteria, so the rule is: the lowest value that
+ * keeps every criterion *and* refuses the 0.2-0.4 tier, which is the defect
+ * being fixed. That is 0.45; 0.35 would leave weak notes admitting meetings,
+ * and 0.6/0.7 only lose meetings.
+ */
+export const MIN_ADMISSION_STRENGTH = 0.45;
 
 interface NoteRow {
   id: number;
@@ -549,6 +584,7 @@ export function runMeetings(db: Db, projectId: number, opts: RunMeetingsOptions 
     candidatesConsidered: 0,
     enumerationMs: 0,
     groupsSkippedForDepth: 0,
+    candidatesSkippedNoNotes: 0,
     meetingsCreated: 0,
     meetingsReused: 0,
     meetingsRefused: 0,
@@ -573,6 +609,7 @@ export function runMeetings(db: Db, projectId: number, opts: RunMeetingsOptions 
     },
   };
   const includeIdentityOnly = opts.includeIdentityOnly === true;
+  const minAdmission = opts.minAdmissionStrength ?? MIN_ADMISSION_STRENGTH;
   const maxBirthsPerRun = opts.maxBirthsPerRun ?? MAX_BIRTHS_PER_RUN;
 
   const nodes = loadThreadNodes(db, projectId);
@@ -629,11 +666,12 @@ export function runMeetings(db: Db, projectId: number, opts: RunMeetingsOptions 
   );
 
   const enumerationStarted = Date.now();
-  const enumeration = enumerateCandidates(db, projectId);
+  const enumeration = enumerateCandidates(db, projectId, { withNotes: new Set(notesByThread.keys()) });
   result.enumerationMs = Date.now() - enumerationStarted;
   const candidates = enumeration.candidates;
   result.candidatesExamined = candidates.length;
   result.candidatesConsidered = candidates.length;
+  result.candidatesSkippedNoNotes = enumeration.skippedNoNotes;
   result.groupsSkippedForDepth = enumeration.groupsSkippedForDepth;
 
   db.transaction(() => {
@@ -659,10 +697,18 @@ export function runMeetings(db: Db, projectId: number, opts: RunMeetingsOptions 
       }
 
       const evidenceA = shareable.filter(
-        (entry) => entry.thread === threadA && entry.scope === 'pair' && entry.note.is_context !== 1,
+        (entry) =>
+          entry.thread === threadA &&
+          entry.scope === 'pair' &&
+          entry.note.is_context !== 1 &&
+          entry.note.strength >= minAdmission,
       );
       const evidenceB = shareable.filter(
-        (entry) => entry.thread === threadB && entry.scope === 'pair' && entry.note.is_context !== 1,
+        (entry) =>
+          entry.thread === threadB &&
+          entry.scope === 'pair' &&
+          entry.note.is_context !== 1 &&
+          entry.note.strength >= minAdmission,
       );
       const sideA = shareable.some((entry) => entry.thread === threadA);
       const sideB = shareable.some((entry) => entry.thread === threadB);
@@ -710,6 +756,14 @@ export function runMeetings(db: Db, projectId: number, opts: RunMeetingsOptions 
         meeting = loadMeetingRow(db, projectId, id)!;
         existing.set(key, meeting);
         created = true;
+        recordRuling(db, projectId, {
+          subject: meetingSubject(id),
+          role: 'clue',
+          actor: 'web',
+          standard: 'shared-subject',
+          toStatus: 'open',
+          basis: `${matchKind} ${matchKey}`,
+        });
       }
 
       let added = 0;
@@ -779,6 +833,15 @@ export function runMeetings(db: Db, projectId: number, opts: RunMeetingsOptions 
           );
         }
         resolvedNow++;
+        recordRuling(db, projectId, {
+          threadId: plan.end.thread_id,
+          role: 'clue',
+          actor: 'web',
+          standard: 'want-answered',
+          fromStatus: 'open',
+          toStatus: 'resolved',
+          basis: `open end ${plan.end.id} answered by note ${plan.note.id}`,
+        });
       }
 
       const activeResolutions = db.all<{ resolved_by_note_id: number }>(
@@ -812,8 +875,9 @@ export function runMeetings(db: Db, projectId: number, opts: RunMeetingsOptions 
              FROM canon_meeting_resolution r
              JOIN canon_meeting_exchange x ON x.meeting_id = r.meeting_id AND x.note_id = r.resolved_by_note_id
              JOIN canon_thread_note n ON n.id = r.resolved_by_note_id
-            WHERE r.meeting_id = ? AND r.superseded_by IS NULL AND n.is_context = 0`,
+            WHERE r.meeting_id = ? AND r.superseded_by IS NULL AND n.is_context = 0 AND n.strength >= ?`,
           meeting.id,
+          minAdmission,
         )
         .filter((row) => row.scope === 'pair');
       if (pairResolved.length) {

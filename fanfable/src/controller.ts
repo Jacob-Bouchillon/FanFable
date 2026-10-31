@@ -24,6 +24,7 @@ import { checkPremise } from './premise-check.ts';
 import { detectConflicts, saveConflicts, listConflicts } from './state-conflicts.ts';
 import * as memory from './memory.ts';
 import * as planner from './planner.ts';
+import { buildWebBrief, renderWebBrief } from './brief.ts';
 import * as writer from './writer.ts';
 import * as continuity from './continuity.ts';
 import { continuitySettings, filterBySeverity } from './continuity-settings.ts';
@@ -972,6 +973,17 @@ export function selectCanonEvents(
  * those are scarce. User-confirmed rows sort first so the author's own ruling
  * outranks a derived pick.
  */
+function castNames(db: Db, projectId: number, text: string): string[] {
+  const entities = lorebook.listEntities(db, projectId);
+  const names: string[] = [];
+  for (const entity of entities) {
+    if (nameMentioned(entity.name, text) || entity.aliases.some((alias) => nameMentioned(alias, text))) {
+      names.push(entity.name);
+    }
+  }
+  return names;
+}
+
 function castRelationshipBlock(db: Db, projectId: number, text: string): string {
   const entities = lorebook.listEntities(db, projectId);
   const cast = new Set<number>();
@@ -1052,6 +1064,20 @@ export async function draftPlan(
   // from the retrieved canon brief so a user-confirmed tie is never buried.
   const castRelationships = castRelationshipBlock(db, projectId, premiseText);
 
+  // The evidence web, for the same cast. A failure here is logged and the plan
+  // proceeds without it: the web must never cost a planning run.
+  let webBrief: string | undefined;
+  const cast = castNames(db, projectId, premiseText);
+  if (cast.length) {
+    try {
+      const web = buildWebBrief(db, projectId, { entities: cast });
+      const rendered = renderWebBrief(web);
+      if (rendered) webBrief = rendered;
+    } catch (err) {
+      console.warn(`  evidence web brief skipped: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   // The connected view of the premise: who it touches, what it connects to, and
   // what the story has already changed. The planner needs the consequences, not
   // just the names.
@@ -1076,6 +1102,7 @@ export async function draftPlan(
     preferences: req.preferences,
     canonBrief: brief,
     castRelationships,
+    webBrief,
     graphContext,
     canonEvents: canonEvents.map((e) => ({ id: e.id, title: e.title, summary: e.summary })),
     userNotes: req.userNotes,
