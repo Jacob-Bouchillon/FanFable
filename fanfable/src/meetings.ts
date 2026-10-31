@@ -1421,6 +1421,19 @@ export function isTempDatabasePath(path: string): boolean {
   return candidates.some((candidate) => norm(expand(candidate)).startsWith(root + norm(sep)));
 }
 
+/**
+ * Attest --write is allowed on a temp copy, or anywhere else only with the
+ * explicit --on-copy flag. The flag never skips the snapshot: the write path
+ * still backs the database up before any row moves.
+ */
+export function attestWriteGuard(dbPath: string, onCopy: boolean): void {
+  if (!onCopy && !isTempDatabasePath(dbPath)) {
+    throw new Error(
+      `refusing --write outside the temp directory (${dbPath}): attest moves relation status and must run on a copy`,
+    );
+  }
+}
+
 export interface ReconcileResult {
   examined: number;
   wouldRefuse: number;

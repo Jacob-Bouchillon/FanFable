@@ -435,6 +435,15 @@ export interface ExtractOptions {
    */
   starvedFirst?: number;
   /**
+   * Starved-thread reservation for unbudgeted (full) runs.
+   *
+   * Full runs mine everything, so there is nothing to reserve from: when set,
+   * up to this many starved windows move to the front of the run order and
+   * the reservation is recorded in stats. Default 0: full runs behave
+   * exactly as before.
+   */
+  starvedReserve?: number;
+  /**
    * How many of the budget always go to the highest-scoring windows.
    * Defaults to the whole budget (pure priority order, no sampling).
    */
@@ -730,6 +739,30 @@ export function selectWindows(
 }
 
 /**
+ * Candidate indices for the first `count` starved windows, in starved order.
+ * Pure over the caller's maps: the same mapping the budgeted reservation uses.
+ */
+export function starvedCandidateIndices(
+  candidateByFirstChunk: Map<number, number>,
+  chunks: { id: number }[],
+  windows: { index: number }[],
+  count: number,
+  windowSize: number,
+): number[] {
+  const reserved: number[] = [];
+  if (count <= 0) return reserved;
+  for (const entry of windows) {
+    const first = chunks[entry.index * windowSize];
+    if (!first) continue;
+    const candidateIndex = candidateByFirstChunk.get(first.id);
+    if (candidateIndex === undefined) continue;
+    reserved.push(candidateIndex);
+    if (reserved.length >= count) break;
+  }
+  return reserved;
+}
+
+/**
  * Read the imported material and record its lore.
  *
  * Runs in windows of passages so a whole book does not have to fit in the
@@ -794,22 +827,20 @@ export async function extractLore(
     opts,
   );
   let chosen = new Set(selection.selected);
+  const candidateByFirstChunk = new Map<number, number>();
+  candidates.forEach(({ window }, index) => {
+    const first = window[0];
+    if (first) candidateByFirstChunk.set(first.id, index);
+  });
   if (budgeted && starvedFirst > 0) {
     const starved = starvedWindowScores(db, projectId, { windowSize });
-    const candidateByFirstChunk = new Map<number, number>();
-    candidates.forEach(({ window }, index) => {
-      const first = window[0];
-      if (first) candidateByFirstChunk.set(first.id, index);
-    });
-    const reserved: number[] = [];
-    for (const entry of starved.windows) {
-      const first = chunks[entry.index * windowSize];
-      if (!first) continue;
-      const candidateIndex = candidateByFirstChunk.get(first.id);
-      if (candidateIndex === undefined) continue;
-      reserved.push(candidateIndex);
-      if (reserved.length >= starvedFirst) break;
-    }
+    const reserved = starvedCandidateIndices(
+      candidateByFirstChunk,
+      chunks,
+      starved.windows,
+      starvedFirst,
+      windowSize,
+    );
     if (reserved.length) {
       const reservedSet = new Set(reserved);
       const pool = candidates
@@ -833,7 +864,30 @@ export async function extractLore(
       stats.threadsCovered = starved.threadsCovered;
     }
   }
-  const runList = candidates.filter((_, i) => chosen.has(i));
+  // Full runs mine everything, so --starved-reserve only moves starved
+  // windows to the front of the run order and records the stats. Default 0.
+  const reserveFull = !budgeted ? Math.max(0, Math.floor(opts.starvedReserve ?? 0)) : 0;
+  let runOrder: number[] | null = null;
+  if (reserveFull > 0) {
+    const starved = starvedWindowScores(db, projectId, { windowSize });
+    const reserved = starvedCandidateIndices(
+      candidateByFirstChunk,
+      chunks,
+      starved.windows,
+      reserveFull,
+      windowSize,
+    );
+    if (reserved.length) {
+      const reservedSet = new Set(reserved);
+      runOrder = [...reserved, ...candidates.map((_, i) => i).filter((i) => !reservedSet.has(i))];
+      stats.starvedReserved = reserved.length;
+      stats.starvedUsed = reserved.length;
+      stats.threadsCovered = starved.threadsCovered;
+    }
+  }
+  const runList = (runOrder ?? candidates.map((_, i) => i))
+    .filter((i) => chosen.has(i))
+    .map((i) => candidates[i]!);
   if (runList.length < candidates.length) {
     const kinds = new Map<string, number>();
     for (const i of selection.selected) {

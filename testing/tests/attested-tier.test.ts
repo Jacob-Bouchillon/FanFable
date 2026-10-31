@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createProject } from '../../fanfable/src/controller.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
+import { attestWriteGuard } from '../../fanfable/src/meetings.ts';
 import * as lore from '../../fanfable/src/lore.ts';
 import { mockProvider, tempDb } from './helpers.ts';
 
@@ -331,5 +332,21 @@ test('lore answers attest without any model call', async () => {
   assert.match(res.answer, /Attested/);
   assert.match(res.answer, /not keeper-grade/);
   assert.equal(res.passages.length, 1, 'cited passage rides along');
+  db.close();
+});
+
+test('attestWriteGuard refuses non-temp writes without --on-copy, never the temp path', () => {
+  const { db, path } = tempDb();
+  assert.doesNotThrow(() => attestWriteGuard(path, false), 'temp copy writes as before');
+  assert.doesNotThrow(() => attestWriteGuard(path, true), 'flag changes nothing on temp');
+  assert.throws(
+    () => attestWriteGuard('testing/trials/scratch.db', false),
+    /must run on a copy/,
+    'non-temp refuses without the flag',
+  );
+  assert.doesNotThrow(
+    () => attestWriteGuard('testing/trials/scratch.db', true),
+    'explicit --on-copy accepts (backup still written first downstream)',
+  );
   db.close();
 });

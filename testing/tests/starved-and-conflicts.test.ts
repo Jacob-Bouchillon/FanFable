@@ -16,7 +16,7 @@ import {
   starvedThreads,
   starvedWindowScores,
 } from '../../fanfable/src/note-ingest.ts';
-import { selectWindows } from '../../fanfable/src/lorebook.ts';
+import { selectWindows, starvedCandidateIndices } from '../../fanfable/src/lorebook.ts';
 import { tempDb } from './helpers.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';
@@ -308,6 +308,31 @@ test('starvedFirst 0 reproduces the old selection exactly', () => {
   const again = selectWindows(scores, { maxWindows: 4, priorityFirst: 4, seed: 42 });
   assert.deepEqual(base.selected, again.selected);
   assert.deepEqual(base.selected, [4, 5, 6, 7], 'pure priority order with no reservation');
+});
+
+test('starvedCandidateIndices maps the same path extract uses, capped at N', () => {
+  const { db, project, chunks } = setup('starved-map', 24);
+  const windowSize = 8;
+  const chunkObjs = chunks.map((id) => ({ id }));
+  // Full-run candidate list: every window, as extract builds it.
+  const candidateByFirstChunk = new Map<number, number>();
+  for (let i = 0; i < chunkObjs.length / windowSize; i++) {
+    candidateByFirstChunk.set(chunkObjs[i * windowSize]!.id, i);
+  }
+  const starved = starvedWindowScores(db, project, { windowSize, limit: 10 });
+  assert.ok(starved.windows.length > 0, 'empty threads starve windows');
+  const two = starvedCandidateIndices(candidateByFirstChunk, chunkObjs, starved.windows, 2, windowSize);
+  assert.ok(two.length >= 1 && two.length <= 2, 'first N starved windows map to candidates');
+  assert.equal(new Set(two).size, two.length, 'distinct candidates');
+  for (const i of two) assert.ok(i >= 0 && i < chunkObjs.length / windowSize, 'in range');
+  const repeat = starvedCandidateIndices(candidateByFirstChunk, chunkObjs, starved.windows, 2, windowSize);
+  assert.deepEqual(repeat, two, 'deterministic');
+  assert.deepEqual(
+    starvedCandidateIndices(candidateByFirstChunk, chunkObjs, starved.windows, 0, windowSize),
+    [],
+    'default 0 reserves nothing',
+  );
+  db.close();
 });
 
 test('migration 25 adds the column and the conflict table, and reruns as a no-op', () => {

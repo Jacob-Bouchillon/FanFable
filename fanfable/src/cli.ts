@@ -137,10 +137,11 @@ ${C.bold('SOURCE MATERIAL')}
   sources                          List imported sources
   lore search <query>              Search canon, show passages with references
   lore ask <question>              Answer a lore question with citations
-  lore extract [--model m] [--max-windows n] [--starved-first n] [--priority-first n] [--random-floor f] [--seed n] [--full]
+  lore extract [--model m] [--max-windows n] [--starved-first n] [--starved-reserve n] [--priority-first n] [--random-floor f] [--seed n] [--full]
                            Extract the book's lore: people, places, rules, facts.
                            No budget flags mines everything; --max-windows caps it (top priority
                            first, seeded sample of the rest); --full ignores the budget.
+                           --starved-reserve n orders starved windows first on full runs (default 0).
   lore embed [--model m]           Embed passages, entities and triples for dense retrieval
   lore trails --query "..." [--out f]  Draw how each top passage connects to the query
                            [--web] show the association layer too (default off)
@@ -169,8 +170,9 @@ ${C.bold('SOURCE MATERIAL')}
   lore rulings replay --in path [--write] [--dry-run] [--limit n]
                            Reapply an exported ruling file to this project
   lore audit [--write] [--limit n]  Recheck accepted ties against the guard; demote failures
-  lore attest [--write] [--limit n] [--no-keeper] [--no-repair]
-                           Move passage-proof rows to the attested tier (dry run by default)
+  lore attest [--write] [--limit n] [--no-keeper] [--no-repair] [--on-copy]
+                           Move passage-proof rows to the attested tier (dry run by default);
+                           --write needs a temp copy, or --on-copy (backup still written first)
   lore docket [--role r] [--actor a] [--limit n] [--backfill]
                            Who decided what, on which standard, and what overruled what
   lore anchors [--write] [--limit n]  Fill the sentence naming the other person (dry run by default)
@@ -857,11 +859,8 @@ async function cmdLore(args: Args): Promise<void> {
     const limit = flagNumber(args, 'limit', 0);
     const promoteKeeper = args.flags['no-keeper'] !== true;
     const repairQuotes = args.flags['no-repair'] !== true;
-    if (write && !meetingWeb.isTempDatabasePath(db.path)) {
-      throw new Error(
-        `refusing --write outside the temp directory (${db.path}): attest moves relation status and must run on a copy`,
-      );
-    }
+    const onCopy = args.flags['on-copy'] === true;
+    if (write) meetingWeb.attestWriteGuard(db.path, onCopy);
     heading(write ? 'Attested tier assignment (write)' : 'Attested tier assignment (dry run)');
     const before = db.all<{ status: string; n: number }>(
       'SELECT review_status AS status, COUNT(*) AS n FROM canon_relation WHERE project_id = ? GROUP BY review_status ORDER BY review_status',
@@ -1114,6 +1113,7 @@ async function cmdLore(args: Args): Promise<void> {
       concurrency: flagNumber(args, 'concurrency', 3),
       maxWindows: budgetFlag(args, 'max-windows'),
       starvedFirst: budgetFlag(args, 'starved-first'),
+      starvedReserve: budgetFlag(args, 'starved-reserve'),
       priorityFirst: budgetFlag(args, 'priority-first'),
       randomFloor: budgetFlag(args, 'random-floor'),
       seed: budgetFlag(args, 'seed'),
