@@ -115,6 +115,15 @@ test('promotion writes an appeal ruling with the standard and the prior status',
 test('attestation writes a passage-proof appeal', () => {
   const s = setup();
   const row = addRelation(s, 'guide to parity with', 'Mara feared him.', 'needs_review');
+  s.db.run('UPDATE canon_relation SET supporting_evidence = ? WHERE id = ?', lorebook.assessmentSupporting({
+    names_both: false,
+    other_person: 'pronoun',
+    asserted: true,
+    hedge: 'certain',
+    kind_fit: 'yes',
+    strength: 0.8,
+    why: 'court test assessment',
+  }), row);
   const result = lorebook.assignAttestedTiers(s.db, s.project.id, { write: true });
   assert.equal(result.attested, 1);
   const history = ruling.listRulings(s.db, s.project.id, { relationId: row });

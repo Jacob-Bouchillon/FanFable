@@ -54,14 +54,14 @@ function addChunk(db: Db, projectId: number, text: string): number {
   );
 }
 
-function assessment(asserted: boolean): string {
+function assessment(asserted: boolean, strength = 0.8, kindFit: 'yes' | 'partly' | 'no' = 'yes'): string {
   return lorebook.assessmentSupporting({
     names_both: false,
     other_person: 'pronoun',
     asserted,
     hedge: 'certain',
-    kind_fit: 'yes',
-    strength: 0.8,
+    kind_fit: kindFit,
+    strength,
     why: 'test assessment',
   });
 }
@@ -74,10 +74,13 @@ function addRelation(
   kind: string,
   evidence: string,
   chunk: number,
-  opts: { status?: string; asserted?: boolean | null; supporting?: string } = {},
+  opts: { status?: string; asserted?: boolean | null; supporting?: string; strength?: number; kindFit?: 'yes' | 'partly' | 'no' } = {},
 ): number {
   const supporting =
-    opts.supporting ?? (opts.asserted === null ? '[]' : assessment(opts.asserted ?? true));
+    opts.supporting ??
+    (opts.asserted === null
+      ? '[]'
+      : assessment(opts.asserted ?? true, opts.strength ?? 0.8, opts.kindFit ?? 'yes'));
   return Number(
     db.run(
       `INSERT INTO canon_relation
@@ -160,11 +163,13 @@ test('single-name quotes without chunk support stay parked; invented quotes stay
   db.close();
 });
 
-test('denied assertions, identity and PARK rules still refuse; a missing assessment does not', () => {
+test('denied, weak, wrong-kind and unassessed rows never attest; identity and PARK still refuse', () => {
   const { db, project, mara, tor } = setup();
   const chunk = addChunk(db, project.id, 'Mara feared him. Tor arrived with the guard at dawn.');
   addRelation(db, project.id, mara, tor, 'aunt of', 'Mara feared him.', chunk, { asserted: false });
   const unassessed = addRelation(db, project.id, mara, tor, 'friend of', 'Mara feared him.', chunk, { asserted: null });
+  const weak = addRelation(db, project.id, mara, tor, 'ally of', 'Mara feared him.', chunk, { strength: 0.5 });
+  const wrongKind = addRelation(db, project.id, mara, tor, 'rival of', 'Mara feared him.', chunk, { kindFit: 'no' });
   addRelation(db, project.id, mara, mara, 'ally of', 'Mara feared him.', chunk);
   const parked = addRelation(db, project.id, mara, tor, 'mentor of', 'Mara feared him.', chunk);
   db.run(
@@ -177,29 +182,28 @@ test('denied assertions, identity and PARK rules still refuse; a missing assessm
     AT,
   );
   const dry = lorebook.assignAttestedTiers(db, project.id);
-  assert.equal(dry.attested, 1, 'no stored assessment is not a refusal');
+  assert.equal(dry.attested, 0, 'nothing attests without a positive stored assessment clearing the bar');
   assert.deepEqual(dry.still, {
-    'assertion-missing': 1,
+    'assertion-missing': 2,
+    'below-threshold': 2,
     'same-identity': 1,
     'ruled-park': 1,
   });
   const wrote = lorebook.assignAttestedTiers(db, project.id, { write: true });
-  assert.equal(wrote.changed, 1);
-  assert.equal(
-    db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', unassessed)!.review_status,
-    'attested',
-  );
-  assert.equal(
-    db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', parked)!.review_status,
-    'provisional',
-  );
+  assert.equal(wrote.changed, 0);
+  for (const id of [unassessed, weak, wrongKind, parked]) {
+    assert.equal(
+      db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', id)!.review_status,
+      'provisional',
+    );
+  }
   db.close();
 });
 
 test('an open-vocabulary label is proved by its passage, not refused by a word list', () => {
   const { db, project, mara, tor } = setup();
   const chunk = addChunk(db, project.id, 'Mara feared him. Tor arrived with the guard at dawn.');
-  const row = addRelation(db, project.id, mara, tor, 'guide to parity with', 'Mara feared him.', chunk, { asserted: null });
+  const row = addRelation(db, project.id, mara, tor, 'guide to parity with', 'Mara feared him.', chunk);
   const dry = lorebook.assignAttestedTiers(db, project.id);
   assert.equal(dry.attested, 1);
   assert.equal(dry.still['open-vocab'], undefined, 'the concept vocabulary is no longer a gate');
@@ -227,7 +231,7 @@ test('co-presence and one-off actions never attest', () => {
 test('a quote whose words are right but punctuation is not is repaired to the chunk', () => {
   const { db, project, mara, tor } = setup();
   const chunk = addChunk(db, project.id, 'Mara feared him at once. Tor arrived with the guard at dawn.');
-  const row = addRelation(db, project.id, mara, tor, 'guide to parity with', 'Mara feared him, at once', chunk, { asserted: null });
+  const row = addRelation(db, project.id, mara, tor, 'guide to parity with', 'Mara feared him, at once', chunk);
   const off = lorebook.assignAttestedTiers(db, project.id, { write: true });
   assert.equal(off.attested, 0);
   assert.equal(off.still['quote-not-verbatim'], 1, 'presentation mismatch stays refused unless repair is asked for');

@@ -5795,12 +5795,18 @@ export function checkAttested(
   // vocabulary is for naming and querying, never a promotion gate.
   if (COVERAGE_KINDS.has(canonical)) return { attested: false, reason: 'coverage-only' };
   if (isMomentKind(canonical)) return { attested: false, reason: 'moment' };
-  // A stored assessment is evidence about the claim, not a requirement: a
-  // row without one is judged by its quote and its chunk. An assessment that
-  // denies the claim still refuses it.
+  // A positive stored assessment clearing the bar is required: a row
+  // without one is unjudged evidence, never attested. Denial, a wrong-kind
+  // verdict, or a sub-bar strength all refuse, reusing existing reasons only.
   const assessment = storedAssessment(row.supportingEvidence);
-  if (assessment && (assessment.asserted === false || assessment.hedge === 'denied' || assessment.hedge === 'doubted')) {
+  if (!assessment) {
     return { attested: false, reason: 'assertion-missing' };
+  }
+  if (assessment.asserted === false || assessment.hedge === 'denied' || assessment.hedge === 'doubted') {
+    return { attested: false, reason: 'assertion-missing' };
+  }
+  if (assessment.kind_fit === 'no' || assessment.strength < DEFAULT_MIN_CONFIDENCE) {
+    return { attested: false, reason: 'below-threshold' };
   }
   if (row.fromId === row.toId) return { attested: false, reason: 'same-identity' };
   if (nestedCharacterNames(db, projectId, row.fromId, row.toId, row.fromName, row.toName)) {
