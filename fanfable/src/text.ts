@@ -25,6 +25,15 @@ export function splitSentences(text: string): string[] {
   return sentenceSpans(text).map((span) => span.text);
 }
 
+/** Normalise a string for comparison: letters and digits, single spaces. */
+export function normalise(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9' ]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 interface SentenceSpan {
   text: string;
   start: number;

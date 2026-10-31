@@ -20,15 +20,18 @@ import { embedMissing, type EmbedFn } from './embeddings.ts';
 import { CORROBORATION_CAP, tripleKey, rankRows } from './edge-rank.ts';
 import { noteFromExtraction, starvedWindowScores } from './note-ingest.ts';
 import { recordRuling } from './ruling.ts';
-import { findHeadings, lexicalScore, splitSentences, tokenize, truncate } from './text.ts';
+import { findHeadings, lexicalScore, normalise, splitSentences, tokenize, truncate } from './text.ts';
 import {
   ANSWER_CUE_STOPWORDS,
+  KIND_FILLER,
   KIND_PARTICLES,
   KINSHIP_CUES,
   MOMENT_WORDS,
   PROOF_FILLER,
   PROOF_TITLES,
   STOPWORDS,
+  headForms,
+  kindHeadWord,
 } from './vocab.ts';
 import { SEARCH_CANDIDATE_POOL } from './search-policy.ts';
 import {
@@ -48,6 +51,38 @@ import {
   type RosterIndex,
 } from './names.ts';
 export { canonicalName, nameRelation, nameTokens } from './names.ts';
+
+/* ------------------------------------------------------------------ gates */
+
+// Gate verdicts live in gates.ts (single owner); lorebook re-exports the
+// public surface so existing importers keep working. No other module may
+// import gate internals except through here or gates.ts.
+export {
+  DEFAULT_MIN_CONFIDENCE,
+  attestedQuoteReason,
+  claimTier,
+  keeperQuoteReason,
+  provenRelation,
+  type AttestedReason,
+  type PromoteContext,
+  type PromoteDecision,
+  type PromoteReason,
+  type PromoteRow,
+} from './gates.ts';
+import {
+  DEFAULT_MIN_CONFIDENCE,
+  attestedQuoteReason,
+  claimTier,
+  explicitVariants,
+  keeperQuoteReason,
+  mentionSpans,
+  provenRelation,
+  type AttestedReason,
+  type PromoteContext,
+  type PromoteDecision,
+  type PromoteReason,
+  type PromoteRow,
+} from './gates.ts';
 
 /* ------------------------------------------------------------------ models */
 
@@ -4446,15 +4481,6 @@ function verifyQuote(
   return empty;
 }
 
-/** Normalise a string for comparison: letters and digits, single spaces. */
-function normalise(text: string): string {
-  return text
-    .toLowerCase()
-    .replace(/[^a-z0-9' ]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
 /**
  * A character name that is a description, not a proper name.
  *
@@ -4840,54 +4866,6 @@ export const RELATIONSHIP_GRADE_KINDS: ReadonlySet<string> = new Set(
   CLOSED_ROLE_KINDS.filter((kind) => !COVERAGE_KINDS.has(kind) && !isMomentKind(kind)),
 );
 
-export type PromoteReason =
-  | 'open-vocab'
-  | 'coverage-only'
-  | 'ruled-park'
-  | 'quote-not-verbatim'
-  | 'tie-word-absent'
-  | 'endpoint-unnamed'
-  | 'direction-mismatch'
-  | 'same-identity'
-  | 'quarantined-entity'
-  | 'assertion-missing'
-  | 'below-threshold'
-  | 'moment';
-
-export interface PromoteRow {
-  fromId: number;
-  toId: number;
-  fromName: string;
-  toName: string;
-  fromAliases?: string[];
-  toAliases?: string[];
-  kind: string;
-  evidence: string;
-  /** Verbatim words from the quote that express the kind, when the model named
-   * them ("sided with" for ally of). */
-  kindSource?: string;
-  /** The sentence that names the other endpoint, when the quote names one. */
-  anchorEvidence?: string;
-  /** The model's own estimate that the passage establishes this relation. */
-  confidence?: number;
-}
-
-export interface PromoteContext {
-  db: Db;
-  projectId: number;
-  /** Text of the passage the quote cites. */
-  chunkText?: string | null;
-  /** Optional per-command roster index, kept for name-variant resolution. */
-  index?: RosterIndex;
-  /** Override the project's `minConfidence` (tests and one-off commands). */
-  minConfidence?: number;
-}
-
-export interface PromoteDecision {
-  ok: boolean;
-  reason?: PromoteReason;
-}
-
 /** Build the per-command roster index: every entity row plus all chunk text. */
 function commandRosterIndex(db: Db, projectId: number): RosterIndex {
   return buildRosterIndex(
@@ -4905,13 +4883,6 @@ function canonicalKind(kind: string): string {
     .toLowerCase()
     .replace(/_/g, ' ')
     .replace(/\s+/g, ' ');
-}
-
-/** The name list a matcher receives: explicit forms, widened by derived
- * variants when a roster index is supplied. With no index this is exactly
- * `[name, ...aliases]`, so non-opting callers behave byte for byte as before. */
-function explicitVariants(name: string, aliases: string[], index?: RosterIndex): string[] {
-  return index ? deriveNameVariants({ name, aliases }, index) : [name, ...aliases];
 }
 
 function endpointTokens(name: string, aliases: string[], index?: RosterIndex): Set<string> {
@@ -5040,9 +5011,6 @@ function sameOrInverseKind(noteKind: string, rowKind: string): boolean {
   return inverseKinds(note).includes(rowHead) || inverseKinds(row).includes(noteHead);
 }
 
-/** Minimum model confidence a claim needs to bank, unless the project overrides it. */
-export const DEFAULT_MIN_CONFIDENCE = 0.7;
-
 /** Read the project's `minConfidence` setting, clamped to 0..1. */
 export function projectMinConfidence(db: Db, projectId: number): number {
   const row = db.get<{ settings: string }>('SELECT settings FROM project WHERE id = ?', projectId);
@@ -5053,11 +5021,6 @@ export function projectMinConfidence(db: Db, projectId: number): number {
     /* a malformed setting means the default, never a crash */
   }
   return DEFAULT_MIN_CONFIDENCE;
-}
-
-/** The tier a model claim gets from its own score. */
-export function claimTier(confidence: number, minConfidence = DEFAULT_MIN_CONFIDENCE): 'accepted' | 'provisional' {
-  return Number.isFinite(confidence) && confidence >= minConfidence ? 'accepted' : 'provisional';
 }
 
 /** The model's assessment of one claim. Stored as provenance, never as a rule. */
@@ -5111,70 +5074,6 @@ function appendAssessment(supportingEvidence: string, assessment: ClaimAssessmen
   const items = fromJson<Record<string, unknown>[]>(supportingEvidence, []);
   items.push({ assessment });
   return toJson(items);
-}
-
-/**
- * What code alone can certify about a quote: it and any anchor sit verbatim
- * in the cited passage. Thin and shared: both tiers start every quote refusal
- * here, then apply their own honesty rule on top.
- */
-function quoteVerbatimReason(row: PromoteRow, chunkText?: string | null): PromoteReason | null {
-  const chunk = chunkText ?? '';
-  if (!row.evidence.trim() || !chunk || !normalise(chunk).includes(normalise(row.evidence))) {
-    return 'quote-not-verbatim';
-  }
-  const anchor = (row.anchorEvidence ?? '').trim();
-  if (anchor && !normalise(chunk).includes(normalise(anchor))) return 'quote-not-verbatim';
-  return null;
-}
-
-/**
- * The keeper tier's quote rule. Owned here: change it deliberately, and the
- * attested tier does not move. Today identical to attestedQuoteReason.
- */
-function keeperQuoteReason(row: PromoteRow, chunkText?: string | null, index?: RosterIndex): PromoteReason | null {
-  const verbatim = quoteVerbatimReason(row, chunkText);
-  if (verbatim) return verbatim;
-  const chunk = chunkText ?? '';
-  const anchor = (row.anchorEvidence ?? '').trim();
-  // Citation honesty, not grammar: "Mara feared Tor" may not be quoted from
-  // "Perhaps Mara feared Tor" as though the hedge were not there.
-  for (const span of anchor ? [row.evidence, anchor] : [row.evidence]) {
-    const holding = splitSentences(chunk).find((sentence) => normalise(sentence).includes(normalise(span))) ?? span;
-    if (leadingDenialOrHedge(holding, row, index)) return 'assertion-missing';
-  }
-  return null;
-}
-
-/**
- * The attested tier's quote rule. Owned here: change it deliberately, and the
- * keeper tier does not move. Today identical to keeperQuoteReason.
- */
-function attestedQuoteReason(row: PromoteRow, chunkText?: string | null, index?: RosterIndex): PromoteReason | null {
-  const verbatim = quoteVerbatimReason(row, chunkText);
-  if (verbatim) return verbatim;
-  const chunk = chunkText ?? '';
-  const anchor = (row.anchorEvidence ?? '').trim();
-  for (const span of anchor ? [row.evidence, anchor] : [row.evidence]) {
-    const holding = splitSentences(chunk).find((sentence) => normalise(sentence).includes(normalise(span))) ?? span;
-    if (leadingDenialOrHedge(holding, row, index)) return 'assertion-missing';
-  }
-  return null;
-}
-
-/**
- * Pure mechanical check plus the confidence threshold. No database access; the
- * context supplies the passage and, when needed, the threshold.
- */
-export function provenRelation(
-  row: PromoteRow,
-  context: { chunkText?: string | null; index?: RosterIndex; minConfidence?: number },
-): PromoteDecision {
-  const quoteReason = keeperQuoteReason(row, context.chunkText, context.index);
-  if (quoteReason) return { ok: false, reason: quoteReason };
-  const min = context.minConfidence ?? DEFAULT_MIN_CONFIDENCE;
-  if (claimTier(row.confidence ?? 1, min) !== 'accepted') return { ok: false, reason: 'below-threshold' };
-  return { ok: true };
 }
 
 /**
@@ -5270,132 +5169,6 @@ export function canPromote(row: PromoteRow, context: PromoteContext): PromoteDec
   const min = context.minConfidence ?? projectMinConfidence(context.db, context.projectId);
   if (claimTier(row.confidence ?? 1, min) !== 'accepted') return { ok: false, reason: 'below-threshold' };
   return { ok: true };
-}
-
-/** Token spans of a name and its variants inside a quote. */
-function mentionSpans(text: string, name: string, aliases: string[], index?: RosterIndex): Array<[number, number]> {
-  const words = canonicalName(text).split(' ').filter(Boolean);
-  const spans: Array<[number, number]> = [];
-  for (const variant of explicitVariants(name, aliases, index)) {
-    const target = canonicalName(variant).split(' ').filter(Boolean);
-    if (!target.length) continue;
-    for (let i = 0; i + target.length <= words.length; i++) {
-      if (target.every((word, k) => words[i + k] === word)) spans.push([i, i + target.length - 1]);
-    }
-  }
-  return spans;
-}
-
-/** Words only: possessives split out, punctuation to spaces, lowercased. */
-function assertionWords(text: string): string[] {
-  return text
-    .toLowerCase()
-    .replace(/[^a-z0-9' ]+/g, ' ')
-    .replace(/'s\b/g, " 's")
-    .replace(/\s+/g, ' ')
-    .trim()
-    .split(' ')
-    .filter(Boolean);
-}
-
-/** The label's own head word and its ordinary inflections. Used only when no
- * `kind_source` is supplied; it is morphology, never a synonym list. */
-function labelHeadForms(kind: string): Set<string> {
-  const head = kindHeadWord(kind);
-  if (!head) return new Set();
-  const forms = new Set([head, ...headForms(head)]);
-  return forms;
-}
-
-/** Negation and uncertainty markers. An asserted tie cannot ride on a denied or
- * merely possible clause. Structural, not a synonym list. */
-const NEGATORS = new Set(['not', 'never', 'no', 'nor', 'neither', 'without', 'hardly', 'barely']);
-const HEDGES = new Set([
-  'perhaps', 'possibly', 'maybe', 'might', 'may', 'could', 'probably', 'apparently',
-  'seemingly', 'seemed', 'seems', 'suspected', 'suspect', 'rumoured', 'rumored',
-]);
-
-/** Grammatical words that cannot carry a relationship on their own. */
-const CITATION_STOP = new Set([
-  'of', 'to', 'with', 'for', 'a', 'an', 'the', 'in', 'on', 'as', 'at', 'by', 'from',
-  'about', 'over', 'under', 'and', 'or', 'but', 'so', 'that', 'this', 'these', 'those',
-  'then', 'when', 'while', 'after', 'before', 'is', 'are', 'was', 'were', 'be', 'been',
-  'being', 'has', 'have', 'had', 'do', 'does', 'did', 'will', 'would', 'can', 'could',
-  'may', 'might', 'must', 'should', 'i', 'me', 'my', 'we', 'us', 'our', 'you', 'your',
-  'he', 'him', 'his', 'she', 'her', 'it', 'its', 'they', 'them', 'their', "'s",
-]);
-
-/** The cited words with the endpoints removed. A model often quotes the whole
- * clause ("Mara loathed Tor"); the relationship words are what remains. A word
- * that is also the kind's head stays even when it appears in a name
- * ("Aunt Petunia" does not swallow the aunt in an aunt-of citation). */
-function citationWords(
-  source: string,
-  kind: string,
-  fromName: string,
-  fromAliases: string[],
-  toName: string,
-  toAliases: string[],
-  index?: RosterIndex,
-): string[] {
-  const head = kindHeadWord(kind);
-  const keep = labelHeadForms(kind);
-  const nameWords = new Set<string>();
-  for (const variant of [...explicitVariants(fromName, fromAliases, index), ...explicitVariants(toName, toAliases, index)]) {
-    for (const token of assertionWords(variant)) nameWords.add(token);
-  }
-  return assertionWords(source).filter((token) => !nameWords.has(token) || keep.has(token) || token === head);
-}
-
-/**
- * True when the clause leading up to the assertion denies or hedges it. The
- * model may quote only the positive core ("Mara feared Tor") from a sentence
- * that says "Perhaps Mara feared Tor"; the quote alone shows no hedge, so the
- * sentence in the source is checked too.
- */
-function leadingDenialOrHedge(sentence: string, row: PromoteRow, index?: RosterIndex): boolean {
-  const words = assertionWords(sentence);
-  if (!words.length) return false;
-  const cited = citationWords(
-    row.kindSource ?? '',
-    row.kind,
-    row.fromName,
-    row.fromAliases ?? [],
-    row.toName,
-    row.toAliases ?? [],
-    index,
-  ).filter((word) => !CITATION_STOP.has(word));
-  const anchors = new Set<string>(cited);
-  const head = kindHeadWord(row.kind);
-  if (head) anchors.add(head);
-  if (!anchors.size) return false;
-  const at = words.findIndex((word) => anchors.has(word));
-  if (at < 0) return false;
-  // A hedge or negator just before the assertion softens or denies it. Looking
-  // back a few tokens covers "Perhaps Mara feared Tor" and "Mara did not trust
-  // Tor" without importing an unrelated clause earlier in the sentence.
-  return words.slice(Math.max(0, at - 4), at).some((word) => NEGATORS.has(word) || HEDGES.has(word));
-}
-
-/** The head noun of a kind: "aunt of" gives "aunt". */
-function kindHeadWord(kind: string): string {
-  for (const word of (kind ?? '').toLowerCase().split(/[^a-z]+/).filter(Boolean)) {
-    if (!KIND_FILLER.has(word)) return word;
-  }
-  return '';
-}
-
-function headForms(head: string): Set<string> {
-  const forms = new Set([head, `${head}s`, `${head}es`, `${head}ed`, `${head}ing`, `${head}d`]);
-  if (head.endsWith('e')) forms.add(`${head.slice(0, -1)}ing`);
-  if (head.endsWith('y')) {
-    forms.add(`${head.slice(0, -1)}ies`);
-    forms.add(`${head.slice(0, -1)}ied`);
-  }
-  // Irregular plurals among the closed kinship concepts.
-  if (head === 'child') forms.add('children');
-  if (head === 'wife') forms.add('wives');
-  return forms;
 }
 
 /**
@@ -5822,8 +5595,6 @@ export function auditAcceptedRelations(
  * passage-proof but not sentence-proof to `attested`. Direction and identity
  * rules are the same helpers the keeper guard uses.
  */
-
-export type AttestedReason = PromoteReason | 'keeper-track' | 'assessment-missing' | 'moment';
 
 export interface AttestedCheck {
   attested: boolean;
@@ -8912,8 +8683,6 @@ export function isMomentKind(kind: string): boolean {
  * `kind_source` instead, so a concept proved by other wording passes there.
  * Open vocabulary is not this rule's job.
  */
-const KIND_FILLER = new Set(['of', 'to', 'with', 'for', 'a', 'the', 'an', 'in', 'on', 'as']);
-
 export function isUnsupportedKind(kind: string, quote: string): boolean {
   if (!isClosedRoleKind(kind)) return false;
   const quoteWords = new Set((quote ?? '').toLowerCase().split(/[^a-z]+/).filter(Boolean));

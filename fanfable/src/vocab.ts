@@ -75,6 +75,31 @@ export const ANSWER_CUE_STOPWORDS = new Set(['of', 'the', 'a', 'an']);
 /** Closed particle set for relation kinds; a kind's head is the role noun. */
 export const KIND_PARTICLES = ['of', 'with', 'to', 'for'] as const;
 
+/** Glue words inside a kind label that carry no meaning ("aunt of" -> "aunt"). */
+export const KIND_FILLER = new Set(['of', 'to', 'with', 'for', 'a', 'the', 'an', 'in', 'on', 'as']);
+
+/** The head noun of a kind: "aunt of" gives "aunt". Morphology, never a synonym list. */
+export function kindHeadWord(kind: string): string {
+  for (const word of (kind ?? '').toLowerCase().split(/[^a-z]+/).filter(Boolean)) {
+    if (!KIND_FILLER.has(word)) return word;
+  }
+  return '';
+}
+
+/** The head word and its ordinary inflections ("aunt" -> aunts, etc.). */
+export function headForms(head: string): Set<string> {
+  const forms = new Set([head, `${head}s`, `${head}es`, `${head}ed`, `${head}ing`, `${head}d`]);
+  if (head.endsWith('e')) forms.add(`${head.slice(0, -1)}ing`);
+  if (head.endsWith('y')) {
+    forms.add(`${head.slice(0, -1)}ies`);
+    forms.add(`${head.slice(0, -1)}ied`);
+  }
+  // Irregular plurals among the closed kinship concepts.
+  if (head === 'child') forms.add('children');
+  if (head === 'wife') forms.add('wives');
+  return forms;
+}
+
 /** Verbs that describe a moment rather than a standing tie. */
 export const MOMENT_WORDS = new Set(
   ('met meet gave give told tell saw see heard hear wished wish refused refuse ' +
