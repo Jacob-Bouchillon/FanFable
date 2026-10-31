@@ -1,5 +1,5 @@
 /**
- * Chain handoff, product-side reader.
+ * Thin-ranked: order re-reads thinnest-first (spread thin, on purpose).
  *
  * Walks (test harness) write one JSON file per run: windows in read order,
  * thin names plus where they appear, banked pairs with quote, place and

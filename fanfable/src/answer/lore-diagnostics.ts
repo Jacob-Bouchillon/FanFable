@@ -21,7 +21,7 @@ import { Db, nowIso, strList, toJson } from '../core/db.ts';
 import { extractJson } from '../core/json.ts';
 import type { LlmClient } from '../core/llm.ts';
 import * as lorebook from '../lorebook.ts';
-import { preferThin, readHandoff } from './chain-handoff.ts';
+import { preferThin, readHandoff } from './thin-ranked.ts';
 import { truncate } from '../core/text.ts';
 import { recordRuling } from '../court/ruling.ts';
 import { DIAGNOSTIC_RELATION_CUES } from '../core/vocab.ts';
