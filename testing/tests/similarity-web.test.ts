@@ -16,14 +16,14 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import * as graph from '../../fanfable/src/graph.ts';
+import * as graph from '../../fanfable/src/support/graph.ts';
 import {
   ALIAS_WEIGHT,
   QUARANTINE_WEIGHT,
   RESEMBLANCE_THRESHOLD,
   RESEMBLANCE_TOPK,
-} from '../../fanfable/src/graph.ts';
-import { DEFAULT_EMBED_MODEL } from '../../fanfable/src/embeddings.ts';
+} from '../../fanfable/src/support/graph.ts';
+import { DEFAULT_EMBED_MODEL } from '../../fanfable/src/support/embeddings.ts';
 import { seedProject, tempDb } from './helpers.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';

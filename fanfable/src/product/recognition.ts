@@ -18,7 +18,7 @@ import { Db } from '../core/db.ts';
 import { extractJson } from '../core/json.ts';
 import type { LlmClient } from '../core/llm.ts';
 import { truncate } from '../core/text.ts';
-import type { DenseSeed, Graph } from '../graph.ts';
+import type { DenseSeed, Graph } from '../support/graph.ts';
 
 export interface RecognitionOptions {
   /** The query the seeds serve: the model judges support for this. */

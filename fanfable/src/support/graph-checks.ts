@@ -10,9 +10,9 @@
  * intentional change from canon as a mistake — the divergence is the point of
  * the story.
  */
-import { Db } from './core/db.ts';
-import type { ContinuityIssue } from './product/continuity.ts';
-import { terms } from './graph.ts';
+import { Db } from '../core/db.ts';
+import type { ContinuityIssue } from '../product/continuity.ts';
+import { terms } from '../support/graph.ts';
 
 export interface GraphCheckInput {
   chapterId: number;

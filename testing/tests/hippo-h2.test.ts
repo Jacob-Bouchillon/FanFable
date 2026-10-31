@@ -13,9 +13,9 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import * as graph from '../../fanfable/src/graph.ts';
-import * as embeddings from '../../fanfable/src/embeddings.ts';
-import type { EmbedFn } from '../../fanfable/src/embeddings.ts';
+import * as graph from '../../fanfable/src/support/graph.ts';
+import * as embeddings from '../../fanfable/src/support/embeddings.ts';
+import type { EmbedFn } from '../../fanfable/src/support/embeddings.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 import { seedProject, tempDb, mockProvider } from './helpers.ts';
 

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { resolveEmbedConfig } from '../../fanfable/src/embeddings.ts';
+import { resolveEmbedConfig } from '../../fanfable/src/support/embeddings.ts';
 import type { Db } from '../../fanfable/src/core/db.ts';
 import { saveGlobalConfig } from '../../fanfable/src/core/llm.ts';
 

@@ -16,8 +16,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { asRecordArray, extractJson, salvageJsonArray, toStringArray } from './core/json.ts';
 import type { LlmClient } from './core/llm.ts';
-import { embedMissing, type EmbedFn } from './embeddings.ts';
-import { CORROBORATION_CAP, tripleKey, rankRows } from './edge-rank.ts';
+import { embedMissing, type EmbedFn } from './support/embeddings.ts';
+import { CORROBORATION_CAP, tripleKey, rankRows } from './support/edge-rank.ts';
 import { noteFromExtraction, starvedWindowScores } from './web/note-ingest.ts';
 import { recordRuling } from './court/ruling.ts';
 import { findHeadings, lexicalScore, normalise, splitSentences, tokenize, truncate } from './core/text.ts';
@@ -33,7 +33,7 @@ import {
   headForms,
   kindHeadWord,
 } from './core/vocab.ts';
-import { SEARCH_CANDIDATE_POOL } from './search-policy.ts';
+import { SEARCH_CANDIDATE_POOL } from './support/search-policy.ts';
 import {
   buildRosterIndex,
   canonicalName,

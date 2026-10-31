@@ -13,7 +13,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import * as graph from '../../fanfable/src/graph.ts';
+import * as graph from '../../fanfable/src/support/graph.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 import { retrieve } from '../../fanfable/src/answer/retrieval.ts';
 import { seedProject, tempDb, mockProvider } from './helpers.ts';

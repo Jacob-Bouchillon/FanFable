@@ -15,9 +15,9 @@ import { join } from 'node:path';
 import { Db } from '../../fanfable/src/core/db.ts';
 import * as controller from '../../fanfable/src/plan/controller.ts';
 import * as lore from '../../fanfable/src/answer/lore.ts';
-import * as graph from '../../fanfable/src/graph.ts';
-import * as embeddings from '../../fanfable/src/embeddings.ts';
-import type { EmbedFn } from '../../fanfable/src/embeddings.ts';
+import * as graph from '../../fanfable/src/support/graph.ts';
+import * as embeddings from '../../fanfable/src/support/embeddings.ts';
+import type { EmbedFn } from '../../fanfable/src/support/embeddings.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';
 const MODEL = 'demo-fake';

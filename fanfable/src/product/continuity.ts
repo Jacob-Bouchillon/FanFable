@@ -13,7 +13,7 @@ import { similarity, splitSentences, truncate } from '../core/text.ts';
 import { nameMentionedExact } from '../identity/names.ts';
 import type { ContextSlice } from './memory.ts';
 import * as lorebook from '../lorebook.ts';
-import { graphContinuityChecks } from '../graph-checks.ts';
+import { graphContinuityChecks } from '../support/graph-checks.ts';
 
 export type IssueSeverity = 'error' | 'warning' | 'note';
 

@@ -11,8 +11,8 @@
  * down, bad shape) instead of throwing: retrieval must degrade to lexical
  * behavior, never fail because an embedder is unreachable.
  */
-import { Db, nowIso } from './core/db.ts';
-import { loadGlobalConfig } from './core/llm.ts';
+import { Db, nowIso } from '../core/db.ts';
+import { loadGlobalConfig } from '../core/llm.ts';
 
 export const DEFAULT_EMBED_MODEL = 'nomic-embed-text';
 export const EMBED_BATCH_SIZE = 32;

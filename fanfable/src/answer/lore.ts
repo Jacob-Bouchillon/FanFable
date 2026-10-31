@@ -12,9 +12,9 @@ import { asRecordArray, extractJson, salvageJsonArray, toStringArray } from '../
 import type { LlmClient } from '../core/llm.ts';
 import { chunkText, lexicalScore, titleFromPath, trimFrontBackMatter, truncate, wordCount } from '../core/text.ts';
 import { STOPWORDS } from '../core/vocab.ts';
-import { SEARCH_CANDIDATE_POOL, SEARCH_CANDIDATE_POOL_MAX } from '../search-policy.ts';
+import { SEARCH_CANDIDATE_POOL, SEARCH_CANDIDATE_POOL_MAX } from '../support/search-policy.ts';
 import { nameMentioned } from '../identity/names.ts';
-import { importFile, readTextFile, type ImportedText } from '../importer.ts';
+import { importFile, readTextFile, type ImportedText } from '../support/importer.ts';
 import * as lorebook from '../lorebook.ts';
 
 export interface SourceInfo {
@@ -44,7 +44,7 @@ import {
   importSource,
   importSourceAsync,
   listSources,
-} from '../lore-import.ts';
+} from '../support/lore-import.ts';
 import {
   expandQuery,
   getChunk,
@@ -62,7 +62,7 @@ export {
   importSource,
   importSourceAsync,
   listSources,
-} from '../lore-import.ts';
+} from '../support/lore-import.ts';
 export {
   expandQuery,
   getChunk,

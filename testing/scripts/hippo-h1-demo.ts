@@ -13,7 +13,7 @@ import { join } from 'node:path';
 import { Db } from '../../fanfable/src/core/db.ts';
 import * as controller from '../../fanfable/src/plan/controller.ts';
 import * as lore from '../../fanfable/src/answer/lore.ts';
-import * as graph from '../../fanfable/src/graph.ts';
+import * as graph from '../../fanfable/src/support/graph.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';
 const dir = mkdtempSync(join(tmpdir(), 'hippo-h1-demo-'));

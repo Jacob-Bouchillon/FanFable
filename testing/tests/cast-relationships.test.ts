@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as controller from '../../fanfable/src/plan/controller.ts';
-import * as graph from '../../fanfable/src/graph.ts';
+import * as graph from '../../fanfable/src/support/graph.ts';
 import { mockProvider, seedProject, tempDb } from './helpers.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';

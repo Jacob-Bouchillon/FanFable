@@ -9,8 +9,8 @@ import { nameMentioned } from '../../fanfable/src/identity/names.ts';
 import type { Passage } from '../../fanfable/src/answer/lore.ts';
 import { passageNamesBoth } from '../../fanfable/src/answer/lore.ts';
 import { findEntity, searchLore, windowEntityNames } from '../../fanfable/src/lorebook.ts';
-import { matchScore } from '../../fanfable/src/graph.ts';
-import type { GraphNode } from '../../fanfable/src/graph.ts';
+import { matchScore } from '../../fanfable/src/support/graph.ts';
+import type { GraphNode } from '../../fanfable/src/support/graph.ts';
 import { tempDb } from './helpers.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';

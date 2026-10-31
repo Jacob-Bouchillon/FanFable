@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { tempDb, seedProject, mockProvider } from './helpers.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
-import * as graph from '../../fanfable/src/graph.ts';
+import * as graph from '../../fanfable/src/support/graph.ts';
 import { CLOSED_TIE_LABELS } from '../../fanfable/src/lorebook.ts';
 
 function ents(db: any, projectId: number, names: string[]): Map<string, number> {

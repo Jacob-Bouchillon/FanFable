@@ -19,7 +19,7 @@ import type { LlmClient, LlmSettings } from '../core/llm.ts';
 import * as lore from '../answer/lore.ts';
 import * as lorebook from '../lorebook.ts';
 import * as retrieval from '../answer/retrieval.ts';
-import * as graph from '../graph.ts';
+import * as graph from '../support/graph.ts';
 import { checkPremise } from '../product/premise-check.ts';
 import { detectConflicts, saveConflicts, listConflicts } from '../product/state-conflicts.ts';
 import * as memory from '../product/memory.ts';

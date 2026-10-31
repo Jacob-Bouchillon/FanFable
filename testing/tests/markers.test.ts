@@ -17,7 +17,7 @@ import { copyFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Db } from '../../fanfable/src/core/db.ts';
 import { hasColumn } from '../../fanfable/src/core/migrations.ts';
-import * as graph from '../../fanfable/src/graph.ts';
+import * as graph from '../../fanfable/src/support/graph.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 import { seedProject, tempDb, mockProvider } from './helpers.ts';
 

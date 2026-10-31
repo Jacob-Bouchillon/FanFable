@@ -27,8 +27,8 @@ import { Db } from '../core/db.ts';
 import type { LlmClient } from '../core/llm.ts';
 import * as lore from './lore.ts';
 import * as lorebook from '../lorebook.ts';
-import * as embeddings from '../embeddings.ts';
-import * as graph from '../graph.ts';
+import * as embeddings from '../support/embeddings.ts';
+import * as graph from '../support/graph.ts';
 import { RELATION_CUES } from '../core/vocab.ts';
 import { nameMentioned } from '../identity/names.ts';
 

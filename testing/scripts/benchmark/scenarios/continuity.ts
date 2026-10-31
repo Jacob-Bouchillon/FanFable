@@ -12,7 +12,7 @@
  */
 import { Db } from '../../../../fanfable/src/core/db.ts';
 import * as continuity from '../../../../fanfable/src/product/continuity.ts';
-import * as graph from '../../../../fanfable/src/graph.ts';
+import * as graph from '../../../../fanfable/src/support/graph.ts';
 import * as memory from '../../../../fanfable/src/product/memory.ts';
 import type { RecordingClient } from '../harness.ts';
 

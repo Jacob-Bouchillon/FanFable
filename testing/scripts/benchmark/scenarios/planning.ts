@@ -15,7 +15,7 @@
  */
 import { Db } from '../../../../fanfable/src/core/db.ts';
 import * as controller from '../../../../fanfable/src/plan/controller.ts';
-import * as graph from '../../../../fanfable/src/graph.ts';
+import * as graph from '../../../../fanfable/src/support/graph.ts';
 import * as lore from '../../../../fanfable/src/answer/lore.ts';
 import * as planner from '../../../../fanfable/src/plan/planner.ts';
 import { extractJson } from '../../../../fanfable/src/core/json.ts';

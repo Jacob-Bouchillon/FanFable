@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { execFileSync } from 'node:child_process';
-import { importFile, readTextFile } from '../../fanfable/src/importer.ts';
+import { importFile, readTextFile } from '../../fanfable/src/support/importer.ts';
 import { chunkText } from '../../fanfable/src/core/text.ts';
 import { makePdf } from './pdf-fixture.ts';
 import * as lore from '../../fanfable/src/answer/lore.ts';

@@ -4,8 +4,8 @@ import { Db } from '../../fanfable/src/core/db.ts';
 import * as controller from '../../fanfable/src/plan/controller.ts';
 import * as memory from '../../fanfable/src/product/memory.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
-import * as graph from '../../fanfable/src/graph.ts';
-import { graphContinuityChecks } from '../../fanfable/src/graph-checks.ts';
+import * as graph from '../../fanfable/src/support/graph.ts';
+import { graphContinuityChecks } from '../../fanfable/src/support/graph-checks.ts';
 import { seedProject, tempDb, mockProvider } from './helpers.ts';
 import { STORY } from './fixtures/long-story.ts';
 

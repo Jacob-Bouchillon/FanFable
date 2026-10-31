@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { graphContinuityChecks } from '../../fanfable/src/graph-checks.ts';
+import { graphContinuityChecks } from '../../fanfable/src/support/graph-checks.ts';
 import * as memory from '../../fanfable/src/product/memory.ts';
 import { seedProject, tempDb } from './helpers.ts';
 

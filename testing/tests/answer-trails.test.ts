@@ -15,8 +15,8 @@ import { existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { mkdtempSync } from 'node:fs';
-import * as graph from '../../fanfable/src/graph.ts';
-import type { Graph, PprResult, TraversalResult } from '../../fanfable/src/graph.ts';
+import * as graph from '../../fanfable/src/support/graph.ts';
+import type { Graph, PprResult, TraversalResult } from '../../fanfable/src/support/graph.ts';
 import { seedProject, tempDb } from './helpers.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';

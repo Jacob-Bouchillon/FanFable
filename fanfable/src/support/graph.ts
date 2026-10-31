@@ -23,14 +23,14 @@
  * from, a confidence, a review status, and — where it matters — the range of
  * story time it holds for.
  */
-import { Db, fromJson, strList } from './core/db.ts';
-import { DEFAULT_EMBED_MODEL, cosine, embedTexts, readVectors, resolveEmbedConfig, type EmbedFn } from './embeddings.ts';
-import type { LlmClient } from './core/llm.ts';
-import { filterDenseSeeds } from './product/recognition.ts';
-import { looksAlike, sharedSpeakerScene, speakerChunksByEntity } from './lorebook.ts';
-import { truncate } from './core/text.ts';
-import { GRAPH_STOPWORDS } from './core/vocab.ts';
-import { canonicalName, linkTokenMatch, nameMentionedFromTokens, nameRelation, textTokenSet } from './identity/names.ts';
+import { Db, fromJson, strList } from '../core/db.ts';
+import { DEFAULT_EMBED_MODEL, cosine, embedTexts, readVectors, resolveEmbedConfig, type EmbedFn } from '../support/embeddings.ts';
+import type { LlmClient } from '../core/llm.ts';
+import { filterDenseSeeds } from '../product/recognition.ts';
+import { looksAlike, sharedSpeakerScene, speakerChunksByEntity } from '../lorebook.ts';
+import { truncate } from '../core/text.ts';
+import { GRAPH_STOPWORDS } from '../core/vocab.ts';
+import { canonicalName, linkTokenMatch, nameMentionedFromTokens, nameRelation, textTokenSet } from '../identity/names.ts';
 
 /* --------------------------------------------- similarity-web weights
  *
