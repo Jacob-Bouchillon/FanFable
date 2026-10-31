@@ -3972,9 +3972,9 @@ function applyRelations(
         continue;
       }
       // Citation honesty: a quoted sub-span may not hide a hedge or denial in
-      // the sentence that holds it. This is the only grammatical check left,
-      // and it protects the source, not a theory of relationships.
-      const citationReason = provenQuoteReason(
+      // the sentence that holds it. Intake holds the attested honesty bar;
+      // the tiers own their copies from here on.
+      const citationReason = attestedQuoteReason(
         { fromId, toId, fromName, toName, kind, evidence: span.quote, kindSource, anchorEvidence },
         passageText,
         index,
@@ -5114,20 +5114,47 @@ function appendAssessment(supportingEvidence: string, assessment: ClaimAssessmen
 }
 
 /**
- * The mechanical promotion guard. It certifies only what code can see: the
- * quote and any anchor are in the cited passage, and a quoted fragment does not
- * hide a hedge or denial in the sentence that holds it. Meaning, linkage,
- * direction and label fitness are the model's and are recorded with the claim.
+ * What code alone can certify about a quote: it and any anchor sit verbatim
+ * in the cited passage. Thin and shared: both tiers start every quote refusal
+ * here, then apply their own honesty rule on top.
  */
-function provenQuoteReason(row: PromoteRow, chunkText?: string | null, index?: RosterIndex): PromoteReason | null {
+function quoteVerbatimReason(row: PromoteRow, chunkText?: string | null): PromoteReason | null {
   const chunk = chunkText ?? '';
   if (!row.evidence.trim() || !chunk || !normalise(chunk).includes(normalise(row.evidence))) {
     return 'quote-not-verbatim';
   }
   const anchor = (row.anchorEvidence ?? '').trim();
   if (anchor && !normalise(chunk).includes(normalise(anchor))) return 'quote-not-verbatim';
+  return null;
+}
+
+/**
+ * The keeper tier's quote rule. Owned here: change it deliberately, and the
+ * attested tier does not move. Today identical to attestedQuoteReason.
+ */
+function keeperQuoteReason(row: PromoteRow, chunkText?: string | null, index?: RosterIndex): PromoteReason | null {
+  const verbatim = quoteVerbatimReason(row, chunkText);
+  if (verbatim) return verbatim;
+  const chunk = chunkText ?? '';
+  const anchor = (row.anchorEvidence ?? '').trim();
   // Citation honesty, not grammar: "Mara feared Tor" may not be quoted from
   // "Perhaps Mara feared Tor" as though the hedge were not there.
+  for (const span of anchor ? [row.evidence, anchor] : [row.evidence]) {
+    const holding = splitSentences(chunk).find((sentence) => normalise(sentence).includes(normalise(span))) ?? span;
+    if (leadingDenialOrHedge(holding, row, index)) return 'assertion-missing';
+  }
+  return null;
+}
+
+/**
+ * The attested tier's quote rule. Owned here: change it deliberately, and the
+ * keeper tier does not move. Today identical to keeperQuoteReason.
+ */
+function attestedQuoteReason(row: PromoteRow, chunkText?: string | null, index?: RosterIndex): PromoteReason | null {
+  const verbatim = quoteVerbatimReason(row, chunkText);
+  if (verbatim) return verbatim;
+  const chunk = chunkText ?? '';
+  const anchor = (row.anchorEvidence ?? '').trim();
   for (const span of anchor ? [row.evidence, anchor] : [row.evidence]) {
     const holding = splitSentences(chunk).find((sentence) => normalise(sentence).includes(normalise(span))) ?? span;
     if (leadingDenialOrHedge(holding, row, index)) return 'assertion-missing';
@@ -5143,7 +5170,7 @@ export function provenRelation(
   row: PromoteRow,
   context: { chunkText?: string | null; index?: RosterIndex; minConfidence?: number },
 ): PromoteDecision {
-  const quoteReason = provenQuoteReason(row, context.chunkText, context.index);
+  const quoteReason = keeperQuoteReason(row, context.chunkText, context.index);
   if (quoteReason) return { ok: false, reason: quoteReason };
   const min = context.minConfidence ?? DEFAULT_MIN_CONFIDENCE;
   if (claimTier(row.confidence ?? 1, min) !== 'accepted') return { ok: false, reason: 'below-threshold' };
@@ -5238,7 +5265,7 @@ export function canPromote(row: PromoteRow, context: PromoteContext): PromoteDec
   if (parked.some((note) => sameOrInverseKind(note.attempted_kind, row.kind))) {
     return { ok: false, reason: 'ruled-park' };
   }
-  const quoteReason = provenQuoteReason(row, context.chunkText, context.index);
+  const quoteReason = keeperQuoteReason(row, context.chunkText, context.index);
   if (quoteReason) return { ok: false, reason: quoteReason };
   const min = context.minConfidence ?? projectMinConfidence(context.db, context.projectId);
   if (claimTier(row.confidence ?? 1, min) !== 'accepted') return { ok: false, reason: 'below-threshold' };
@@ -5831,7 +5858,7 @@ function chunkNamesEndpoint(chunkText: string, name: string, aliases: string[]):
  * Passage-level proof for one row. Pure and read-only: no writes, no model.
  * `chunkText` must be the raw cited chunk: verbatim here is the strict
  * auditNormalize standard integrity enforces, so assignment and integrity
- * agree exactly. provenQuoteReason still runs for hedge/anchor honesty.
+ * agree exactly. attestedQuoteReason still runs for hedge/anchor honesty.
  */
 export function checkAttested(
   db: Db,
@@ -5885,7 +5912,7 @@ export function checkAttested(
   if (!auditNormalize(chunkText).includes(auditNormalize(row.evidence))) {
     return { attested: false, reason: 'quote-not-verbatim' };
   }
-  const quoteReason = provenQuoteReason(
+  const quoteReason = attestedQuoteReason(
     {
       fromId: row.fromId,
       toId: row.toId,

@@ -350,3 +350,26 @@ test('attestWriteGuard refuses non-temp writes without --on-copy, never the temp
   );
   db.close();
 });
+
+test('a sentence-proof quote routes keeper-track while its one-name twin attests', () => {
+  const { db, project, mara, tor } = setup();
+  const chunk = addChunk(db, project.id, 'Mara is the aunt of Tor. The gate was cold.');
+  const sentence = addRelation(db, project.id, mara, tor, 'aunt of', 'Mara is the aunt of Tor.', chunk);
+  const thin = addChunk(db, project.id, 'Mara feared him. Tor arrived with the guard at dawn.');
+  const passage = addRelation(db, project.id, mara, tor, 'mentor of', 'Mara feared him.', thin);
+  const dry = lorebook.assignAttestedTiers(db, project.id);
+  assert.equal(dry.attested, 1, 'the one-name quote proceeds past the quote stage');
+  assert.equal(dry.keeperTrack, 1, 'the sentence-proof quote stays keeper-track');
+  const wrote = lorebook.assignAttestedTiers(db, project.id, { write: true });
+  assert.equal(wrote.changed, 1);
+  assert.equal(
+    db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', sentence)!.review_status,
+    'provisional',
+    'sentence-proof never attests',
+  );
+  assert.equal(
+    db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', passage)!.review_status,
+    'attested',
+  );
+  db.close();
+});
