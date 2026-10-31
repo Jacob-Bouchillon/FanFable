@@ -8,7 +8,7 @@
  * a mutable check.
  */
 import type { Db } from '../db.ts';
-import { canonicalName, deriveNameVariants, type RosterIndex } from '../names.ts';
+import { canonicalName, deriveNameVariants, type RosterIndex } from '../identity/names.ts';
 import { normalise, splitSentences } from '../text.ts';
 import { KIND_FILLER, headForms, kindHeadWord } from '../vocab.ts';
 
