@@ -68,7 +68,7 @@ export {
   type PromoteDecision,
   type PromoteReason,
   type PromoteRow,
-} from './gates.ts';
+} from './gates/gates.ts';
 import {
   DEFAULT_MIN_CONFIDENCE,
   attestedQuoteReason,
@@ -82,7 +82,7 @@ import {
   type PromoteDecision,
   type PromoteReason,
   type PromoteRow,
-} from './gates.ts';
+} from './gates/gates.ts';
 
 // Prompt text lives in extract-prompts.ts (single owner); lorebook re-exports
 // the full prior public surface so existing importers keep working. No other
@@ -93,14 +93,14 @@ export {
   EXTRACT_EVENTS_SYSTEM,
   EXTRACT_RELATIONS_SYSTEM,
   formatKnownEntities,
-} from './extract-prompts.ts';
+} from './extract/extract-prompts.ts';
 import {
   ASSESSMENT_QUESTIONS,
   EXTRACT_ENTITIES_SYSTEM,
   EXTRACT_EVENTS_SYSTEM,
   EXTRACT_RELATIONS_SYSTEM,
   formatKnownEntities,
-} from './extract-prompts.ts';
+} from './extract/extract-prompts.ts';
 
 /* ------------------------------------------------------------------ models */
 
