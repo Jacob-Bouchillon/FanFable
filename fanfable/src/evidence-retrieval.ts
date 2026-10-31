@@ -6,7 +6,7 @@
  */
 import { Db, fromJson } from './db.ts';
 import * as lorebook from './lorebook.ts';
-import { canonicalName } from './names.ts';
+import { canonicalName } from './identity/names.ts';
 import {
   sharedCharacters,
   type EvidenceRecord,

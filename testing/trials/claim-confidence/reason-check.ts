@@ -11,7 +11,7 @@
  */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { Db } from '../../../fanfable/src/db.ts';
-import { canonicalName } from '../../../fanfable/src/names.ts';
+import { canonicalName } from '../../../fanfable/src/identity/names.ts';
 
 const resultsPath = process.argv[2];
 const verdictsPath = process.argv[3] ?? 'testing/trials/adjudication/gold-verdicts-v2.txt';

@@ -4,7 +4,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildRosterIndex, canonicalName, deriveNameVariants, nameRelation } from '../../fanfable/src/names.ts';
+import { buildRosterIndex, canonicalName, deriveNameVariants, nameRelation } from '../../fanfable/src/identity/names.ts';
 
 const STRAIGHT = "Shi'ido";
 const CURLY = 'Shi\u2019ido';

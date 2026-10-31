@@ -10,7 +10,7 @@ import { Db, nowIso } from './db.ts';
 import { extractJson } from './json.ts';
 import type { LlmClient } from './llm.ts';
 import { similarity, splitSentences, truncate } from './text.ts';
-import { nameMentionedExact } from './names.ts';
+import { nameMentionedExact } from './identity/names.ts';
 import type { ContextSlice } from './memory.ts';
 import * as lorebook from './lorebook.ts';
 import { graphContinuityChecks } from './graph-checks.ts';

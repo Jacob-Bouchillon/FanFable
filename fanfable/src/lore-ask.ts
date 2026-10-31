@@ -6,7 +6,7 @@
 import { Db } from './db.ts';
 import { extractJson, toStringArray } from './json.ts';
 import type { LlmClient } from './llm.ts';
-import { nameMentionedExact, buildRosterIndex, deriveNameVariants, canonicalName, nameRelation, type RosterIndex } from './names.ts';
+import { nameMentionedExact, buildRosterIndex, deriveNameVariants, canonicalName, nameRelation, type RosterIndex } from './identity/names.ts';
 import * as lorebook from './lorebook.ts';
 import { expandQuery, searchCanon } from './lore-search.ts';
 import type { Passage } from './lore.ts';

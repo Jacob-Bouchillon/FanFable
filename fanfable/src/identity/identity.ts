@@ -9,7 +9,7 @@
  * Nothing here merges, renames or re-kinds. A collision is a flag for a human;
  * an ambiguous name stays ambiguous.
  */
-import { Db, strList } from './db.ts';
+import { Db, strList } from '../db.ts';
 import {
   NAME_DF_CAP,
   buildRosterIndex,

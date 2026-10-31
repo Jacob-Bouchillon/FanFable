@@ -30,7 +30,7 @@ import * as lorebook from './lorebook.ts';
 import * as embeddings from './embeddings.ts';
 import * as graph from './graph.ts';
 import { RELATION_CUES } from './vocab.ts';
-import { nameMentioned } from './names.ts';
+import { nameMentioned } from './identity/names.ts';
 
 export interface RetrievalRequest {
   /** The question or the scene's subject. */

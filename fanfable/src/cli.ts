@@ -39,7 +39,7 @@ import * as threadWeb from './web/threads.ts';
 import * as meetingWeb from './web/meetings.ts';
 import * as noteIngest from './web/note-ingest.ts';
 import * as briefWeb from './brief.ts';
-import * as identityCheck from './identity-check.ts';
+import * as identityCheck from './identity/identity-check.ts';
 import type { PassageTrail } from './graph.ts';
 import { truncate } from './text.ts';
 import { buildTrailsHtml, trailText } from './trail-html.ts';

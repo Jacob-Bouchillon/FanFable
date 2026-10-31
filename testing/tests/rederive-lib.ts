@@ -1,6 +1,6 @@
 ﻿/** Deterministic evidence re-derivation for quarantined keepers. No model calls. */
 import { Db, fromJson, nowIso, strList, toJson } from '../../fanfable/src/db.ts';
-import { nameMentionedExact } from '../../fanfable/src/names.ts';
+import { nameMentionedExact } from '../../fanfable/src/identity/names.ts';
 import { splitSentences } from '../../fanfable/src/text.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 

@@ -16,7 +16,7 @@
  * rows for a human to rule on, and says why. Idempotent: a second run finds
  * nothing new to flag.
  */
-import { Db } from './db.ts';
+import { Db } from '../db.ts';
 import { nameRelation } from './names.ts';
 import {
   NAME_GROUP_CAP,

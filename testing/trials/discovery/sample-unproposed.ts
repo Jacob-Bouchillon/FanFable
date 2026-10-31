@@ -16,7 +16,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { Db } from '../../../fanfable/src/db.ts';
-import { buildRosterIndex, canonicalName, deriveNameVariants } from '../../../fanfable/src/names.ts';
+import { buildRosterIndex, canonicalName, deriveNameVariants } from '../../../fanfable/src/identity/names.ts';
 import { splitSentences } from '../../../fanfable/src/text.ts';
 
 const SAMPLE_N = 80;

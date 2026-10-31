@@ -15,7 +15,7 @@ import {
   NAME_DF_CAP,
   occursLowercaseInText,
   type RosterIndex,
-} from '../../fanfable/src/names.ts';
+} from '../../fanfable/src/identity/names.ts';
 import { tempDb } from './helpers.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';

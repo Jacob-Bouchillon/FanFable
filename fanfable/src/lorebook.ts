@@ -49,8 +49,8 @@ import {
   NAME_MIN_TOKEN,
   textTokenSet,
   type RosterIndex,
-} from './names.ts';
-export { canonicalName, nameRelation, nameTokens } from './names.ts';
+} from './identity/names.ts';
+export { canonicalName, nameRelation, nameTokens } from './identity/names.ts';
 
 /* ------------------------------------------------------------------ gates */
 

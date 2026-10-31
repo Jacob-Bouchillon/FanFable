@@ -14,7 +14,7 @@
  * tokens inside the other's) are refused as one person the bank split.
  */
 import { Db, nowIso, strList, toJson } from '../db.ts';
-import { buildRosterIndex, canonicalName, deriveNameVariants } from '../names.ts';
+import { buildRosterIndex, canonicalName, deriveNameVariants } from '../identity/names.ts';
 
 export interface PairThreadBuild {
   /** Non-quarantined characters considered. */

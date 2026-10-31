@@ -17,7 +17,7 @@ import {
   namesBothDistinctly,
   scanSentenceCandidates,
 } from '../../../fanfable/src/lorebook.ts';
-import { buildRosterIndex } from '../../../fanfable/src/names.ts';
+import { buildRosterIndex } from '../../../fanfable/src/identity/names.ts';
 import { writeFileSync } from 'node:fs';
 
 const dbPath = process.argv[2];

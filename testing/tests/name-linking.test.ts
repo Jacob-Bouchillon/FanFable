@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createProject } from '../../fanfable/src/controller.ts';
-import { nameMentioned } from '../../fanfable/src/names.ts';
+import { nameMentioned } from '../../fanfable/src/identity/names.ts';
 import type { Passage } from '../../fanfable/src/lore.ts';
 import { passageNamesBoth } from '../../fanfable/src/lore.ts';
 import { findEntity, searchLore, windowEntityNames } from '../../fanfable/src/lorebook.ts';

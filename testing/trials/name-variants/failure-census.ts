@@ -15,7 +15,7 @@ import {
   canPromote,
   scanSentenceCandidates,
 } from '../../../fanfable/src/lorebook.ts';
-import { buildRosterIndex } from '../../../fanfable/src/names.ts';
+import { buildRosterIndex } from '../../../fanfable/src/identity/names.ts';
 
 const dbPath = process.argv[2];
 const outPath = process.argv[3] ?? 'testing/trials/name-variants/failure-census.json';

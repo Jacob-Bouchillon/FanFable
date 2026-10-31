@@ -12,7 +12,7 @@ import { writeFileSync } from 'node:fs';
 import { Db } from '../../../fanfable/src/db.ts';
 import { clientFrom } from '../../../fanfable/src/llm.ts';
 import { extractJson } from '../../../fanfable/src/json.ts';
-import { buildRosterIndex, canonicalName, deriveNameVariants } from '../../../fanfable/src/names.ts';
+import { buildRosterIndex, canonicalName, deriveNameVariants } from '../../../fanfable/src/identity/names.ts';
 import { scanSentenceCandidates } from '../../../fanfable/src/lorebook.ts';
 
 const dbPath = process.argv[2];

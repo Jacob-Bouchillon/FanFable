@@ -1,5 +1,5 @@
 import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';
-import * as names from '/home/jacob/Documents/FanFable/fanfable/src/names.ts';
+import * as names from '/home/jacob/Documents/FanFable/fanfable/src/identity/names.ts';
 import * as lb from '/home/jacob/Documents/FanFable/fanfable/src/lorebook.ts';
 import { mkdirSync, writeFileSync } from 'node:fs';
 

@@ -6,7 +6,7 @@
  */
 import { writeFileSync } from 'node:fs';
 import { Db } from '../../../fanfable/src/db.ts';
-import { nameMentionedExact } from '../../../fanfable/src/names.ts';
+import { nameMentionedExact } from '../../../fanfable/src/identity/names.ts';
 import { strList } from '../../../fanfable/src/db.ts';
 
 const APPLY = process.argv.includes('--apply');

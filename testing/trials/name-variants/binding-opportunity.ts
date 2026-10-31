@@ -21,7 +21,7 @@ import {
   canPromote,
   scanSentenceCandidates,
 } from '../../../fanfable/src/lorebook.ts';
-import { buildRosterIndex, canonicalName } from '../../../fanfable/src/names.ts';
+import { buildRosterIndex, canonicalName } from '../../../fanfable/src/identity/names.ts';
 
 const dbPath = process.argv[2];
 const outPath = process.argv[3] ?? 'testing/trials/name-variants/binding-opportunity.json';

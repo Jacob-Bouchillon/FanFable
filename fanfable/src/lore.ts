@@ -13,7 +13,7 @@ import type { LlmClient } from './llm.ts';
 import { chunkText, lexicalScore, titleFromPath, trimFrontBackMatter, truncate, wordCount } from './text.ts';
 import { STOPWORDS } from './vocab.ts';
 import { SEARCH_CANDIDATE_POOL, SEARCH_CANDIDATE_POOL_MAX } from './search-policy.ts';
-import { nameMentioned } from './names.ts';
+import { nameMentioned } from './identity/names.ts';
 import { importFile, readTextFile, type ImportedText } from './importer.ts';
 import * as lorebook from './lorebook.ts';
 

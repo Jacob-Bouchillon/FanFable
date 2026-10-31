@@ -29,7 +29,7 @@ import * as writer from './writer.ts';
 import * as continuity from './continuity.ts';
 import { continuitySettings, filterBySeverity } from './continuity-settings.ts';
 import { truncate, wordCount } from './text.ts';
-import { nameMentioned, nameMentionedExact } from './names.ts';
+import { nameMentioned, nameMentionedExact } from './identity/names.ts';
 
 export interface Project {
   id: number;

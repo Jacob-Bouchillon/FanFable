@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createProject } from '../../fanfable/src/controller.ts';
-import { resolveEntity, resolvePair } from '../../fanfable/src/identity.ts';
+import { resolveEntity, resolvePair } from '../../fanfable/src/identity/identity.ts';
 import { tempDb } from './helpers.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';

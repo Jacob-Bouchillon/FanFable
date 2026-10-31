@@ -30,7 +30,7 @@ import { filterDenseSeeds } from './recognition.ts';
 import { looksAlike, sharedSpeakerScene, speakerChunksByEntity } from './lorebook.ts';
 import { truncate } from './text.ts';
 import { GRAPH_STOPWORDS } from './vocab.ts';
-import { canonicalName, linkTokenMatch, nameMentionedFromTokens, nameRelation, textTokenSet } from './names.ts';
+import { canonicalName, linkTokenMatch, nameMentionedFromTokens, nameRelation, textTokenSet } from './identity/names.ts';
 
 /* --------------------------------------------- similarity-web weights
  *
