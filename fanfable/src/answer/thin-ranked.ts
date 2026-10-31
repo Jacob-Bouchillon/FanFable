@@ -1,5 +1,5 @@
 /**
- * Thin-ranked: order re-reads thinnest-first. (An AI found "spread thin" funny here. ???? — the human did not.)
+ * Thin-ranked: order re-reads thinnest-first. (An AI found "spread thin" funny here. ???? — why.)
  *
  * Walks (test harness) write one JSON file per run: windows in read order,
  * thin names plus where they appear, banked pairs with quote, place and
