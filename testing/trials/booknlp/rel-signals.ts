@@ -1,0 +1,370 @@
+/**
+ * BookNLP-for-rel test — do its signals predict banked ties?
+ *
+ * Trial-only, read-only bank. Builds three candidate pair sets from the ran
+ * chapter outputs, code-only: (1) agent→patient action pairs sharing one verb;
+ * (2) quote-exchange pairs (speaker → roster person named in the quote text);
+ * (3) coref co-mention pairs (two roster persons in one chain's passages, via
+ * any mention kind — the weakest signal). Identity follows the bank's own
+ * rules (exact, alias, guarded containment); ambiguous or absent names are
+ * dropped, never guessed. Scoring is UNORDERED (the bank's threads normalize
+ * pairs lo:hi while relation from/to stays as read, so direction is kept as
+ * info, never as a hit condition).
+ *
+ * usage (from the repo root):
+ *   node --experimental-strip-types testing/trials/booknlp/rel-signals.ts [pairs.json]
+ *
+ * The pair sheet is local scratch data (names live there, never here).
+ * Writes only under testing/trials/booknlp/out-rel/ (gitignored). The bank is
+ * opened read-only and never written. Reports print counts only, never
+ * passage prose or names. Nothing banks — candidates for review, verbatim.
+ */
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import type { Db } from '../../../fanfable/src/core/db.ts';
+import { loadIdentityContext, createResolver } from '../../../fanfable/src/identity/identity.ts';
+
+const TRACK = 'testing/trials/booknlp';
+const OUT_DIR = `${TRACK}/out`;
+const REL_DIR = `${TRACK}/out-rel`;
+const BOOK_ID = 'chapter';
+const DB_PATH = 'testing/trials/halfbook-run/plagueis-half.db';
+const PROJECT = 'halfbook';
+const SELECT_JSON = `${TRACK}/select.json`;
+
+function fail(message: string): never {
+  throw new Error(`rel-signals: ${message}`);
+}
+
+function dbStat(): { main: string; sidecars: Record<string, string> } {
+  // The gate is the main file's content identity. Journal sidecars (-shm)
+  // churn on any connection, even read-only, so they are recorded as info.
+  const dir = resolve(DB_PATH, '..');
+  const sidecars: Record<string, string> = {};
+  for (const entry of readdirSync(dir)) {
+    if (!entry.startsWith('plagueis-half.db')) continue;
+    const st = statSync(resolve(dir, entry));
+    if (entry === 'plagueis-half.db') continue;
+    sidecars[entry] = `${st.size}:${st.mtimeMs}`;
+  }
+  const main = statSync(DB_PATH);
+  return { main: `${main.size}:${main.mtimeMs}`, sidecars };
+}
+
+function sameStats(a: ReturnType<typeof dbStat>, b: ReturnType<typeof dbStat>): boolean {
+  return a.main === b.main;
+}
+
+function detok(words: string[]): string {
+  return words
+    .join(' ')
+    .replace(/\s+([.,!?;:…%‰'’"”)\]}»])/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function bodyRows(path: string): string[][] {
+  const lines = readFileSync(path, 'utf8').split('\n').filter((line) => line.length > 0);
+  const rows = lines.map((line) => line.split('\t'));
+  if (rows.length && !/^-?\d+$/.test((rows[0]![0] ?? '').trim())) rows.shift();
+  return rows;
+}
+
+const normName = (s: string): string =>
+  String(s ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9 ]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+/** Roster person named in text: token-boundary match on full name or alias. */
+function mentionedPersons(text: string, forms: { id: number; forms: string[] }[]): Set<number> {
+  const padded = ` ${normName(text)} `;
+  const found = new Set<number>();
+  for (const entry of forms) {
+    for (const form of entry.forms) {
+      if (form && padded.includes(` ${form} `)) {
+        found.add(entry.id);
+        break;
+      }
+    }
+  }
+  return found;
+}
+
+const pairKey = (a: number, b: number): string => `${Math.min(a, b)}:${Math.max(a, b)}`;
+
+export function run(): Record<string, unknown> {
+  const before = dbStat();
+  const ro = new DatabaseSync(resolve(DB_PATH), { readOnly: true });
+  // identity.ts only reads via .all; this adapter keeps the bank read-only.
+  const dbLike = {
+    all: <T>(sql: string, ...params: unknown[]): T[] => ro.prepare(sql).all(...params) as T[],
+  };
+  const all = dbLike.all;
+  const one = <T>(sql: string, ...params: unknown[]): T | undefined =>
+    ro.prepare(sql).get(...params) as T | undefined;
+  try {
+    const project = one<{ id: number }>('SELECT id FROM project WHERE name = ?', PROJECT);
+    if (!project) fail(`no project ${PROJECT}`);
+    const pid = project.id;
+    const sel = JSON.parse(readFileSync(SELECT_JSON, 'utf8')) as { pick: { seqFrom: number; seqTo: number } };
+
+    const context = loadIdentityContext(dbLike as unknown as Db, pid);
+    const resolver = createResolver(context);
+    const characters = context.entities.filter((e) => e.kind === 'character');
+    const forms = characters.map((e) => {
+      const aliases = Array.isArray(e.aliases) ? e.aliases.map(String) : [];
+      return { id: e.id, forms: [e.name, ...aliases].map(normName).filter(Boolean) };
+    });
+
+    const book = JSON.parse(readFileSync(`${OUT_DIR}/${BOOK_ID}.book`, 'utf8')) as {
+      characters?: {
+        id: number;
+        mentions?: { proper?: { c: number; n: string }[] };
+        agent?: { w: string; i: number }[];
+        patient?: { w: string; i: number }[];
+      }[];
+    };
+    const chars = book.characters ?? [];
+    // Chain -> single banked person, or null when unmapped/ambiguous/merged.
+    const personOf = new Map<number, number | null>();
+    let droppedUnmapped = 0;
+    let droppedAmbiguous = 0;
+    for (const c of chars) {
+      const persons = new Set<number>();
+      let bad = false;
+      for (const m of c.mentions?.proper ?? []) {
+        const r = resolver.resolve(String(m.n));
+        if (r.status === 'resolved' && r.id !== null && characters.some((e) => e.id === r.id)) {
+          persons.add(r.id);
+        } else {
+          bad = true;
+          if (r.status === 'ambiguous') droppedAmbiguous++;
+          else droppedUnmapped++;
+        }
+      }
+      personOf.set(Number(c.id), !bad && persons.size === 1 ? [...persons][0]! : null);
+    }
+    const topName = new Map<number, string>();
+    for (const c of chars) {
+      const proper = [...(c.mentions?.proper ?? [])].sort((a, b) => b.c - a.c);
+      topName.set(Number(c.id), proper.length ? String(proper[0]!.n) : '');
+    }
+    void topName;
+
+    // Token -> sentence text (+ key for grouping chains per passage).
+    const tokRows = bodyRows(`${OUT_DIR}/${BOOK_ID}.tokens`);
+    const sentOfDoc = new Map<number, string>();
+    const keyOfDoc = new Map<number, string>();
+    const bySent = new Map<string, { doc: number; word: string }[]>();
+    for (const r of tokRows) {
+      const doc = Number(r[3]);
+      if (!Number.isFinite(doc)) continue;
+      const key = `${r[0]}\t${r[1]}`;
+      const list = bySent.get(key) ?? [];
+      list.push({ doc, word: String(r[4] ?? '') });
+      bySent.set(key, list);
+    }
+    for (const [key, list] of bySent) {
+      const text = detok([...list].sort((a, b) => a.doc - b.doc).map((e) => e.word));
+      for (const e of list) {
+        sentOfDoc.set(e.doc, text);
+        keyOfDoc.set(e.doc, key);
+      }
+    }
+
+    // Set 1: agent→patient pairs sharing one verb token.
+    const set1 = new Set<string>();
+    {
+      const agents = new Map<number, Set<number>>();
+      const patients = new Map<number, Set<number>>();
+      for (const c of chars) {
+        const person = personOf.get(Number(c.id));
+        if (person === null || person === undefined) continue;
+        for (const a of c.agent ?? []) {
+          const set = agents.get(a.i) ?? new Set<number>();
+          set.add(person);
+          agents.set(a.i, set);
+        }
+        for (const p of c.patient ?? []) {
+          const set = patients.get(p.i) ?? new Set<number>();
+          set.add(person);
+          patients.set(p.i, set);
+        }
+      }
+      for (const [verb, aSet] of agents) {
+        const pSet = patients.get(verb) ?? new Set<number>();
+        for (const a of aSet) {
+          for (const p of pSet) {
+            if (a !== p) set1.add(pairKey(a, p));
+          }
+        }
+      }
+    }
+
+    // Set 2: quote-exchange pairs (speaker → roster person named in the quote).
+    const set2 = new Set<string>();
+    {
+      const quoteRows = bodyRows(`${OUT_DIR}/${BOOK_ID}.quotes`);
+      for (const r of quoteRows) {
+        const speaker = personOf.get(Number(r[5]));
+        if (speaker === null || speaker === undefined) continue;
+        const quote = String(r[6] ?? '');
+        for (const mentioned of mentionedPersons(quote, forms)) {
+          if (mentioned !== speaker) set2.add(pairKey(speaker, mentioned));
+        }
+      }
+    }
+
+    // Set 3: coref co-mention pairs (chains sharing one passage, any mention
+    // kind — proper, common, or pronoun; the weakest signal, recorded as is).
+    const set3 = new Set<string>();
+    {
+      const entRows = bodyRows(`${OUT_DIR}/${BOOK_ID}.entities`);
+      const sentPersons = new Map<string, Set<number>>();
+      for (const r of entRows) {
+        const person = personOf.get(Number(r[0]));
+        if (person === null || person === undefined) continue;
+        const start = Number(r[1]);
+        const end = Number(r[2]);
+        const keys = new Set<string>();
+        for (let doc = start; doc <= end; doc++) {
+          const key = keyOfDoc.get(doc);
+          if (key !== undefined) keys.add(key);
+        }
+        for (const key of keys) {
+          const set = sentPersons.get(key) ?? new Set<number>();
+          set.add(person);
+          sentPersons.set(key, set);
+        }
+      }
+      for (const persons of sentPersons.values()) {
+        const ids = [...persons].sort((a, b) => a - b);
+        for (let i = 0; i < ids.length; i++) {
+          for (let j = i + 1; j < ids.length; j++) set3.add(pairKey(ids[i]!, ids[j]!));
+        }
+      }
+    }
+
+    // Bank side, same chapter range, read-only.
+    const chunkSeq = new Map<number, number>();
+    for (const row of all<{ id: number; seq: number }>(
+      'SELECT id, seq FROM canon_chunk WHERE project_id = ?',
+      pid,
+    )) {
+      chunkSeq.set(row.id, row.seq);
+    }
+    const inRange = (seq: number | undefined): boolean =>
+      seq !== undefined && seq >= sel.pick.seqFrom && seq <= sel.pick.seqTo;
+    const chunkIdsOf = (sourceRefs: string): number[] => {
+      try {
+        const refs = JSON.parse(sourceRefs || '[]') as { chunk?: unknown }[];
+        return refs
+          .map((ref) => Number(ref?.chunk))
+          .filter((n) => Number.isFinite(n) && n > 0);
+      } catch {
+        return [];
+      }
+    };
+    // Banked pairs in range: a relation row (any status) citing this chapter.
+    const bankedInRange = new Set<string>();
+    const bankedAll = new Set<string>();
+    for (const row of all<{ from_entity: number; to_entity: number; source_refs: string }>(
+      'SELECT from_entity, to_entity, source_refs FROM canon_relation WHERE project_id = ?',
+      pid,
+    )) {
+      const key = pairKey(row.from_entity, row.to_entity);
+      bankedAll.add(key);
+      if (chunkIdsOf(row.source_refs).some((id) => inRange(chunkSeq.get(id)))) {
+        bankedInRange.add(key);
+      }
+    }
+
+    const scoreSet = (pairs: Set<string>): { n: number; hits: number; precision: number } => {
+      let hits = 0;
+      for (const key of pairs) if (bankedAll.has(key)) hits++;
+      return { n: pairs.size, hits, precision: pairs.size ? Number((hits / pairs.size).toFixed(3)) : 0 };
+    };
+    const s1 = scoreSet(set1);
+    const s2 = scoreSet(set2);
+    const s3 = scoreSet(set3);
+    const combined = new Set([...set1, ...set2, ...set3]);
+    const sc = scoreSet(combined);
+    const recallOf = (pairs: Set<string>): { hit: number; total: number; recall: number } => {
+      let hit = 0;
+      for (const key of bankedInRange) if (pairs.has(key)) hit++;
+      return { hit, total: bankedInRange.size, recall: bankedInRange.size ? Number((hit / bankedInRange.size).toFixed(3)) : 0 };
+    };
+
+    // Locked-20 overlap from the local scratch sheet (counts per block only).
+    const sheetPath = process.argv[2] ?? '';
+    const lockedHits: Record<string, number> = {};
+    let lockedResolved = 0;
+    if (sheetPath && existsSync(sheetPath)) {
+      const sheet = JSON.parse(readFileSync(sheetPath, 'utf8')) as {
+        id: string;
+        a: string;
+        b: string;
+        block: string;
+      }[];
+      const formToIds = new Map<string, number[]>();
+      for (const entry of forms) {
+        for (const form of entry.forms) {
+          formToIds.set(form, [...(formToIds.get(form) ?? []), entry.id]);
+        }
+      }
+      for (const pair of sheet) {
+        const aIds = formToIds.get(normName(pair.a)) ?? [];
+        const bIds = formToIds.get(normName(pair.b)) ?? [];
+        if (aIds.length !== 1 || bIds.length !== 1) continue;
+        lockedResolved++;
+        if (combined.has(pairKey(aIds[0]!, bIds[0]!))) {
+          lockedHits[pair.block] = (lockedHits[pair.block] ?? 0) + 1;
+        }
+      }
+    }
+
+    const manifest = {
+      directionRule: 'scored unordered (bank threads normalize lo:hi; relation from/to stays as read)',
+      range: { seqFrom: sel.pick.seqFrom, seqTo: sel.pick.seqTo },
+      sets: {
+        actionPairs: { ...s1, ...recallOf(set1) },
+        quoteExchange: { ...s2, ...recallOf(set2) },
+        corefComentions: { ...s3, ...recallOf(set3) },
+        combined: { ...sc, ...recallOf(combined) },
+      },
+      bankedPairsInRange: bankedInRange.size,
+      bankedPairsTotal: bankedAll.size,
+      droppedUnmapped,
+      droppedAmbiguous,
+      lockedResolved,
+      lockedHits,
+      reviewStatus: 'Nothing banks — candidates for review, verbatim',
+      dbUntouched: dbStat(),
+      dbBefore: before,
+    };
+    mkdirSync(REL_DIR, { recursive: true });
+    writeFileSync(`${REL_DIR}/manifest.json`, JSON.stringify(manifest, null, 1));
+    const after = dbStat();
+    if (!sameStats(after, before)) {
+      fail('bank changed during scoring (size/mtime moved)');
+    }
+    console.log(
+      `sets: action ${s1.n}/${s1.hits} exchange ${s2.n}/${s2.hits} coref ${s3.n}/${s3.hits} combined ${sc.n}/${sc.hits}`,
+    );
+    console.log(
+      `recall: rangePairs ${bankedInRange.size} bySet action ${recallOf(set1).hit} exchange ${recallOf(set2).hit} coref ${recallOf(set3).hit} combined ${recallOf(combined).hit}`,
+    );
+    console.log(`locked: resolved ${lockedResolved} hits ${JSON.stringify(lockedHits)}`);
+    console.log(`dropped: unmapped ${droppedUnmapped} ambiguous ${droppedAmbiguous}`);
+    console.log(`bank untouched (main ${before.main}); manifest ${REL_DIR}/manifest.json`);
+    console.log('Nothing banks — candidates for review, verbatim');
+    return manifest;
+  } finally {
+    ro.close();
+  }
+}
+
+run();
