@@ -36,6 +36,7 @@ node --experimental-strip-types testing/trials/chain/watch-log.ts book-coord
 | `audit/` | past system audit reports (local-only) |
 | `discovery/` | unproposed-pair threads, packet sampler, verdict scorer, top-yield followup allocator, and single-sentence evidence prototype (run output under `discovery/unproposed/`) |
 | `benchmark/` | web validation against the locked 20-pair sheet (`validate-web.ts`); the pair list is local data (`pairs.json`, untracked) |
+| `booknlp/` | one-chapter E1+E3 probe (`run-chapter.ts`); venv, chapter text and outputs stay local (gitignored) |
 
 ## archive/ — finished or superseded runs, local data included
 
