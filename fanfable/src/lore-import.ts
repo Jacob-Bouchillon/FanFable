@@ -8,7 +8,7 @@ import { statSync } from 'node:fs';
 import { Db, nowIso, strList } from './db.ts';
 import { chunkText, titleFromPath, trimFrontBackMatter, wordCount } from './text.ts';
 import { importFile, readTextFile, type ImportedText } from './importer.ts';
-import type { SourceInfo } from './lore.ts';
+import type { SourceInfo } from './answer/lore.ts';
 
 /* --------------------------------------------------------------- importing */
 

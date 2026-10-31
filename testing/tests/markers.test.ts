@@ -250,7 +250,7 @@ test('opposing same-subject pairs flag contested on both sides', async () => {
     .map((r) => r.id);
   assert.ok(relIds.every((id) => rstatus(id) === 'contested'), 'both rival relations flagged');
 
-  const gaps = (await import('../../fanfable/src/lore-diagnostics.ts')).diagnose(db, project.id);
+  const gaps = (await import('../../fanfable/src/answer/lore-diagnostics.ts')).diagnose(db, project.id);
   assert.ok(gaps.some((g) => g.kind === 'contested-claim'), 'diagnostics report the rivals');
   db.close();
 });

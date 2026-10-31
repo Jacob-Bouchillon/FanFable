@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Db } from '../../fanfable/src/db.ts';
 import { MockProvider } from '../../fanfable/src/llm.ts';
-import * as lore from '../../fanfable/src/lore.ts';
+import * as lore from '../../fanfable/src/answer/lore.ts';
 import * as controller from '../../fanfable/src/plan/controller.ts';
 
 export const FIXTURE = resolve(import.meta.dirname, 'fixtures/sample-book.txt');

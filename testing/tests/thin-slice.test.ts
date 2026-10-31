@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { tempDb, seedProject } from './helpers.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
-import * as loreDiag from '../../fanfable/src/lore-diagnostics.ts';
+import * as loreDiag from '../../fanfable/src/answer/lore-diagnostics.ts';
 import * as graph from '../../fanfable/src/graph.ts';
 
 function setupBank(db: any, projectId: number) {

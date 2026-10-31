@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import * as loreDiag from '../../fanfable/src/lore-diagnostics.ts';
+import * as loreDiag from '../../fanfable/src/answer/lore-diagnostics.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 import { seedProject, tempDb, mockProvider } from './helpers.ts';
 

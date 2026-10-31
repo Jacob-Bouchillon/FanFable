@@ -7,7 +7,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { seedProject, tempDb, mockProvider } from './helpers.ts';
-import * as lore from '../../fanfable/src/lore.ts';
+import * as lore from '../../fanfable/src/answer/lore.ts';
 
 /** Add `n` extra passages after the fixture's own, with known seqs. */
 function addChunks(db: ReturnType<typeof tempDb>['db'], projectId: number, n: number, startSeq: number): void {

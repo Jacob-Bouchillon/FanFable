@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Db } from '../../fanfable/src/db.ts';
 import * as controller from '../../fanfable/src/plan/controller.ts';
-import * as lore from '../../fanfable/src/lore.ts';
+import * as lore from '../../fanfable/src/answer/lore.ts';
 import * as graph from '../../fanfable/src/graph.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 import { MockProvider } from '../../fanfable/src/llm.ts';

@@ -1,4 +1,4 @@
-import * as lore from '/home/jacob/Documents/FanFable/fanfable/src/lore.ts';
+import * as lore from '/home/jacob/Documents/FanFable/fanfable/src/answer/lore.ts';
 import { seedProject, tempDb, mockProvider } from '/home/jacob/Documents/FanFable/testing/tests/helpers.ts';
 const { db } = tempDb();
 const project = seedProject(db, 'guard-check');

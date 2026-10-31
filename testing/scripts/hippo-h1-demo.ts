@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Db } from '../../fanfable/src/db.ts';
 import * as controller from '../../fanfable/src/plan/controller.ts';
-import * as lore from '../../fanfable/src/lore.ts';
+import * as lore from '../../fanfable/src/answer/lore.ts';
 import * as graph from '../../fanfable/src/graph.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';

@@ -10,7 +10,7 @@ import { Db } from '../../fanfable/src/db.ts';
 import { runMigrations, tableExists } from '../../fanfable/src/migrations.ts';
 import * as controller from '../../fanfable/src/plan/controller.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
-import * as loreDiag from '../../fanfable/src/lore-diagnostics.ts';
+import * as loreDiag from '../../fanfable/src/answer/lore-diagnostics.ts';
 import { mockProvider, tempDb } from './helpers.ts';
 
 const REFS = [{ source: 'Probe', locator: 'p. 3', chunk: 7 }];

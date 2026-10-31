@@ -15,8 +15,8 @@ import {
   type ClaimRequirement,
   type Packet,
   type SceneRequirements,
-} from '../../../fanfable/src/evidence.ts';
-import { loadEvidenceRecords, validatePacket } from '../../../fanfable/src/evidence-retrieval.ts';
+} from '../../../fanfable/src/answer/evidence.ts';
+import { loadEvidenceRecords, validatePacket } from '../../../fanfable/src/answer/evidence-retrieval.ts';
 
 const DB_PATH = 'testing/trials/model-ab/hp3.db';
 const raw = new DatabaseSync(DB_PATH, { readOnly: true });

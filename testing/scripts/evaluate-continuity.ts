@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import * as graph from '../../fanfable/src/graph.ts';
 import * as memory from '../../fanfable/src/memory.ts';
-import * as lore from '../../fanfable/src/lore.ts';
+import * as lore from '../../fanfable/src/answer/lore.ts';
 import { graphContinuityChecks } from '../../fanfable/src/graph-checks.ts';
 import { checkChapter, deterministicChecks } from '../../fanfable/src/continuity.ts';
 

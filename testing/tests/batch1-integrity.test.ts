@@ -4,9 +4,9 @@ import { join, resolve, sep, normalize } from 'node:path';
 import { Db } from '../../fanfable/src/db.ts';
 import * as controller from '../../fanfable/src/plan/controller.ts';
 import * as planner from '../../fanfable/src/plan/planner.ts';
-import * as lore from '../../fanfable/src/lore.ts';
+import * as lore from '../../fanfable/src/answer/lore.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
-import { retrieve } from '../../fanfable/src/retrieval.ts';
+import { retrieve } from '../../fanfable/src/answer/retrieval.ts';
 import { tempDb, seedProject, mockProvider } from './helpers.ts';
 
 test('FKs enforced: deleting a source cascades chunks', () => {

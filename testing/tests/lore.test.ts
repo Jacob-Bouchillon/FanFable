@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import * as lore from '../../fanfable/src/lore.ts';
+import * as lore from '../../fanfable/src/answer/lore.ts';
 import { seedProject, tempDb, mockProvider, FIXTURE } from './helpers.ts';
 
 test('import creates chunks and a searchable index', () => {

@@ -17,14 +17,14 @@
  *                 what is missing about it, so a single under-described
  *                 character can be fixed without re-indexing the book.
  */
-import { Db, nowIso, strList, toJson } from './db.ts';
-import { extractJson } from './json.ts';
-import type { LlmClient } from './llm.ts';
-import * as lorebook from './lorebook.ts';
+import { Db, nowIso, strList, toJson } from '../db.ts';
+import { extractJson } from '../json.ts';
+import type { LlmClient } from '../llm.ts';
+import * as lorebook from '../lorebook.ts';
 import { preferThin, readHandoff } from './chain-handoff.ts';
-import { truncate } from './text.ts';
-import { recordRuling } from './court/ruling.ts';
-import { DIAGNOSTIC_RELATION_CUES } from './vocab.ts';
+import { truncate } from '../text.ts';
+import { recordRuling } from '../court/ruling.ts';
+import { DIAGNOSTIC_RELATION_CUES } from '../vocab.ts';
 
 /* ------------------------------------------------------------- diagnostics */
 

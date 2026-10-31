@@ -20,7 +20,7 @@ import { copyFileSync } from 'node:fs';
 import { join } from 'node:path';
 import * as graph from '../../fanfable/src/graph.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
-import { quarantineReport } from '../../fanfable/src/lore-diagnostics.ts';
+import { quarantineReport } from '../../fanfable/src/answer/lore-diagnostics.ts';
 import { Db } from '../../fanfable/src/db.ts';
 import { seedProject, tempDb, mockProvider } from './helpers.ts';
 

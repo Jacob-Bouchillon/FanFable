@@ -7,15 +7,15 @@
  */
 import { createHash } from 'node:crypto';
 import { statSync } from 'node:fs';
-import { Db, nowIso, strList } from './db.ts';
-import { asRecordArray, extractJson, salvageJsonArray, toStringArray } from './json.ts';
-import type { LlmClient } from './llm.ts';
-import { chunkText, lexicalScore, titleFromPath, trimFrontBackMatter, truncate, wordCount } from './text.ts';
-import { STOPWORDS } from './vocab.ts';
-import { SEARCH_CANDIDATE_POOL, SEARCH_CANDIDATE_POOL_MAX } from './search-policy.ts';
-import { nameMentioned } from './identity/names.ts';
-import { importFile, readTextFile, type ImportedText } from './importer.ts';
-import * as lorebook from './lorebook.ts';
+import { Db, nowIso, strList } from '../db.ts';
+import { asRecordArray, extractJson, salvageJsonArray, toStringArray } from '../json.ts';
+import type { LlmClient } from '../llm.ts';
+import { chunkText, lexicalScore, titleFromPath, trimFrontBackMatter, truncate, wordCount } from '../text.ts';
+import { STOPWORDS } from '../vocab.ts';
+import { SEARCH_CANDIDATE_POOL, SEARCH_CANDIDATE_POOL_MAX } from '../search-policy.ts';
+import { nameMentioned } from '../identity/names.ts';
+import { importFile, readTextFile, type ImportedText } from '../importer.ts';
+import * as lorebook from '../lorebook.ts';
 
 export interface SourceInfo {
   id: number;
@@ -44,7 +44,7 @@ import {
   importSource,
   importSourceAsync,
   listSources,
-} from './lore-import.ts';
+} from '../lore-import.ts';
 import {
   expandQuery,
   getChunk,
@@ -62,7 +62,7 @@ export {
   importSource,
   importSourceAsync,
   listSources,
-} from './lore-import.ts';
+} from '../lore-import.ts';
 export {
   expandQuery,
   getChunk,

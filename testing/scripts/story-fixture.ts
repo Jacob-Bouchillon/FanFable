@@ -5,7 +5,7 @@
  * The canon is the sample book; the story is written on top of it.
  */
 import { Db } from '../../fanfable/src/db.ts';
-import * as lore from '../../fanfable/src/lore.ts';
+import * as lore from '../../fanfable/src/answer/lore.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 import * as memory from '../../fanfable/src/memory.ts';
 import { MockProvider } from '../../fanfable/src/llm.ts';

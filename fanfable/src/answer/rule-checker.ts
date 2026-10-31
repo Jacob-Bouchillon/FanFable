@@ -10,8 +10,8 @@
  * scene AND no co-speaker veto fired AND corroboration < 2 for the merged
  * form. Otherwise keep separate.
  */
-import type { Db } from './db.ts';
-import { isClosedRoleKind, isMomentKind, isUnsupportedKind } from './lorebook.ts';
+import type { Db } from '../db.ts';
+import { isClosedRoleKind, isMomentKind, isUnsupportedKind } from '../lorebook.ts';
 
 export interface RuleHit {
   id: number;

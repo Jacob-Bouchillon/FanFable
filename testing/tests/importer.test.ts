@@ -9,7 +9,7 @@ import { execFileSync } from 'node:child_process';
 import { importFile, readTextFile } from '../../fanfable/src/importer.ts';
 import { chunkText } from '../../fanfable/src/text.ts';
 import { makePdf } from './pdf-fixture.ts';
-import * as lore from '../../fanfable/src/lore.ts';
+import * as lore from '../../fanfable/src/answer/lore.ts';
 
 
 const exec = promisify(execFile);

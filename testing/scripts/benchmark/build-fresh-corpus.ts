@@ -146,7 +146,7 @@ export async function buildFreshCorpus(
         ['corpusBuilder', resolve(here, './corpus.ts')],
         ['runHarness', resolve(here, './harness.ts')],
         ['loreExtractor', resolve(here, '../../../fanfable/src/lorebook.ts')],
-        ['loreStorage', resolve(here, '../../../fanfable/src/lore.ts')],
+        ['loreStorage', resolve(here, '../../../fanfable/src/answer/lore.ts')],
         ['fileImporter', resolve(here, '../../../fanfable/src/importer.ts')],
         ['llmClient', resolve(here, '../../../fanfable/src/llm.ts')],
         ['databaseSchema', resolve(here, '../../../fanfable/src/schema.ts')],

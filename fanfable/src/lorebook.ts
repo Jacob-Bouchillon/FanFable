@@ -869,7 +869,7 @@ export async function extractLore(
   // Identity-claim sweep over entity summaries: flags only, merges stay
   // human-gated. Dynamic import avoids the lorebook<->rule-checker cycle
   // (same precedent as the deferred diagnostics import).
-  const identityHits = (await import('./rule-checker.ts')).checkEntities(db, projectId);
+  const identityHits = (await import('./answer/rule-checker.ts')).checkEntities(db, projectId);
   if (identityHits.length) {
     opts.onProgress?.(
       `identity sweep: ${identityHits.length} summar${identityHits.length === 1 ? 'y' : 'ies'} flagged for review`,
@@ -977,7 +977,7 @@ async function closeTheLoop(
     if (!tight.length) return [`loop: ${gaps.length} gap entities, 0 tight-gated, 0 extra calls`];
     // Deferred import: lore-diagnostics reads lorebook at module load, so a
     // top-level import would cycle. Resolved here at runtime, long after init.
-    const { enrichEntity } = await import('./lore-diagnostics.ts');
+    const { enrichEntity } = await import('./answer/lore-diagnostics.ts');
     let calls = 0;
     for (const e of tight) {
       try {
@@ -1077,7 +1077,7 @@ export async function ensureWindowsForChunks(
   // Identity-claim sweep over entity summaries: flags only, merges stay
   // human-gated. Dynamic import avoids the lorebook<->rule-checker cycle
   // (same precedent as the deferred diagnostics import).
-  const identityHits = (await import('./rule-checker.ts')).checkEntities(db, projectId);
+  const identityHits = (await import('./answer/rule-checker.ts')).checkEntities(db, projectId);
   if (identityHits.length) {
     opts.onProgress?.(
       `identity sweep: ${identityHits.length} summar${identityHits.length === 1 ? 'y' : 'ies'} flagged for review`,

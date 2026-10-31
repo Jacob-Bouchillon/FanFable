@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { tempDb, seedProject } from './helpers.ts';
-import { checkEntities } from '../../fanfable/src/rule-checker.ts';
+import { checkEntities } from '../../fanfable/src/answer/rule-checker.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 
 function addEntity(db: any, projectId: number, name: string, summary: string, evidence: string, role = ''): number {

@@ -13,8 +13,8 @@ import {
   type EvidenceRecord,
   type Packet,
   type SceneRequirements,
-} from '../../fanfable/src/evidence.ts';
-import { loadEvidenceRecords, validatePacket } from '../../fanfable/src/evidence-retrieval.ts';
+} from '../../fanfable/src/answer/evidence.ts';
+import { loadEvidenceRecords, validatePacket } from '../../fanfable/src/answer/evidence-retrieval.ts';
 import { tempDb } from './helpers.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';

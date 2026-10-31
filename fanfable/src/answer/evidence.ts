@@ -4,8 +4,8 @@
  * Pure: plain inputs and outputs. No database handle, no model call, no I/O.
  * Records are supplied by retrieval; validation is a separate, impure step.
  */
-import { canonicalName, nameRelation } from './identity/names.ts';
-import { STOPWORDS } from './vocab.ts';
+import { canonicalName, nameRelation } from '../identity/names.ts';
+import { STOPWORDS } from '../vocab.ts';
 
 export type ClaimKind = 'canon' | 'au';
 

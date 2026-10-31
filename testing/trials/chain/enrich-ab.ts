@@ -8,7 +8,7 @@
  */
 import { Db } from '/home/jacob/Documents/FanFable/fanfable/src/db.ts';
 import * as controller from '/home/jacob/Documents/FanFable/fanfable/src/plan/controller.ts';
-import * as loreDiag from '/home/jacob/Documents/FanFable/fanfable/src/lore-diagnostics.ts';
+import * as loreDiag from '/home/jacob/Documents/FanFable/fanfable/src/answer/lore-diagnostics.ts';
 import { readHandoff } from './chain-handoff.ts';
 import { baselineClient } from '/home/jacob/Documents/FanFable/testing/scripts/benchmark/corpus.ts';
 

@@ -1,5 +1,5 @@
-import * as lore from '/home/jacob/Documents/FanFable/fanfable/src/lore.ts';
-import { routeQuery } from '/home/jacob/Documents/FanFable/fanfable/src/retrieval.ts';
+import * as lore from '/home/jacob/Documents/FanFable/fanfable/src/answer/lore.ts';
+import { routeQuery } from '/home/jacob/Documents/FanFable/fanfable/src/answer/retrieval.ts';
 import { seedProject, tempDb } from '/home/jacob/Documents/FanFable/testing/tests/helpers.ts';
 
 const GATE = 'hf.co/mradermacher/RAG-Gate-4B-GGUF:latest';

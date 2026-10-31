@@ -4,7 +4,7 @@ import { rmSync, existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tempDb, seedProject, mockProvider } from './helpers.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
-import * as checker from '../../fanfable/src/rule-checker.ts';
+import * as checker from '../../fanfable/src/answer/rule-checker.ts';
 
 test('v12 migrates old rows as verified with empty scope', () => {
   const { db } = tempDb();

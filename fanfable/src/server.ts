@@ -13,11 +13,11 @@ import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync } from 
 import { join, extname, basename, normalize, resolve, sep } from 'node:path';
 import { Db } from './db.ts';
 import * as controller from './plan/controller.ts';
-import * as lore from './lore.ts';
+import * as lore from './answer/lore.ts';
 import * as lorebook from './lorebook.ts';
 import * as embeddings from './embeddings.ts';
 import * as graph from './graph.ts';
-import * as loreDiag from './lore-diagnostics.ts';
+import * as loreDiag from './answer/lore-diagnostics.ts';
 import { listConflicts, resolveConflict } from './state-conflicts.ts';
 import * as memory from './memory.ts';
 import * as planner from './plan/planner.ts';

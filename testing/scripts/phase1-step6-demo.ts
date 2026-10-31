@@ -11,9 +11,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Db } from '../../fanfable/src/db.ts';
 import * as controller from '../../fanfable/src/plan/controller.ts';
-import * as lore from '../../fanfable/src/lore.ts';
+import * as lore from '../../fanfable/src/answer/lore.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
-import { retrieve } from '../../fanfable/src/retrieval.ts';
+import { retrieve } from '../../fanfable/src/answer/retrieval.ts';
 import { MockProvider } from '../../fanfable/src/llm.ts';
 
 const SERENA_QUOTE = 'Serena Marsh watched it from the ridge';

@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createProject } from '../../fanfable/src/plan/controller.ts';
-import * as lore from '../../fanfable/src/lore.ts';
+import * as lore from '../../fanfable/src/answer/lore.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 import { mockProvider, tempDb } from './helpers.ts';
 

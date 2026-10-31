@@ -16,7 +16,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 import type { ChunkRow } from '../../fanfable/src/lorebook.ts';
-import { retrieve } from '../../fanfable/src/retrieval.ts';
+import { retrieve } from '../../fanfable/src/answer/retrieval.ts';
 import { seedProject, tempDb, mockProvider } from './helpers.ts';
 
 const SERENA_QUOTE = 'Serena Marsh watched it from the ridge';
