@@ -367,4 +367,233 @@ export function run(): Record<string, unknown> {
   }
 }
 
-run();
+/**
+ * Action-set rescore under both identity rules.
+ *
+ * Correction record: the voided run's 0 was NOT a schema mismatch — this
+ * harness always read agent[]/patient[] (see set 1 above), and the file holds
+ * no actions/possessives/modifiers keys. The 0 came from unanimous identity
+ * voiding 89 of 97 chains. This rescore measures the same agent→patient
+ * signal under (a) unanimous identity (expect ~0) and (b) feeder-grade loose
+ * mapping (expect ~1 pair from ~6 shared verbs), with identical chapter,
+ * bank range, and precision/recall/locked scoring per column. Wire neither:
+ * strict stays the banking rule, loose stays a measurement.
+ */
+export function rescoreActions(): Record<string, unknown> {
+  const before = dbStat();
+  const ro = new DatabaseSync(resolve(DB_PATH), { readOnly: true });
+  const dbLike = {
+    all: <T>(sql: string, ...params: unknown[]): T[] => ro.prepare(sql).all(...params) as T[],
+  };
+  try {
+    const project = ro.prepare('SELECT id FROM project WHERE name = ?').get(PROJECT) as
+      | { id: number }
+      | undefined;
+    if (!project) fail(`no project ${PROJECT}`);
+    const pid = project.id;
+    const sel = JSON.parse(readFileSync(SELECT_JSON, 'utf8')) as { pick: { seqFrom: number; seqTo: number } };
+    const context = loadIdentityContext(dbLike as unknown as Db, pid);
+    const resolver = createResolver(context);
+    const characters = context.entities.filter((e) => e.kind === 'character');
+
+    const book = JSON.parse(readFileSync(`${OUT_DIR}/${BOOK_ID}.book`, 'utf8')) as {
+      characters?: {
+        id: number;
+        mentions?: { proper?: { c: number; n: string }[] };
+        agent?: { w: string; i: number }[];
+        patient?: { w: string; i: number }[];
+      }[];
+    };
+    const chars = book.characters ?? [];
+    // (a) unanimous: every proper name resolves cleanly to one person.
+    const strictPersons = new Map<number, number[]>();
+    // (b) loose: any resolved person counts (feeder grade).
+    const loosePersons = new Map<number, number[]>();
+    let voidChains = 0;
+    let cleanChains = 0;
+    for (const c of chars) {
+      const persons = new Set<number>();
+      let bad = false;
+      for (const m of c.mentions?.proper ?? []) {
+        const r = resolver.resolve(String(m.n));
+        if (r.status === 'resolved' && r.id !== null && characters.some((e) => e.id === r.id)) {
+          persons.add(r.id);
+        } else {
+          bad = true;
+        }
+      }
+      const id = Number(c.id);
+      if (!bad && persons.size === 1) {
+        cleanChains++;
+        strictPersons.set(id, [...persons]);
+      } else {
+        voidChains++;
+      }
+      if (persons.size >= 1) loosePersons.set(id, [...persons]);
+    }
+
+    const buildPairs = (personsOf: Map<number, number[]>): { pairs: Set<string>; sharedVerbs: number } => {
+      const agents = new Map<number, Set<number>>();
+      const patients = new Map<number, Set<number>>();
+      for (const c of chars) {
+        for (const person of personsOf.get(Number(c.id)) ?? []) {
+          for (const a of c.agent ?? []) {
+            const set = agents.get(a.i) ?? new Set<number>();
+            set.add(person);
+            agents.set(a.i, set);
+          }
+          for (const p of c.patient ?? []) {
+            const set = patients.get(p.i) ?? new Set<number>();
+            set.add(person);
+            patients.set(p.i, set);
+          }
+        }
+      }
+      const pairs = new Set<string>();
+      let sharedVerbs = 0;
+      for (const [verb, aSet] of agents) {
+        const pSet = patients.get(verb) ?? new Set<number>();
+        for (const a of aSet) {
+          for (const p of pSet) {
+            if (a !== p) {
+              sharedVerbs++;
+              pairs.add(pairKey(a, p));
+            }
+          }
+        }
+      }
+      return { pairs, sharedVerbs };
+    };
+    const strict = buildPairs(strictPersons);
+    const loose = buildPairs(loosePersons);
+
+    // Bank side: same range, same unordered scoring as the voided run.
+    const chunkSeq = new Map<number, number>();
+    for (const row of dbLike.all<{ id: number; seq: number }>(
+      'SELECT id, seq FROM canon_chunk WHERE project_id = ?',
+      pid,
+    )) {
+      chunkSeq.set(row.id, row.seq);
+    }
+    const bankedInRange = new Set<string>();
+    const bankedAll = new Set<string>();
+    for (const row of dbLike.all<{ from_entity: number; to_entity: number; source_refs: string }>(
+      'SELECT from_entity, to_entity, source_refs FROM canon_relation WHERE project_id = ?',
+      pid,
+    )) {
+      const key = pairKey(row.from_entity, row.to_entity);
+      bankedAll.add(key);
+      try {
+        const refs = JSON.parse(row.source_refs || '[]') as { chunk?: unknown }[];
+        const seqs = refs
+          .map((ref) => chunkSeq.get(Number(ref?.chunk)))
+          .filter((seq): seq is number => Number.isFinite(seq));
+        if (seqs.some((seq) => seq >= sel.pick.seqFrom && seq <= sel.pick.seqTo)) {
+          bankedInRange.add(key);
+        }
+      } catch {
+        /* unparseable refs cite nothing */
+      }
+    }
+    const scorePairs = (pairs: Set<string>): { n: number; hits: number; precision: number; recallHit: number } => {
+      let hits = 0;
+      for (const key of pairs) if (bankedAll.has(key)) hits++;
+      let recallHit = 0;
+      for (const key of bankedInRange) if (pairs.has(key)) recallHit++;
+      return {
+        n: pairs.size,
+        hits,
+        precision: pairs.size ? Number((hits / pairs.size).toFixed(3)) : 0,
+        recallHit,
+      };
+    };
+    const strictScore = scorePairs(strict.pairs);
+    const looseScore = scorePairs(loose.pairs);
+
+    // Locked-20 overlap per column from the local scratch sheet.
+    const sheetPath = process.argv[3] ?? process.argv[2] ?? '';
+    const locked = (pairs: Set<string>): { resolved: number; byBlock: Record<string, number> } => {
+      const byBlock: Record<string, number> = {};
+      let resolved = 0;
+      if (!sheetPath || !existsSync(sheetPath)) return { resolved, byBlock };
+      const sheet = JSON.parse(readFileSync(sheetPath, 'utf8')) as {
+        a: string;
+        b: string;
+        block: string;
+      }[];
+      const formToIds = new Map<string, number[]>();
+      for (const e of characters) {
+        const aliases = Array.isArray(e.aliases) ? e.aliases.map(String) : [];
+        for (const form of [e.name, ...aliases].map(normName).filter(Boolean)) {
+          formToIds.set(form, [...(formToIds.get(form) ?? []), e.id]);
+        }
+      }
+      for (const pair of sheet) {
+        const aIds = formToIds.get(normName(pair.a)) ?? [];
+        const bIds = formToIds.get(normName(pair.b)) ?? [];
+        if (aIds.length !== 1 || bIds.length !== 1) continue;
+        resolved++;
+        if (pairs.has(pairKey(aIds[0]!, bIds[0]!))) {
+          byBlock[pair.block] = (byBlock[pair.block] ?? 0) + 1;
+        }
+      }
+      return { resolved, byBlock };
+    };
+    const strictLocked = locked(strict.pairs);
+    const looseLocked = locked(loose.pairs);
+
+    const manifest = {
+      correction:
+        'the voided 0 was identity strictness, not a schema mismatch: this harness always read agent[]/patient[] and the file holds no other keys',
+      directionRule: 'scored unordered (bank threads normalize lo:hi; relation from/to stays as read)',
+      range: { seqFrom: sel.pick.seqFrom, seqTo: sel.pick.seqTo },
+      gapCost: { chains: chars.length, cleanChains, voidChains },
+      unanimous: {
+        sharedVerbs: strict.sharedVerbs,
+        ...strictScore,
+        recallTotal: bankedInRange.size,
+        lockedResolved: strictLocked.resolved,
+        lockedHits: strictLocked.byBlock,
+      },
+      loose: {
+        sharedVerbs: loose.sharedVerbs,
+        ...looseScore,
+        recallTotal: bankedInRange.size,
+        lockedResolved: looseLocked.resolved,
+        lockedHits: looseLocked.byBlock,
+      },
+      bankedPairsInRange: bankedInRange.size,
+      bankedPairsTotal: bankedAll.size,
+      reviewStatus: 'Nothing banks — candidates for review, verbatim',
+      dbUntouched: dbStat(),
+      dbBefore: before,
+    };
+    mkdirSync(REL_DIR, { recursive: true });
+    writeFileSync(`${REL_DIR}/manifest2.json`, JSON.stringify(manifest, null, 1));
+    const after = dbStat();
+    if (!sameStats(after, before)) fail('bank changed during rescore (content moved)');
+    console.log(
+      `unanimous: chains ${cleanChains} verbs ${strict.sharedVerbs} pairs ${strictScore.n} ` +
+        `precision ${strictScore.precision} recall ${strictScore.recallHit}/${bankedInRange.size} ` +
+        `locked ${JSON.stringify(strictLocked.byBlock)}`,
+    );
+    console.log(
+      `loose: verbs ${loose.sharedVerbs} pairs ${looseScore.n} ` +
+        `precision ${looseScore.precision} recall ${looseScore.recallHit}/${bankedInRange.size} ` +
+        `locked ${JSON.stringify(looseLocked.byBlock)}`,
+    );
+    console.log(`gap: void ${voidChains} of ${chars.length} chains`);
+    console.log(`bank untouched (main ${before.main}); manifest ${REL_DIR}/manifest2.json`);
+    console.log('Nothing banks — candidates for review, verbatim');
+    return manifest;
+  } finally {
+    ro.close();
+  }
+}
+
+const step = process.argv[2] ?? 'run';
+if (step === 'rescore') {
+  rescoreActions();
+} else {
+  run();
+}
