@@ -21,9 +21,9 @@ import { projectMinConfidence } from '../../../fanfable/src/lorebook.ts';
 import { combineScore, meetsBar, quotePairCounts, type WeakNote } from '../../../fanfable/src/core/combine.ts';
 
 const TRACK = 'testing/trials/combine';
-const SOURCE = '/tmp/opencode/qwen35-copy.db.attested-backup-2026-10-31T04-12-43-478Z.db';
-const WORK = `${TRACK}/work.db`;
-const MANIFEST = `${TRACK}/manifest.json`;
+const SOURCE = process.env.COMBINE_SOURCE ?? '/tmp/opencode/qwen35-copy.db.attested-backup-2026-10-31T04-12-43-478Z.db';
+const WORK = process.env.COMBINE_WORK ?? `${TRACK}/work.db`;
+const MANIFEST = process.env.COMBINE_MANIFEST ?? `${TRACK}/manifest.json`;
 const FROZEN50 = 'testing/trials/nuextract-duel/frozen50.json';
 const PROJECT = 'halfbook';
 
@@ -52,7 +52,9 @@ const normName = (s: string): string =>
 function main(): void {
   const sourceStat = statSync(SOURCE);
   mkdirSync(TRACK, { recursive: true });
-  copyFileSync(SOURCE, WORK);
+  // A prebuilt copy (e.g. with feeder notes) is reused as-is; sync and
+  // backfill below are idempotent, so re-running them adds nothing twice.
+  if (!existsSync(WORK)) copyFileSync(SOURCE, WORK);
   const db = new Db(WORK);
   try {
     const project = db.get<{ id: number }>('SELECT id FROM project WHERE name = ?', PROJECT);
