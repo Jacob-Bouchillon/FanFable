@@ -6,10 +6,10 @@
  * by construction. A proposal is a `canon_tie_note` row — never a relation and
  * never a promotion.
  */
-import { Db, fromJson, nowIso } from './db.ts';
-import * as lorebook from './lorebook.ts';
-import type { LlmClient } from './llm.ts';
-import { nameRelation } from './names.ts';
+import { Db, fromJson, nowIso } from '../db.ts';
+import * as lorebook from '../lorebook.ts';
+import type { LlmClient } from '../llm.ts';
+import { nameRelation } from '../names.ts';
 
 const norm = (text: string): string =>
   (text ?? '')

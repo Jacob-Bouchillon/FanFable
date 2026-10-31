@@ -32,7 +32,7 @@ import * as continuity from './continuity.ts';
 import { continuitySettings, filterBySeverity } from './continuity-settings.ts';
 import * as controller from './controller.ts';
 import * as retrieval from './retrieval.ts';
-import * as sweep from './sweep.ts';
+import * as sweep from './extract/sweep.ts';
 import * as ruling from './ruling.ts';
 import * as pairThreads from './pair-threads.ts';
 import * as threadWeb from './threads.ts';
