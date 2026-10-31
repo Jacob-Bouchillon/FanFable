@@ -29,7 +29,7 @@ import { extractJson } from '../../../fanfable/src/json.ts';
 
 const DB = process.argv[2] ?? 'testing/trials/discovery/namepass-copy.db';
 const LIMIT = process.argv[3] === undefined ? Infinity : Math.max(0, Number(process.argv[3]));
-const SPARK = 'http://127.0.0.1:11437/generate';
+const SPARK = process.env.NAMEPASS_URL ?? 'http://127.0.0.1:11437/generate';
 const PACKET_CAP = 6;
 
 const fold = (s: string): string => String(s ?? '').replace(/[\u2018\u2019]/g, "'").toLowerCase();
@@ -180,24 +180,50 @@ for (const person of people) {
   let items: SparkItem[] = [];
   try {
     counts.calls++;
+    const isOllama = SPARK.includes(':11434/api/chat');
     const res = await fetch(SPARK, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        messages: [
-          { role: 'system', content: SYSTEM },
-          { role: 'user', content: `PERSON: ${person.name}\n\nPASSAGES:\n${block}` },
-        ],
-        max_tokens: 2048,
-        temperature: 0,
-        seed: 42,
-        thinking: false,
-      }),
+      body: JSON.stringify(
+        isOllama
+          ? {
+              model: process.env.NAMEPASS_MODEL ?? 'spark-x2-q8',
+              messages: [
+                { role: 'system', content: SYSTEM },
+                { role: 'user', content: `PERSON: ${person.name}\n\nPASSAGES:\n${block}` },
+              ],
+              think: false,
+              stream: false,
+              options: { temperature: 0, seed: 42, num_predict: 2048 },
+            }
+          : {
+              messages: [
+                { role: 'system', content: SYSTEM },
+                { role: 'user', content: `PERSON: ${person.name}\n\nPASSAGES:\n${block}` },
+              ],
+              max_tokens: 2048,
+              temperature: 0,
+              seed: 42,
+              thinking: false,
+            },
+      ),
     });
     if (!res.ok) throw new Error(`http ${res.status}`);
-    const data = (await res.json()) as { text?: string; error?: string };
+    const data = (await res.json()) as {
+      text?: string;
+      error?: string;
+      message?: { content?: string };
+      choices?: { message?: { content?: string } }[];
+    };
     if (data.error) throw new Error(data.error);
-    const parsed = extractJson<unknown>(data.text ?? '');
+    const text = isOllama
+      ? data.message?.content ?? ''
+      : (data.choices?.[0]?.message?.content ?? data.text ?? '');
+    if (process.env.NAMEPASS_DUMP && counts.calls === 1) {
+      const { writeFileSync } = await import('node:fs');
+      writeFileSync('/tmp/namepass-raw.txt', text);
+    }
+    const parsed = extractJson<unknown>(text);
     items = Array.isArray(parsed) ? (parsed as SparkItem[]) : [];
   } catch (e) {
     counts.callErrors++;
