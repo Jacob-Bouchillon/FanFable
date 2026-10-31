@@ -35,7 +35,7 @@ export function maskSettingsForOutput<T extends Record<string, unknown>>(setting
   return copy as T;
 }
 
-const UI_DIR = join(import.meta.dirname, 'ui');
+const UI_DIR = join(import.meta.dirname, '../ui');
 
 /**
  * The dev visualizer is opt-in. It is a separate page and a separate
