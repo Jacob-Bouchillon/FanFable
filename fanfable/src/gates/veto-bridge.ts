@@ -22,6 +22,8 @@ export interface VetoBridgeOptions {
   cwd?: string;
   timeoutMs?: number;
   threshold?: number;
+  /** 'cuda' for the adopted lite runtime; 'cpu' only for the fallback. */
+  device?: 'cpu' | 'cuda';
 }
 
 export function vetoEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -53,7 +55,12 @@ function run(opts: VetoBridgeOptions & { payload: string }): Promise<{ score?: n
     const child = spawn(opts.python, [opts.script], {
       cwd: opts.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, CUDA_VISIBLE_DEVICES: '', FANFABLE_VETO_THRESHOLD: String(opts.threshold ?? 0.6) },
+      env: {
+        ...process.env,
+        // The adopted runtime is GPU-only; the verifier fallback is CPU-only.
+        ...(opts.device === 'cuda' ? {} : { CUDA_VISIBLE_DEVICES: '' }),
+        FANFABLE_VETO_THRESHOLD: String(opts.threshold ?? 0.6),
+      },
     });
     let stdout = '';
     let stderr = '';
