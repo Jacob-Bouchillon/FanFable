@@ -128,6 +128,13 @@ const CLOSED_HEADS = new Set(
   lorebook.CLOSED_ROLE_KINDS.map(relationHead).filter(Boolean),
 );
 
+/** Closed heads whose concept is the same claim in either order. */
+const SYMMETRIC_HEADS = new Set(
+  lorebook.CLOSED_ROLE_KINDS.filter((kind) => lorebook.isSymmetricKind(kind))
+    .map(relationHead)
+    .filter(Boolean),
+);
+
 const INVERSE_HEADS = (() => {
   const map = new Map<string, Set<string>>();
   const link = (a: string, b: string): void => {
@@ -159,8 +166,8 @@ interface OpenTerm {
 
 /** Open wording detected for relationship checking, never for extraction. */
 const OPEN_TERMS: OpenTerm[] = [
-  { term: 'partnership', re: /\bpartnership\b/i, kind: 'partner with' },
-  { term: 'partner', re: /\bpartners?\b/i, kind: 'partner with' },
+  { term: 'partnership', re: /\bpartnership\b/i, kind: 'partner' },
+  { term: 'partner', re: /\bpartners?\b/i, kind: 'partner' },
   { term: 'alliance', re: /\balliance\b/i, kind: 'ally of' },
   { term: 'allied', re: /\ballied\b/i, kind: 'ally of' },
   { term: 'served under', re: /\bserved\s+(?:under|for)\b/i, kind: 'aide of' },
@@ -174,7 +181,7 @@ const OPEN_TERMS: OpenTerm[] = [
   { term: 'married', re: /\bmarried\b/i, kind: 'married to' },
   { term: 'friend', re: /\bfriends?\b/i, kind: 'friend of' },
   { term: 'enemy', re: /\benem(?:y|ies)\b/i, kind: 'enemy of' },
-  { term: 'rival', re: /\brivals?\b/i, kind: 'enemy of' },
+  { term: 'rival', re: /\brivals?\b/i, kind: 'rival of' },
   { term: 'subordinate', re: /\bsubordinates?\b/i },
   { term: 'superior', re: /\bsuperiors?\b/i },
   { term: 'employer', re: /\bemployers?\b/i },
@@ -391,6 +398,9 @@ function verifyClaim(
     const inverse = INVERSE_HEADS.get(claim.head)?.has(rowHead) ?? false;
     if (rowHead !== claim.head && !inverse) continue;
     matchedKind = true;
+    // A symmetric concept is the same claim in either order; heads that
+    // correspond (same or inverse) support it regardless of the arrow.
+    if (SYMMETRIC_HEADS.has(claim.head) || SYMMETRIC_HEADS.has(rowHead)) return { supported: true };
     const direction = rowDirection(row.fromId, row.toId);
     if (claim.direction === 'unknown' || direction === 'unknown') return { supported: true };
     if (inverse ? direction !== claim.direction : direction === claim.direction) return { supported: true };
@@ -402,6 +412,7 @@ function verifyClaim(
     const inverse = INVERSE_HEADS.get(claim.head)?.has(rowHead) ?? false;
     if (rowHead !== claim.head && !inverse) continue;
     matchedKind = true;
+    if (SYMMETRIC_HEADS.has(claim.head) || SYMMETRIC_HEADS.has(rowHead)) return { supported: true };
     const direction = rowDirection(row.fromId, row.toId);
     if (claim.direction === 'unknown' || direction === 'unknown') return { supported: true };
     if (inverse ? direction !== claim.direction : direction === claim.direction) return { supported: true };

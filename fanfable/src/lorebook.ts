@@ -2948,6 +2948,9 @@ export const INVERSE_PAIRS: ReadonlyArray<readonly [string, string]> = [
   ['parent', 'child'],
   ['parent', 'son'],
   ['parent', 'daughter'],
+  ['teacher', 'student'],
+  ['mentor', 'student'],
+  ['employer', 'aide'],
 ];
 
 /**
@@ -4987,6 +4990,12 @@ export function isClosedRoleKind(kind: string): boolean {
  * direction claim (and cannot be promoted anyway). */
 export function isDirectionalKind(kind: string): boolean {
   return KIND_GLOSSES[(kind ?? '').trim().toLowerCase()]?.direction === 'directional';
+}
+
+/** True when a concept is the same claim in either order. An unknown stored
+ * kind has no symmetry claim. */
+export function isSymmetricKind(kind: string): boolean {
+  return KIND_GLOSSES[(kind ?? '').trim().toLowerCase()]?.direction === 'symmetric';
 }
 
 

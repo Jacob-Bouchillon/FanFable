@@ -97,3 +97,59 @@ test('who-is and punctuation forms parse the same pair', () => {
   assert.equal(guard(db, project.id, 'What is Asha to Bram?!', draft), draft);
   db.close();
 });
+
+test('a reversed symmetric claim matches the keeper in either direction', () => {
+  for (const [kind, word] of [
+    ['friend of', 'friend'],
+    ['ally of', 'ally'],
+    ['sibling of', 'sibling'],
+    ['peer of', 'peer'],
+    ['colleague of', 'colleague'],
+    ['partner', 'partner'],
+  ] as const) {
+    const { db, project, asha, bram, add } = setup();
+    add(asha, bram, kind);
+    // The bank reads Asha -> Bram; the draft states the same symmetric claim
+    // from the other side, which is the same fact.
+    const draft = `Bram is Asha's ${word}.`;
+    assert.equal(guard(db, project.id, `Is Asha Bram's ${word}?`, draft), draft, `${kind} accepts the reverse arrow`);
+    db.close();
+  }
+});
+
+test('the declared inverse roles accept the reverse arrow', () => {
+  for (const [kind, question, draft] of [
+    ['teacher of', "Is Asha Bram's teacher?", "Bram is Asha's student."],
+    ['mentor of', "Is Asha Bram's mentor?", "Bram is Asha's student."],
+    ['employer of', "Is Asha Bram's employer?", "Bram is Asha's aide."],
+  ] as const) {
+    const { db, project, asha, bram, add } = setup();
+    add(asha, bram, kind);
+    assert.equal(guard(db, project.id, question, draft), draft, `${kind} accepts its inverse`);
+    db.close();
+  }
+});
+
+test('rival wording maps to rival of and authorises the reverse claim', () => {
+  const { db, project, asha, bram, add } = setup();
+  add(asha, bram, 'rival of');
+  const draft = "Bram is Asha's rival.";
+  assert.equal(guard(db, project.id, "Is Asha Bram's rival?", draft), draft);
+  db.close();
+});
+
+test('a directional role still rejects the wrong arrow', () => {
+  const { db, project, asha, bram, add } = setup();
+  add(asha, bram, 'mother of');
+  const output = guard(db, project.id, "Is Asha Bram's mother?", "Asha is Bram's daughter.");
+  assert.match(output, /Tie not established/);
+  db.close();
+});
+
+test('the inverse pair does not excuse the same arrow', () => {
+  const { db, project, asha, bram, add } = setup();
+  add(asha, bram, 'teacher of');
+  const output = guard(db, project.id, "Is Asha Bram's teacher?", "Asha is Bram's student.");
+  assert.match(output, /Tie not established/);
+  db.close();
+});
