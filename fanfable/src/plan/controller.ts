@@ -1010,12 +1010,9 @@ function castRelationshipBlock(db: Db, projectId: number, text: string): string 
        JOIN canon_entity b ON b.id = r.to_entity
       WHERE r.project_id = ?
         AND COALESCE(r.modality, 'asserted') = 'asserted'
-        AND (r.confirmed_by_user = 1 OR r.review_status IN ('accepted','user_confirmed'))
+        AND r.review_status IN ('accepted','user_confirmed')
         AND lower(r.kind) != 'appears with'
-      ORDER BY CASE WHEN r.confirmed_by_user = 1 THEN 0
-                    WHEN r.review_status = 'user_confirmed' THEN 1
-                    ELSE 2 END,
-               r.id`,
+      ORDER BY r.id`,
     projectId,
   );
   const both = rows.filter((row) => cast.has(row.from_entity) && cast.has(row.to_entity));
@@ -1030,11 +1027,10 @@ function castRelationshipBlock(db: Db, projectId: number, text: string): string 
       seen.add(row.id);
     }
   }
-  // Selection runs in two stages, so order the final list again: the author's
-  // confirmation first, then user-confirmed, then accepted, then by id.
-  const rank = (row: { review_status: string; confirmed_by_user: number | null }): number =>
-    row.confirmed_by_user === 1 ? 0 : row.review_status === 'user_confirmed' ? 1 : 2;
-  chosen.sort((x, y) => rank(x) - rank(y) || x.id - y.id);
+  // Selection runs in two stages, so order the final list again. A verdict is
+  // a label, not a rank: ties stay in id order so a confirmation cannot move
+  // a line in the plan prompt.
+  chosen.sort((x, y) => x.id - y.id);
   return chosen
     .map((row) => {
       const confirmed = row.confirmed_by_user === 1 || row.review_status === 'user_confirmed';

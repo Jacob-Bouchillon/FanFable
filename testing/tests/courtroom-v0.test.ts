@@ -109,7 +109,7 @@ test('prioritise surfaces a closed-kind note without writing a tie', () => {
   db.close();
 });
 
-test('judge never re-judges human-confirmed ties', async () => {
+test('the judge sees every tie, confirmed or not, and the label survives', async () => {
   const { db } = tempDb();
   const project = seedProject(db, 'ledger-human');
   const now = new Date().toISOString();
@@ -117,13 +117,22 @@ test('judge never re-judges human-confirmed ties', async () => {
   const a = mk('Asha'); const b = mk('Bram');
   const chunk = db.get<{ id: number }>('SELECT id FROM canon_chunk WHERE project_id = ? ORDER BY seq LIMIT 1', project.id)!;
   const refs = JSON.stringify([{ source: 's', locator: 'p1', chunk: chunk.id }]);
-  db.run(`INSERT INTO canon_relation (project_id, from_entity, to_entity, kind, evidence, source_refs, review_status, created_at)
-    VALUES (?, ?, ?, 'trusted with life', 'ridge quote here', ?, 'user_confirmed', ?)`, project.id, a, b, refs, now);
+  const row = Number(db.run(`INSERT INTO canon_relation (project_id, from_entity, to_entity, kind, evidence, source_refs, review_status, confirmed_by_user, created_at)
+    VALUES (?, ?, ?, 'trusted with life', 'ridge quote here', ?, 'user_confirmed', 1, ?)`, project.id, a, b, refs, now).lastInsertRowid);
   let calls = 0;
   const llm = mockProvider(() => { calls++; return JSON.stringify({ verdict: 'drop', reason: 'x' }); });
   const r = await lorebook.evaluateTies(db, llm, project.id, { maxTies: 10 });
-  assert.equal(calls, 0, 'human ruling untouched');
-  assert.equal(r.checked, 0);
+  // A verdict is a label, not an input filter: the judge reads the row like
+  // any other and its evidence decides the tier.
+  assert.equal(calls, 1, 'the confirmed row is judged');
+  assert.equal(r.checked, 1);
+  assert.equal(r.parked, 1);
+  const after = db.get<{ review_status: string; confirmed_by_user: number }>(
+    'SELECT review_status, confirmed_by_user FROM canon_relation WHERE id = ?',
+    row,
+  )!;
+  assert.equal(after.review_status, 'needs_review');
+  assert.equal(after.confirmed_by_user, 1, 'the human label is never erased');
   db.close();
 });
 

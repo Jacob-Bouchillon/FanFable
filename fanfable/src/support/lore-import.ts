@@ -73,6 +73,33 @@ function storeSource(
     };
   }
 
+  // The same bytes under another path are the same book, not a second one.
+  // Without this, importing a renamed copy doubles every chunk and every
+  // citation has two equally good homes. Content identity, not path identity,
+  // decides whether this is a new import.
+  const sameContent = db.get<RowSource>(
+    'SELECT * FROM canon_source WHERE project_id = ? AND sha256 = ? ORDER BY id LIMIT 1',
+    projectId,
+    sha,
+  );
+  if (sameContent && !opts.overwrite) {
+    return {
+      source: {
+        id: sameContent.id,
+        path: sameContent.path,
+        title: sameContent.title,
+        author: sameContent.author,
+        format: sameContent.format,
+        sha256: sameContent.sha256,
+        byteSize: sameContent.byte_size,
+        pageCount: sameContent.page_count,
+        importedAt: sameContent.imported_at,
+      },
+      chunks: 0,
+      replaced: false,
+    };
+  }
+
   let sourceId = 0;
   let replaced = false;
   // Front/back matter (copyright, ads, other-book excerpts) never becomes
@@ -100,9 +127,16 @@ function storeSource(
       importedAt,
     );
     sourceId = res.lastInsertRowid;
+    // One chunk, one address. A chapter's several passages share a page and a
+    // heading, so a bare "p. 12" is not an address: the ordinal inside the
+    // page makes every locator resolvable and keeps duplicates countable.
+    const seenLocators = new Map<string, number>();
     for (const c of chunks) {
       const page = c.pageStart ? (c.pageEnd > c.pageStart ? `p. ${c.pageStart}-${c.pageEnd}` : `p. ${c.pageStart}`) : '';
-      const locator = c.heading ? (page ? `${c.heading} (${page})` : c.heading) : page || `passage ${c.seq + 1}`;
+      const base = c.heading ? (page ? `${c.heading} (${page})` : c.heading) : page || `passage ${c.seq + 1}`;
+      const seen = (seenLocators.get(base) ?? 0) + 1;
+      seenLocators.set(base, seen);
+      const locator = seen === 1 ? base : `${base} #${seen}`;
       db.run(
         `INSERT INTO canon_chunk (source_id, project_id, seq, locator, heading, text, char_start, char_end, words, page_start, page_end)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,

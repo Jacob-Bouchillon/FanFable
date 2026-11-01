@@ -187,7 +187,7 @@ test('export is deterministic, sorted and name-keyed', () => {
   db.close();
 });
 
-test('a missing keeper is inserted when its quote still verifies', () => {
+test('a missing keeper with a confirmation is parked with its label, never banked', () => {
   const { db } = tempDb();
   const project = controller.createProject(db, 'rulings-insert');
   const chunk = addChunk(db, project.id, 'Asha counted the lantern before dawn.');
@@ -202,47 +202,60 @@ test('a missing keeper is inserted when its quote still verifies', () => {
   assert.equal(result.keepers.resolved, 1);
   assert.equal(result.keepers.applied, 1);
   assert.equal(result.keepers.unresolved, 0);
-  const row = db.get<{ from_entity: number; to_entity: number; review_status: string; evidence: string; source_refs: string }>(
-    'SELECT from_entity, to_entity, review_status, evidence, source_refs FROM canon_relation WHERE project_id = ?',
+  const row = db.get<{
+    from_entity: number;
+    to_entity: number;
+    review_status: string;
+    confirmed_by_user: number;
+    evidence: string;
+    source_refs: string;
+  }>(
+    'SELECT from_entity, to_entity, review_status, confirmed_by_user, evidence, source_refs FROM canon_relation WHERE project_id = ?',
     project.id,
   )!;
   assert.equal(row.from_entity, asha);
   assert.equal(row.to_entity, corin);
-  assert.equal(row.review_status, 'user_confirmed');
+  // A verdict is a label: the row stays in review and is not a keeper.
+  assert.equal(row.review_status, 'needs_review');
+  assert.equal(row.confirmed_by_user, 1);
   assert.equal(row.evidence, 'Asha counted the lantern before dawn.');
   assert.deepEqual(JSON.parse(row.source_refs), [{ source: 'Probe', locator: 'p. 1', chunk }]);
   db.close();
 });
 
-test('a stored relation is upgraded to user_confirmed and never downgraded', () => {
+test('a stored relation keeps its tier when a confirmation is replayed', () => {
   const { db } = tempDb();
   const project = controller.createProject(db, 'rulings-upgrade');
   const asha = addEntity(db, project.id, 'Asha');
   const corin = addEntity(db, project.id, 'Corin');
   const relation = addRelation(db, project.id, asha, corin, 'ally of', 'needs_review');
-  const upgraded = lorebook.replayRulings(
+  const labelled = lorebook.replayRulings(
     db,
     project.id,
-    payload([keeper('Asha', 'Corin', 'ally of', 'user_confirmed', 'quote absent')]),
+    payload([keeper('Asha', 'Corin', 'ally of', 'user_confirmed', '')]),
     { write: true },
   );
-  assert.equal(upgraded.keepers.applied, 1);
-  assert.equal(
-    db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', relation)!.review_status,
-    'user_confirmed',
-  );
+  assert.equal(labelled.keepers.applied + labelled.keepers.already_present, 1);
+  const after = db.get<{ review_status: string; confirmed_by_user: number }>(
+    'SELECT review_status, confirmed_by_user FROM canon_relation WHERE id = ?',
+    relation,
+  )!;
+  // The label is recorded; the tier the row's evidence earned is untouched.
+  assert.equal(after.review_status, 'needs_review');
+  assert.equal(after.confirmed_by_user, 1);
 
-  const downgrade = lorebook.replayRulings(
+  // Replaying the same verdict is idempotent and still moves nothing.
+  const again = lorebook.replayRulings(
     db,
     project.id,
-    payload([keeper('Asha', 'Corin', 'ally of', 'accepted', 'quote absent')]),
+    payload([keeper('Asha', 'Corin', 'ally of', 'user_confirmed', '')]),
     { write: true },
   );
-  assert.equal(downgrade.keepers.applied, 0);
-  assert.equal(downgrade.keepers.already_present, 1);
+  assert.equal(again.keepers.applied, 0);
+  assert.equal(again.keepers.already_present, 1);
   assert.equal(
     db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', relation)!.review_status,
-    'user_confirmed',
+    'needs_review',
   );
   db.close();
 });

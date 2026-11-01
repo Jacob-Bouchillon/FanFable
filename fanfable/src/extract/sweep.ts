@@ -340,7 +340,7 @@ export async function runNameSweep(
         `SELECT id FROM canon_relation
           WHERE project_id = ?
             AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))
-            AND review_status IN ('accepted','user_confirmed')
+            AND review_status = 'accepted'
           LIMIT 1`,
         projectId,
         character.id,

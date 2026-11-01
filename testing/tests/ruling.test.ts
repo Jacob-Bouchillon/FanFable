@@ -141,7 +141,14 @@ test('a human correction and a removal each leave a ruling', () => {
   assert.equal(loreDiag.correctRelation(s.db, s.project.id, row, { kind: 'guardian of', confirm: true }), true);
   let history = ruling.listRulings(s.db, s.project.id, { relationId: row });
   assert.equal(history[0]!.actor, 'human');
-  assert.equal(history[0]!.to_status, 'user_confirmed');
+  // A confirmation is a label: the ruling records the human decision without
+  // claiming a tier change.
+  assert.equal(history[0]!.to_status, 'provisional');
+  assert.equal(
+    s.db.get<{ confirmed_by_user: number }>('SELECT confirmed_by_user FROM canon_relation WHERE id = ?', row)!
+      .confirmed_by_user,
+    1,
+  );
   assert.equal(loreDiag.removeRelation(s.db, s.project.id, row), true);
   const removal = ruling
     .listRulings(s.db, s.project.id, { subject: ruling.relationSubject(row) })
@@ -308,15 +315,21 @@ test('replay records the keeper it applies', () => {
   const s = setup();
   const row = addRelation(s, 'aunt of', 'Mara is the aunt of Tor.', 'provisional');
   const result = lorebook.replayRulings(s.db, s.project.id, keeperPayload('user_confirmed'), { write: true });
-  assert.equal(result.keepers.applied, 1);
+  assert.equal(result.keepers.applied + result.keepers.already_present, 1);
   const replay = ruling
     .listRulings(s.db, s.project.id, { relationId: row })
     .find((r) => r.standard === 'replay');
   assert.ok(replay, 'replay writes a ruling');
   assert.equal(replay!.actor, 'human');
   assert.equal(replay!.from_status, 'provisional');
-  assert.equal(replay!.to_status, 'user_confirmed');
-  assert.equal(statusOf(s.db, row), 'user_confirmed');
+  // The verdict is recorded but moves no tier.
+  assert.equal(replay!.to_status, 'provisional');
+  assert.equal(statusOf(s.db, row), 'provisional');
+  assert.equal(
+    s.db.get<{ confirmed_by_user: number }>('SELECT confirmed_by_user FROM canon_relation WHERE id = ?', row)!
+      .confirmed_by_user,
+    1,
+  );
   s.db.close();
 });
 

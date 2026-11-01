@@ -131,7 +131,7 @@ function passage(text: string): Passage {
 
 /* ---------------------------------------------------------------- replay */
 
-test('an evidence-free user confirmation inserts a new row', () => {
+test('an evidence-free user confirmation is parked with its label', () => {
   const { db } = tempDb();
   const project = createProject(db, 'confirm-insert');
   addEntity(db, project.id, 'Asha');
@@ -153,14 +153,17 @@ test('an evidence-free user confirmation inserts a new row', () => {
     source_refs: string;
     confirmed_by_user: number;
   }>('SELECT review_status, evidence, source_refs, confirmed_by_user FROM canon_relation WHERE project_id = ?', project.id)!;
-  assert.equal(row.review_status, 'user_confirmed');
+  // A verdict is a label: no sentence, no keeper tier.
+  assert.equal(row.review_status, 'needs_review');
   assert.equal(row.evidence, '');
   assert.equal(row.source_refs, '[]');
   assert.equal(row.confirmed_by_user, 1);
+  // And nothing about it is retrievable.
+  assert.deepEqual(lorebook.lookupKeeperPair(db, project.id, 'Asha', 'Corin'), []);
   db.close();
 });
 
-test('an existing row is still promoted to user_confirmed', () => {
+test('an existing row keeps its tier when a confirmation is replayed', () => {
   const { db } = tempDb();
   const project = createProject(db, 'confirm-promote');
   const asha = addEntity(db, project.id, 'Asha');
@@ -177,15 +180,15 @@ test('an existing row is still promoted to user_confirmed', () => {
     payload([exportKeeper('Asha', 'Corin', 'friend of', 'user_confirmed')]),
     { write: true },
   );
-  assert.equal(result.keepers.applied, 1);
+  assert.equal(result.keepers.applied + result.keepers.already_present, 1);
   const count = db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_relation WHERE project_id = ?', project.id)!;
   assert.equal(count.n, 1, 'no second row created');
   const row = db.get<{ review_status: string; confirmed_by_user: number }>(
     'SELECT review_status, confirmed_by_user FROM canon_relation WHERE id = ?',
     relation,
   )!;
-  assert.equal(row.review_status, 'user_confirmed');
-  assert.equal(row.confirmed_by_user, 1);
+  assert.equal(row.review_status, 'needs_review', 'the tier is unchanged by the verdict');
+  assert.equal(row.confirmed_by_user, 1, 'the label is restored');
   db.close();
 });
 
@@ -322,7 +325,7 @@ test('without any confirmation the directed pick is unchanged', () => {
   db.close();
 });
 
-test('a confirmation stored in the reverse direction renders as stored', () => {
+test('a confirmation does not reorder the answer', () => {
   const { db } = tempDb();
   const project = createProject(db, 'pick-reverse');
   const mara = addEntity(db, project.id, 'Mara');
@@ -337,8 +340,10 @@ test('a confirmation stored in the reverse direction renders as stored', () => {
     evidence: '',
     confirmedByUser: true,
   });
+  // The label is audit only: the directed pick by story order answers, exactly
+  // as it would with no confirmation on file.
   const answer = lorebook.bankAnswerForQuestion(db, project.id, 'status of Mara to Tor');
-  assert.deepEqual(answer, { status: 'keeper', line: 'Tor — father of Mara', quote: '' });
+  assert.deepEqual(answer, { status: 'keeper', line: 'Mara — relative of Tor', quote: 'They were in the same room.' });
   db.close();
 });
 

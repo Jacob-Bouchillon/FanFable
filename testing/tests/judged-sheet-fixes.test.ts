@@ -98,7 +98,7 @@ test('directed status separates the two arrows (#8)', () => {
   db.close();
 });
 
-test('open vocabulary is no longer a promotion verdict; missing score queues both', async () => {
+test('open vocabulary parks at intake instead of banking; missing score queues the rest', async () => {
   const { db } = tempDb();
   const project = seedProject(db, 'open-vocab');
   const { chunk } = chunkRefs(db, project.id);
@@ -116,12 +116,12 @@ test('open vocabulary is no longer a promotion verdict; missing score queues bot
   });
   await lorebook.extractLore(db, llm as never, project.id, { windowSize: 8, concurrency: 1, maxWindows: 1 } as never);
   const rows = db.all<{ kind: string; review_status: string }>(`SELECT kind, review_status FROM canon_relation WHERE project_id = ? ORDER BY kind`, project.id);
-  const enc = rows.find((r) => r.kind === 'encourager of');
+  // "encourager of" is outside the twelve families: it parks, never banks.
+  assert.equal(rows.find((r) => r.kind === 'encourager of'), undefined);
   const aide = rows.find((r) => r.kind === 'aide of');
-  assert.equal(enc?.review_status, 'provisional', 'no model score, so it queues');
-  assert.equal(aide?.review_status, 'provisional', 'no model score, so it queues');
+  assert.equal(aide?.review_status, 'provisional', 'a family kind still queues without a model score');
   assert.equal(lorebook.isClosedRoleKind('encourager of'), false, 'the concept set still governs querying');
   const note = db.get<{ reason: string }>(`SELECT reason FROM canon_tie_note WHERE project_id = ? AND attempted_kind = 'encourager of'`, project.id);
-  assert.equal(note, undefined, 'the old open-vocab note is gone');
+  assert.equal(note?.reason, 'kind-unsupported', 'the parked kind says why it parked');
   db.close();
 });

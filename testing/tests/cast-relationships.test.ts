@@ -163,17 +163,19 @@ test('ties outside the premise cast are excluded when enough cast ties exist', a
   assert.ok(!section.includes('Pip — friend of — Lark'), 'tie outside the premise excluded');
 });
 
-test('a confirmation sorts above an accepted tie from the earlier selection stage', async () => {
+test('a confirmation does not sort above an accepted tie', async () => {
   const section = castSection(
     await plannedPrompt((db, projectId, cast) => {
       // Only two both-endpoint ties, so the one-endpoint confirmed tie is added
-      // by the wider stage; it must still render first.
+      // by the wider stage. A verdict is a label: it must not reorder the list.
       addRelation(db, projectId, cast.mara, cast.tor, 'friend of', 'accepted');
       addRelation(db, projectId, cast.tor, cast.corin, 'ally of', 'accepted');
       addRelation(db, projectId, cast.vell, cast.tor, 'cousin of', 'user_confirmed', true);
     }),
   );
   const lines = section.split('\n').filter((line) => line.startsWith('- '));
-  assert.match(lines[0]!, /Mara Vell — cousin of — Tor\s+\[user-confirmed\]/);
-  assert.ok(lines.slice(1).every((line) => line.includes('[quoted]')));
+  assert.match(lines[0]!, /Mara — friend of — Tor\s+\[quoted\]/);
+  // The label still renders where the row falls in id order.
+  assert.ok(lines.some((line) => /Mara Vell — cousin of — Tor\s+\[user-confirmed\]/.test(line)));
+  assert.equal(lines[lines.length - 1]!, lines.find((line) => line.includes('[user-confirmed]')));
 });

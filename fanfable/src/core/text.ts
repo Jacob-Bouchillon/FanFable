@@ -297,6 +297,8 @@ export function chunkText(
   const maxWords = opts.maxWords ?? 220;
   const overlapWords = opts.overlapWords ?? 40;
   const headings = findHeadings(text);
+  // Terminal punctuation, optionally followed by a closing quote or bracket.
+  const endsSentence = (value: string): boolean => /[.!?…]["'”’)\]]?\s*$/.test(value.trim());
 
   interface Block {
     /** Nearest heading at or before this block, used as the source locator. */
@@ -324,6 +326,13 @@ export function chunkText(
   const flush = () => {
     if (!buffer.length) return;
     const body = buffer.join(' ');
+    // A bare folio ("12", "Page 12", "- 12 -") is the PDF's own page label,
+    // not prose. Left in, it becomes a one-word passage whose locator is a
+    // number the reader never wrote.
+    if (/^(?:page\s+)?[-–—]?\s*\d{1,4}\s*[-–—]?$/.test(body.trim())) {
+      buffer = [];
+      return;
+    }
     const own = headings.find((h) => h.start >= bufStart && h.start <= bufEnd);
     const startsHeading = !!own;
     if (own) lastHeading = own.heading;
@@ -485,7 +494,14 @@ export function chunkText(
     // Prefer to end a chunk on a page boundary, so a citation points at one
     // page rather than a spread. Page breaks never carry overlap: the break is
     // already a citation boundary, and repeating text across it duplicates it.
-    if (current.length && block.page !== current[0].page && currentWords >= Math.min(50, maxWords * 0.5)) {
+    // A page that ends mid-sentence is not a boundary: splitting there is how
+    // a passage starts on "and" and ends in the middle of a clause.
+    if (
+      current.length &&
+      block.page !== current[0].page &&
+      currentWords >= Math.min(50, maxWords * 0.5) &&
+      endsSentence(current[current.length - 1]!.text)
+    ) {
       flushChunk(false);
     }
     if (currentWords + w > maxWords && current.length) {

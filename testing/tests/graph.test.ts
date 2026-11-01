@@ -402,9 +402,12 @@ test('a kind that is really the prompt example list is not stored', () => {
   );
   return import( '../../fanfable/src/lorebook.ts').then(async (lorebook) => {
     await lorebook.extractLore(db, llm, project.id);
+    // The example list collapses to the "related to" fallback, which is not a
+    // proof kind: it parks for review instead of being banked as a tie.
     const rows = db.all<{ kind: string }>('SELECT kind FROM canon_relation WHERE project_id = ?', project.id);
-    assert.equal(rows.length, 1);
-    assert.equal(rows[0].kind, 'related to');
+    assert.equal(rows.length, 0);
+    const note = db.get<{ reason: string }>('SELECT reason FROM canon_tie_note WHERE project_id = ? ORDER BY id LIMIT 1', project.id);
+    assert.equal(note?.reason, 'kind-unsupported');
     db.close();
   });
 });

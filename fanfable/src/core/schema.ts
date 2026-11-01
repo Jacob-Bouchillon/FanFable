@@ -147,6 +147,7 @@ CREATE TABLE IF NOT EXISTS canon_relation (
   source_refs   TEXT NOT NULL DEFAULT '[]',
   confidence    REAL NOT NULL DEFAULT 1.0,
   review_status TEXT NOT NULL DEFAULT 'accepted',
+  relation_status TEXT NOT NULL DEFAULT 'unknown', -- current | past | suspected | unknown
   valid_from_event_id INTEGER REFERENCES canon_event(id) ON DELETE SET NULL,
   valid_to_event_id   INTEGER REFERENCES canon_event(id) ON DELETE SET NULL,
   ledger_state  TEXT NOT NULL DEFAULT 'verified',

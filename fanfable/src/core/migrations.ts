@@ -723,6 +723,16 @@ export const MIGRATIONS: Migration[] = [
         ON canon_ruling(project_id, subject, id);
     `,
   },
+  {
+    version: 27,
+    name: 'relation status: when the tie holds',
+    // Current, past, suspected or unknown, read from the winning sentence.
+    // Every banked row carries one; `unknown` is the honest value when no
+    // sentence proved the row, never a silent default of `current`.
+    columns: [
+      ['canon_relation', 'relation_status', "TEXT NOT NULL DEFAULT 'unknown'"],
+    ],
+  },
 ];
 
 /**

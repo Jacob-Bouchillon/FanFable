@@ -636,16 +636,18 @@ export function correctRelation(
   if (!existing) return false;
   db.transaction(() => {
     db.run(
-      `UPDATE canon_relation SET kind = ?, description = ?, evidence = ?, review_status = ?, confidence = ? WHERE id = ? AND project_id = ?`,
+      `UPDATE canon_relation SET kind = ?, description = ?, evidence = ?, confidence = ? WHERE id = ? AND project_id = ?`,
       patch.kind ?? existing.kind,
       patch.description ?? existing.description,
       patch.evidence ?? existing.evidence,
-      patch.confirm === false ? existing.review_status : 'user_confirmed',
       patch.confirm === false ? undefined : 1,
       id,
       projectId,
     );
     if (patch.confirm !== false) {
+      // A verdict is a label, never a promotion. The row keeps the tier its
+      // own evidence earned, so confirming it cannot move it into retrieval
+      // and cannot change any extraction output.
       db.run('UPDATE canon_relation SET confirmed_by_user = 1 WHERE id = ? AND project_id = ?', id, projectId);
     }
     recordRuling(db, projectId, {
@@ -654,7 +656,7 @@ export function correctRelation(
       actor: 'human',
       standard: 'manual',
       fromStatus: existing.review_status,
-      toStatus: patch.confirm === false ? existing.review_status : 'user_confirmed',
+      toStatus: existing.review_status,
       basis: 'manual correction',
       quote: patch.evidence ?? existing.evidence,
     });

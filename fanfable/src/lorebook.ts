@@ -51,6 +51,27 @@ import {
   type RosterIndex,
 } from './identity/names.ts';
 export { canonicalName, nameRelation, nameTokens } from './identity/names.ts';
+import {
+  directionOfSentence,
+  familyOfKind,
+  isProofKind,
+  proofIntake,
+  relationStatusOf,
+  type RelationStatus,
+} from './identity/relation-proof.ts';
+import { mergeVerdict } from './identity/roster-rules.ts';
+export {
+  RELATION_FAMILIES,
+  canonicalProofKind,
+  directionOfSentence,
+  familyOfKind,
+  inverseFamilyOf,
+  isProofKind,
+  proofIntake,
+  relationStatusOf,
+  type RelationFamily,
+  type RelationStatus,
+} from './identity/relation-proof.ts';
 
 /* ------------------------------------------------------------------ gates */
 
@@ -436,6 +457,9 @@ export interface VerificationStats {
   retriedFixed: number;
   /** Retries that did not. */
   retriedFailed: number;
+  /** Claims whose arrow the winning sentence showed was backwards; stored
+   * the way the passage says it. */
+  flipped: number;
 }
 
 /**
@@ -1134,7 +1158,7 @@ function blankResult(): ExtractLoreResult {
     timeline: 0,
     passages: 0,
     windows: 0,
-    verification: { claimed: 0, verified: 0, repointed: 0, dropped: 0, unresolved: 0, unrelated: 0, moment: 0, redundant: 0, unsupported: 0, hinted: 0, retried: 0, retriedFixed: 0, retriedFailed: 0 },
+    verification: { claimed: 0, verified: 0, repointed: 0, dropped: 0, unresolved: 0, unrelated: 0, moment: 0, redundant: 0, unsupported: 0, hinted: 0, retried: 0, retriedFixed: 0, retriedFailed: 0, flipped: 0 },
     provisional: 0,
     emptyWindows: [],
     quarantinedAliases: [],
@@ -2234,11 +2258,11 @@ function uniqueNames(names: string[]): string[] {
   return unique;
 }
 
-/** Trust order for automatic merges: a human ruling always outranks the
- * machine, and the machine never downgrades either on its own. Explicit
- * user action (or a user-run review) is the only way a keeper changes. */
+/** Trust order for automatic merges. A human confirmation is a label, not a
+ * promotion: an accepted row and a confirmed accepted row are the same tier,
+ * so a verdict can never change which claim survives or what it says. */
 function trustRank(status: string): number {
-  return status === 'user_confirmed' ? 2 : status === 'accepted' ? 1 : 0;
+  return status === 'accepted' || status === 'user_confirmed' ? 1 : 0;
 }
 
 function maxTrust(a: string, b: string): string {
@@ -3355,20 +3379,12 @@ export function bankAnswerForQuestion(
         ...(cited.locator ? { locator: cited.locator } : {}),
       };
     }
-    // A human confirmation outranks a derived pick: answer from the confirmed
-    // row itself, deterministically (lowest id), so the line matches what was
-    // confirmed. With no confirmation the directed-status path is unchanged.
-    const confirmed = rows
-      .filter((candidate) => candidate.reviewStatus === 'user_confirmed' || candidate.confirmedByUser)
-      .sort((x, y) => x.id - y.id);
-    let row: (typeof rows)[number];
-    if (confirmed.length) {
-      row = confirmed[0]!;
-    } else {
-      const directed = directedPairStatus(db, projectId, rows[0]!.fromId, rows[0]!.toId);
-      const currentId = directed.forward.current?.id ?? directed.reverse.current?.id;
-      row = rows.find((candidate) => candidate.id === currentId) ?? rows[0]!;
-    }
+    // The arrow comes from the rows' own story order, never from a verdict:
+    // a confirmed row answers exactly where its evidence puts it, so adding or
+    // removing a confirmation cannot change which line is returned.
+    const directed = directedPairStatus(db, projectId, rows[0]!.fromId, rows[0]!.toId);
+    const currentId = directed.forward.current?.id ?? directed.reverse.current?.id;
+    const row = rows.find((candidate) => candidate.id === currentId) ?? rows[0]!;
     return {
       status: 'keeper',
       line: `${row.fromName} — ${row.kind} ${row.toName}`,
@@ -3795,10 +3811,10 @@ function applyRelations(
   let accepted = 0;
   const minConfidence = projectMinConfidence(db, projectId);
   for (const raw of raws) {
-    const fromName = String(raw.from ?? '').trim();
-    const toName = String(raw.to ?? '').trim();
-    const fromId = resolveEntity(db, projectId, entityIdByName, fromName);
-    const toId = resolveEntity(db, projectId, entityIdByName, toName);
+    let fromName = String(raw.from ?? '').trim();
+    let toName = String(raw.to ?? '').trim();
+    let fromId = resolveEntity(db, projectId, entityIdByName, fromName);
+    let toId = resolveEntity(db, projectId, entityIdByName, toName);
     if (!fromId || !toId || fromId === toId) {
       // A relation naming someone the bank has never seen is a recall hole,
       // not noise: keep the names, kind and quote as a hint. No entity is
@@ -3895,6 +3911,17 @@ function applyRelations(
         ? kindSourceRaw
         : '';
 
+    // The arrow comes from the winning sentence, never from the order the
+    // candidate listed. A directional kind whose passage reads the other way
+    // is stored the other way; a passage that names neither side in a
+    // relationship leaves the stated order alone.
+    const leadingKind = kinds.find((kind) => familyOfKind(kind) !== 'other');
+    if (leadingKind && directionOfSentence(span.quote, fromName, toName, leadingKind) === 'reverse') {
+      [fromId, toId] = [toId, fromId];
+      [fromName, toName] = [toName, fromName];
+      stats.verification.flipped++;
+    }
+
     for (const kind of kinds) {
       // Moments are not ties: the happening banks as an event with both people
       // attached, and the tie question stays in the queue. Routed before the
@@ -3905,9 +3932,10 @@ function applyRelations(
         persistTieNote(db, projectId, fromId, toId, kind, 'moment', span.quote, toJson(refs), '', kindSource);
         continue;
       }
-      // Citation honesty: a quoted sub-span may not hide a hedge or denial in
-      // the sentence that holds it. Intake holds the attested honesty bar;
-      // the tiers own their copies from here on.
+      // Citation honesty runs first: a quote that hides a hedge or a denial is
+      // a refused citation whatever the label is. "Perhaps X is his sister"
+      // must report unsupported-citation, never kind-unsupported — the quote
+      // is the worse defect and the one a human needs to see.
       const citationReason = attestedQuoteReason(
         { fromId, toId, fromName, toName, kind, evidence: span.quote, kindSource, anchorEvidence },
         passageText,
@@ -3916,6 +3944,15 @@ function applyRelations(
       if (citationReason) {
         stats.verification.unsupported++;
         persistTieNote(db, projectId, fromId, toId, kind, 'unsupported-citation', span.quote, toJson(refs), '', kindSource);
+        continue;
+      }
+      // Only the twelve families are proof kinds. Anything else ("was",
+      // "suspected of", "influence over", a bare verb) parks as a review note
+      // and never banks, whatever confidence the model claimed. The family
+      // table is the whole allow-list; there is no second one.
+      if (proofIntake(kind).action === 'park') {
+        stats.verification.unsupported++;
+        persistTieNote(db, projectId, fromId, toId, kind, 'kind-unsupported', span.quote, toJson(refs), '', kindSource);
         continue;
       }
       // A generic kinship word repeats a specific one: "parent of" beside
@@ -4108,6 +4145,7 @@ function applyRelations(
         reviewStatus: rowReview,
         confidence,
         supportingEvidence: supporting,
+        relationStatus: relationStatusOf(span.quote),
       });
       stats.relations++;
       accepted++;
@@ -6187,6 +6225,9 @@ export interface RelationInsert {
   confidence?: number;
   /** Provenance: the model's assessment, stored as JSON. */
   supportingEvidence?: string;
+  /** When the tie holds, read from the winning sentence. Defaults to the
+   * status the sentence itself asserts, `unknown` when there is none. */
+  relationStatus?: RelationStatus;
 }
 
 /**
@@ -6208,8 +6249,8 @@ export function insertRelation(
   return db.transaction(() => {
     const id = Number(
       db.run(
-        `INSERT INTO canon_relation (project_id, from_entity, to_entity, kind, description, evidence, source_refs, confidence, modality, review_status, kind_source, anchor_evidence, supporting_evidence, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO canon_relation (project_id, from_entity, to_entity, kind, description, evidence, source_refs, confidence, modality, review_status, kind_source, anchor_evidence, supporting_evidence, relation_status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         projectId,
         row.fromEntity,
         row.toEntity,
@@ -6223,6 +6264,7 @@ export function insertRelation(
         row.kindSource ?? '',
         row.anchorEvidence ?? '',
         row.supportingEvidence ?? '[]',
+        row.relationStatus ?? relationStatusOf(row.evidence),
         nowIso(),
       ).lastInsertRowid,
     );
@@ -6364,7 +6406,7 @@ export function persistTieNote(
   fromId: number,
   toId: number,
   attemptedKind: string,
-  reason: 'moment' | 'unsupported' | 'unsupported-citation' | 'open-vocab' | 'evaluation' | 'no-ref',
+  reason: 'moment' | 'unsupported' | 'unsupported-citation' | 'open-vocab' | 'kind-unsupported' | 'evaluation' | 'no-ref',
   evidence: string,
   sourceRefs: string,
   ruling = '',
@@ -7245,11 +7287,13 @@ export function mergeCanonEntities(
       for (let j = i + 1; j < entities.length; j++) {
         const a = entities[i]!;
         const b = entities[j]!;
-        // A person and a place can share a name; they are not the same thing.
-        if (a.kind !== b.kind) continue;
-        const relation = nameRelation(a.name, b.name);
-        if (!relation) continue;
-        if (relation === 'containment' && sharedSpeakerScene(speakers, a.id, b.id)) {
+        // One rule, applied uniformly: `mergeVerdict` owns the same-name,
+        // containment, title-only, shared-scene and shared-surname decisions.
+        const verdict = mergeVerdict(a, b, {
+          sharedSpeakerScene: sharedSpeakerScene(speakers, a.id, b.id),
+        });
+        if (verdict.action === 'separate') continue;
+        if (verdict.action === 'quarantine') {
           vetoed.add(quarantineKey(a.name, b.name));
           continue;
         }
@@ -7754,7 +7798,7 @@ export async function evaluateTies(
        FROM canon_relation r
        JOIN canon_entity fe ON fe.id = r.from_entity
        JOIN canon_entity te ON te.id = r.to_entity
-      WHERE r.project_id = ? AND r.id > ? AND r.review_status != 'user_confirmed' ORDER BY r.id LIMIT ?`,
+      WHERE r.project_id = ? AND r.id > ? ORDER BY r.id LIMIT ?`,
     projectId,
     afterId,
     maxTies,
@@ -8628,6 +8672,21 @@ export function normaliseKind(kind: string): EntityKind {
   if (k.includes('item') || k.includes('object') || k.includes('thing')) return 'item';
   if (k.includes('rule') || k.includes('law') || k.includes('magic') || k.includes('lore')) return 'rule';
   if (k.includes('faction') || k.includes('group') || k.includes('family')) return 'faction';
+  // Organisations and the roles they hold are never people. The schema has no
+  // role bucket, so both land in `faction`: a non-person row that can still
+  // carry membership, instead of a character invented from a job title.
+  if (
+    k.includes('organi') ||
+    k.includes('company') ||
+    k.includes('guild') ||
+    k.includes('order') ||
+    k.includes('institution') ||
+    k.includes('role') ||
+    k.includes('rank') ||
+    k.includes('occupation')
+  ) {
+    return 'faction';
+  }
   if (
     k.includes('species') ||
     k.includes('race') ||
@@ -9135,6 +9194,8 @@ export interface RulingsExportKeeper {
   evidence: string;
   locator: string;
   exported_at: string;
+  /** True when a human confirmed this row. A label for replay, never a tier. */
+  confirmed_by_user?: boolean;
 }
 
 export interface RulingsExportNote {
@@ -9228,10 +9289,11 @@ export function exportRulings(
     to_entity: number;
     kind: string;
     review_status: string;
+    confirmed_by_user: number | null;
     evidence: string;
     source_refs: string;
   }>(
-    `SELECT from_entity, to_entity, kind, review_status, evidence, source_refs
+    `SELECT from_entity, to_entity, kind, review_status, confirmed_by_user, evidence, source_refs
        FROM canon_relation
       WHERE project_id = ? AND review_status IN ('accepted','user_confirmed')`,
     projectId,
@@ -9250,6 +9312,9 @@ export function exportRulings(
       to_aliases: sortedAliases(to.aliases),
       kind: row.kind,
       review_status: row.review_status,
+      // The label travels with the keeper so replay can restore it without
+      // inventing a tier. Export is the only way a verdict survives a wipe.
+      confirmed_by_user: row.confirmed_by_user === 1,
       evidence: row.evidence,
       locator,
       exported_at: exportedAt,
@@ -9370,6 +9435,9 @@ export function parseRulingsExport(value: unknown): RulingsExport {
       to_aliases: asAliases(raw, 'to_aliases', where),
       kind: asText(raw, 'kind', where),
       review_status: asText(raw, 'review_status', where),
+      // Older exports predate the label; absent means "no verdict recorded"
+      // and the keeper replays as an ordinary evidence-backed row.
+      confirmed_by_user: raw.confirmed_by_user === true,
       evidence: asText(raw, 'evidence', where),
       locator: asText(raw, 'locator', where),
       exported_at: asText(raw, 'exported_at', where),
@@ -9608,20 +9676,65 @@ export function replayRulings(
       to.id,
       keeper.kind,
     );
+    // A confirmation is a verdict, and a verdict is only ever a label here.
+    // Replay restores the label and never the tier, so a confirmations file
+    // cannot add, remove, score or reorder one retrieval row. An existing row
+    // keeps the status its own evidence earned; a missing one is parked for
+    // review with the label attached, for measurement.
+    if (keeper.confirmed_by_user === true || keeper.review_status === 'user_confirmed') {
+      if (existing) {
+        writes.push({
+          sql: 'UPDATE canon_relation SET confirmed_by_user = 1 WHERE id = ? AND project_id = ?',
+          params: [existing.id, projectId],
+          // The ruling records the human decision without claiming a tier
+          // change: from and to are the row's own status.
+          court: {
+            relationId: existing.id,
+            fromStatus: existing.review_status,
+            toStatus: existing.review_status,
+            reference: keeper.kind,
+            quote: keeper.evidence ?? '',
+          },
+        });
+        keeperReport.already_present++;
+      } else {
+        const verdictEvidence = (keeper.evidence ?? '').trim();
+        // A quote that is present but does not verify is still a bad quote:
+        // the verdict labels rows, it does not excuse a fabricated citation.
+        const verdictRefs = verdictEvidence ? quoteRefs(verdictEvidence) : undefined;
+        if (verdictEvidence && !verdictRefs) {
+          deficit(keeperReport, 'keeper', entry, 'quote not found');
+          continue;
+        }
+        keeperReport.applied++;
+        writes.push({
+          sql: `INSERT INTO canon_relation
+                  (project_id, from_entity, to_entity, kind, description, evidence, source_refs,
+                   confidence, review_status, confirmed_by_user, relation_status, created_at)
+                VALUES (?, ?, ?, ?, '', ?, ?, 1.0, 'needs_review', 1, 'unknown', ?)`,
+          params: [projectId, from.id, to.id, keeper.kind, verdictEvidence, JSON.stringify(verdictRefs ?? []), now],
+          court: {
+            relationId: null,
+            insert: true,
+            fromStatus: '',
+            toStatus: 'needs_review',
+            reference: keeper.kind,
+            quote: verdictEvidence,
+          },
+        });
+      }
+      continue;
+    }
     if (existing) {
-      if (
-        existing.review_status === keeper.review_status ||
-        existing.review_status === 'user_confirmed'
-      ) {
+      if (existing.review_status === keeper.review_status) {
         keeperReport.already_present++;
       } else {
         keeperReport.applied++;
         writes.push({
           sql: `UPDATE canon_relation
-                   SET review_status = ?,
-                       confirmed_by_user = CASE WHEN ? = 'user_confirmed' THEN 1 ELSE confirmed_by_user END
+                   SET review_status = ?
                  WHERE id = ? AND project_id = ?`,
-          params: [keeper.review_status, keeper.review_status, existing.id, projectId],
+          params: [keeper.review_status, existing.id, projectId],
           court: {
             relationId: existing.id,
             fromStatus: existing.review_status,
@@ -9635,28 +9748,9 @@ export function replayRulings(
     }
     const evidence = (keeper.evidence ?? '').trim();
     if (!evidence) {
-      // A user's own confirmation needs no book quotation. An accepted row
-      // still does: nothing may enter the accepted tier without evidence.
-      if (keeper.review_status !== 'user_confirmed') {
-        deficit(keeperReport, 'keeper', entry, 'evidence-required');
-        continue;
-      }
-      keeperReport.applied++;
-      writes.push({
-        sql: `INSERT INTO canon_relation
-                (project_id, from_entity, to_entity, kind, description, evidence, source_refs,
-                 confidence, review_status, confirmed_by_user, created_at)
-              VALUES (?, ?, ?, ?, '', '', '[]', 1.0, ?, 1, ?)`,
-        params: [projectId, from.id, to.id, keeper.kind, keeper.review_status, now],
-        court: {
-          relationId: null,
-          insert: true,
-          fromStatus: '',
-          toStatus: keeper.review_status,
-          reference: keeper.kind,
-          quote: '',
-        },
-      });
+      // No sentence means no acceptance, whoever asked. A confirmation is a
+      // label and this branch is only reached for non-verdict keepers.
+      deficit(keeperReport, 'keeper', entry, 'evidence-required');
       continue;
     }
     const refs = quoteRefs(evidence);
@@ -9668,8 +9762,8 @@ export function replayRulings(
     writes.push({
       sql: `INSERT INTO canon_relation
               (project_id, from_entity, to_entity, kind, description, evidence, source_refs,
-               confidence, review_status, confirmed_by_user, created_at)
-            VALUES (?, ?, ?, ?, '', ?, ?, 1.0, ?, ?, ?)`,
+               confidence, review_status, confirmed_by_user, relation_status, created_at)
+            VALUES (?, ?, ?, ?, '', ?, ?, 1.0, ?, 0, ?, ?)`,
       params: [
         projectId,
         from.id,
@@ -9678,7 +9772,7 @@ export function replayRulings(
         keeper.evidence,
         JSON.stringify(refs),
         keeper.review_status,
-        keeper.review_status === 'user_confirmed' ? 1 : 0,
+        relationStatusOf(keeper.evidence),
         now,
       ],
       court: {
@@ -10385,7 +10479,9 @@ export function listRelationshipPairs(db: Db, projectId: number): RelationshipPa
   const groups = new Map<string, { best: (typeof rows)[number]; count: number }>();
   for (const row of rows) {
     const key = `${Math.min(row.from_id, row.to_id)}|${Math.max(row.from_id, row.to_id)}`;
-    const rank = row.confirmed_by_user === 1 ? 0 : RELATION_STATUS_RANK[row.review_status] ?? 4;
+    // Status selects the display label among duplicate rows; a verdict adds no
+    // rank, so confirming one of two duplicate rows cannot change the pick.
+    const rank = RELATION_STATUS_RANK[row.review_status === 'user_confirmed' ? 'accepted' : row.review_status] ?? 4;
     const group = groups.get(key);
     if (!group) {
       groups.set(key, { best: row, count: 1 });
@@ -10393,7 +10489,7 @@ export function listRelationshipPairs(db: Db, projectId: number): RelationshipPa
     }
     group.count++;
     const bestRank =
-      group.best.confirmed_by_user === 1 ? 0 : RELATION_STATUS_RANK[group.best.review_status] ?? 4;
+      RELATION_STATUS_RANK[group.best.review_status === 'user_confirmed' ? 'accepted' : group.best.review_status] ?? 4;
     if (rank < bestRank) group.best = row;
   }
   const locatorOf = (refs: string): string => {
@@ -10409,7 +10505,8 @@ export function listRelationshipPairs(db: Db, projectId: number): RelationshipPa
       fromName: best.from_name,
       toName: best.to_name,
       kind: best.kind,
-      status: best.confirmed_by_user === 1 ? 'user_confirmed' : best.review_status,
+      // The label rides along for audit; the tier is the row's own evidence.
+      status: best.review_status,
       locator: locatorOf(best.source_refs),
       confirmedByUser: best.confirmed_by_user === 1,
       rows: count,
