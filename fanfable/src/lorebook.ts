@@ -359,6 +359,8 @@ export interface ExtractOptions {
   concurrency?: number;
   /** Only process passages that have not been extracted yet (default on). */
   incremental?: boolean;
+  /** Ignore every stored lore_mined flag: reset them inside the run. */
+  fresh?: boolean;
   /**
    * How many tokens the model may use for one window.
    *
@@ -750,8 +752,13 @@ export async function extractLore(
   const runStartedAt = nowIso();
 
   // Passages that have already been mined are skipped, so re-running the
-  // extraction over a long book is cheap.
-  const mined = loadMinedSet(db, projectId);
+  // extraction over a long book is cheap. A --fresh run is the exception: it
+  // resets the flags inside the run, so no external or stale flag can decide
+  // what a full pass reads.
+  if (opts.fresh === true) {
+    db.run('UPDATE canon_chunk SET lore_mined = 0 WHERE project_id = ?', projectId);
+  }
+  const mined = opts.fresh === true ? new Set<number>() : loadMinedSet(db, projectId);
   const ctx = loadChunkContext(db, projectId);
   const entityIdByName = new Map<string, number>();
   // Names harvested from the whole book once, before any window runs.
@@ -764,10 +771,18 @@ export async function extractLore(
   // every window — including already-mined ones — while only candidates run.
   const docFreq = buildNameDocFreq(allWindows);
   const candidates: { window: ChunkRow[]; index: number }[] = [];
+  let skippedMined = 0;
   allWindows.forEach((window, index) => {
-    if (opts.incremental !== false && window.every((c) => mined.has(c.id))) return;
+    if (opts.incremental !== false && window.every((c) => mined.has(c.id))) {
+      skippedMined++;
+      return;
+    }
     candidates.push({ window, index });
   });
+  if (skippedMined > 0) {
+    // A skipped window is a decision, so it is counted and said out loud.
+    opts.onProgress?.(`skipped ${skippedMined} window(s) already marked read`);
+  }
   if (!candidates.length) {
     opts.onProgress?.('everything has already been read');
     return stats;
@@ -1290,7 +1305,10 @@ async function runWindowBatch(
             detail: err instanceof Error ? err.message : String(err),
           });
         }
-        const failed = stats.emptyWindows.slice(emptyBefore).some((e) => e.index === index && e.reason !== 'empty-answer');
+        // Any empty-window record for this index — including a parsed-but-empty
+        // answer — means the window produced nothing. It must stay unmined so
+        // a later pass can retry it instead of trusting a silent gap.
+        const failed = stats.emptyWindows.slice(emptyBefore).some((e) => e.index === index);
         if (!failed) {
           for (const c of window) db.run('UPDATE canon_chunk SET lore_mined = 1 WHERE id = ?', c.id);
         }

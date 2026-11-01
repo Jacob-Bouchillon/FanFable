@@ -1111,6 +1111,7 @@ async function cmdLore(args: Args): Promise<void> {
       sourceId: flagNumber(args, 'source', 0) || undefined,
       windowSize: flagNumber(args, 'window', 8),
       concurrency: flagNumber(args, 'concurrency', 3),
+      fresh: args.flags.fresh === true,
       maxWindows: budgetFlag(args, 'max-windows'),
       starvedFirst: budgetFlag(args, 'starved-first'),
       starvedReserve: budgetFlag(args, 'starved-reserve'),
