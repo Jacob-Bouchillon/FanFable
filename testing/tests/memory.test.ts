@@ -86,6 +86,55 @@ test('a relationship that changes keeps its history', () => {
   db.close();
 });
 
+test('a partial character upsert keeps the stored fields', () => {
+  const { db } = tempDb();
+  const project = seedProject(db, 'character-partial');
+  const id = memory.upsertCharacter(db, project.id, 'Serena Marsh', {
+    aliases: ['Serena'],
+    profile: 'watches the bridge from the ridge',
+    traits: ['observant'],
+    canonRef: 'canon:12',
+  });
+  memory.upsertCharacter(db, project.id, 'Serena Marsh', { profile: 'crosses at dawn' });
+
+  const [character] = memory.listCharacters(db, project.id);
+  assert.equal(character.id, id);
+  assert.deepEqual(character.aliases, ['Serena']);
+  assert.deepEqual(character.traits, ['observant']);
+  assert.equal(character.profile, 'crosses at dawn');
+  assert.equal(character.canonRef, 'canon:12');
+  db.close();
+});
+
+test('a partial relationship update keeps sentiment and source', () => {
+  const { db } = tempDb();
+  const project = seedProject(db, 'rel-partial');
+  const a = memory.upsertCharacter(db, project.id, 'Serena');
+  const b = memory.upsertCharacter(db, project.id, 'Ilsa');
+
+  memory.upsertRelationship(db, project.id, a, b, { kind: 'friend', sentiment: 'warm', source: 'au' });
+  memory.upsertRelationship(db, project.id, a, b, { description: 'share a secret' });
+
+  const [relationship] = memory.listRelationships(db, project.id);
+  assert.equal(relationship.description, 'share a secret');
+  assert.equal(relationship.sentiment, 'warm', 'the unspecified sentiment stays');
+  assert.equal(relationship.source, 'au', 'the unspecified source stays');
+  db.close();
+});
+
+test('a title-only thread upsert keeps its description and status', () => {
+  const { db } = tempDb();
+  const project = seedProject(db, 'thread-partial');
+  const id = memory.upsertThread(db, project.id, 'The third light', 'who carried the lantern', 'resolved');
+  memory.upsertThread(db, project.id, 'The third light');
+
+  const [thread] = memory.listThreads(db, project.id);
+  assert.equal(thread.id, id);
+  assert.equal(thread.description, 'who carried the lantern');
+  assert.equal(thread.status, 'resolved');
+  db.close();
+});
+
 test('context slice returns the relevant subset, not the whole story', () => {
   const { db } = tempDb();
   const project = seedProject(db);
@@ -189,6 +238,65 @@ test('characters that are obviously the same person are merged', () => {
   const rels = memory.listRelationships(db, project.id);
   assert.equal(rels.length, 1, 'relationships are not duplicated');
   assert.equal(rels[0].kind, 'uneasy');
+  db.close();
+});
+
+test('merging characters keeps the canon link', () => {
+  const { db } = tempDb();
+  const project = seedProject(db, 'merge-canon');
+  const canonId = Number(db.run(
+    'INSERT INTO canon_entity (project_id, kind, name, aliases, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+    project.id,
+    'character',
+    'Serena Marsh',
+    '[]',
+    '2026-01-01T00:00:00.000Z',
+    '2026-01-01T00:00:00.000Z',
+  ).lastInsertRowid);
+  const short = memory.upsertCharacter(db, project.id, 'Serena');
+  memory.upsertCharacter(db, project.id, 'Serena Marsh');
+  db.run('UPDATE character SET canon_entity_id = ? WHERE id = ?', canonId, short);
+
+  memory.mergeSimilarCharacters(db, project.id);
+
+  const keep = db.get<{ name: string; canon_entity_id: number | null }>(
+    'SELECT name, canon_entity_id FROM character WHERE project_id = ?',
+    project.id,
+  )!;
+  assert.equal(keep.name, 'Serena Marsh');
+  assert.equal(keep.canon_entity_id, canonId, 'the dropped row canon link follows the survivor');
+  db.close();
+});
+
+test('merging characters preserves closed relationship history', () => {
+  const { db } = tempDb();
+  const project = seedProject(db, 'merge-rel-history');
+  const chapterId = Number(db.run(
+    "INSERT INTO chapter (project_id, number, title, status, body, created_at, updated_at) VALUES (?, 1, 'One', 'draft', 'text', '2024-01-01', '2024-01-01')",
+    project.id,
+  ).lastInsertRowid);
+  const short = memory.upsertCharacter(db, project.id, 'Serena');
+  memory.upsertCharacter(db, project.id, 'Serena Marsh');
+  const kade = memory.upsertCharacter(db, project.id, 'Kade');
+  memory.upsertRelationship(db, project.id, short, kade, { kind: 'friend' });
+  memory.upsertRelationship(db, project.id, short, kade, { kind: 'estranged' });
+  db.run(
+    "UPDATE relationship SET chapter_id = ? WHERE project_id = ? AND closed = 1 AND kind = 'friend'",
+    chapterId,
+    project.id,
+  );
+
+  memory.mergeSimilarCharacters(db, project.id);
+
+  const rows = db.all<{ kind: string; closed: number; chapter_id: number | null }>(
+    'SELECT kind, closed, chapter_id FROM relationship WHERE project_id = ? ORDER BY id',
+    project.id,
+  );
+  assert.equal(rows.length, 2, 'the old state and the current one both survive');
+  const friend = rows.find((row) => row.kind === 'friend')!;
+  assert.equal(friend.closed, 1, 'the old state stays closed');
+  assert.equal(friend.chapter_id, chapterId, 'the history row keeps its chapter');
+  assert.equal(rows.find((row) => row.kind === 'estranged')!.closed, 0);
   db.close();
 });
 

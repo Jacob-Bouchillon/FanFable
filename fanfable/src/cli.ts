@@ -953,7 +953,7 @@ async function cmdLore(args: Args): Promise<void> {
   if (sub === 'conflicts') {
     const dismiss = flagNumber(args, 'dismiss', 0);
     if (dismiss > 0) {
-      const changed = noteIngest.dismissConflict(db, dismiss);
+      const changed = noteIngest.dismissConflict(db, project.id, dismiss);
       console.log(changed ? `dismissed conflict ${dismiss}` : `conflict ${dismiss} was already dismissed`);
       return;
     }

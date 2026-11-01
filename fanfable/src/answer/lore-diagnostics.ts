@@ -635,12 +635,13 @@ export function correctRelation(
   }>('SELECT id, kind, description, evidence, review_status FROM canon_relation WHERE id = ? AND project_id = ?', id, projectId);
   if (!existing) return false;
   db.transaction(() => {
+    // A human edit is a label, never a promotion: confidence and tier stay
+    // exactly as the evidence earned them.
     db.run(
-      `UPDATE canon_relation SET kind = ?, description = ?, evidence = ?, confidence = ? WHERE id = ? AND project_id = ?`,
+      `UPDATE canon_relation SET kind = ?, description = ?, evidence = ? WHERE id = ? AND project_id = ?`,
       patch.kind ?? existing.kind,
       patch.description ?? existing.description,
       patch.evidence ?? existing.evidence,
-      patch.confirm === false ? undefined : 1,
       id,
       projectId,
     );

@@ -218,8 +218,8 @@ test('a dismissed conflict stays dismissed and is never recreated', () => {
   db.run("UPDATE canon_thread_note SET claim_kind = 'ally of' WHERE id = ?", b);
   markContradictions(db, project);
   const conflict = db.get<{ id: number }>('SELECT id FROM canon_thread_conflict WHERE project_id = ?', project)!.id;
-  assert.equal(dismissConflict(db, conflict), true);
-  assert.equal(dismissConflict(db, conflict), false, 'dismissing twice changes nothing');
+  assert.equal(dismissConflict(db, project, conflict), true);
+  assert.equal(dismissConflict(db, project, conflict), false, 'dismissing twice changes nothing');
 
   const again = markContradictions(db, project);
   assert.equal(again.created, 0);

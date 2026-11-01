@@ -6306,15 +6306,30 @@ If no single sentence does, reply {"sentence":"NONE"}. Never paraphrase or use o
           reason: 'superseded',
           moved_at: nowIso(),
         });
-        db.run(
-          `UPDATE canon_relation
-              SET evidence = ?, supporting_evidence = ?, review_status = 'accepted'
-            WHERE id = ? AND project_id = ? AND review_status = 'provisional'`,
-          sentence,
-          toJson(supporting),
-          row.id,
-          projectId,
-        );
+        db.transaction(() => {
+          const changed = db.run(
+            `UPDATE canon_relation
+                SET evidence = ?, relation_status = ?, supporting_evidence = ?, review_status = 'accepted'
+              WHERE id = ? AND project_id = ? AND review_status = 'provisional'`,
+            sentence,
+            relationStatusOf(sentence),
+            toJson(supporting),
+            row.id,
+            projectId,
+          ).changes;
+          if (changed) {
+            recordRuling(db, projectId, {
+              relationId: row.id,
+              role: 'appeal',
+              actor: 'guard',
+              standard: 'sentence-proof',
+              fromStatus: 'provisional',
+              toStatus: 'accepted',
+              basis: 'proven quote and threshold (find-evidence)',
+              quote: sentence,
+            });
+          }
+        });
       }
     }
   }
@@ -6385,6 +6400,8 @@ export interface RelationInsert {
   /** The sentence that asserts the relationship, when the quote is context. */
   anchorEvidence?: string;
   modality?: string;
+  /** The status the row starts in. Intake defaults to `needs_review`; only
+   * the gate promotes to accepted. */
   reviewStatus?: string;
   confidence?: number;
   /** Provenance: the model's assessment, stored as JSON. */
@@ -6443,7 +6460,7 @@ export function insertRelation(
         row.sourceRefs,
         row.confidence ?? 1.0,
         row.modality ?? 'asserted',
-        row.reviewStatus ?? 'accepted',
+        row.reviewStatus ?? 'needs_review',
         row.kindSource ?? '',
         row.anchorEvidence ?? '',
         row.supportingEvidence ?? '[]',
@@ -6456,7 +6473,7 @@ export function insertRelation(
       role: 'charge',
       actor: 'bank',
       standard: 'claim',
-      toStatus: row.reviewStatus ?? 'accepted',
+      toStatus: row.reviewStatus ?? 'needs_review',
       basis: `inserted ${row.kind}`,
       quote: row.evidence,
     });
@@ -7334,7 +7351,7 @@ export function mergeEntityPair(
             basis: 'merge collapsed the pair to one entity',
             quote: r.evidence,
           });
-          db.run("UPDATE canon_relation SET review_status = 'needs_review' WHERE id = ?", r.id);
+          db.run("UPDATE canon_relation SET review_status = 'needs_review' WHERE id = ? AND project_id = ?", r.id, projectId);
         } else {
           recordRuling(db, projectId, {
             relationId: r.id,
@@ -7346,21 +7363,34 @@ export function mergeEntityPair(
             basis: 'merge collapsed the pair to one entity',
             quote: r.evidence,
           });
-          db.run('DELETE FROM canon_relation WHERE id = ?', r.id);
+          db.run('DELETE FROM canon_relation WHERE id = ? AND project_id = ?', r.id, projectId);
         }
         continue;
       }
+      const sameTie = pairClause(r.kind);
       const existing = db.get<{ id: number }>(
-        'SELECT id FROM canon_relation WHERE project_id = ? AND from_entity = ? AND to_entity = ? AND kind = ?',
+        `SELECT id FROM canon_relation
+          WHERE project_id = ? AND id <> ? AND lower(kind) = lower(?) AND ${sameTie.sql}
+          LIMIT 1`,
         projectId,
-        from,
-        to,
+        r.id,
         r.kind,
+        ...sameTie.args(from, to),
       );
       if (existing) {
-        db.run('DELETE FROM canon_relation WHERE id = ?', r.id);
+        recordRuling(db, projectId, {
+          relationId: r.id,
+          role: 'removal',
+          actor: 'guard',
+          standard: 'merge',
+          fromStatus: r.review_status,
+          toStatus: 'merged',
+          basis: `merged into relation ${existing.id} after entity merge`,
+          quote: r.evidence,
+        });
+        db.run('DELETE FROM canon_relation WHERE id = ? AND project_id = ?', r.id, projectId);
       } else {
-        db.run('UPDATE canon_relation SET from_entity = ?, to_entity = ? WHERE id = ?', from, to, r.id);
+        db.run('UPDATE canon_relation SET from_entity = ?, to_entity = ? WHERE id = ? AND project_id = ?', from, to, r.id, projectId);
       }
     }
     db.run('UPDATE canon_fact SET subject = ? WHERE project_id = ? AND subject = ?', keep.name, projectId, drop.name);
@@ -10411,22 +10441,59 @@ export function updateEntity(
   id: number,
   patch: Partial<Pick<CanonEntity, 'name' | 'summary' | 'role' | 'status' | 'kind'>>,
 ): void {
-  const existing = db.get<{ id: number }>('SELECT id FROM canon_entity WHERE id = ? AND project_id = ?', id, projectId);
+  const existing = db.get<{ name: string; summary: string; role: string; status: string; kind: string }>(
+    'SELECT name, summary, role, status, kind FROM canon_entity WHERE id = ? AND project_id = ?',
+    id,
+    projectId,
+  );
   if (!existing) return;
+  // A partial patch changes only the fields it names. Resetting the rest to
+  // empty would erase the entity's summary or turn a location into a person.
   db.run(
-    'UPDATE canon_entity SET name = ?, summary = ?, role = ?, status = ?, kind = ?, updated_at = ? WHERE id = ?',
-    patch.name ?? '',
-    patch.summary ?? '',
-    patch.role ?? '',
-    patch.status ?? '',
-    patch.kind ?? 'character',
+    'UPDATE canon_entity SET name = ?, summary = ?, role = ?, status = ?, kind = ?, updated_at = ? WHERE id = ? AND project_id = ?',
+    patch.name ?? existing.name,
+    patch.summary ?? existing.summary,
+    patch.role ?? existing.role,
+    patch.status ?? existing.status,
+    patch.kind === undefined ? existing.kind : normaliseKind(patch.kind),
     nowIso(),
     id,
+    projectId,
   );
 }
 
+/**
+ * Remove an entity. Its relations cascade with it, so each one leaves a
+ * removal ruling first: a deletion is a court decision, not an absence.
+ */
 export function deleteEntity(db: Db, projectId: number, id: number): void {
-  db.run('DELETE FROM canon_entity WHERE id = ? AND project_id = ?', id, projectId);
+  const entity = db.get<{ id: number; name: string }>(
+    'SELECT id, name FROM canon_entity WHERE id = ? AND project_id = ?',
+    id,
+    projectId,
+  );
+  if (!entity) return;
+  const relations = db.all<{ id: number; kind: string; evidence: string; review_status: string }>(
+    'SELECT id, kind, evidence, review_status FROM canon_relation WHERE project_id = ? AND (from_entity = ? OR to_entity = ?)',
+    projectId,
+    id,
+    id,
+  );
+  db.transaction(() => {
+    for (const row of relations) {
+      recordRuling(db, projectId, {
+        relationId: row.id,
+        role: 'removal',
+        actor: 'human',
+        standard: 'entity-removal',
+        fromStatus: row.review_status,
+        toStatus: 'removed',
+        basis: `entity ${entity.name} removed (${row.kind})`,
+        quote: row.evidence,
+      });
+    }
+    db.run('DELETE FROM canon_entity WHERE id = ? AND project_id = ?', id, projectId);
+  });
 }
 
 /* ------------------------------------------------------------------ brief */

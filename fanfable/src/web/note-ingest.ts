@@ -1244,13 +1244,18 @@ export function markContradictions(
 }
 
 /** Mark one conflict dismissed. Never deletes, never re-opens another one. */
-export function dismissConflict(db: Db, conflictId: number): boolean {
+export function dismissConflict(db: Db, projectId: number, conflictId: number): boolean {
   const row = db.get<{ id: number; status: string }>(
-    'SELECT id, status FROM canon_thread_conflict WHERE id = ?',
+    'SELECT id, status FROM canon_thread_conflict WHERE id = ? AND project_id = ?',
     conflictId,
+    projectId,
   );
   if (!row) throw new Error(`no conflict ${conflictId}`);
   if (row.status === 'dismissed') return false;
-  db.run("UPDATE canon_thread_conflict SET status = 'dismissed' WHERE id = ?", conflictId);
+  db.run(
+    "UPDATE canon_thread_conflict SET status = 'dismissed' WHERE id = ? AND project_id = ? AND status <> 'dismissed'",
+    conflictId,
+    projectId,
+  );
   return true;
 }

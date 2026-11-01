@@ -112,21 +112,24 @@ export function upsertCharacter(
 ): number {
   const clean = name.trim();
   if (!clean) throw new Error('character name is required');
-  const existing = db.get<{ id: number }>(
-    'SELECT id FROM character WHERE project_id = ? AND lower(name) = lower(?)',
+  const existing = db.get<{ id: number; aliases: string; profile: string; traits: string; canon_ref: string }>(
+    'SELECT id, aliases, profile, traits, canon_ref FROM character WHERE project_id = ? AND lower(name) = lower(?)',
     projectId,
     clean,
   );
   const ts = nowIso();
   if (existing) {
+    // A partial patch changes only what it names; missing fields keep the
+    // stored value instead of being reset to empty.
     db.run(
-      'UPDATE character SET aliases = ?, profile = ?, traits = ?, canon_ref = ?, updated_at = ? WHERE id = ?',
-      toJson(fields.aliases ?? []),
-      fields.profile ?? '',
-      toJson(fields.traits ?? []),
-      fields.canonRef ?? '',
+      'UPDATE character SET aliases = ?, profile = ?, traits = ?, canon_ref = ?, updated_at = ? WHERE id = ? AND project_id = ?',
+      fields.aliases === undefined ? existing.aliases : toJson(fields.aliases),
+      fields.profile ?? existing.profile,
+      fields.traits === undefined ? existing.traits : toJson(fields.traits),
+      fields.canonRef ?? existing.canon_ref,
       ts,
       existing.id,
+      projectId,
     );
     return existing.id;
   }
@@ -404,8 +407,8 @@ export function upsertRelationship(
   // The current, open relationship for this pair. A relationship that changes
   // kind is not overwritten: the old one is closed and a new one is opened, so
   // the history of how two people relate survives.
-  const existing = db.get<{ id: number; kind: string; description: string }>(
-    `SELECT id, kind, description FROM relationship
+  const existing = db.get<{ id: number; kind: string; description: string; sentiment: string; source: string }>(
+    `SELECT id, kind, description, sentiment, source FROM relationship
      WHERE project_id = ? AND character_a = ? AND character_b = ? AND closed = 0
      ORDER BY id DESC LIMIT 1`,
     projectId,
@@ -417,21 +420,23 @@ export function upsertRelationship(
 
   if (existing && kindChanged) {
     db.run(
-      'UPDATE relationship SET closed = 1, valid_to_event_id = ?, updated_at = ? WHERE id = ?',
+      'UPDATE relationship SET closed = 1, valid_to_event_id = ?, updated_at = ? WHERE id = ? AND project_id = ?',
       rel.validFromEventId ?? null,
       nowIso(),
       existing.id,
+      projectId,
     );
   } else if (existing) {
     db.run(
-      'UPDATE relationship SET kind = ?, description = ?, sentiment = ?, source = ?, chapter_id = COALESCE(?, chapter_id), updated_at = ? WHERE id = ?',
+      'UPDATE relationship SET kind = ?, description = ?, sentiment = ?, source = ?, chapter_id = COALESCE(?, chapter_id), updated_at = ? WHERE id = ? AND project_id = ?',
       rel.kind ?? existing.kind,
       rel.description || existing.description,
-      rel.sentiment ?? '',
-      rel.source ?? 'inferred',
+      rel.sentiment ?? existing.sentiment,
+      rel.source ?? existing.source,
       rel.chapterId ?? null,
       nowIso(),
       existing.id,
+      projectId,
     );
     return;
   }
@@ -494,33 +499,39 @@ export function upsertThread(
   db: Db,
   projectId: number,
   title: string,
-  description = '',
-  status = 'open',
+  description?: string,
+  status?: string,
 ): number {
-  status = normalizeThreadStatus(status);
-  const existing = db.get<{ id: number }>(
-    'SELECT id FROM plot_thread WHERE project_id = ? AND lower(title) = lower(?)',
+  const nextStatus = status === undefined ? undefined : normalizeThreadStatus(status);
+  const existing = db.get<{ id: number; description: string; status: string; resolved_at: string | null }>(
+    'SELECT id, description, status, resolved_at FROM plot_thread WHERE project_id = ? AND lower(title) = lower(?)',
     projectId,
     title.trim(),
   );
   if (existing) {
+    const next = nextStatus ?? existing.status;
+    const resolvedAt = next === 'resolved'
+      ? (existing.status === 'resolved' ? existing.resolved_at : nowIso())
+      : null;
     db.run(
-      'UPDATE plot_thread SET description = ?, status = ?, resolved_at = ? WHERE id = ?',
-      description,
-      status,
-      status === 'resolved' ? nowIso() : null,
+      'UPDATE plot_thread SET description = ?, status = ?, resolved_at = ? WHERE id = ? AND project_id = ?',
+      description ?? existing.description,
+      next,
+      resolvedAt,
       existing.id,
+      projectId,
     );
     return existing.id;
   }
+  const createdStatus = nextStatus ?? 'open';
   const r = db.run(
     'INSERT INTO plot_thread (project_id, title, description, status, created_at, resolved_at) VALUES (?, ?, ?, ?, ?, ?)',
     projectId,
     title.trim(),
-    description,
-    status,
+    description ?? '',
+    createdStatus,
     nowIso(),
-    status === 'resolved' ? nowIso() : null,
+    createdStatus === 'resolved' ? nowIso() : null,
   );
   return r.lastInsertRowid;
 }
@@ -882,18 +893,33 @@ export function mergeSimilarCharacters(db: Db, projectId: number): string[] {
       const aliases = [...keep.aliases, drop.name, ...drop.aliases].filter(
         (a, i, arr) => a.toLowerCase() !== keep.name.toLowerCase() && arr.findIndex((x) => x.toLowerCase() === a.toLowerCase()) === i,
       );
+      // A canon link is provenance: keep the surviving row's link, or adopt
+      // the dropped row's when the survivor has none.
+      const links = db.all<{ id: number; canon_entity_id: number | null }>(
+        'SELECT id, canon_entity_id FROM character WHERE project_id = ? AND id IN (?, ?)',
+        projectId,
+        keep.id,
+        drop.id,
+      );
+      const canonLink =
+        links.find((row) => row.id === keep.id)?.canon_entity_id
+        ?? links.find((row) => row.id === drop.id)?.canon_entity_id
+        ?? null;
       db.run(
-        'UPDATE character SET aliases = ?, profile = ?, traits = ?, updated_at = ? WHERE id = ?',
+        'UPDATE character SET aliases = ?, profile = ?, traits = ?, canon_entity_id = ?, updated_at = ? WHERE id = ? AND project_id = ?',
         toJson(aliases),
         keep.profile || drop.profile,
         toJson([...new Set([...keep.traits, ...drop.traits])]),
+        canonLink,
         nowIso(),
         keep.id,
+        projectId,
       );
       db.run('UPDATE character_state SET character_id = ? WHERE character_id = ?', keep.id, drop.id);
       db.run('UPDATE character_knowledge SET character_id = ? WHERE character_id = ?', keep.id, drop.id);
 
-      // Relationships: move the dropped character's links onto the kept one.
+      // Relationships: move the dropped character's links onto the kept one,
+      // preserving closed history instead of reopening it.
       const dropRels = db.all<{
         character_a: number;
         character_b: number;
@@ -901,8 +927,15 @@ export function mergeSimilarCharacters(db: Db, projectId: number): string[] {
         description: string;
         sentiment: string;
         source: string;
+        confidence: number;
+        chapter_id: number | null;
+        valid_from_event_id: number | null;
+        valid_to_event_id: number | null;
+        closed: number;
       }>(
-        'SELECT character_a, character_b, kind, description, sentiment, source FROM relationship WHERE project_id = ? AND (character_a = ? OR character_b = ?)',
+        `SELECT character_a, character_b, kind, description, sentiment, source, confidence,
+                chapter_id, valid_from_event_id, valid_to_event_id, closed
+           FROM relationship WHERE project_id = ? AND (character_a = ? OR character_b = ?)`,
         projectId,
         drop.id,
         drop.id,
@@ -917,31 +950,52 @@ export function mergeSimilarCharacters(db: Db, projectId: number): string[] {
         const other = r.character_a === drop.id ? r.character_b : r.character_a;
         if (other === keep.id) continue;
         const [x, y] = keep.id <= other ? [keep.id, other] : [other, keep.id];
+        // An open row and each closed historical kind stay distinct.
         const existing = db.get<{ id: number; kind: string; description: string; sentiment: string }>(
-          'SELECT id, kind, description, sentiment FROM relationship WHERE project_id = ? AND character_a = ? AND character_b = ?',
+          `SELECT id, kind, description, sentiment FROM relationship
+            WHERE project_id = ? AND character_a = ? AND character_b = ? AND closed = ?
+              AND (? = 0 OR kind = ?)
+            ORDER BY id LIMIT 1`,
           projectId,
           x,
           y,
+          r.closed,
+          r.closed,
+          r.kind,
         );
         if (existing) {
           // Keep what is already known and only fill in the gaps.
           db.run(
-            'UPDATE relationship SET kind = ?, description = ?, sentiment = ? WHERE id = ?',
+            'UPDATE relationship SET kind = ?, description = ?, sentiment = ? WHERE id = ? AND project_id = ?',
             existing.kind || r.kind,
             existing.description || r.description,
             existing.sentiment || r.sentiment,
             existing.id,
+            projectId,
           );
         } else {
-          upsertRelationship(db, projectId, keep.id, other, {
-            kind: r.kind,
-            description: r.description,
-            sentiment: r.sentiment,
-            source: r.source,
-          });
+          db.run(
+            `INSERT INTO relationship
+               (project_id, character_a, character_b, kind, description, sentiment, source,
+                chapter_id, valid_from_event_id, valid_to_event_id, confidence, closed, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            projectId,
+            x,
+            y,
+            r.kind,
+            r.description,
+            r.sentiment,
+            r.source,
+            r.chapter_id,
+            r.valid_from_event_id,
+            r.valid_to_event_id,
+            r.confidence,
+            r.closed,
+            nowIso(),
+          );
         }
       }
-      db.run('DELETE FROM character WHERE id = ?', drop.id);
+      db.run('DELETE FROM character WHERE id = ? AND project_id = ?', drop.id, projectId);
     });
     merged.push(`${drop.name} -> ${keep.name}`);
   }

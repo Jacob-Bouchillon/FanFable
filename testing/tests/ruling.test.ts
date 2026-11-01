@@ -149,6 +149,11 @@ test('a human correction and a removal each leave a ruling', () => {
       .confirmed_by_user,
     1,
   );
+  assert.equal(
+    s.db.get<{ confidence: number }>('SELECT confidence FROM canon_relation WHERE id = ?', row)!.confidence,
+    0.8,
+    'a human correction does not rewrite the model score',
+  );
   assert.equal(loreDiag.removeRelation(s.db, s.project.id, row), true);
   const removal = ruling
     .listRulings(s.db, s.project.id, { subject: ruling.relationSubject(row) })
@@ -157,6 +162,23 @@ test('a human correction and a removal each leave a ruling', () => {
   assert.equal(removal[0]!.to_status, 'removed');
   const docket = ruling.docket(s.db, s.project.id);
   assert.equal(docket[0]!.status, 'removed');
+  s.db.close();
+});
+
+test('an unconfirmed correction keeps the score and the flag clear', () => {
+  const s = setup();
+  const row = addRelation(s, 'aunt of', 'Mara is the aunt of Tor.', 'provisional');
+  assert.equal(
+    loreDiag.correctRelation(s.db, s.project.id, row, { kind: 'guardian of', confirm: false }),
+    true,
+  );
+  const saved = s.db.get<{ confidence: number; confirmed_by_user: number; kind: string }>(
+    'SELECT confidence, confirmed_by_user, kind FROM canon_relation WHERE id = ?',
+    row,
+  )!;
+  assert.equal(saved.kind, 'guardian of');
+  assert.equal(saved.confidence, 0.8);
+  assert.equal(saved.confirmed_by_user, 0);
   s.db.close();
 });
 

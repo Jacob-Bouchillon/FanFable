@@ -76,6 +76,14 @@ test('the words are stored with the row', () => {
   db.close();
 });
 
+test('an insert without an explicit status enters review, never accepted', () => {
+  const quote = 'Mara threw in with Tor before the vote.';
+  const { db, id } = setup('kind-source-default-status', quote);
+  const row = db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', id)!;
+  assert.equal(row.review_status, 'needs_review');
+  db.close();
+});
+
 test('without the words, the same quote still passes: kind_source is provenance', () => {
   const quote = 'Mara threw in with Tor before the vote.';
   const { db, project, id } = setup('kind-source-absent', quote);

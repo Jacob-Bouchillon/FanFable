@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import * as controller from '../../fanfable/src/plan/controller.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
+import * as ruling from '../../fanfable/src/court/ruling.ts';
 import { runMigrations } from '../../fanfable/src/core/migrations.ts';
 import { mockProvider, tempDb } from './helpers.ts';
 
@@ -77,6 +78,12 @@ test('promotion moves the quote: new primary, old preserved as supporting', asyn
   assert.equal((supporting[0]!.source_refs as { chunk: number }[])[0]!.chunk, db.get<{ chunk: number }>(
     'SELECT json_extract(source_refs, \'$[0].chunk\') AS chunk FROM canon_relation WHERE id = ?', rel,
   )!.chunk);
+  const appeal = ruling
+    .listRulings(db, project.id, { relationId: rel })
+    .find((entry) => entry.standard === 'sentence-proof');
+  assert.ok(appeal, 'the promotion leaves a court ruling');
+  assert.equal(appeal!.from_status, 'provisional');
+  assert.equal(appeal!.to_status, 'accepted');
   db.close();
 });
 
@@ -92,6 +99,20 @@ test('failed verification writes nothing', async () => {
   assert.equal(row.evidence, OLD);
   assert.equal(row.review_status, 'provisional');
   assert.equal(row.supporting_evidence, '[]');
+  db.close();
+});
+
+test('a failed ruling rolls the find-evidence promotion back', async () => {
+  const { db, project, rel } = setup();
+  db.exec("CREATE TRIGGER fail_ruling BEFORE INSERT ON canon_ruling BEGIN SELECT RAISE(ABORT, 'boom'); END");
+  await assert.rejects(() =>
+    lorebook.promoteProvisionalWithEvidence(db, finder(NEW) as never, project.id, { limit: 5 }),
+  );
+  const row = db.get<{ evidence: string; review_status: string }>(
+    'SELECT evidence, review_status FROM canon_relation WHERE id = ?', rel,
+  )!;
+  assert.equal(row.evidence, OLD, 'the primary quote did not survive without its ruling');
+  assert.equal(row.review_status, 'provisional');
   db.close();
 });
 

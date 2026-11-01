@@ -148,8 +148,8 @@ test('enrichment adds only what is missing', async () => {
 
 test('a hand-made correction is marked as the author’s', async () => {
   const { db, projectId } = await seeded();
-  const relation = db.get<{ id: number; review_status: string }>(
-    'SELECT id, review_status FROM canon_relation WHERE project_id = ?',
+  const relation = db.get<{ id: number; review_status: string; confidence: number }>(
+    'SELECT id, review_status, confidence FROM canon_relation WHERE project_id = ?',
     projectId,
   )!;
   loreDiag.correctRelation(db, projectId, relation.id, { kind: 'protects' });
@@ -162,7 +162,7 @@ test('a hand-made correction is marked as the author’s', async () => {
   // evidence earned, so a verdict never promotes a row.
   assert.equal(row?.review_status, relation.review_status);
   assert.equal(row?.confirmed_by_user, 1);
-  assert.equal(row?.confidence, 1);
+  assert.equal(row?.confidence, relation.confidence, 'a correction does not rewrite the model score');
   db.close();
 });
 
