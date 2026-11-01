@@ -4262,7 +4262,7 @@ async function extractWindowSplit(
   const answers: string[] = [];
   let failed = false;
 
-  const ask = async (system: string, maxTok: number, temp = 0.1): Promise<string | null> => {
+  const ask = async (system: string, maxTok: number, temp = 0): Promise<string | null> => {
     try {
       const res = await llm.chat({
         system,
