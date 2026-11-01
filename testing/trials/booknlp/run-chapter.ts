@@ -166,6 +166,8 @@ from booknlp.booknlp import BookNLP
 inp, outdir, book_id = sys.argv[1], sys.argv[2], sys.argv[3]
 params = {"pipeline": "entity,quote,event,coref", "model": "small"}
 import os as _os
+if _os.environ.get("BOOKNLP_MODEL") in ("big", "small", "custom"):
+    params["model"] = _os.environ["BOOKNLP_MODEL"]
 if _os.environ.get("BOOKNLP_PRONOMINAL") == "0":
     params["pronominalCorefOnly"] = False
 nlp = BookNLP("en", params)
@@ -180,6 +182,8 @@ from booknlp.english.english_booknlp import EnglishBookNLP
 inp, outdir, book_id = sys.argv[1], sys.argv[2], sys.argv[3]
 params = {"pipeline": "entity,quote,event,coref", "model": "small"}
 import os as _os
+if _os.environ.get("BOOKNLP_MODEL") in ("big", "small", "custom"):
+    params["model"] = _os.environ["BOOKNLP_MODEL"]
 if _os.environ.get("BOOKNLP_PRONOMINAL") == "0":
     params["pronominalCorefOnly"] = False
 nlp = EnglishBookNLP(params)
