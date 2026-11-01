@@ -284,5 +284,28 @@ Rules that must accompany it, whichever point is chosen:
   measured recall mixes the two, in an unknown proportion.
 - One run per model; no threshold tuning beyond a reported sweep; no batching, so the latency
   figures are single-item CPU numbers.
-- The re-run proposed in §11 has not happened. Until it does, the judge slot is **open**, not
-  won.
+
+---
+
+## 15. Addendum — what happened after this bench (same day)
+
+The Phase 1b re-run proposed in §11 was superseded, and the judge question was answered a
+different way. Recorded here so this document is not read as the last word on judging.
+
+**Entailment ranking over the real queue.** With the claim string and passage window fixed, GLiClass
+scored 364 of the 578 queue rows and reached **AUC 0.775** on the 90 rows the two audits had
+labelled (32 positives, 5 negatives that survived the kind join). At 0.5 it kept 15 rows, all true,
+for 19 of 34 confirmed ties lost. That is the 0.70–0.80 band: **sort order only**, no flags, no
+gate. Full record: `PIPELINE-PLAN.md` §6.
+
+**A strict quote check of all 277 proof rows.** A second model, given each row's quote, names,
+relation and direction, rejected **130 of 277** — 109 of the 151 rows that carry a relation word.
+Failure classes: the arrow reversed, the wrong actor credited, one endpoint never named, or a
+relation word outside any fixed vocabulary. The two audits had measured ~75% support on samples;
+this check is harsher because it demands the *sentence* prove the claim, not merely the passage.
+
+**What that changes for this document.** The judge slot was never the bottleneck. Even a perfect
+judge cannot see that `Maul — master of — Sidious` contradicts its own evidence, because that is a
+structural fact about direction, not a semantic score. The correction belongs in the pipeline, not
+in a better assessor: fixed relation vocabulary with known inverses, actor and endpoint checks,
+and evidence regathered per relation after the roster is de-duplicated. See `PIPELINE-PLAN.md` §6a.

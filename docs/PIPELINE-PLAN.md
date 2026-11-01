@@ -28,6 +28,15 @@ because doing so conflates characters.
 
 The 70% was cleared *around* that failure, not by solving it.
 
+**The denominator is under audit.** 74.7% counts 136 covered names out of a roster of 182, but the
+roster contains the same person several times (`Darth Plagueis` / `Damask` / `Magister Hego
+Damask`; `Palpatine` and `Darth Sidious` unlinked; `Blir'` / `Blir’`; `Pax Teem` / `Senator Pax
+Teem` / `Teem`; `Finis Valorum` / `Supreme Chancellor Valorum` / `Valorum` / an invented `Darth
+Valorum`; `Jabba Desilijic Tiure` / `Jabba the Hutt`; `Sate Pestage` / `Darth Pestage`; `Ellin Lah`
+/ `Captain Lah`) and non-persons (species, organisations, places, roles). Duplicates split ties
+across two ids; non-persons can never hold a person-tie. Until the roster is rebuilt, treat 74.7%
+as provisional. Stage A of the rebuild does exactly that on a copy.
+
 ---
 
 ## 2. The rule
@@ -55,7 +64,7 @@ Four supporting rules:
 | stage | owner | measured | state |
 |---|---|---|---|
 | Ingest | our chunker | — | running |
-| Names / roster | our roster + guarded identity | 84% of name-bearing BookNLP clusters map; never merges | running |
+| Names / roster | our roster + guarded identity | 84% of name-bearing BookNLP clusters map; never merges — but the roster itself holds duplicates and non-persons | **under rebuild** |
 | Mentions, pronouns | BookNLP | 27,848 pronouns; 52% sit with a named person | running |
 | Descriptions ("the captain") | **nobody** | 2,107 description-only clusters, 5,157 pronouns stranded there | **gap** |
 | Speakers | BookNLP | 10,005/10,005 attributed; 66.8% to a named person, 15.8% to a description, 16.1% anonymous | running, weak |
@@ -75,8 +84,10 @@ part can add capability rather than volume.
 **Coreference layer (descriptions → named people).** Admitted only if, on the whole book, it
 resolves at least 40% of the 2,107 description-only clusters to a named character *and* a blind
 check of 40 joins is at least 85% correct. Coverage alone is worthless: a wrong join fuses two
-people, which is the one error that cannot be undone cheaply. Candidates: fastcoref (window-level),
-pairwise model (judgement), BookNLP full coreference (measured: 56 joins of 3,279 clusters; fails).
+people, which is the one error that cannot be undone cheaply. Measured candidates, all below bar:
+BookNLP full coreference 56 joins of 3,279 clusters; fastcoref/LingMess 16 joins on the test slice
+against an 18 bar, 2 of them wrong; our own pairwise model 63.5% correct with a 35% wrong-person
+rate and a 70% invention rate on descriptions that refer to nobody.
 
 **Speaker layer.** Admitted only if it raises the named-speaker share above 66.8% without
 degrading the quotes it already gets right, and 40 sampled attributions (especially the changed
@@ -103,20 +114,43 @@ qualification: BookNLP's relation signals already deliver 2,145 candidate pairs 
 
 ---
 
-## 6. Pending results and what they change
+## 6. Results of the part tests, and what replaces them
 
-Three tests are queued or running. Each has a pre-registered bar; none may be relaxed after the
-fact.
+| test | result | bar | outcome |
+|---|---|---|---|
+| BookNLP nominal coref, small model | 56 joins in 3,279 clusters; precision 0.108 → 0.059 | 40% of 2,107 | fail |
+| BookNLP nominal coref, big model | 4 joins vs 6 on the same slice | 3× the small model | fail |
+| fastcoref FCoref | 5 joins on the slice | 18 | fail |
+| fastcoref LingMess | 16 joins, 2 wrong | 18 | fail (close) |
+| pairwise model (qwen3.5:9b) | 63.5% on resolvable; 35% wrong person; 30% right on hard negatives | 0.80 / ≤0.05 wrong | fail |
+| ModernBookNLP speaker model | not yet run | named-speaker share > 66.8% | pending |
 
-| test | question | changes |
-|---|---|---|
-| pairwise description resolution (running) | can our model pick the right person for a description, given the passage? | descriptions stage, speaker fallback |
-| fastcoref (queued) | how many description joins, and are they right? | descriptions stage |
-| ModernBookNLP (queued) | does named-speaker share rise above 66.8%? | speakers stage |
+Conclusion for the descriptions stage: four independent approaches, none clears the bar. The stage
+stays open and is recorded as unsolved rather than patched.
 
-If all three fail their bars, both gap stages stay open and are closed as unsolved rather than
-patched with something unmeasured. If one passes, it is adopted alone, measured end to end, and
-the other two are dropped — not stacked.
+**What replaced the search for a better judge.** Two things were tried. An entailment ranking with
+GLiClass reached AUC 0.775 on 90 labelled rows — sort order only, never a gate. Then a strict
+quote-by-quote check of all 277 proof rows (Gemini) rejected 130 of them, mostly for direction,
+wrong actor, missing names, or a relation word that isn't in a fixed list. That is not a judge
+problem; it is a **mechanical** one, and it is being fixed at the source: rebuild the roster, then
+regather the evidence per relation.
+
+---
+
+## 6a. The rebuild (current work)
+
+**Stage A — identities (copy only).** Merge the same person stored under several names, drop
+non-persons and placeholders, keep genuinely distinct people sharing a surname apart (Larsh Hill
+vs San Hill, Palpatine vs Cosinga Palpatine, Ranulph vs Wilhuff Tarkin, Pax Teem vs Ainlee Teem).
+Output: a merge list for confirmation and a coverage figure computed on the cleaned roster.
+
+**Stage B — evidence.** With one name per person, search the whole text using every alias, so a
+row stored as "Damask" can find the passages that say "Plagueis". Keep the passage that states the
+relation; no passage, no proof.
+
+**Stage C — relation and direction.** Derive the relation word and the arrow from that passage
+against a fixed vocabulary with known inverses, and record whether it is current, past or
+suspected. Rows that cannot be rebuilt go to `needs_review`, never to proof.
 
 ---
 
@@ -131,6 +165,7 @@ the other two are dropped — not stacked.
 
 ## 8. Current state, in one line
 
-Coverage target met with two thirds of it from BookNLP and one third from our own model; quality
-measured at ~75%; two stages still unowned (descriptions, speakers); three tests in flight, each
-with a fixed bar.
+Coverage target met on paper (136/182) but the denominator is contaminated by duplicate and
+non-person entries, so the honest figure is being recomputed; quality measured at ~75% by two
+audits and questioned harder by a strict quote check; descriptions unsolved by four approaches;
+speakers untouched; the rebuild of identities, evidence and relation direction is the current job.

@@ -40,9 +40,10 @@ domain, size, licence, or absence of evidence.
 | Licence | Apache-2.0 | Apache-2.0 | Apache-2.0 |
 | Weakness | policy-style judgment 64.0; hallucination head 58.6 | English only; fictional benchmark is 150 passages | unproven locally; cost grows with pairs × types |
 
-All three are untested locally. Probe plan: same frozen pairs, our kinds, blind, scored against
-Q8's assessments and the author's rulings. Operating point comes from each model's own
-precision/recall curve, never a single copied threshold.
+All three were benched. Result: GLiClass AUC 0.727 on the frozen 58, rising to **0.775** on 90 rows
+after the harness's claim string and passage window were fixed; relweave could not run without CUDA
+torch; GLiDRE left 40 of 58 spans unlocatable. Verdict: **sort order only, never a gate** — a judge
+cannot see that a row's arrow points the wrong way. Full record: `ASSESSOR-BENCH.md`.
 
 **Rejected in this slot:** fixed-schema extractors (business, biomedical, DEI, code), models
 with no published accuracy, and anything that needs a knowledge base fiction does not have.
@@ -68,23 +69,35 @@ missing behind every gate decision taken so far.
 
 ---
 
-## 3. The mapper — our biggest measured loss
+## 3. The mapper — measured and dropped
 
-**GLiNER-Linker large** (DeBERTa-v3-large bi-encoder, Apache-2.0): disambiguates a mention
-against a candidate list of entities with labels and descriptions. It is the candidate for the
-identity door.
+**GLiNER-Linker large** (DeBERTa-v3-large bi-encoder, Apache-2.0) was the candidate for the
+identity door. It has since been measured and dropped, because the loss it was meant to fix is not
+a linking loss.
 
-**The diagnosis that justifies it** — three stages, same whole-book outputs, measured:
+**Where the 93% actually goes** — the same whole-book output, broken open:
 
-| layer | number |
+| what a BookNLP "character" cluster is | count |
 |---|---|
-| instrument raw | 3,647 clusters; 12,860 candidate pairs; 27,848/28,807 pronouns linked; 10,005/10,005 quotes attributed |
-| adapter | coverage **0.051** — 93% of candidate pairs die at the roster door |
-| signals among mapped | 1,118 pairs; 121 banked hits; precision 0.108; recall 0.515 of all banked (0.747 of reachable) |
+| no proper-name mention at all ("the old man", pronouns) | 3,091 of 3,647 |
+| named, but a species / organisation / place mislabelled as a person | 323 |
+| named and one of our roster characters | 219 |
+| non-person | 14 |
 
-The reader was never the problem. Any mapper probe must count **bad merges**, not only coverage:
-18 whole-book merges already require quarantine review, and one bad auto-merge once fused six
-people.
+Our adapter already maps **185 of those 219** named roster clusters (84%). A mention linker asked
+to choose among 182 character names for "the Muuns" would produce bad merges, not coverage. The
+real gap is that BookNLP does not resolve *descriptions* to names — a coreference problem, not a
+linking one, and its own README says the default avoids it on purpose because full coreference
+conflates characters.
+
+Measured description attempts, all below bar: BookNLP full coreference (56 joins in 3,279
+clusters), BookNLP big model (4 joins on the test slice), fastcoref/LingMess (16 joins, 2 wrong),
+our pairwise model (63.5% correct, 35% wrong person, 30% correct on hard negatives).
+
+**One correction to earlier numbers:** "27,848 of 28,807 pronouns linked" counted pronouns assigned
+to *any* cluster, including anonymous ones. Of the 27,848, only **14,405 (52%)** sit with a named
+person; 5,157 sit with a description that never gets a name and 8,286 in clusters with neither.
+That 96.7% figure should not be quoted as pronoun-to-character accuracy.
 
 ---
 
@@ -92,7 +105,7 @@ people.
 
 | Resource | Status | What it gives | Numbers |
 |---|---|---|---|
-| BookNLP (upstream) | measured, in use | 3,647 clusters; 27,848/28,807 pronouns; 10,005 quotes; 178 candidates staged | 26 banked hits of 209 (0.124); speakers 0.85 blind; both forks byte-identical |
+| BookNLP (upstream) | measured, in use | 3,647 clusters; 10,005/10,005 quotes attributed; 178 candidates staged | 26 banked hits of 209 (0.124); speakers 0.85 blind; both forks byte-identical. Pronouns: 52% of mentions sit with a named person |
 | GLiNER-Relex large | bench | joint spans and labelled relations, zero-shot | 25.6 average end-to-end |
 | tiny-graph-extractor 0.8B | bench | 0.5GB, sweeps whole books, free-form triplets | 0.796 vs Gemini 2.5 Flash Lite 0.858; 8/200 parse failures |
 
@@ -110,7 +123,10 @@ uncovered names need.
 - **BookNLP speaker attribution** — 34/40 blind (0.85); in production use as a candidate source.
 - **UAR character embeddings** (`gasmichel/UAR_scene`, `UAR_Play`) — trained voice fingerprints.
   Our general-embedding probe failed (nomic: same/cross gap 0.03, top-1 0.18), and their paper's
-  premise is precisely that general embeddings fail; untested here.
+  premise is precisely that general embeddings fail; untested here. The group's EMNLP 2024 follow-up
+  (`deezer/character_embeddings_qa`) injects these into a quotation-attribution model, but its
+  successor — ModernBookNLP, already queued — reports 94.5% on the same benchmark, so the embedding
+  route is a product idea (does this line sound like this character?), not the attribution test.
 - **DramaCV** — the drama corpus behind UAR. Not needed for the pretrained weights; needed only
   if the UAR probe fails and fingerprints must be fine-tuned here.
 
@@ -182,15 +198,29 @@ makes it the stronger evaluation set and the weaker training set.
 
 ---
 
-## 10. Test queue, in order
+## 10. Test queue — what ran, what remains
 
-1. **Assessor bench** — GLiClass Edge vs relweave vs GLiDRE on frozen pairs, blind.
-2. **Valve bench** — GLiNER2 verifier vs Vela on held-aside rows and ARF negatives.
-3. **Mapper probe** — GLiNER-Linker on the 3,647 clusters; coverage and bad merges.
-4. **Sweep** — tiny-graph 0.8B over the passages of the 91 uncovered names.
-5. **Voice** — UAR against nomic on the same 9,093 quotes.
+**Run:**
+
+1. **Assessor bench** — GLiClass Edge scored, relweave blocked (needs CUDA torch), GLiDRE 40/58
+   spans unlocatable. GLiClass AUC 0.727, then 0.775 on 90 labelled rows after two harness bugs
+   were fixed. Verdict: sort order only, never a gate.
+2. **Mapper probe** — dropped. See §3: the named clusters are already mapped, and the rest are
+   not names.
+3. **Descriptions** — four approaches measured, none clears the bar (BookNLP small/big, fastcoref,
+   pairwise). Stage recorded as unsolved.
+
+**Still queued:**
+
+4. **Speakers** — ModernBookNLP graph attribution (reported 94.5% on PDNC); must lift named-speaker
+   share above 66.8% and survive a blind check of 40 changed attributions.
+5. **Valve bench** — GLiNER2 verifier vs Vela on held-aside rows and ARF's 35,230 negatives; this
+   is the invention-rate number still missing behind every gate decision.
 6. **ARF station** — build once, then score every future change there.
-7. **Own worker** — QLoRA on our bank with the Acervo recipe, our kinds, only after 1–4.
+7. **Own worker** — QLoRA on our bank with the Acervo recipe, our kinds, only after 4–5.
+8. **Identity and evidence rebuild** — Stage A roster repair, Stage B re-gather evidence per
+   relation using every alias, Stage C re-derive relation and direction. Current work; see
+   `PIPELINE-PLAN.md` §6a.
 
 ---
 
