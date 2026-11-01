@@ -164,7 +164,11 @@ torch.nn.Module.load_state_dict = _tolerant_load
 const DRIVER_TAIL_WRAPPER = `
 from booknlp.booknlp import BookNLP
 inp, outdir, book_id = sys.argv[1], sys.argv[2], sys.argv[3]
-nlp = BookNLP("en", {"pipeline": "entity,quote,event,coref", "model": "small"})
+params = {"pipeline": "entity,quote,event,coref", "model": "small"}
+import os as _os
+if _os.environ.get("BOOKNLP_PRONOMINAL") == "0":
+    params["pronominalCorefOnly"] = False
+nlp = BookNLP("en", params)
 nlp.process(inp, outdir, book_id)
 `;
 
@@ -174,7 +178,11 @@ nlp.process(inp, outdir, book_id)
 const DRIVER_TAIL_ENGLISH = `
 from booknlp.english.english_booknlp import EnglishBookNLP
 inp, outdir, book_id = sys.argv[1], sys.argv[2], sys.argv[3]
-nlp = EnglishBookNLP({"pipeline": "entity,quote,event,coref", "model": "small"})
+params = {"pipeline": "entity,quote,event,coref", "model": "small"}
+import os as _os
+if _os.environ.get("BOOKNLP_PRONOMINAL") == "0":
+    params["pronominalCorefOnly"] = False
+nlp = EnglishBookNLP(params)
 nlp.process(inp, outdir, book_id)
 `;
 

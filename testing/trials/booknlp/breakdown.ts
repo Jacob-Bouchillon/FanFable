@@ -25,8 +25,8 @@ import { loadIdentityContext, createResolver } from '../../../fanfable/src/ident
 import { bodyRows, detok, normName, pairKey } from './rel-signals.ts';
 
 const TRACK = 'testing/trials/booknlp';
-const BOOK_OUT = `${TRACK}/out-book`;
-const BOOK_ID = 'book';
+const BOOK_OUT = process.env.BOOKNLP_OUT ?? `${TRACK}/out-book`;
+const BOOK_ID = process.env.BOOKNLP_ID ?? 'book';
 const DB_PATH = 'testing/trials/halfbook-run/plagueis-half.db';
 const PROJECT = 'halfbook';
 
@@ -221,6 +221,18 @@ export function run(): Record<string, unknown> {
     for (const persons of chainPerson.values()) {
       for (const id of persons) mappedPersons.add(id);
     }
+    // Nominal-merge diagnostics: mapped chains carrying a NOM mention, and
+    // chains naming two or more distinct roster persons (bad merges).
+    const hasNom = new Map<number, boolean>();
+    for (const c of chars) {
+      hasNom.set(Number(c.id), ((c.mentions?.common ?? []).length ?? 0) > 0);
+    }
+    let mappedWithNom = 0;
+    let badMerges = 0;
+    for (const [id, persons] of chainPerson) {
+      if (persons.length >= 2) badMerges++;
+      if (persons.length >= 1 && hasNom.get(id) === true) mappedWithNom++;
+    }
     // Pair survival: own-namespace pairs with both endpoints mapped.
     let survived = 0;
     for (const [a, b] of pairKeys) {
@@ -238,6 +250,8 @@ export function run(): Record<string, unknown> {
       ambiguous,
       absent,
       chainsMapped: [...chainPerson.values()].filter((p) => p.length >= 1).length,
+      mappedWithNom,
+      badMerges,
       chainsTotal: chars.length,
       mappingCoverage: coverage,
       ownPairs: ownPairs.size,
