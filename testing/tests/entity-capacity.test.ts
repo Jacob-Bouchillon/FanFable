@@ -20,6 +20,7 @@ function addEntity(
   opts: {
     kind?: string;
     aliases?: string[];
+    summary?: string;
     role?: string;
     status?: string;
     mentions?: number;
@@ -30,12 +31,13 @@ function addEntity(
 ): number {
   return db.run(
     `INSERT INTO canon_entity
-       (project_id, kind, name, aliases, role, status, mentions, evidence, source_refs, review_status, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (project_id, kind, name, aliases, summary, role, status, mentions, evidence, source_refs, review_status, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     projectId,
     opts.kind ?? 'character',
     name,
     JSON.stringify(opts.aliases ?? []),
+    opts.summary ?? '',
     opts.role ?? '',
     opts.status ?? '',
     opts.mentions ?? 1,
@@ -386,16 +388,59 @@ test('lore capacity dry-run reports without writing; the real run parks', () => 
       cwd: resolve(import.meta.dirname, '../..'),
       encoding: 'utf8',
     });
+  const capacityRulings = (): number =>
+    ruling
+      .listRulings(db, project.id, { subject: ruling.entitySubject(id) })
+      .filter((entry) => entry.standard === 'capacity').length;
 
   const dry = run('--dry-run', '--limit', '1');
   assert.match(dry, /scanned 1, parked 1, funneled 0, skipped 1, skippedReferenced 0/);
   assert.equal(db.get<{ review_status: string }>('SELECT review_status FROM canon_entity WHERE id = ?', id)!.review_status, 'accepted');
+  assert.equal(capacityRulings(), 0, 'a dry run writes no ruling');
 
   const real = run('--limit', '1');
   assert.match(real, /scanned 1, parked 1, funneled 0, skipped 1, skippedReferenced 0/);
   assert.equal(db.get<{ review_status: string }>('SELECT review_status FROM canon_entity WHERE id = ?', id)!.review_status, 'needs_review');
+  assert.equal(capacityRulings(), 1, 'the first parking records one capacity ruling');
 
   const second = run('--limit', '1');
   assert.match(second, /scanned 1, parked 0, funneled 0, skipped 0, skippedReferenced 0/);
+  assert.equal(capacityRulings(), 1, 'a second pass does not duplicate the ruling');
+  db.close();
+});
+
+test('lore correct entity --kind normalises the kind and keeps the summary', () => {
+  const { db, path } = tempDb();
+  const project = controller.createProject(db, 'entity-cli-kind');
+  const id = addEntity(db, project.id, 'Old Harbour', {
+    kind: 'character',
+    summary: 'A working harbour.',
+  });
+  const cli = resolve(import.meta.dirname, '../../fanfable/src/cli.ts');
+  const output = execFileSync(
+    process.execPath,
+    [
+      '--no-warnings',
+      cli,
+      '--db',
+      path,
+      '--project',
+      project.name,
+      'lore',
+      'correct',
+      'entity',
+      String(id),
+      '--kind',
+      'Place',
+    ],
+    { cwd: resolve(import.meta.dirname, '../..'), encoding: 'utf8' },
+  );
+  assert.match(output, /Entity updated\./);
+  const row = db.get<{ kind: string; summary: string }>(
+    'SELECT kind, summary FROM canon_entity WHERE id = ?',
+    id,
+  )!;
+  assert.equal(row.kind, 'location', 'Place is normalised to the stored label');
+  assert.equal(row.summary, 'A working harbour.', 'the partial patch keeps the summary');
   db.close();
 });

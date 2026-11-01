@@ -138,6 +138,16 @@ test('rival wording maps to rival of and authorises the reverse claim', () => {
   db.close();
 });
 
+test('relative of accepts both arrows', () => {
+  const { db, project, asha, bram, add } = setup();
+  add(asha, bram, 'relative of');
+  const forward = "Asha is Bram's relative.";
+  const reverse = "Bram is Asha's relative.";
+  assert.equal(guard(db, project.id, "Is Asha Bram's relative?", forward), forward);
+  assert.equal(guard(db, project.id, "Is Asha Bram's relative?", reverse), reverse);
+  db.close();
+});
+
 test('a directional role still rejects the wrong arrow', () => {
   const { db, project, asha, bram, add } = setup();
   add(asha, bram, 'mother of');

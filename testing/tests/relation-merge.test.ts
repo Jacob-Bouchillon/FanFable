@@ -191,6 +191,8 @@ test('dedupe keeps both directions of a directional kind and folds a symmetric o
   insert(db, project.id, tor, mara, 'aunt of', { evidence: 'Mara is the aunt of Tor.', chunkId: c });
   insert(db, project.id, mara, tor, 'friend of', { evidence: 'Mara and Tor are friends.', chunkId: c });
   insert(db, project.id, tor, mara, 'friend of', { evidence: 'Mara and Tor are friends.', chunkId: c });
+  insert(db, project.id, mara, tor, 'relative of', { evidence: 'Mara and Tor are relatives.', chunkId: c });
+  insert(db, project.id, tor, mara, 'relative of', { evidence: 'Mara and Tor are relatives.', chunkId: c });
 
   lorebook.dedupeRelations(db, project.id);
 
@@ -203,6 +205,7 @@ test('dedupe keeps both directions of a directional kind and folds a symmetric o
     [
       { kind: 'aunt of', n: 2 },
       { kind: 'friend of', n: 1 },
+      { kind: 'relative of', n: 1 },
     ],
   );
   db.close();

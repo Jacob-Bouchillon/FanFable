@@ -200,15 +200,18 @@ export function flagIdentityCollisions(
           entity.id,
           projectId,
         );
-        recordRuling(db, projectId, {
-          subject: entitySubject(entity.id),
-          role: 'appeal',
-          actor: 'guard',
-          standard: 'identity-collision',
-          fromStatus: entity.review_status,
-          toStatus: 'needs_review',
-          basis: reason,
-        });
+        // The reason may change on a rerun; the ruling is only for the move.
+        if (entity.review_status !== 'needs_review') {
+          recordRuling(db, projectId, {
+            subject: entitySubject(entity.id),
+            role: 'appeal',
+            actor: 'guard',
+            standard: 'identity-collision',
+            fromStatus: entity.review_status,
+            toStatus: 'needs_review',
+            basis: reason,
+          });
+        }
       });
     }
   }

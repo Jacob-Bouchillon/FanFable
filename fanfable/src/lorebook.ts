@@ -4833,7 +4833,7 @@ export const KIND_GLOSSES: Readonly<Record<string, { says: string; direction: Ki
   },
   'relative of': {
     says: 'Is kin by blood or marriage when no closer term fits; differs from sibling of and cousin of in leaving the degree of kinship unspecified.',
-    direction: 'directional',
+    direction: 'symmetric',
   },
   'friend of': {
     says: 'Holds personal affection and companionable regard for the other person beyond a working tie; differs from acquaintance in closeness, and from ally of in affection rather than a shared cause.',
@@ -9421,15 +9421,18 @@ export function checkEntityCapacity(
           projectId,
           entity.id,
         );
-        recordRuling(db, projectId, {
-          subject: entitySubject(entity.id),
-          role: 'appeal',
-          actor: 'guard',
-          standard: 'capacity',
-          fromStatus: 'accepted',
-          toStatus: 'needs_review',
-          basis: 'unproven entity parked (single mention, no role or tie)',
-        });
+        // Park the row either way; only a real status move is a new decision.
+        if (entity.review_status !== 'needs_review') {
+          recordRuling(db, projectId, {
+            subject: entitySubject(entity.id),
+            role: 'appeal',
+            actor: 'guard',
+            standard: 'capacity',
+            fromStatus: entity.review_status,
+            toStatus: 'needs_review',
+            basis: 'unproven entity parked (single mention, no role or tie)',
+          });
+        }
       });
     }
   }

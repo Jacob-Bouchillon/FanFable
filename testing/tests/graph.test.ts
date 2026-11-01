@@ -334,6 +334,55 @@ test('the graph context is bounded and carries evidence', async () => {
   db.close();
 });
 
+test('a quarantined entity stays out of the retrieval context but not diagnostics', () => {
+  const { db } = tempDb();
+  const project = controller.createProject(db, 'graph-quarantine');
+  const now = '2026-01-01T00:00:00.000Z';
+  const ent = (name: string, reviewStatus: string): number =>
+    db.run(
+      `INSERT INTO canon_entity
+         (project_id, kind, name, aliases, summary, evidence, source_refs, review_status, created_at, updated_at)
+       VALUES (?, 'character', ?, '[]', ?, ?, '[]', ?, ?, ?)`,
+      project.id,
+      name,
+      `${name} keeps the gate.`,
+      `${name} stood at the gate.`,
+      reviewStatus,
+      now,
+      now,
+    ).lastInsertRowid;
+  const asha = ent('Asha', 'accepted');
+  const bill = ent('Bill', 'quarantined');
+  db.run(
+    `INSERT INTO canon_relation (project_id, from_entity, to_entity, kind, evidence, source_refs, review_status, created_at)
+     VALUES (?, ?, ?, 'ally of', 'Asha stood with Bill.', '[]', 'accepted', ?)`,
+    project.id,
+    asha,
+    bill,
+    now,
+  );
+
+  const full = graph.loadGraph(db, project.id);
+  assert.ok(full.nodes.has(graph.canonEntityId(bill)), 'diagnostics still load the quarantined row');
+  assert.ok(full.nodes.has(graph.canonEntityId(asha)), 'and the accepted control');
+
+  const ctx = graph.buildGraphContext(db, project.id, { focus: ['Asha', 'Bill'], hops: 1 });
+  assert.ok(
+    !ctx.nodes.some((node) => node.id === graph.canonEntityId(bill)),
+    'the quarantined entity is not a context node',
+  );
+  assert.ok(!ctx.text.includes('Bill'), 'nor does the rendered text name it');
+  assert.ok(
+    !ctx.edges.some((edge) => edge.from === graph.canonEntityId(bill) || edge.to === graph.canonEntityId(bill)),
+    'the relation touching it contributes no edge',
+  );
+  assert.ok(
+    ctx.nodes.some((node) => node.id === graph.canonEntityId(asha)),
+    'the accepted control keeps the context non-empty',
+  );
+  db.close();
+});
+
 test('the graph survives a restart', async () => {
   const { db, path } = tempDb();
   const project = await seedProject(db, 'graph-restart');

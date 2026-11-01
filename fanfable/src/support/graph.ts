@@ -208,6 +208,8 @@ interface GraphLoadOptions {
   maxNodes?: number;
   /** Load the association layer (alias/resemblance/co-occurrence edges). Default on. */
   web?: boolean;
+  /** Leave quarantined canon entities out of the graph (retrieval context). */
+  excludeQuarantined?: boolean;
 }
 
 function addNode(graph: Graph, node: GraphNode): void {
@@ -244,6 +246,7 @@ export function loadGraph(db: Db, projectId: number, opts: GraphLoadOptions = {}
   const scope = opts.scope ?? 'both';
   const includeFacts = opts.includeFacts ?? true;
   const maxNodes = opts.maxNodes ?? 20_000;
+  const excludeQuarantined = opts.excludeQuarantined === true;
   const graph: Graph = { nodes: new Map(), edges: [], adjacency: new Map(), byNumeric: new Map() };
 
   /* ------------------------------------------------------------- canon */
@@ -261,7 +264,10 @@ export function loadGraph(db: Db, projectId: number, opts: GraphLoadOptions = {}
       confidence: number;
       review_status: string;
       first_chunk: number | null;
-    }>('SELECT * FROM canon_entity WHERE project_id = ? ORDER BY id', projectId);
+    }>(
+      `SELECT * FROM canon_entity WHERE project_id = ?${excludeQuarantined ? " AND review_status != 'quarantined'" : ''} ORDER BY id`,
+      projectId,
+    );
     for (const e of entities) {
       if (graph.nodes.size >= maxNodes) break;
       addNode(graph, {
@@ -1849,7 +1855,7 @@ export function buildGraphContext(
   projectId: number,
   opts: GraphContextOptions = {},
 ): GraphContext {
-  const graph = loadGraph(db, projectId, { scope: opts.scope, web: opts.web });
+  const graph = loadGraph(db, projectId, { scope: opts.scope, web: opts.web, excludeQuarantined: true });
   const queryTerms = terms(opts.query ?? '');
   const focusNames = opts.focus ?? [];
 
@@ -2170,7 +2176,7 @@ export async function buildPprGraphContext(
   projectId: number,
   opts: GraphContextOptions = {},
 ): Promise<GraphContext> {
-  const graph = loadGraph(db, projectId, { scope: opts.scope, web: opts.web });
+  const graph = loadGraph(db, projectId, { scope: opts.scope, web: opts.web, excludeQuarantined: true });
   const edgeById = new Map(graph.edges.map((edge) => [edge.id, edge]));
   const queryTerms = terms(opts.query ?? '');
   const focusNames = opts.focus ?? [];
