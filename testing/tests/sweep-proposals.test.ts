@@ -13,15 +13,23 @@ type Db = ReturnType<typeof tempDb>['db'];
 
 const QUOTE = "Mara's brother, Corin, waited inside.";
 
-function addEntity(db: Db, projectId: number, name: string, mentions = 1, kind = 'character'): number {
+function addEntity(
+  db: Db,
+  projectId: number,
+  name: string,
+  mentions = 1,
+  kind = 'character',
+  aliases: string[] = [],
+): number {
   return Number(
     db.run(
       `INSERT INTO canon_entity
          (project_id, kind, name, aliases, role, status, mentions, evidence, source_refs, review_status, created_at, updated_at)
-       VALUES (?, ?, ?, '[]', '', '', ?, '', '[]', 'accepted', ?, ?)`,
+       VALUES (?, ?, ?, ?, '', '', ?, '', '[]', 'accepted', ?, ?)`,
       projectId,
       kind,
       name,
+      JSON.stringify(aliases),
       mentions,
       AT,
       AT,
@@ -152,6 +160,93 @@ test('a second sweep adds no duplicates', async () => {
   assert.equal(second.proposals, 0);
   assert.equal(second.skippedPending, 1);
   assert.equal(db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_tie_note WHERE project_id = ?', project)!.n, 1);
+  db.close();
+});
+
+test('a reverse-direction pending note is a different claim', async () => {
+  const { db } = tempDb();
+  const project = createProject(db, 'sweep-direction');
+  addEntity(db, project.id, 'Mara', 5);
+  addEntity(db, project.id, 'Corin', 2);
+  addChunk(db, project.id, "Mara's brother, Corin, waited inside.");
+  const provider = mockProvider((req) => {
+    if (!(req.system ?? '').startsWith('You track one character')) return '{}';
+    const user = req.messages[0]!.content;
+    if (user.includes('Character: Mara')) {
+      return JSON.stringify({ ties: [{ to: 'Corin', kind: 'brother of', line: 0 }], notes: [] });
+    }
+    if (user.includes('Character: Corin')) {
+      return JSON.stringify({ ties: [{ to: 'Mara', kind: 'brother of', line: 0 }], notes: [] });
+    }
+    return '{}';
+  });
+
+  const result = await runNameSweep(db, provider, project.id, { batchSize: 60 });
+  assert.equal(result.proposals, 2, 'the reversed arrow is its own pending claim');
+  const notes = db.all<{ attempted_kind: string }>(
+    'SELECT attempted_kind FROM canon_tie_note WHERE project_id = ? ORDER BY id',
+    project.id,
+  );
+  assert.deepEqual(notes.map((note) => note.attempted_kind), ['brother of', 'brother of']);
+  db.close();
+});
+
+test('a later batch does not erase a tie found earlier', async () => {
+  const { db } = tempDb();
+  const project = createProject(db, 'sweep-batches');
+  addEntity(db, project.id, 'Mara', 5);
+  addEntity(db, project.id, 'Corin', 2);
+  addChunk(db, project.id, 'Mara waited. Mara looked up. Mara left.');
+  let maraBatch = 0;
+  const provider = mockProvider((req) => {
+    if (!(req.system ?? '').startsWith('You track one character')) return '{}';
+    if (!req.messages[0]!.content.includes('Character: Mara')) return '{}';
+    maraBatch++;
+    return maraBatch === 1
+      ? JSON.stringify({ ties: [{ to: 'Corin', kind: 'friend of', line: 0 }], notes: [] })
+      : JSON.stringify({ ties: [], notes: [] });
+  });
+  const result = await runNameSweep(db, provider, project.id, { batchSize: 1 });
+  assert.equal(result.proposals, 1);
+  const note = db.get<{ evidence: string }>('SELECT evidence FROM canon_tie_note WHERE project_id = ?', project.id)!;
+  assert.equal(note.evidence, 'Mara waited.');
+  db.close();
+});
+
+test('malformed or out-of-batch line numbers never become citations', async () => {
+  const { db } = tempDb();
+  const project = createProject(db, 'sweep-lines');
+  addEntity(db, project.id, 'Mara', 5);
+  addEntity(db, project.id, 'Corin', 2);
+  addChunk(db, project.id, 'Mara waited. Mara looked up. Mara left.');
+  const lines: unknown[] = ['1.5', 0, '-1'];
+  let call = 0;
+  const provider = mockProvider((req) => {
+    if (!(req.system ?? '').startsWith('You track one character')) return '{}';
+    if (!req.messages[0]!.content.includes('Character: Mara')) return '{}';
+    return JSON.stringify({ ties: [{ to: 'Corin', kind: 'friend of', line: lines[call++] }], notes: [] });
+  });
+  const result = await runNameSweep(db, provider, project.id, { batchSize: 1 });
+  assert.equal(result.proposals, 0);
+  assert.equal(db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_tie_note WHERE project_id = ?', project.id)!.n, 0);
+  db.close();
+});
+
+test('a shared alias target is reported unresolved, not attached by popularity', async () => {
+  const { db } = tempDb();
+  const project = createProject(db, 'sweep-ambiguous');
+  addEntity(db, project.id, 'Mara', 5);
+  addEntity(db, project.id, 'First Captain', 1, 'character', ['Captain']);
+  addEntity(db, project.id, 'Second Captain', 2, 'character', ['Captain']);
+  addChunk(db, project.id, 'Mara trusted Captain.');
+  const provider = mockProvider((req) => {
+    if (!(req.system ?? '').startsWith('You track one character')) return '{}';
+    if (!req.messages[0]!.content.includes('Character: Mara')) return '{}';
+    return JSON.stringify({ ties: [{ to: 'Captain', kind: 'trusted', line: 0 }], notes: [] });
+  });
+  const result = await runNameSweep(db, provider, project.id, { batchSize: 60 });
+  assert.equal(result.proposals, 0);
+  assert.deepEqual(result.unresolvedTargets, ['Mara -> Captain']);
   db.close();
 });
 

@@ -1009,7 +1009,11 @@ export function starvedThreads(
     oldest_open_end: string | null;
   }>(
     `SELECT t.id, t.kind, COALESCE(ea.name, '') AS a_name, eb.name AS b_name, t.created_at,
-            (SELECT COUNT(*) FROM canon_thread_note n WHERE n.thread_id = t.id) AS note_count,
+            (SELECT COUNT(*) FROM (
+               SELECT id FROM canon_thread_note WHERE thread_id = t.id
+               UNION
+               SELECT note_id FROM canon_thread_note_ref WHERE thread_id = t.id
+             )) AS note_count,
             (SELECT COUNT(*) FROM canon_open_end o WHERE o.thread_id = t.id AND o.status = 'open') AS open_end_count,
             (SELECT MIN(o.created_at) FROM canon_open_end o WHERE o.thread_id = t.id AND o.status = 'open') AS oldest_open_end
        FROM canon_thread t
@@ -1017,7 +1021,10 @@ export function starvedThreads(
        LEFT JOIN canon_entity eb ON eb.id = t.b_entity
       WHERE t.project_id = ?
         AND (
-          NOT EXISTS (SELECT 1 FROM canon_thread_note n WHERE n.thread_id = t.id)
+          (
+            NOT EXISTS (SELECT 1 FROM canon_thread_note n WHERE n.thread_id = t.id)
+            AND NOT EXISTS (SELECT 1 FROM canon_thread_note_ref r WHERE r.thread_id = t.id)
+          )
           OR EXISTS (
             SELECT 1 FROM canon_open_end o
              WHERE o.thread_id = t.id AND o.status = 'open' AND o.created_at <= ?

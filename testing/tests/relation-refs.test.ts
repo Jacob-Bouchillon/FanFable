@@ -67,6 +67,54 @@ test('a claim with no matching passage becomes a no-ref tie note', async () => {
   db.close();
 });
 
+test('a relation cannot cite a chunk from another project', () => {
+  const { db, project, asha, bram } = setup();
+  const other = controller.createProject(db, 'other-project');
+  const otherSource = db.run(
+    'INSERT INTO canon_source (project_id, path, title, sha256, imported_at) VALUES (?, ?, ?, ?, ?)',
+    other.id, '/other', 'Other', 'sha-other', AT,
+  ).lastInsertRowid;
+  const foreignChunk = db.run(
+    'INSERT INTO canon_chunk (source_id, project_id, seq, locator, heading, text, words) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    otherSource, other.id, 1, 'p. 1', '', PASSAGE, 8,
+  ).lastInsertRowid;
+  assert.throws(
+    () => lorebook.insertRelation(db, project.id, {
+      fromEntity: asha, toEntity: bram, kind: 'ally of', evidence: PASSAGE,
+      sourceRefs: JSON.stringify([{ chunk: foreignChunk }]),
+    }),
+    /chunks in this project/,
+  );
+  // Legacy rows are still judged against their own project, never a foreign
+  // chunk whose text happens to match.
+  const relationId = Number(db.run(
+    `INSERT INTO canon_relation
+       (project_id, from_entity, to_entity, kind, evidence, source_refs, confidence, review_status, created_at)
+     VALUES (?, ?, ?, 'ally of', ?, ?, 0.9, 'provisional', ?)`,
+    project.id, asha, bram, PASSAGE, JSON.stringify([{ chunk: foreignChunk }]), AT,
+  ).lastInsertRowid);
+  assert.equal(lorebook.canPromoteRelation(db, project.id, relationId).reason, 'quote-not-verbatim');
+  db.close();
+});
+
+test('promotion by id checks a stored anchor just like the direct guard', () => {
+  const { db, project, chunkId, asha, bram } = setup();
+  const relationId = Number(db.run(
+    `INSERT INTO canon_relation
+       (project_id, from_entity, to_entity, kind, evidence, source_refs, anchor_evidence, confidence, review_status, created_at)
+     VALUES (?, ?, ?, 'ally of', ?, ?, ?, 0.9, 'provisional', ?)`,
+    project.id,
+    asha,
+    bram,
+    PASSAGE,
+    JSON.stringify([{ chunk: chunkId }]),
+    'An invented sentence that is nowhere in the passage.',
+    AT,
+  ).lastInsertRowid);
+  assert.equal(lorebook.canPromoteRelation(db, project.id, relationId).reason, 'quote-not-verbatim');
+  db.close();
+});
+
 test('the audit finds no locator-only refs in a clean DB and one when seeded', () => {
   const { db, project, chunkId, asha, bram } = setup();
   assert.deepEqual(lorebook.findLocatorOnlyRefs(db, project.id), []);

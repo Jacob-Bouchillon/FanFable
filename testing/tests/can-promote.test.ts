@@ -10,6 +10,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as controller from '../../fanfable/src/plan/controller.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
+import { buildRosterIndex } from '../../fanfable/src/identity/names.ts';
 import { tempDb } from './helpers.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';
@@ -62,12 +63,19 @@ interface Fixture {
   to: string;
   kind: string;
   evidence: string;
+  anchorEvidence?: string;
   confidence?: number;
   prior?: { evidence: string; ruling: string; kind?: string };
 }
 
-function decide(fixture: Fixture, chunkText = fixture.evidence) {
+function decide(fixture: Fixture, chunkText = [fixture.evidence, fixture.anchorEvidence].filter(Boolean).join(' ')) {
   const { db, project, fromId, toId } = setup(fixture.from, fixture.to, fixture.prior);
+  // The command's roster index, as production promotion builds it: derived
+  // given/surname forms resolve a quote that uses less than the stored name.
+  const index = buildRosterIndex(
+    [{ name: fixture.from, aliases: [] }, { name: fixture.to, aliases: [] }],
+    chunkText,
+  );
   const decision = lorebook.canPromote(
     {
       fromId,
@@ -76,9 +84,10 @@ function decide(fixture: Fixture, chunkText = fixture.evidence) {
       toName: fixture.to,
       kind: fixture.kind,
       evidence: fixture.evidence,
+      anchorEvidence: fixture.anchorEvidence,
       confidence: fixture.confidence,
     },
-    { db, projectId: project.id, chunkText },
+    { db, projectId: project.id, chunkText, index },
   );
   db.close();
   return decision;
@@ -86,33 +95,57 @@ function decide(fixture: Fixture, chunkText = fixture.evidence) {
 
 const RULED_PARK = 'PARK (user: he only had 1; 2026-10-27)';
 
-const OLD_REFUSALS: Fixture[] = [
+/**
+ * The old adjudication vetoes — grammar, concept membership, direction — are
+ * gone. The endpoint rule is the citation's own proof and stays: the quote
+ * (with any anchor) must name both people. These historical fixtures are kept
+ * as data so the difference is visible; only the one whose quote names both
+ * people still banks.
+ */
+const OLD_REFUSALS: { fixture: Fixture; reason?: 'endpoint-unnamed' }[] = [
   {
-    from: 'Maa Kaap', to: 'Doo Zuto', kind: 'appears_with',
-    evidence: 'love the work, or perhaps be on the run—from the law, yourself, or whoever else.',
+    fixture: {
+      from: 'Maa Kaap', to: 'Doo Zuto', kind: 'appears_with',
+      evidence: 'love the work, or perhaps be on the run—from the law, yourself, or whoever else.',
+    },
+    reason: 'endpoint-unnamed',
   },
   {
-    from: 'Alderaanian Senator Bail Antilles', to: 'Senator Eelen Li', kind: 'appears_with',
-    evidence: 'Servants hurried over to take Valorum’s and Taria’s veda cloth cloaks.',
+    fixture: {
+      from: 'Alderaanian Senator Bail Antilles', to: 'Senator Eelen Li', kind: 'appears_with',
+      evidence: 'Servants hurried over to take Valorum’s and Taria’s veda cloth cloaks.',
+    },
+    reason: 'endpoint-unnamed',
   },
   {
-    from: 'Darth Plagueis', to: 'Palpatine', kind: 'contacting',
-    evidence: 'No. The young human—Palpatine. A deep-space transmission.',
+    fixture: {
+      from: 'Darth Plagueis', to: 'Palpatine', kind: 'contacting',
+      evidence: 'No. The young human—Palpatine. A deep-space transmission.',
+    },
+    reason: 'endpoint-unnamed',
   },
   {
-    from: 'Ronhar Kim', to: 'Jedi Knights', kind: 'family of',
-    evidence: 'But that he considers the Temple to be his home and the Jedi to be his family.',
+    fixture: {
+      from: 'Ronhar Kim', to: 'Jedi Knights', kind: 'family of',
+      evidence: 'But that he considers the Temple to be his home and the Jedi to be his family.',
+    },
+    reason: 'endpoint-unnamed',
   },
   {
-    from: 'Darth Plagueis', to: 'Darth Sidious', kind: 'challenged',
-    evidence: 'This being who had survived assassinations and killed countless opponents merely gazed at Sidious, until it struck him that Plagueis was challenging him!',
+    fixture: {
+      from: 'Darth Plagueis', to: 'Darth Sidious', kind: 'challenged',
+      evidence: 'This being who had survived assassinations and killed countless opponents merely gazed at Sidious, until it struck him that Plagueis was challenging him!',
+    },
   },
 ];
 
-for (const fixture of OLD_REFUSALS) {
-  test(`no longer refuses ${fixture.kind}: ${fixture.from} / ${fixture.to}`, () => {
-    assert.deepEqual(decide(fixture), { ok: true });
-  });
+for (const [index, { fixture, reason }] of OLD_REFUSALS.entries()) {
+  test(
+    `${reason ? 'the endpoint rule stops' : 'no longer refuses'} fixture ${index + 1} (${fixture.kind})`,
+    () => {
+      assert.deepEqual(decide(fixture), reason ? { ok: false, reason } : { ok: true });
+    },
+  );
 }
 
 test('a PARK binds a different quote for the same pair and kind', () => {
@@ -181,9 +214,31 @@ test('the guard refuses a quote that is not in the cited chunk, whatever the sco
   assert.deepEqual(decision, { ok: false, reason: 'quote-not-verbatim' });
 });
 
-test('one endpoint in the quote is not a promotion requirement', () => {
+test('a quote that names only one endpoint is refused without an anchor', () => {
   const decision = decide({
     from: 'Asha', to: 'Bram', kind: 'sister of', evidence: 'Asha waited by the gate.',
+  });
+  assert.deepEqual(decision, { ok: false, reason: 'endpoint-unnamed' });
+});
+
+test('an anchor naming the other endpoint completes a one-name quote', () => {
+  const decision = decide({
+    from: 'Asha',
+    to: 'Bram',
+    kind: 'sister of',
+    evidence: 'Asha waited by the gate.',
+    anchorEvidence: 'Bram came down the road to meet her.',
+  });
+  assert.deepEqual(decision, { ok: true });
+});
+
+test('a pronoun-only quote banks when its anchor names both people', () => {
+  const decision = decide({
+    from: 'Asha',
+    to: 'Bram',
+    kind: 'sister of',
+    evidence: 'She waited by the gate.',
+    anchorEvidence: "Asha was Bram's sister.",
   });
   assert.deepEqual(decision, { ok: true });
 });

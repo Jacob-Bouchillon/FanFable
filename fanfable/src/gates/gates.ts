@@ -107,6 +107,49 @@ export function mentionSpans(text: string, name: string, aliases: string[], inde
   return spans;
 }
 
+/**
+ * True when the citation names both endpoints at two different places.
+ *
+ * One surface string cannot stand for both sides. When two rows share an alias
+ * (one row carrying the other's name as an alias), a quote that says only that
+ * name would otherwise satisfy both endpoints and prove a tie between a person
+ * and themself. Requiring two disjoint mentions closes that hole without
+ * needing to know who is who, and without trusting model-written aliases.
+ */
+export function namesBothDistinctly(
+  quote: string,
+  fromName: string,
+  fromAliases: string[],
+  toName: string,
+  toAliases: string[],
+  index?: RosterIndex,
+): boolean {
+  const from = mentionSpans(quote, fromName, fromAliases, index);
+  const to = mentionSpans(quote, toName, toAliases, index);
+  return from.some(([s1, e1]) => to.some(([s2, e2]) => e1 < s2 || e2 < s1));
+}
+
+/**
+ * True when the citation names both endpoints. The quote states the claim;
+ * the anchor may supply the sentence that names the other person. The two
+ * halves are read as one citation, so a pronoun-only quote can bank only
+ * when its anchor names both people, and a one-name quote only when the
+ * anchor supplies the other. A citation that names neither, or names the
+ * same side twice, proves no tie.
+ */
+export function citationNamesBothEndpoints(row: PromoteRow, index?: RosterIndex): boolean {
+  const anchor = (row.anchorEvidence ?? '').trim();
+  const citation = anchor ? `${row.evidence} ${anchor}` : row.evidence;
+  return namesBothDistinctly(
+    citation,
+    row.fromName,
+    row.fromAliases ?? [],
+    row.toName,
+    row.toAliases ?? [],
+    index,
+  );
+}
+
 /** Words only: possessives split out, punctuation to spaces, lowercased. */
 export function assertionWords(text: string): string[] {
   return text
@@ -217,10 +260,12 @@ export function quoteVerbatimReason(row: PromoteRow, chunkText?: string | null):
 }
 
 /**
- * The proven-tie track's quote rule: the citation is verbatim and hides no
- * hedge or denial in its sentence. Born in the gate split as an exact copy
- * of the attested rule so the two tracks can evolve apart; today they agree.
- * It must never weaken the verbatim floor to rescue a good claim.
+ * The proven-tie track's quote rule: the citation is verbatim, hides no
+ * hedge or denial in its sentence, and names both endpoints (the quote may
+ * name one and its anchor the other). Born in the gate split as an exact copy
+ * of the attested rule so the two tracks can evolve apart; the endpoint rule
+ * is the proven track's own. It must never weaken the verbatim floor to
+ * rescue a good claim.
  */
 export function keeperQuoteReason(row: PromoteRow, chunkText?: string | null, index?: RosterIndex): PromoteReason | null {
   const verbatim = quoteVerbatimReason(row, chunkText);
@@ -233,6 +278,9 @@ export function keeperQuoteReason(row: PromoteRow, chunkText?: string | null, in
     const holding = splitSentences(chunk).find((sentence) => normalise(sentence).includes(normalise(span))) ?? span;
     if (leadingDenialOrHedge(holding, row, index)) return 'assertion-missing';
   }
+  // Mechanical proof: the citation must put both people in the sentence, not
+  // merely in the roster. A quote that names neither side proves no tie.
+  if (!citationNamesBothEndpoints(row, index)) return 'endpoint-unnamed';
   return null;
 }
 

@@ -81,8 +81,10 @@ export {
 export {
   DEFAULT_MIN_CONFIDENCE,
   attestedQuoteReason,
+  citationNamesBothEndpoints,
   claimTier,
   keeperQuoteReason,
+  namesBothDistinctly,
   provenRelation,
   type AttestedReason,
   type PromoteContext,
@@ -93,6 +95,7 @@ export {
 import {
   DEFAULT_MIN_CONFIDENCE,
   attestedQuoteReason,
+  citationNamesBothEndpoints,
   claimTier,
   explicitVariants,
   keeperQuoteReason,
@@ -1520,63 +1523,149 @@ function refsSeq(db: Db, sourceRefs: string): number | null {
   return db.get<{ seq: number }>('SELECT seq FROM canon_chunk WHERE id = ?', chunkId)?.seq ?? null;
 }
 
-/** The earlier of two places; a known place beats an unknown one. */
-function earliestRefs(db: Db, a: string, b: string): string {
-  const sa = refsSeq(db, a);
-  const sb = refsSeq(db, b);
-  if (sa === null) return sb === null ? a : b;
-  if (sb === null) return a;
-  return sa <= sb ? a : b;
+/**
+ * One citation, kept together. Every primary field of a relation is written
+ * from a single bundle, so a surviving row never pairs one run's quote with
+ * another run's place, anchor, or score.
+ */
+interface EvidenceBundle {
+  id: number | null;
+  description: string;
+  evidence: string;
+  source_refs: string;
+  kind_source: string;
+  anchor_evidence: string;
+  confidence: number;
+  review_status: string;
+  supporting_evidence: string;
+}
+
+/**
+ * True when `candidate` makes the better primary citation.
+ *
+ * Trust first (a verdict outranks an unjudged row), then the model's own
+ * strength, then the longer quote, then the earlier place, then the earlier
+ * row. The order is total and deterministic, so two runs over the same rows
+ * choose the same bundle.
+ */
+function bundleOutranks(db: Db, current: EvidenceBundle, candidate: EvidenceBundle): boolean {
+  const trust = trustRank(candidate.review_status) - trustRank(current.review_status);
+  if (trust !== 0) return trust > 0;
+  if (candidate.confidence !== current.confidence) return candidate.confidence > current.confidence;
+  if (candidate.evidence.length !== current.evidence.length) return candidate.evidence.length > current.evidence.length;
+  const currentSeq = refsSeq(db, current.source_refs);
+  const candidateSeq = refsSeq(db, candidate.source_refs);
+  if (currentSeq !== candidateSeq) {
+    if (currentSeq === null) return candidateSeq !== null;
+    if (candidateSeq === null) return false;
+    return candidateSeq < currentSeq;
+  }
+  return (candidate.id ?? Number.MAX_SAFE_INTEGER) < (current.id ?? Number.MAX_SAFE_INTEGER);
+}
+
+/**
+ * Keep every losing bundle beside the surviving one: its assessments and its
+ * own quote/place, marked `merged`. Citations read only the primary evidence.
+ */
+function mergeBundleSupporting(winner: EvidenceBundle, loser: EvidenceBundle): string {
+  const items = fromJson<Record<string, unknown>[]>(winner.supporting_evidence, []);
+  for (const item of fromJson<Record<string, unknown>[]>(loser.supporting_evidence, [])) items.push(item);
+  // The twin case has the same citation already primary; only its assessment
+  // and other supporting items need preserving.
+  if (loser.evidence !== winner.evidence || loser.source_refs !== winner.source_refs) {
+    items.push({
+      quote: loser.evidence,
+      source_refs: fromJson<unknown[]>(loser.source_refs, []),
+      reason: 'merged',
+      moved_at: nowIso(),
+    });
+  }
+  return toJson(items);
+}
+
+/** The dedupe key: reversed order is the same tie only for symmetric kinds. */
+function relationKey(row: { from_entity: number; to_entity: number; kind: string }): string {
+  const kind = row.kind.toLowerCase();
+  if (isDirectionalKind(kind)) return `${row.from_entity}:${row.to_entity}:${kind}`;
+  const pair =
+    row.from_entity < row.to_entity
+      ? `${row.from_entity}:${row.to_entity}`
+      : `${row.to_entity}:${row.from_entity}`;
+  return `${pair}:${kind}`;
+}
+
+/**
+ * SQL matching the rows that hold the same tie as `kind`: ordered when the
+ * kind's arrow matters, either order when it does not. Callers bind the pair
+ * through `args`, so a directional claim never merges with its reverse.
+ */
+function pairClause(kind: string): { sql: string; args: (fromId: number, toId: number) => number[] } {
+  return isDirectionalKind(kind)
+    ? { sql: '(from_entity = ? AND to_entity = ?)', args: (fromId, toId) => [fromId, toId] }
+    : {
+        sql: '((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))',
+        args: (fromId, toId) => [fromId, toId, toId, fromId],
+      };
 }
 
 /**
  * One relation per pair and label.
  *
- * The model can name the same tie from either side (A→B and B→A), so the pair
- * is unordered and the label is lower-cased. Surviving rows keep the longer
- * sentence and quote, the earliest place, and needs_review if either side had
- * it. Different labels on the same pair stay separate.
+ * The model can name a symmetric tie from either side (A→B and B→A), so those
+ * pairs are unordered; a directional kind keeps the arrow it was banked with.
+ * The label is lower-cased, and different labels on the same pair stay
+ * separate. The best bundle supplies the surviving row's quote, place, anchor,
+ * kind source, description, confidence and status together; every other
+ * bundle is preserved as supporting evidence.
  */
 export function dedupeRelations(db: Db, projectId: number): void {
-  type Row = { id: number; from_entity: number; to_entity: number; kind: string; description: string; evidence: string; source_refs: string; review_status: string };
+  type Row = EvidenceBundle & { from_entity: number; to_entity: number; kind: string };
   const rows = db.all<Row>(
-    'SELECT id, from_entity, to_entity, kind, description, evidence, source_refs, review_status FROM canon_relation WHERE project_id = ? ORDER BY id',
+    `SELECT id, from_entity, to_entity, kind, description, evidence, source_refs,
+            kind_source, anchor_evidence, COALESCE(confidence, 0) AS confidence,
+            review_status, supporting_evidence
+       FROM canon_relation WHERE project_id = ? ORDER BY id`,
     projectId,
   );
-  const pairOf = (row: Row) => (row.from_entity < row.to_entity ? `${row.from_entity}:${row.to_entity}` : `${row.to_entity}:${row.from_entity}`);
   const merged = new Map<string, Row>();
   for (const row of rows) {
-    // The same pair can hold several relationships, so the label is part of the key.
-    const key = `${pairOf(row)}:${row.kind.toLowerCase()}`;
-    const first = merged.get(key);
-    if (!first) {
-      merged.set(key, row);
+    const key = relationKey(row);
+    const survivor = merged.get(key);
+    if (!survivor) {
+      merged.set(key, { ...row });
       continue;
     }
-    const description = row.description.length > first.description.length ? row.description : first.description;
-    const evidence = row.evidence.length > first.evidence.length ? row.evidence : first.evidence;
-    const sourceRefs = earliestRefs(db, first.source_refs, row.source_refs);
-    const review = maxTrust(first.review_status, row.review_status);
+    // The earliest row stays the case id; the best bundle supplies its fields.
+    const primary = bundleOutranks(db, survivor, row) ? row : survivor;
+    const other = primary === row ? survivor : row;
+    const supporting = mergeBundleSupporting(primary, other);
     db.transaction(() => {
-      const survivorBefore = first.review_status;
+      const survivorBefore = survivor.review_status;
       db.run(
-        'UPDATE canon_relation SET description = ?, evidence = ?, source_refs = ?, review_status = ? WHERE id = ?',
-        description,
-        evidence,
-        sourceRefs,
-        review,
-        first.id,
+        `UPDATE canon_relation
+            SET description = ?, evidence = ?, source_refs = ?, review_status = ?,
+                kind_source = ?, anchor_evidence = ?, confidence = ?, supporting_evidence = ?
+          WHERE id = ?`,
+        primary.description,
+        primary.evidence,
+        primary.source_refs,
+        primary.review_status,
+        primary.kind_source,
+        primary.anchor_evidence,
+        primary.confidence,
+        supporting,
+        survivor.id,
       );
-      if (review !== survivorBefore) {
+      if (primary.review_status !== survivorBefore) {
         recordRuling(db, projectId, {
-          relationId: first.id,
+          relationId: survivor.id,
           role: 'appeal',
           actor: 'guard',
           standard: 'merge',
           fromStatus: survivorBefore,
-          toStatus: review,
-          basis: `merge trust from relation ${row.id}`,
-          quote: evidence,
+          toStatus: primary.review_status,
+          basis: `primary evidence from relation ${primary.id ?? other.id}`,
+          quote: primary.evidence,
         });
       }
       recordRuling(db, projectId, {
@@ -1586,15 +1675,19 @@ export function dedupeRelations(db: Db, projectId: number): void {
         standard: 'merge',
         fromStatus: row.review_status,
         toStatus: 'merged',
-        basis: `merged into relation ${first.id}`,
+        basis: `merged into relation ${survivor.id}`,
         quote: row.evidence,
       });
       db.run('DELETE FROM canon_relation WHERE id = ?', row.id);
     });
-    first.description = description;
-    first.evidence = evidence;
-    first.source_refs = sourceRefs;
-    first.review_status = review;
+    survivor.description = primary.description;
+    survivor.evidence = primary.evidence;
+    survivor.source_refs = primary.source_refs;
+    survivor.kind_source = primary.kind_source;
+    survivor.anchor_evidence = primary.anchor_evidence;
+    survivor.confidence = primary.confidence;
+    survivor.review_status = primary.review_status;
+    survivor.supporting_evidence = supporting;
   }
 }
 
@@ -1698,6 +1791,37 @@ export function verifySpan(
     }
   }
   return { ...cited, quote: '', status: 'dropped' };
+}
+
+/**
+ * Resolve a relation's cited chunk inside its own project. A chunk id from
+ * another project is not provenance for this claim, even when its text
+ * happens to contain the quote.
+ */
+function citedEvidenceText(db: Db, projectId: number, sourceRefs: string): string | null {
+  let refs: { chunk?: unknown }[] = [];
+  try {
+    refs = JSON.parse(sourceRefs || '[]') as { chunk?: unknown }[];
+  } catch {
+    return null;
+  }
+  const chunkId = refs
+    .map((ref) => Number(ref?.chunk))
+    .find((id) => Number.isInteger(id) && id > 0);
+  if (chunkId === undefined) return null;
+  const owned = db.get<{ id: number }>(
+    'SELECT id FROM canon_chunk WHERE id = ? AND project_id = ?',
+    chunkId,
+    projectId,
+  );
+  if (!owned) return null;
+  return pageEvidenceText(db, chunkId)
+    ?? db.get<{ text: string }>(
+      'SELECT text FROM canon_chunk WHERE id = ? AND project_id = ?',
+      chunkId,
+      projectId,
+    )?.text
+    ?? null;
 }
 
 /**
@@ -2281,10 +2405,6 @@ function uniqueNames(names: string[]): string[] {
  * so a verdict can never change which claim survives or what it says. */
 function trustRank(status: string): number {
   return status === 'accepted' || status === 'user_confirmed' ? 1 : 0;
-}
-
-function maxTrust(a: string, b: string): string {
-  return trustRank(a) >= trustRank(b) ? a : b;
 }
 
 /** Cached finder-spans map: chunk seq -> names. Missing/unreadable = none. */
@@ -3979,16 +4099,14 @@ function applyRelations(
       // "father of" says nothing new. Pure dedupe, not a meaning judgment.
       const lk = kind.toLowerCase();
       const specifics = GENERIC_KINSHIP.get(lk);
+      const kinPair = pairClause(kind);
       if (specifics) {
         const dup = db.get<{ id: number }>(
           `SELECT id FROM canon_relation WHERE project_id = ? AND lower(kind) IN (${[...specifics].map(() => '?').join(',')})
-             AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?)) LIMIT 1`,
+             AND ${kinPair.sql} LIMIT 1`,
           projectId,
           ...[...specifics].map((s) => s.toLowerCase()),
-          fromId,
-          toId,
-          toId,
-          fromId,
+          ...kinPair.args(fromId, toId),
         );
         if (dup) {
           stats.verification.redundant++;
@@ -3997,18 +4115,30 @@ function applyRelations(
       } else {
         for (const [generic, genericKinds] of GENERIC_KINSHIP) {
           if (!genericKinds.has(lk)) continue;
-          const stale = db.all<{ id: number }>(
-            'SELECT id FROM canon_relation WHERE project_id = ? AND lower(kind) = ? AND review_status != ? AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))',
+          const stale = db.all<{ id: number; evidence: string; review_status: string }>(
+            `SELECT id, evidence, review_status FROM canon_relation
+              WHERE project_id = ? AND lower(kind) = ? AND review_status != ? AND ${kinPair.sql}`,
             projectId,
             generic,
             'user_confirmed',
-            fromId,
-            toId,
-            toId,
-            fromId,
+            ...kinPair.args(fromId, toId),
           );
           if (stale.length) {
-            for (const row of stale) db.run('DELETE FROM canon_relation WHERE id = ?', row.id);
+            for (const row of stale) {
+              db.transaction(() => {
+                recordRuling(db, projectId, {
+                  relationId: row.id,
+                  role: 'appeal',
+                  actor: 'guard',
+                  standard: 'generic-kinship',
+                  fromStatus: row.review_status,
+                  toStatus: 'merged',
+                  basis: `replaced by specific relation ${kind}`,
+                  quote: row.evidence,
+                });
+                db.run('DELETE FROM canon_relation WHERE id = ?', row.id);
+              });
+            }
             stats.verification.redundant += stale.length;
           }
           break;
@@ -4019,66 +4149,83 @@ function applyRelations(
         const stop = new Set(['a', 'an', 'the', 'to', 'of', 'with', 'by', 'for', 'in', 'on', 'at']);
         return k.toLowerCase().split(/[^a-z]+/).filter((w) => w && !stop.has(w))[0] ?? '';
       };
+      const pair = pairClause(kind);
+      const incoming: EvidenceBundle = {
+        id: null,
+        description: String(raw.description ?? '').trim(),
+        evidence: span.quote,
+        source_refs: toJson(refs),
+        kind_source: kindSource,
+        anchor_evidence: anchorEvidence,
+        confidence,
+        review_status: rowReview,
+        supporting_evidence: supporting,
+      };
       const rivals = db.all<{
         id: number;
         kind: string;
         description: string;
         evidence: string;
         source_refs: string;
+        kind_source: string;
+        anchor_evidence: string;
         review_status: string;
         confidence: number;
         supporting_evidence: string;
       }>(
-        `SELECT id, kind, description, evidence, source_refs, review_status, confidence, supporting_evidence
+        `SELECT id, kind, description, evidence, source_refs, kind_source, anchor_evidence,
+                review_status, confidence, supporting_evidence
            FROM canon_relation
-          WHERE project_id = ? AND evidence = ? AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))
+          WHERE project_id = ? AND evidence = ? AND ${pair.sql}
           ORDER BY id`,
         projectId,
         span.quote,
-        fromId,
-        toId,
-        toId,
-        fromId,
+        ...pair.args(fromId, toId),
       );
       const twin = rivals.find((r) => headWord(r.kind) === headWord(kind) && headWord(kind).length > 0);
       if (twin) {
-        const description = String(raw.description ?? '').trim();
-        const sentence = description.length > twin.description.length ? description : twin.description;
-        const quote = span.quote.length > twin.evidence.length ? span.quote : twin.evidence;
-        const sourceRefs = earliestRefs(db, toJson(refs), twin.source_refs);
-        const twinReview = maxTrust(rowReview, twin.review_status);
-        const twinConfidence = Math.max(Number(twin.confidence) || 0, confidence);
+        const stored: EvidenceBundle = {
+          id: twin.id,
+          description: twin.description,
+          evidence: twin.evidence,
+          source_refs: twin.source_refs,
+          kind_source: twin.kind_source,
+          anchor_evidence: twin.anchor_evidence,
+          confidence: Number(twin.confidence) || 0,
+          review_status: twin.review_status,
+          supporting_evidence: twin.supporting_evidence,
+        };
+        // One bundle supplies every primary field; the other is preserved.
+        const primary = bundleOutranks(db, stored, incoming) ? incoming : stored;
+        const other = primary === incoming ? stored : incoming;
+        const mergedSupporting = mergeBundleSupporting(primary, other);
         db.transaction(() => {
           db.run(
             `UPDATE canon_relation
                 SET kind = ?, description = ?, evidence = ?, source_refs = ?, review_status = ?,
-                    confidence = ?, supporting_evidence = ?,
-                    kind_source = CASE WHEN ? <> '' THEN ? ELSE kind_source END,
-                    anchor_evidence = CASE WHEN ? <> '' THEN ? ELSE anchor_evidence END
+                    kind_source = ?, anchor_evidence = ?, confidence = ?, supporting_evidence = ?
               WHERE id = ?`,
             twin.kind,
-            sentence,
-            quote,
-            sourceRefs,
-            twinReview,
-            twinConfidence,
-            appendAssessment(twin.supporting_evidence, assessment),
-            kindSource,
-            kindSource,
-            anchorEvidence,
-            anchorEvidence,
+            primary.description,
+            primary.evidence,
+            primary.source_refs,
+            primary.review_status,
+            primary.kind_source,
+            primary.anchor_evidence,
+            primary.confidence,
+            mergedSupporting,
             twin.id,
           );
-          if (twinReview !== twin.review_status) {
+          if (primary.review_status !== stored.review_status) {
             recordRuling(db, projectId, {
               relationId: twin.id,
               role: 'appeal',
               actor: 'guard',
               standard: 'merge',
-              fromStatus: twin.review_status,
-              toStatus: twinReview,
+              fromStatus: stored.review_status,
+              toStatus: primary.review_status,
               basis: 'same quote merged into the rival claim',
-              quote,
+              quote: primary.evidence,
             });
           }
         });
@@ -4091,61 +4238,65 @@ function applyRelations(
         description: string;
         evidence: string;
         source_refs: string;
+        kind_source: string;
+        anchor_evidence: string;
         review_status: string;
         confidence: number;
         supporting_evidence: string;
       }>(
-        `SELECT id, kind, description, evidence, source_refs, review_status, confidence, supporting_evidence
+        `SELECT id, kind, description, evidence, source_refs, kind_source, anchor_evidence,
+                review_status, confidence, supporting_evidence
            FROM canon_relation
-          WHERE project_id = ? AND lower(kind) = ?
-            AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))
+          WHERE project_id = ? AND lower(kind) = ? AND ${pair.sql}
           ORDER BY id LIMIT 1`,
         projectId,
         kind.toLowerCase(),
-        fromId,
-        toId,
-        toId,
-        fromId,
+        ...pair.args(fromId, toId),
       );
       if (existing) {
-        // One relation per pair and label, whichever side named it: merge
-        // rather than bank the same tie twice in opposite directions.
-        const description = String(raw.description ?? '').trim();
-        const sentence = description.length > existing.description.length ? description : existing.description;
-        const quote = span.quote.length > existing.evidence.length ? span.quote : existing.evidence;
-        const sourceRefs = earliestRefs(db, toJson(refs), existing.source_refs);
-        const mergedReview = maxTrust(rowReview, existing.review_status);
-        const mergedConfidence = Math.max(Number(existing.confidence) || 0, confidence);
+        // One relation per pair and label: merge rather than bank the same
+        // tie twice. Symmetric kinds merge from either side; a directional
+        // kind keeps its arrow.
+        const stored: EvidenceBundle = {
+          id: existing.id,
+          description: existing.description,
+          evidence: existing.evidence,
+          source_refs: existing.source_refs,
+          kind_source: existing.kind_source,
+          anchor_evidence: existing.anchor_evidence,
+          confidence: Number(existing.confidence) || 0,
+          review_status: existing.review_status,
+          supporting_evidence: existing.supporting_evidence,
+        };
+        const primary = bundleOutranks(db, stored, incoming) ? incoming : stored;
+        const other = primary === incoming ? stored : incoming;
+        const mergedSupporting = mergeBundleSupporting(primary, other);
         db.transaction(() => {
           db.run(
             `UPDATE canon_relation
                 SET description = ?, evidence = ?, source_refs = ?, review_status = ?,
-                    confidence = ?, supporting_evidence = ?,
-                    kind_source = CASE WHEN ? <> '' THEN ? ELSE kind_source END,
-                    anchor_evidence = CASE WHEN ? <> '' THEN ? ELSE anchor_evidence END
+                    kind_source = ?, anchor_evidence = ?, confidence = ?, supporting_evidence = ?
               WHERE id = ?`,
-            sentence,
-            quote,
-            sourceRefs,
-            mergedReview,
-            mergedConfidence,
-            appendAssessment(existing.supporting_evidence, assessment),
-            kindSource,
-            kindSource,
-            anchorEvidence,
-            anchorEvidence,
+            primary.description,
+            primary.evidence,
+            primary.source_refs,
+            primary.review_status,
+            primary.kind_source,
+            primary.anchor_evidence,
+            primary.confidence,
+            mergedSupporting,
             existing.id,
           );
-          if (mergedReview !== existing.review_status) {
+          if (primary.review_status !== stored.review_status) {
             recordRuling(db, projectId, {
               relationId: existing.id,
               role: 'appeal',
               actor: 'guard',
               standard: 'merge',
-              fromStatus: existing.review_status,
-              toStatus: mergedReview,
+              fromStatus: stored.review_status,
+              toStatus: primary.review_status,
               basis: 'duplicate claim merged',
-              quote,
+              quote: primary.evidence,
             });
           }
         });
@@ -5144,28 +5295,6 @@ export function canPromote(row: PromoteRow, context: PromoteContext): PromoteDec
   return { ok: true };
 }
 
-/**
- * True when the quote names both endpoints at two different places.
- *
- * One surface string cannot stand for both sides. When two rows share an alias
- * (one row carrying the other's name as an alias), a quote that says only that
- * name would otherwise satisfy both endpoints and prove a tie between a person
- * and themself. Requiring two disjoint mentions closes that hole without
- * needing to know who is who, and without trusting model-written aliases.
- */
-export function namesBothDistinctly(
-  quote: string,
-  fromName: string,
-  fromAliases: string[],
-  toName: string,
-  toAliases: string[],
-  index?: RosterIndex,
-): boolean {
-  const from = mentionSpans(quote, fromName, fromAliases, index);
-  const to = mentionSpans(quote, toName, toAliases, index);
-  return from.some(([s1, e1]) => to.some(([s2, e2]) => e1 < s2 || e2 < s1));
-}
-
 /** Load one relation and check only the pure proven tier (no PARK lookup). */
 export function provenRelationById(
   db: Db,
@@ -5213,20 +5342,7 @@ function loadGuardRow(db: Db, projectId: number, relationId: number): GuardedRow
     relationId,
   );
   if (!row) return null;
-  let chunkText: string | null = null;
-  try {
-    const refs = JSON.parse(row.source_refs || '[]') as { chunk?: unknown }[];
-    const chunkId = refs.find((ref) => Number.isFinite(Number(ref?.chunk)) && Number(ref?.chunk) > 0)?.chunk;
-    if (chunkId) {
-      const citedId = Number(chunkId);
-      chunkText =
-        pageEvidenceText(db, citedId) ??
-        db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', citedId)?.text ??
-        null;
-    }
-  } catch {
-    chunkText = null;
-  }
+  const chunkText = citedEvidenceText(db, projectId, row.source_refs);
   return {
     row: {
       fromId: row.from_entity,
@@ -5673,7 +5789,7 @@ export function checkAttested(
   );
   if (quoteReason) return { attested: false, reason: quoteReason };
   // Sentence-proof rows belong to the keeper track (promoteProvisional), not here.
-  if (namesBothDistinctly(row.evidence, row.fromName, row.fromAliases, row.toName, row.toAliases)) {
+  if (citationNamesBothEndpoints(row)) {
     return { attested: false, reason: 'keeper-track' };
   }
   if (!chunkNamesEndpoint(chunkText, row.fromName, row.fromAliases)) {
@@ -6200,9 +6316,10 @@ export function canPromoteRelation(
     to_name: string;
     to_aliases: string;
     kind_source: string;
+    anchor_evidence: string;
     confidence: number;
   }>(
-    `SELECT r.from_entity, r.to_entity, r.kind, r.evidence, r.source_refs, r.kind_source, r.confidence,
+    `SELECT r.from_entity, r.to_entity, r.kind, r.evidence, r.source_refs, r.kind_source, r.anchor_evidence, r.confidence,
             a.name AS from_name, a.aliases AS from_aliases,
             b.name AS to_name, b.aliases AS to_aliases
        FROM canon_relation r
@@ -6213,20 +6330,7 @@ export function canPromoteRelation(
     relationId,
   );
   if (!row) return { ok: false, reason: 'quote-not-verbatim' };
-  let chunkText: string | null = null;
-  try {
-    const refs = JSON.parse(row.source_refs || '[]') as { chunk?: unknown }[];
-    const chunkId = refs.find((ref) => Number.isFinite(Number(ref?.chunk)) && Number(ref?.chunk) > 0)?.chunk;
-    if (chunkId) {
-      const citedId = Number(chunkId);
-      chunkText =
-        pageEvidenceText(db, citedId) ??
-        db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', citedId)?.text ??
-        null;
-    }
-  } catch {
-    chunkText = null;
-  }
+  const chunkText = citedEvidenceText(db, projectId, row.source_refs);
   return canPromote(
     {
       fromId: row.from_entity,
@@ -6238,6 +6342,7 @@ export function canPromoteRelation(
       kind: row.kind,
       evidence: row.evidence,
       kindSource: row.kind_source,
+      anchorEvidence: row.anchor_evidence,
       confidence: row.confidence,
     },
     { db, projectId, chunkText, index },
@@ -6276,11 +6381,30 @@ export function insertRelation(
   row: RelationInsert,
 ): number {
   const refs = fromJson<{ chunk?: unknown }[]>(row.sourceRefs, []);
-  if (!refs.some((ref) => {
-    const id = Number(ref?.chunk);
-    return Number.isFinite(id) && id > 0;
-  })) {
+  const chunkIds = [...new Set(
+    refs
+      .map((ref) => Number(ref?.chunk))
+      .filter((id) => Number.isInteger(id) && id > 0),
+  )];
+  if (!chunkIds.length) {
     throw new Error('relation insert refused: source_refs must contain a numeric chunk id');
+  }
+  const entityIds = [...new Set([row.fromEntity, row.toEntity])];
+  const ownedEntities = db.all<{ id: number }>(
+    `SELECT id FROM canon_entity WHERE project_id = ? AND id IN (${entityIds.map(() => '?').join(',')})`,
+    projectId,
+    ...entityIds,
+  );
+  if (ownedEntities.length !== entityIds.length) {
+    throw new Error('relation insert refused: endpoints must belong to this project');
+  }
+  const ownedChunks = db.all<{ id: number }>(
+    `SELECT id FROM canon_chunk WHERE project_id = ? AND id IN (${chunkIds.map(() => '?').join(',')})`,
+    projectId,
+    ...chunkIds,
+  );
+  if (ownedChunks.length !== chunkIds.length) {
+    throw new Error('relation insert refused: source refs must cite chunks in this project');
   }
   return db.transaction(() => {
     const id = Number(
@@ -6463,17 +6587,15 @@ export function persistTieNote(
   };
   const firstRefs = withSource(sourceRefs);
   const courtFor = (basis: string, quote: string): void => {
+    const courtPair = pairClause(attemptedKind);
     const relation = db.get<{ id: number }>(
       `SELECT id FROM canon_relation
         WHERE project_id = ? AND lower(kind) = lower(?)
-          AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))
+          AND ${courtPair.sql}
         ORDER BY id LIMIT 1`,
       projectId,
       attemptedKind,
-      fromId,
-      toId,
-      toId,
-      fromId,
+      ...courtPair.args(fromId, toId),
     );
     recordRuling(db, projectId, {
       relationId: relation?.id ?? null,
@@ -8310,17 +8432,15 @@ export async function relabelRelations(
       result.skipped.same++;
       continue;
     }
+    const duplicatePair = pairClause(kind);
     const duplicate = db.get<{ id: number }>(
       `SELECT id FROM canon_relation
         WHERE project_id = ? AND id != ? AND lower(kind) = ?
-          AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?)) LIMIT 1`,
+          AND ${duplicatePair.sql} LIMIT 1`,
       projectId,
       row.id,
       kind,
-      row.from_entity,
-      row.to_entity,
-      row.to_entity,
-      row.from_entity,
+      ...duplicatePair.args(row.from_entity, row.to_entity),
     );
     if (duplicate) {
       result.skipped.duplicate++;

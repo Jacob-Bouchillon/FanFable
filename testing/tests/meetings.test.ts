@@ -272,6 +272,115 @@ test('running meetings is idempotent and revision moves only on new evidence', (
   db.close();
 });
 
+test('new evidence enriches the child of the same meeting', () => {
+  const { db, project, pair, chunks } = setup('meeting-same-enrich', 8);
+  const later = addPeriodThread(db, pair, 'p2', 60);
+  threadWeb.addNote(db, project, pair, {
+    chunkId: chunks[0]!,
+    locator: 'p. 1',
+    quote: 'Mara Voss met Corin Hale at the gate 1.',
+    claim: 'they meet at the gate',
+    strength: 0.5,
+  });
+  threadWeb.addNote(db, project, later, {
+    chunkId: chunks[1]!,
+    locator: 'p. 2',
+    quote: 'Mara Voss met Corin Hale at the gate 2.',
+    claim: 'they meet again later',
+    strength: 0.5,
+  });
+  meetingWeb.runMeetings(db, project, { minAdmissionStrength: 0 });
+  const childId = db.get<{ child_thread: number }>(
+    'SELECT child_thread FROM canon_birth WHERE project_id = ?',
+    project,
+  )!.child_thread;
+  const birthsBefore = db.get<{ n: number }>(
+    'SELECT COUNT(*) AS n FROM canon_birth WHERE project_id = ?',
+    project,
+  )!.n;
+  const refsBefore = db.get<{ n: number }>(
+    'SELECT COUNT(*) AS n FROM canon_thread_note_ref WHERE thread_id = ?',
+    childId,
+  )!.n;
+
+  // The same meeting gains a note on one side. It already has a child, so the
+  // new evidence must attach to that child rather than be counted and dropped.
+  threadWeb.addNote(db, project, later, {
+    chunkId: chunks[2]!,
+    locator: 'p. 3',
+    quote: 'Mara Voss met Corin Hale at the gate 3.',
+    claim: 'they keep meeting through the year',
+    strength: 0.5,
+  });
+  const second = meetingWeb.runMeetings(db, project, { minAdmissionStrength: 0 });
+  assert.equal(second.birthsCreated, 0, 'a meeting never births twice');
+  assert.ok(second.birthsEnriched >= 1, 'the existing child is enriched');
+  assert.equal(
+    db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_birth WHERE project_id = ?', project)!.n,
+    birthsBefore,
+    'still exactly one birth row',
+  );
+  assert.ok(
+    db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_thread_note_ref WHERE thread_id = ?', childId)!.n >
+      refsBefore,
+    'the new evidence was referenced',
+  );
+  assert.equal(
+    db.get<{ child_thread: number }>('SELECT child_thread FROM canon_meeting WHERE project_id = ?', project)!.child_thread,
+    childId,
+  );
+  db.close();
+});
+
+test('two candidates never resolve one open end twice in a run', () => {
+  const { db, project, mara, pair, personMara, chunks } = setup('meeting-double-resolve', 6);
+  const doran = addEntity(db, project, 'Doran Pike');
+  const source = db.get<{ id: number }>('SELECT id FROM canon_source WHERE project_id = ?', project)!.id;
+  const extra = [7, 8].map((seq) =>
+    addChunk(db, project, source, seq, `Mara Voss met Doran Pike at the mill ${seq}.`),
+  );
+  buildPairThreads(db, project);
+  threadWeb.syncThreads(db, project);
+  const otherPair = db.get<{ id: number }>(
+    "SELECT id FROM canon_thread WHERE project_id = ? AND kind = 'pair' AND a_entity = ? AND b_entity = ?",
+    project,
+    Math.min(mara, doran),
+    Math.max(mara, doran),
+  )!.id;
+  const claim = 'the gate keys and the ledger';
+  threadWeb.addNote(db, project, pair, {
+    chunkId: chunks[0]!,
+    locator: 'p. 1',
+    quote: 'Mara Voss met Corin Hale at the gate 1.',
+    claim,
+    strength: 0.8,
+  });
+  threadWeb.addNote(db, project, otherPair, {
+    chunkId: extra[0]!,
+    locator: 'p. 7',
+    quote: 'Mara Voss met Doran Pike at the mill 7.',
+    claim,
+    strength: 0.8,
+  });
+  const want = threadWeb.addOpenEnd(db, project, personMara, {
+    question: 'Who holds the gate keys and the ledger?',
+    wouldResolve: claim,
+  });
+
+  const result = meetingWeb.runMeetings(db, project, { minAdmissionStrength: 0 });
+  assert.equal(result.wantsResolved, 1, 'one answer, not one per candidate');
+  assert.equal(
+    db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_meeting_resolution WHERE open_end_id = ?', want)!.n,
+    1,
+    'the open end has exactly one resolution row',
+  );
+  assert.equal(
+    db.get<{ status: string }>('SELECT status FROM canon_open_end WHERE id = ?', want)!.status,
+    'resolved',
+  );
+  db.close();
+});
+
 test('an identity note resolves a want but never raises birth support', () => {
   const { db, project, pair, personMara, chunks } = setup('meeting-scope');
   const want = threadWeb.addOpenEnd(db, project, pair, {

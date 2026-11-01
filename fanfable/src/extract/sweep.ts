@@ -107,6 +107,14 @@ const BATCH_SYSTEM =
 
 const DERIVE_SYSTEM = 'Reply with JSON only: {"ties":[{"to":"name","kind":"short phrase","line":12}]}.';
 
+/** A citation index is an exact non-negative integer, never a repaired number. */
+function parseLineNumber(value: unknown): number {
+  const text = String(value ?? '').trim().replace(/^#/, '');
+  if (!/^\d+$/.test(text)) return -1;
+  const line = Number(text);
+  return Number.isSafeInteger(line) ? line : -1;
+}
+
 /** One batch: sentences are numbered; the model returns line numbers only. */
 async function askBatch(
   llm: LlmClient,
@@ -147,17 +155,13 @@ async function askBatch(
       ties?: { to?: unknown; kind?: unknown; line?: unknown }[];
       notes?: { name?: unknown; says?: unknown; line?: unknown }[];
     };
-    const asLine = (value: unknown): number => {
-      const n = Number(String(value ?? '').replace(/[^0-9]/g, ''));
-      return Number.isFinite(n) ? n : -1;
-    };
     return {
       ties: (parsed.ties ?? [])
-        .map((tie) => ({ to: String(tie.to ?? '').trim(), kind: String(tie.kind ?? '').trim(), line: asLine(tie.line) }))
-        .filter((tie) => tie.to && tie.line >= 0 && tie.line < ledger.length),
+        .map((tie) => ({ to: String(tie.to ?? '').trim(), kind: String(tie.kind ?? '').trim(), line: parseLineNumber(tie.line) }))
+        .filter((tie) => tie.to && tie.line >= from && tie.line < to),
       notes: (parsed.notes ?? [])
-        .map((note) => ({ name: String(note.name ?? '').trim(), says: String(note.says ?? '').trim(), line: asLine(note.line) }))
-        .filter((note) => note.name && note.line >= 0 && note.line < ledger.length),
+        .map((note) => ({ name: String(note.name ?? '').trim(), says: String(note.says ?? '').trim(), line: parseLineNumber(note.line) }))
+        .filter((note) => note.name && note.line >= from && note.line < to),
     };
   } catch {
     return { ties: [], notes: [] };
@@ -186,9 +190,10 @@ async function deriveTies(llm: LlmClient, name: string, notes: Note[]): Promise<
     const parsed = JSON.parse(raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1)) as {
       ties?: { to?: unknown; kind?: unknown; line?: unknown }[];
     };
+    const offered = new Set(notes.map((note) => note.line));
     return (parsed.ties ?? [])
-      .map((tie) => ({ to: String(tie.to ?? '').trim(), kind: String(tie.kind ?? '').trim(), line: Number(tie.line) }))
-      .filter((tie) => tie.to && Number.isFinite(tie.line));
+      .map((tie) => ({ to: String(tie.to ?? '').trim(), kind: String(tie.kind ?? '').trim(), line: parseLineNumber(tie.line) }))
+      .filter((tie) => tie.to && offered.has(tie.line));
   } catch {
     return [];
   }
@@ -236,20 +241,22 @@ export async function runNameSweep(
 
   // Target names the model reports resolve to roster rows by name or alias; a
   // unique same-person match is accepted, an ambiguous one is not guessed.
-  const entities = lorebook.listEntities(db, projectId);
-  const byCanonical = new Map<string, (typeof entities)[number]>();
+  const entities = lorebook
+    .listEntities(db, projectId, 'character')
+    .filter((entity) => entity.reviewStatus !== 'quarantined');
+  const byCanonical = new Map<string, Map<number, (typeof entities)[number]>>();
   for (const entity of entities) {
     for (const key of [entity.name, ...entity.aliases]) {
       const canonical = norm(key);
       if (!canonical) continue;
-      const previous = byCanonical.get(canonical);
-      if (!previous || entity.mentions > previous.mentions) byCanonical.set(canonical, entity);
+      const matches = byCanonical.get(canonical) ?? new Map<number, (typeof entities)[number]>();
+      matches.set(entity.id, entity);
+      byCanonical.set(canonical, matches);
     }
   }
   const resolveTarget = (name: string): (typeof entities)[number] | undefined => {
-    const canonical = norm(name);
-    const exact = byCanonical.get(canonical);
-    if (exact) return exact;
+    const exact = [...(byCanonical.get(norm(name))?.values() ?? [])];
+    if (exact.length) return exact.length === 1 ? exact[0] : undefined;
     const related = entities.filter((entity) => nameRelation(name, entity.name) !== null);
     return related.length === 1 ? related[0] : undefined;
   };
@@ -295,8 +302,23 @@ export async function runNameSweep(
     for (let i = 0; i < ledger.length; i += batchSize) {
       opts.onProgress?.(`${character.name}: lines ${i + 1}-${Math.min(i + batchSize, ledger.length)} of ${ledger.length}`);
       const out = await askBatch(llm, character.name, ledger, known, i, Math.min(i + batchSize, ledger.length), prior);
-      known = out.ties.map((tie) => ({ ...tie, quote: ledger[tie.line]!.sentence }));
-      notes = [...notes, ...out.notes.map((note) => ({ ...note, quote: ledger[note.line]!.sentence }))];
+      // A later batch does not retract what an earlier batch found. Accumulate
+      // by pair and kind, keeping the longer verbatim sentence.
+      const batchTies = out.ties.map((tie) => ({ ...tie, quote: ledger[tie.line]!.sentence }));
+      const mergedKnown = new Map<string, Tie>();
+      for (const tie of [...known, ...batchTies]) {
+        const key = `${norm(tie.to)}|${norm(tie.kind)}`;
+        const previous = mergedKnown.get(key);
+        if (!previous || tie.quote.length > previous.quote.length) mergedKnown.set(key, tie);
+      }
+      known = [...mergedKnown.values()];
+      const noteKeys = new Set(notes.map((note) => `${note.line}|${norm(note.name)}|${norm(note.says)}`));
+      for (const note of out.notes) {
+        const key = `${note.line}|${norm(note.name)}|${norm(note.says)}`;
+        if (noteKeys.has(key)) continue;
+        noteKeys.add(key);
+        notes.push({ ...note, quote: ledger[note.line]!.sentence });
+      }
       batches++;
     }
 
@@ -353,18 +375,24 @@ export async function runNameSweep(
         skippedKeeper++;
         continue;
       }
-      const pending = db.get<{ id: number }>(
-        `SELECT id FROM canon_tie_note
-          WHERE project_id = ? AND attempted_kind = ? AND status = 'pending'
-            AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))
-          LIMIT 1`,
-        projectId,
-        tie.kind,
-        character.id,
-        target.id,
-        target.id,
-        character.id,
-      );
+      const pending = ((): { id: number } | undefined => {
+        const directional = lorebook.isDirectionalKind(tie.kind);
+        const pairSql = directional
+          ? '(from_entity = ? AND to_entity = ?)'
+          : '((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))';
+        const pairArgs = directional
+          ? [character.id, target.id]
+          : [character.id, target.id, target.id, character.id];
+        return db.get<{ id: number }>(
+          `SELECT id FROM canon_tie_note
+            WHERE project_id = ? AND attempted_kind = ? AND status = 'pending'
+              AND ${pairSql}
+            LIMIT 1`,
+          projectId,
+          tie.kind,
+          ...pairArgs,
+        );
+      })();
       if (pending) {
         characterResult.skippedPending++;
         skippedPending++;

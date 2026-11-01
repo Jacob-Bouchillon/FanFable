@@ -168,6 +168,68 @@ test('a gap is reported when no event matches', () => {
   assert.deepEqual(packet.gaps, [{ claim: 'Mara is placed in Gryffindor', reason: 'no-event' }]);
 });
 
+test('a shared given name does not let a different participant carry the action', () => {
+  const packet = selectEvidence(
+    {
+      title: 'The Gate',
+      characters: ['John Smith'],
+      requires: [claim('John Smith opened the gate')],
+    },
+    [record(88, 'The Gate', 'John Jones opened the gate.', ['John Smith', 'John Jones'])],
+  );
+  assert.deepEqual(packet.support, []);
+  assert.equal(packet.gaps.length, 1);
+});
+
+test('canon and AU requirements with the same words stay separate', () => {
+  const text = 'Mara opened the gate';
+  const packet = selectEvidence(
+    {
+      title: 'The Gate',
+      characters: ['Mara'],
+      requires: [claim(text, 'canon'), claim(text, 'au')],
+    },
+    [record(89, 'The Gate', 'Mara opened the gate.', ['Mara'])],
+  );
+  assert.equal(packet.support.length, 1);
+  assert.equal(packet.support[0]!.source, 'canon');
+  assert.deepEqual(packet.gaps, [{ claim: text, reason: 'au-dependent' }]);
+});
+
+test('an ambiguous participant alias is unresolved, never expanded to every person', () => {
+  const { db } = tempDb();
+  const project = createProject(db, 'evidence-ambiguous');
+  addEntity(db, project.id, 'Mara', ['Captain']);
+  addEntity(db, project.id, 'Tor', ['Captain']);
+  const eventId = addCanonEvent(db, project.id, 'Orders', 'The captain gave an order.', ['Captain']);
+  const result = loadEvidenceRecords(db, project.id, {
+    title: 'probe',
+    characters: ['Mara', 'Captain'],
+    requires: [],
+  });
+  assert.deepEqual(result.unresolvedCharacters, ['Captain']);
+  assert.deepEqual(result.unresolvedParticipants, [{ eventId, source: 'canon', name: 'Captain' }]);
+  assert.equal(result.records.length, 0, 'the ambiguous name does not invent participants');
+  db.close();
+});
+
+test('a quarantined character is not an event participant', () => {
+  const { db } = tempDb();
+  const project = createProject(db, 'evidence-quarantine');
+  const id = addEntity(db, project.id, 'Ghost');
+  db.run("UPDATE canon_entity SET review_status = 'quarantined' WHERE id = ?", id);
+  const eventId = addCanonEvent(db, project.id, 'Haunting', 'Ghost waited.', ['Ghost']);
+  const result = loadEvidenceRecords(db, project.id, {
+    title: 'probe',
+    characters: ['Ghost'],
+    requires: [],
+  });
+  assert.deepEqual(result.unresolvedCharacters, ['Ghost']);
+  assert.deepEqual(result.unresolvedParticipants, [{ eventId, source: 'canon', name: 'Ghost' }]);
+  assert.equal(result.records.length, 0);
+  db.close();
+});
+
 test('unresolved characters and participants are reported with their source', () => {
   const { db } = tempDb();
   const project = createProject(db, 'evidence-unresolved');
@@ -270,7 +332,7 @@ test('Dudley is magical is rejected: the term does not sit with Dudley', () => {
   assert.notEqual(packet.gaps[0]!.reason, 'unclassified');
 });
 
-test('Snape questions Harry is rejected when the event names only Harry', () => {
+test('a second character question is rejected when the event names only the first', () => {
   const packet = selectEvidence(
     {
       title: 'Potions Class',

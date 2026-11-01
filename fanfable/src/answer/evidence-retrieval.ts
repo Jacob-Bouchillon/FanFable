@@ -62,19 +62,26 @@ export function loadEvidenceRecords(
   projectId: number,
   requirements: SceneRequirements,
 ): EvidenceRetrieval {
-  const entities = lorebook.listEntities(db, projectId);
-  const byName = new Map<string, typeof entities>();
+  // Only playable people may become event participants. Quarantined rows are
+  // held aside precisely because their identity is not trusted.
+  const entities = lorebook
+    .listEntities(db, projectId, 'character')
+    .filter((entity) => entity.reviewStatus !== 'quarantined');
+  const byName = new Map<string, Map<number, (typeof entities)[number]>>();
   for (const entity of entities) {
     for (const key of [entity.name, ...entity.aliases]) {
       const canonical = canonicalName(key);
       if (!canonical) continue;
-      byName.set(canonical, [...(byName.get(canonical) ?? []), entity]);
+      const matches = byName.get(canonical) ?? new Map<number, (typeof entities)[number]>();
+      matches.set(entity.id, entity);
+      byName.set(canonical, matches);
     }
   }
-  const resolve = (name: string) => byName.get(canonicalName(name)) ?? [];
+  // One surface name for two people is unresolved, never expanded to both.
+  const resolve = (name: string) => [...(byName.get(canonicalName(name))?.values() ?? [])];
 
   const characters = requirements.characters ?? [];
-  const unresolvedCharacters = characters.filter((name) => resolve(name).length === 0);
+  const unresolvedCharacters = characters.filter((name) => resolve(name).length !== 1);
 
   const after = requirements.timeline?.after ?? null;
   const before = requirements.timeline?.before ?? null;
@@ -106,7 +113,7 @@ export function loadEvidenceRecords(
     const missing: string[] = [];
     for (const name of raw) {
       const matched = resolve(name);
-      if (!matched.length) {
+      if (matched.length !== 1) {
         missing.push(name);
         unresolvedParticipants.push({ eventId, source, name });
         continue;

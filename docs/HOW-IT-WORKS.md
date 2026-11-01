@@ -4,7 +4,7 @@ Merged 2026-10-29 from the four specs, the kinds checkpoint, and the handoff. A 
 
 ## 1. Guard: the code certifies citations, nothing more
 
-A row banks only when all hold: the quote is verbatim in the cited passage; both entities exist in the roster; they are not the same person; a confidence threshold the author sets is cleared (default 0.7). A quote that hides a preceding "perhaps" or "not" in its holding sentence is refused — misquotation, not grammar.
+A row banks only when all hold: the quote is verbatim in the cited passage; both entities exist in the roster; they are not the same person; the citation names both people — the quote may name one and its anchor the other, but one surface string cannot stand for both — and a confidence threshold the author sets is cleared (default 0.7). A quote that hides a preceding "perhaps" or "not" in its holding sentence is refused — misquotation, not grammar.
 
 Everything else is the model's judgement, recorded with the claim: whether the sentence says it, whether "him" is Ron, which concept fits, how sure it is. Nothing in the code enumerates English words for a relationship — the closed label list, synonym lists, `KIN_GROUPS`, the head-word test, the possessive/of-phrase/SVO assertion matcher, reverse-direction enforcement as a promotion condition, the concept set as a promotion gate (it stays for labelling and querying), the `kind_source` substitution loophole, and the `open-vocab` rejection were all deleted, not disabled. Before them, three attempts failed the same way: the label list banked 30 rows with 7 genuine, then 3 with 3 — precision bought by throwing away 90%; the assertion matcher rejected scenes correctly and most real relationships too (only 9.1% of sweep quotes name both people); the vocab gate owned just 5 of 258 queue notes and was never the bottleneck. Two definitions of truth in one codebase is how the last month happened.
 
@@ -25,7 +25,7 @@ A label names a concept; its description explains it and how it differs from its
 
 Each concept declares itself **directional** (`enemy`, `mentor`, `teacher`, `bullied`, `protective of`, `obeyed`, `loyal to`, family set — direction checked, reversals refused) or **symmetric** (`disliked`, `admired`, `trusted`, `distrusted`, `feared`, `friend`, `sibling`, `cousin`, `colleague`, `partner` — stored once, either order).
 
-The guard's checkable conditions: the label is one of the concepts (the set stays closed so the bank stays queryable); the model's `kind_source` appears verbatim in the quote or anchor; the anchor's sentence links it to *both* endpoints; direction resolves or is left unknown, enforced only where directional. The label itself need not appear in the quote.
+The guard's checkable conditions: the citation names both people (the quote may name one and its anchor the other); a generic restatement of the question (`related to`, `relative of`) never proves a kind; direction resolves or is left unknown, enforced only where directional. The model's `kind_source`, when present, is stored only if it appears verbatim in the quote or anchor; the concept vocabulary is for naming and querying, never a promotion gate. The label itself need not appear in the quote.
 
 Judged on a fixed hand-written set: same concept in different wording maps together; near-miss concepts don't cross (`disliked` vs `enemy`); co-occurrence and three-character passages yield no false proposals (measured 6/6 stable across 3 runs, 0 false, 0 wrong pairs); negation never banks the positive; uncertainty never banks as asserted; change over time wants time-scoped claims (not stored — see §8). One earlier run emitted `loathed` as a label: it parked rather than banked, the failure mode the concept set exists to catch.
 
@@ -63,7 +63,7 @@ Per relation the model returns:
 | tier | meaning |
 |---|---|
 | `user_confirmed` | you checked it. Proof-grade. |
-| `model_asserted` | quote real, calibrated score cleared your threshold |
+| `model_asserted` | quote real and both people named, calibrated score cleared your threshold |
 | `attested` | passage-proof and citable with passage scope: quote states the tie, verbatim in its cited chunk, both names in that chunk; below keeper, above provisional |
 | `provisional` | below threshold, kept with score and evidence |
 | `rejected` | fabricated quote, unknown entity, same person twice |

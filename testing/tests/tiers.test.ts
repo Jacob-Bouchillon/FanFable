@@ -168,7 +168,7 @@ test('promoteProvisional is dry-run safe, rule-only and idempotent', () => {
   const weak = insertRelation(db, project.id, asha, bram, 'brother of', 'Asha waited by the gate.', chunkId);
 
   const dry = lorebook.promoteProvisional(db, project.id, { dryRun: true });
-  assert.equal(dry.promoted, 2, 'both quotes are verbatim and carry the default confidence');
+  assert.equal(dry.promoted, 1, 'only the citation that names both people is provable');
   assert.equal(
     db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', provable)!.review_status,
     'provisional',
@@ -176,20 +176,21 @@ test('promoteProvisional is dry-run safe, rule-only and idempotent', () => {
   );
 
   const real = lorebook.promoteProvisional(db, project.id);
-  assert.equal(real.promoted, 2);
-  assert.equal(real.still.length, 0);
+  assert.equal(real.promoted, 1);
+  assert.deepEqual(real.still, [{ id: weak, reason: 'endpoint-unnamed' }]);
   assert.equal(
     db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', provable)!.review_status,
     'accepted',
   );
   assert.equal(
     db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', weak)!.review_status,
-    'accepted',
+    'provisional',
   );
 
   const second = lorebook.promoteProvisional(db, project.id);
   assert.equal(second.promoted, 0);
-  assert.equal(second.checked, 0);
+  assert.equal(second.checked, 1);
+  assert.deepEqual(second.still, [{ id: weak, reason: 'endpoint-unnamed' }]);
   db.close();
 });
 

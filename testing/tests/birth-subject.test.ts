@@ -9,6 +9,7 @@ import { buildPairThreads } from '../../fanfable/src/web/pair-threads.ts';
 import { syncThreads } from '../../fanfable/src/web/threads.ts';
 import * as threadWeb from '../../fanfable/src/web/threads.ts';
 import * as meetingWeb from '../../fanfable/src/web/meetings.ts';
+import * as ingest from '../../fanfable/src/web/note-ingest.ts';
 import { tempDb } from './helpers.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';
@@ -192,6 +193,62 @@ test('a second meeting pooling the same pair enriches instead of birthing', () =
     childId,
   );
   assert.ok(meeting, 'the enriching meeting points at the existing child');
+  db.close();
+});
+
+test('a born thread uses its referenced knowledge in a later meeting', () => {
+  const { db, project, mara, early, late, periods } = setupPeriods('birth-refs-meet');
+  const [p1, p2] = periods;
+  threadWeb.addNote(db, project, p1!.id, {
+    chunkId: early[0]!,
+    locator: 'p. 1',
+    quote: 'Mara Voss met Corin Hale near the marker 1.',
+    claim: 'they meet at the marker',
+    strength: 0.55,
+  });
+  threadWeb.addNote(db, project, p2!.id, {
+    chunkId: late[0]!,
+    locator: 'p. 60',
+    quote: 'Mara Voss met Corin Hale near the marker 60.',
+    claim: 'they meet again later',
+    strength: 0.6,
+  });
+  meetingWeb.runMeetings(db, project, { minConfidence: 0.7 });
+  const childId = db.get<{ child_thread: number }>(
+    'SELECT child_thread FROM canon_birth WHERE project_id = ?',
+    project,
+  )!.child_thread;
+  const personMara = db.get<{ id: number }>(
+    "SELECT id FROM canon_thread WHERE project_id = ? AND kind = 'person' AND a_entity = ?",
+    project,
+    mara,
+  )!.id;
+
+  // The parents are no longer live investigations; only the child carries
+  // their knowledge by reference.
+  db.run('UPDATE canon_thread SET status = \'dormant\' WHERE id IN (?, ?)', p1!.id, p2!.id);
+  const want = threadWeb.addOpenEnd(db, project, personMara, {
+    question: 'Where do they meet?',
+    wouldResolve: 'they meet at the marker',
+  });
+  const result = meetingWeb.runMeetings(db, project, { minConfidence: 0.7 });
+  assert.equal(result.wantsResolved, 1, 'the referenced note answered the want');
+  const end = db.get<{ status: string; resolved_by_note_id: number }>(
+    'SELECT status, resolved_by_note_id FROM canon_open_end WHERE id = ?',
+    want,
+  )!;
+  assert.equal(end.status, 'resolved');
+  assert.ok(
+    db
+      .all<{ note_id: number }>('SELECT note_id FROM canon_thread_note_ref WHERE thread_id = ?', childId)
+      .some((ref) => ref.note_id === end.resolved_by_note_id),
+    'the answer is one of the child\'s referenced notes',
+  );
+
+  // References are knowledge for starvation too: a child with only refs is
+  // not a thread with nothing gathered.
+  const starved = ingest.starvedThreads(db, project, 0);
+  assert.ok(!starved.some((row) => row.id === childId), 'a ref-only born thread is not starved');
   db.close();
 });
 

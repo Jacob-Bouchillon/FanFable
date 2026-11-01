@@ -109,18 +109,19 @@ function json(res: ServerResponse, code: number, body: unknown): void {
 function readBody(req: IncomingMessage, maxBytes = 2 * 1024 * 1024): Promise<string> {
   return new Promise((resolve, reject) => {
     let size = 0;
-    let data = '';
+    const chunks: Buffer[] = [];
     req.on('data', (c: string | Buffer) => {
-      const chunk = typeof c === 'string' ? c : c.toString('utf-8');
-      size += Buffer.byteLength(chunk);
+      const chunk = typeof c === 'string' ? Buffer.from(c) : c;
+      size += chunk.length;
       if (size > maxBytes) {
         reject(Object.assign(new Error('request body too large'), { statusCode: 413 }));
         req.destroy();
         return;
       }
-      data += chunk;
+      chunks.push(chunk);
     });
-    req.on('end', () => resolve(data));
+    // Decode once: an HTTP chunk can end in the middle of a UTF-8 character.
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
     req.on('error', (e) => reject(e));
   });
 }
@@ -129,7 +130,9 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
   const raw = await readBody(req);
   if (!raw) return {};
   try {
-    return JSON.parse(raw) as Record<string, unknown>;
+    const value: unknown = JSON.parse(raw);
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('expected object');
+    return value as Record<string, unknown>;
   } catch {
     throw Object.assign(new Error('malformed JSON body'), { statusCode: 400 });
   }
@@ -178,11 +181,26 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
   const activeId = (): number | null => (projectId === null ? null : projectId);
 
   const server = createServer(async (req, res) => {
-    const url = new URL(req.url ?? '/', `http://localhost:${port}`);
-    const path = url.pathname;
-    const method = req.method ?? 'GET';
-
     try {
+      // Loopback binding alone does not prevent browser CSRF or DNS rebinding.
+      const address = server.address();
+      const localPort = address && typeof address !== 'string' ? address.port : port;
+      const hosts = new Set([`127.0.0.1:${localPort}`, `localhost:${localPort}`]);
+      const host = req.headers.host ?? '';
+      if (!hosts.has(host) || req.headers['sec-fetch-site'] === 'cross-site'
+        || (req.headers.origin !== undefined && req.headers.origin !== `http://${host}`)) {
+        json(res, 403, { error: 'forbidden origin or host' });
+        return;
+      }
+      const url = new URL(req.url ?? '/', `http://${host}`);
+      let path: string;
+      try {
+        path = decodeURIComponent(url.pathname);
+      } catch {
+        json(res, 400, { error: 'malformed path' });
+        return;
+      }
+      const method = req.method ?? 'GET';
       /* ---------------------------------------------------------- static */
       if (method === 'GET' && (path === '/' || path === '/index.html')) {
         serveStatic(res, join(UI_DIR, 'index.html'));
@@ -207,7 +225,7 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
         return;
       }
       if (method === 'GET' && path.startsWith('/ui/')) {
-        const reqPath = normalize(decodeURIComponent(path.slice(4))).replace(/^(\.\.[\\/])+/, '');
+        const reqPath = normalize(path.slice(4)).replace(/^(\.\.[\\/])+/, '');
         const file = resolve(UI_DIR, reqPath);
         if (file !== UI_DIR && !file.startsWith(UI_DIR + sep)) {
           json(res, 403, { error: 'forbidden' });
@@ -266,12 +284,13 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
         const p = projectId === null ? undefined : controller.getProject(db, projectId);
         // The API key stays on the server: the UI sends settings, never reads the key back.
         const saved: Record<string, unknown> = { ...(loadGlobalConfig() as object) };
-        delete saved.apiKey;
+        const model = { ...saved, ...(p?.settings as object) } as Record<string, unknown>;
+        delete model.apiKey;
         json(res, 200, {
           projects: controller.listProjects(db).map((x) => ({ id: x.id, name: x.name, updatedAt: x.updatedAt })),
           currentProjectId: p?.id ?? null,
           projectName: p?.name ?? null,
-          model: { ...saved, ...(p?.settings as object) },
+          model,
         });
         return;
       }

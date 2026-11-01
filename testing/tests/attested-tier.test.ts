@@ -127,6 +127,22 @@ test('sentence-proof rows stay keeper-track; passage-proof rows land attested', 
   db.close();
 });
 
+test('a one-name quote with an anchor naming the other is keeper-track, not attested', () => {
+  const { db, project, mara, tor } = setup();
+  const chunk = addChunk(db, project.id, "Tor arrived. Mara was Tor's aunt.");
+  const id = addRelation(db, project.id, mara, tor, 'aunt of', 'Tor arrived.', chunk);
+  db.run('UPDATE canon_relation SET anchor_evidence = ? WHERE id = ?', "Mara was Tor's aunt.", id);
+  const result = lorebook.assignAttestedTiers(db, project.id, { write: true });
+  assert.equal(result.keeperTrack, 1, 'the citation names both people across quote and anchor');
+  assert.equal(result.attested, 0);
+  assert.equal(
+    db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', id)!.review_status,
+    'provisional',
+    'the keeper path owns a citation that names both people',
+  );
+  db.close();
+});
+
 test('a passage-proof quote with a stored asserted assessment becomes attested', () => {
   const { db, project, mara, tor } = setup();
   const chunk = addChunk(db, project.id, 'Mara feared him. Tor arrived with the guard at dawn.');

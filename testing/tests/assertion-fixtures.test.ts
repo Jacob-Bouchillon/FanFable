@@ -22,7 +22,7 @@ test('a co-occurrence sentence is not vetoed by grammar', () => {
 });
 
 test('a sentence about a third person is not vetoed by grammar', () => {
-  assert.deepEqual(decide("Bran's mentor was Tor.", 'mentor of'), { ok: true });
+  assert.deepEqual(decide("Bran said Mara was Tor's mentor.", 'mentor of'), { ok: true });
 });
 
 test('a bare action verb is not vetoed by grammar', () => {

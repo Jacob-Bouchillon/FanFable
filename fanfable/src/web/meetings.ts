@@ -629,6 +629,22 @@ export function runMeetings(db: Db, projectId: number, opts: RunMeetingsOptions 
     list.push(note);
     notesByThread.set(note.thread_id, list);
   }
+  // A born thread owns its knowledge by reference. Those references are as
+  // usable in later meetings as a directly owned note, without copying rows.
+  for (const note of db.all<NoteRow>(
+    `SELECT n.id, r.thread_id AS thread_id, n.chunk_id, n.claim, n.strength, n.is_context,
+            COALESCE(c.seq, 0) AS seq
+       FROM canon_thread_note_ref r
+       JOIN canon_thread_note n ON n.id = r.note_id
+       LEFT JOIN canon_chunk c ON c.id = n.chunk_id
+      WHERE n.project_id = ?
+      ORDER BY r.thread_id, n.id`,
+    projectId,
+  )) {
+    const list = notesByThread.get(note.thread_id) ?? [];
+    if (!list.some((existing) => existing.id === note.id)) list.push(note);
+    notesByThread.set(note.thread_id, list);
+  }
   const openEndsByThread = new Map<number, OpenEndRow[]>();
   for (const end of db.all<OpenEndRow>(
     'SELECT id, thread_id, question, origin, would_resolve, status, resolved_by_note_id, resolved_at FROM canon_open_end WHERE project_id = ? ORDER BY id',
@@ -641,10 +657,19 @@ export function runMeetings(db: Db, projectId: number, opts: RunMeetingsOptions 
   // Event ids cited by each thread through its notes' chunks.
   const eventsByThread = new Map<number, Set<number>>();
   for (const row of db.all<{ thread_id: number; event_id: number }>(
-    `SELECT DISTINCT n.thread_id AS thread_id, e.id AS event_id
-       FROM canon_thread_note n
-       JOIN canon_event e ON e.chunk_id = n.chunk_id AND e.project_id = n.project_id
-      WHERE n.project_id = ?`,
+    `SELECT DISTINCT owner AS thread_id, event_id FROM (
+       SELECT n.thread_id AS owner, e.id AS event_id
+         FROM canon_thread_note n
+         JOIN canon_event e ON e.chunk_id = n.chunk_id AND e.project_id = n.project_id
+        WHERE n.project_id = ?
+       UNION ALL
+       SELECT r.thread_id AS owner, e.id AS event_id
+         FROM canon_thread_note_ref r
+         JOIN canon_thread_note n ON n.id = r.note_id
+         JOIN canon_event e ON e.chunk_id = n.chunk_id AND e.project_id = n.project_id
+        WHERE n.project_id = ?
+     )`,
+    projectId,
     projectId,
   )) {
     const set = eventsByThread.get(row.thread_id) ?? new Set<number>();
@@ -794,6 +819,16 @@ export function runMeetings(db: Db, projectId: number, opts: RunMeetingsOptions 
       let resolvedNow = 0;
       for (const plan of plans) {
         if (plan.kind === 'new') {
+          // Claim the open end first. A cached row may already have been
+          // resolved by an earlier candidate in this same run.
+          const claimed = db.run(
+            `UPDATE canon_open_end SET status = 'resolved', resolved_by_note_id = ?, resolved_at = ?
+              WHERE id = ? AND status = 'open'`,
+            plan.note.id,
+            at,
+            plan.end.id,
+          ).changes;
+          if (!claimed) continue;
           db.run(
             `INSERT INTO canon_meeting_resolution
                (meeting_id, open_end_id, resolved_by_note_id, match_tokens, created_at)
@@ -804,13 +839,9 @@ export function runMeetings(db: Db, projectId: number, opts: RunMeetingsOptions 
             plan.tokens.join(','),
             at,
           );
-          db.run(
-            `UPDATE canon_open_end SET status = 'resolved', resolved_by_note_id = ?, resolved_at = ?
-              WHERE id = ? AND status = 'open'`,
-            plan.note.id,
-            at,
-            plan.end.id,
-          );
+          plan.end.status = 'resolved';
+          plan.end.resolved_by_note_id = plan.note.id;
+          plan.end.resolved_at = at;
         } else {
           const newId = Number(
             db.run(
@@ -999,7 +1030,13 @@ export function runMeetings(db: Db, projectId: number, opts: RunMeetingsOptions 
         };
 
         if (meeting.child_thread) {
-          result.birthsSkipped['one-per-meeting']++;
+          // One birth per meeting stays true, but new evidence in the same
+          // meeting still belongs to the child it already produced.
+          if (enrichBirth(db, projectId, meeting.child_thread, meeting, pairExchanged, at)) {
+            result.birthsEnriched++;
+          } else {
+            result.birthsSkipped['one-per-meeting']++;
+          }
         } else if (existingBornThread(db, projectId, child) !== null) {
           // The subject already has a born investigation: attach the new pooled
           // evidence instead of creating a sibling. This is not a second birth.
@@ -1175,17 +1212,19 @@ function enrichBirth(
   meeting: MeetingRow,
   pooled: { note: NoteRow; thread: number; scope: NoteScope }[],
   at: string,
-): void {
+): number {
+  let added = 0;
   for (const entry of pooled) {
-    db.run(
+    added += db.run(
       `INSERT OR IGNORE INTO canon_thread_note_ref (thread_id, note_id, role, created_at)
        VALUES (?, ?, 'pooled', ?)`,
       childId,
       entry.note.id,
       at,
-    );
+    ).changes;
   }
   carryWants(db, projectId, childId, meeting, at, true);
+  return added;
 }
 
 function createBirth(

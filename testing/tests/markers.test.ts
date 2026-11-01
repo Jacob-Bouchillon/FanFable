@@ -546,7 +546,8 @@ test('a parked moment is queued for review, never banked by a model', async () =
     entities: [SERENA, KADE],
     relations: [{
       from: 'Serena Marsh', to: 'Kade', kind: 'met',
-      description: 'They met.', chunk_index: 0, evidence: RIDGE_QUOTE,
+      description: 'They met.', chunk_index: 0,
+      evidence: 'Serena did not answer. She had learned that the fewer words she gave Kade, the fewer of them he spent.',
     }],
   });
   await lorebook.extractLore(db, extractMock, project.id);

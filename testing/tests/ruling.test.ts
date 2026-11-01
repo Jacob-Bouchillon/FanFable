@@ -441,6 +441,34 @@ test('a relabel replaces a wrong kind and records the appeal', async () => {
   s.db.close();
 });
 
+test('a relabel does not treat the reverse arrow as the same claim', async () => {
+  const s = setup();
+  const row = addRelation(s, 'ally of', 'Mara is the aunt of Tor.', 'attested');
+  // The same label on the opposite pair is a different directed claim.
+  s.db.run(
+    `INSERT INTO canon_relation
+       (project_id, from_entity, to_entity, kind, description, evidence, source_refs,
+        confidence, modality, review_status, created_at)
+     VALUES (?, ?, ?, 'enemy of', '', 'Mara is the aunt of Tor.', ?, 0.8, 'asserted', 'attested', ?)`,
+    s.project.id,
+    s.tor,
+    s.mara,
+    JSON.stringify([{ source: 'Court', locator: 'p. 1', chunk: s.chunk }]),
+    AT,
+  );
+  const llm = mockProvider(() => JSON.stringify({ kind: 'enemy of', why: 'the passage says so' }));
+  const wrote = await lorebook.relabelRelations(s.db, llm, s.project.id, { ids: [row], write: true });
+  assert.equal(wrote.changed, 1, 'the reverse row does not block the relabel');
+  const saved = s.db.get<{ kind: string }>('SELECT kind FROM canon_relation WHERE id = ?', row)!;
+  assert.equal(saved.kind, 'enemy of');
+  const sameKind = s.db.all<{ from_entity: number; to_entity: number }>(
+    "SELECT from_entity, to_entity FROM canon_relation WHERE project_id = ? AND kind = 'enemy of' ORDER BY from_entity",
+    s.project.id,
+  );
+  assert.equal(sameKind.length, 2, 'both directions survive as separate claims');
+  s.db.close();
+});
+
 test('the docket counts open wants on the relation pair', () => {
   const s = setup();
   addRelation(s, 'aunt of', 'Mara is the aunt of Tor.', 'provisional');

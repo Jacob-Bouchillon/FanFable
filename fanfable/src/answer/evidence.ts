@@ -171,6 +171,7 @@ interface ClaimInfo {
 
 interface ScoredRecord {
   claim: string;
+  kind: ClaimInfo['kind'];
   record: EvidenceRecord;
   matched: string[];
   titleHits: number;
@@ -201,8 +202,11 @@ export function selectEvidence(requirements: SceneRequirements, records: Evidenc
   const uniqueClaims: ClaimInfo[] = [];
   const seenClaims = new Set<string>();
   for (const claim of claims) {
-    if (!claim.text || seenClaims.has(claim.text)) continue;
-    seenClaims.add(claim.text);
+    // Canon and AU requirements are different questions even when their words
+    // match. Collapsing them would let one source silently satisfy the other.
+    const key = `${claim.kind}\u0000${claim.text}`;
+    if (!claim.text || seenClaims.has(key)) continue;
+    seenClaims.add(key);
     uniqueClaims.push(claim);
   }
 
@@ -219,9 +223,14 @@ export function selectEvidence(requirements: SceneRequirements, records: Evidenc
 
   const scored: ScoredRecord[] = [];
   const gaps: Gap[] = [];
+  const gapKind = new Map<Gap, ClaimInfo['kind']>();
+  const addGap = (gap: Gap, kind: ClaimInfo['kind']): void => {
+    gaps.push(gap);
+    gapKind.set(gap, kind);
+  };
   for (const info of uniqueClaims) {
     if (info.kind === 'unknown') {
-      gaps.push({ claim: info.text, reason: 'unclassified' });
+      addGap({ claim: info.text, reason: 'unclassified' }, info.kind);
       continue;
     }
     const source: EvidenceSource = info.kind;
@@ -255,9 +264,20 @@ export function selectEvidence(requirements: SceneRequirements, records: Evidenc
         const sentencesOfRecord = sentences(record.text);
         const agentOk = info.named.every((character) => {
           const nameTokens = normalizeTerms(character);
+          // A shared given name is not identity. When another participant in
+          // this event carries one of the character's tokens, only the full
+          // name may stand for that character.
+          const otherTokens = new Set(
+            participants
+              .filter((participant) => !namesRelate(character, participant))
+              .flatMap((participant) => normalizeTerms(participant)),
+          );
+          const ambiguous = nameTokens.some((token) => otherTokens.has(token));
           return sentencesOfRecord.some(
             (tokens) =>
-              nameTokens.some((token) => tokens.includes(token)) &&
+              (ambiguous
+                ? nameTokens.every((token) => tokens.includes(token))
+                : nameTokens.some((token) => tokens.includes(token))) &&
               matched.some((term) => tokens.includes(term)),
           );
         });
@@ -270,7 +290,7 @@ export function selectEvidence(requirements: SceneRequirements, records: Evidenc
         continue;
       }
       const score = Math.round((matched.length / Math.max(1, content.length)) * 100) / 100;
-      const candidate: ScoredRecord = { claim: info.text, record, matched, titleHits, score };
+      const candidate: ScoredRecord = { claim: info.text, kind: info.kind, record, matched, titleHits, score };
       if (
         !best ||
         score > best.score ||
@@ -295,7 +315,7 @@ export function selectEvidence(requirements: SceneRequirements, records: Evidenc
           : sawOverlap
             ? 'no-term-match'
             : 'no-event';
-    gaps.push({ claim: info.text, reason });
+    addGap({ claim: info.text, reason }, info.kind);
   }
 
   scored.sort(
@@ -307,7 +327,7 @@ export function selectEvidence(requirements: SceneRequirements, records: Evidenc
       a.claim.localeCompare(b.claim),
   );
   const supported = scored.slice(0, MAX_SUPPORT);
-  for (const dropped of scored.slice(MAX_SUPPORT)) gaps.push({ claim: dropped.claim, reason: 'support-limit' });
+  for (const dropped of scored.slice(MAX_SUPPORT)) addGap({ claim: dropped.claim, reason: 'support-limit' }, dropped.kind);
 
   const support: ClaimSupport[] = supported.map((entry) => ({
     claim: entry.claim,
@@ -378,6 +398,11 @@ export function selectEvidence(requirements: SceneRequirements, records: Evidenc
   }
 
   const seenGaps = new Set<string>();
-  const dedupedGaps = gaps.filter((gap) => (seenGaps.has(gap.claim) ? false : (seenGaps.add(gap.claim), true)));
+  const dedupedGaps = gaps.filter((gap) => {
+    const key = `${gapKind.get(gap) ?? 'unknown'}\u0000${gap.reason}\u0000${gap.claim}`;
+    if (seenGaps.has(key)) return false;
+    seenGaps.add(key);
+    return true;
+  });
   return { support, context, gaps: dedupedGaps, suspiciousReuse };
 }

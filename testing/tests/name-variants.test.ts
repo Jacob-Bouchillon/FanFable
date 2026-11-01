@@ -122,7 +122,7 @@ test('a df title token is stripped only above NAME_DF_CAP', () => {
   assert.ok(!atCapVariants.includes('verity'), 'without a strip there is no stripped given name');
 });
 
-test('a quote naming only the given name is no longer a promotion gate', () => {
+test('a derived given name satisfies the endpoint rule through the index', () => {
   const { db, project } = setup('variants-proof');
   const fromId = entity(db, project.id, 'Aunt Petunia Dursley');
   const toId = entity(db, project.id, 'Lily Potter');
@@ -139,9 +139,13 @@ test('a quote naming only the given name is no longer a promotion gate', () => {
     confidence: 0.9,
   };
 
-  // The model decided this claim; the mechanical guard does not re-litigate
-  // which surface form of the name appears in the quote.
-  assert.deepEqual(lorebook.canPromote(row, { db, projectId: project.id, chunkText: quote }), { ok: true });
+  // Without the command's roster index only the stored full names match, so
+  // the citation names neither endpoint. With it, the derived given names
+  // resolve both and the claim banks.
+  assert.deepEqual(lorebook.canPromote(row, { db, projectId: project.id, chunkText: quote }), {
+    ok: false,
+    reason: 'endpoint-unnamed',
+  });
   assert.deepEqual(lorebook.canPromote(row, { db, projectId: project.id, chunkText: quote, index }), { ok: true });
   db.close();
 });

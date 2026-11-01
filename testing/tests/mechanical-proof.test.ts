@@ -52,7 +52,7 @@ function decision(
   );
 }
 
-test('a backwards arrow never banks: Harry as Vernon father is refused', () => {
+test('a backwards arrow never banks: the child named as father is refused', () => {
   // The sentence makes Harry the child, so "Harry father of Vernon" is backwards.
   const { db, projectId, ids } = projectWith('Harry Potter was the son of Uncle Vernon.');
   const verdict = decision(db, projectId, ids, 'father of', 'Harry Potter was the son of Uncle Vernon.');
