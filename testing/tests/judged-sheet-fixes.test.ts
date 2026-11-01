@@ -119,7 +119,7 @@ test('open vocabulary parks at intake instead of banking; missing score queues t
   // "encourager of" is outside the twelve families: it parks, never banks.
   assert.equal(rows.find((r) => r.kind === 'encourager of'), undefined);
   const aide = rows.find((r) => r.kind === 'aide of');
-  assert.equal(aide?.review_status, 'provisional', 'a family kind still queues without a model score');
+  assert.equal(aide?.review_status, 'needs_review', 'a family kind enters review; the gate decides');
   assert.equal(lorebook.isClosedRoleKind('encourager of'), false, 'the concept set still governs querying');
   const note = db.get<{ reason: string }>(`SELECT reason FROM canon_tie_note WHERE project_id = ? AND attempted_kind = 'encourager of'`, project.id);
   assert.equal(note?.reason, 'kind-unsupported', 'the parked kind says why it parked');

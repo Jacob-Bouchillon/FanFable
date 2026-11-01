@@ -68,7 +68,7 @@ test('a noun-silent tie without a model score stays provisional', async () => {
     from: 'Serena Marsh', to: 'Kade', kind: 'apprentice of', description: 'x', chunk_index: 0,
     evidence: 'Two hundred yards, said Kade behind her',
   }]);
-  assert.equal(status, 'provisional', 'a missing confidence is zero, never a pass');
+  assert.equal(status, 'needs_review', 'intake banks nothing; a missing confidence cannot pass');
   assert.equal(note, 0, 'the concept set is not a promotion gate, so it leaves no relabel note');
 });
 
@@ -77,7 +77,7 @@ test('a quote naming neither endpoint does not bank without a model score', asyn
     from: 'Serena Marsh', to: 'Kade', kind: 'brother of', description: 'x', chunk_index: 0,
     evidence: 'wrapped in a coat that had belonged to her brother',
   }]);
-  assert.equal(status, 'provisional', 'below threshold stays in the queue');
+  assert.equal(status, 'needs_review', 'every claim enters review');
   assert.equal(note, 0);
 });
 
@@ -91,5 +91,5 @@ test('a stated tie naming one endpoint is provisional, not a keeper', async () =
     from: 'Serena Marsh', to: 'Kade', kind: 'brother of', description: 'x', chunk_index: 0,
     evidence: COAT,
   }]);
-  assert.equal(status, 'provisional');
+  assert.equal(status, 'needs_review');
 });

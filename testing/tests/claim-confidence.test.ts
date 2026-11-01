@@ -99,7 +99,7 @@ test('a fabricated quote is never banked, whatever the confidence', async () => 
   db.close();
 });
 
-test('a pronoun-bound claim with a verbatim anchor banks and stores the anchor', async () => {
+test('a pronoun-bound claim with a verbatim anchor enters review and stores the anchor', async () => {
   const text = 'She feared him. Mara was afraid of Tor.';
   const { db, project } = await extract(
     'confidence-anchor',
@@ -123,7 +123,7 @@ test('a pronoun-bound claim with a verbatim anchor banks and stores the anchor',
     anchor_evidence: string;
     supporting_evidence: string;
   }>('SELECT review_status, confidence, anchor_evidence, supporting_evidence FROM canon_relation WHERE project_id = ?', project.id)!;
-  assert.equal(row.review_status, 'accepted');
+  assert.equal(row.review_status, 'needs_review', 'intake banks nothing');
   assert.equal(row.confidence, 0.9);
   assert.equal(row.anchor_evidence, 'Mara was afraid of Tor.');
   const supporting = JSON.parse(row.supporting_evidence) as { assessment: Record<string, unknown> }[];
@@ -134,7 +134,7 @@ test('a pronoun-bound claim with a verbatim anchor banks and stores the anchor',
   db.close();
 });
 
-test('the same claim below the threshold stays provisional with its score', async () => {
+test('the same claim below the threshold still records its score', async () => {
   const { db, project } = await extract(
     'confidence-low',
     'Mara was a friend of Tor.',
@@ -144,7 +144,7 @@ test('the same claim below the threshold stays provisional with its score', asyn
     'SELECT review_status, confidence FROM canon_relation WHERE project_id = ?',
     project.id,
   )!;
-  assert.equal(row.review_status, 'provisional');
+  assert.equal(row.review_status, 'needs_review');
   assert.equal(row.confidence, 0.4);
   db.close();
 });
@@ -206,29 +206,24 @@ test('no assertion-pattern rule can veto a claim that clears the threshold', asy
     'SELECT review_status, confidence FROM canon_relation WHERE project_id = ?',
     project.id,
   )!;
-  assert.equal(row.review_status, 'accepted', 'co-occurrence shape is not a veto');
+  assert.equal(row.review_status, 'needs_review', 'the shape is not a veto; intake still banks nothing');
   assert.equal(row.confidence, 0.9);
   db.close();
 });
 
-test('the project setting moves the threshold', async () => {
-  const low = await extract('confidence-setting-low', 'Mara was a friend of Tor.', relation({ strength: 0.6 }), {
+test('the project threshold decides at the gate, not at intake', async () => {
+  // The threshold moved from intake to the gate. The claim tier is the rule
+  // the gate applies; intake stores the claim and the score either way.
+  assert.equal(lorebook.claimTier(0.6, 0.5), 'accepted');
+  assert.equal(lorebook.claimTier(0.6, 0.8), 'provisional');
+  const { db, project } = await extract('confidence-setting', 'Mara was a friend of Tor.', relation({ strength: 0.6 }), {
     minConfidence: 0.5,
   });
-  const lowRow = low.db.get<{ review_status: string }>(
-    'SELECT review_status FROM canon_relation WHERE project_id = ?',
-    low.project.id,
+  const row = db.get<{ review_status: string; confidence: number }>(
+    'SELECT review_status, confidence FROM canon_relation WHERE project_id = ?',
+    project.id,
   )!;
-  assert.equal(lowRow.review_status, 'accepted');
-  low.db.close();
-
-  const high = await extract('confidence-setting-high', 'Mara was a friend of Tor.', relation({ strength: 0.6 }), {
-    minConfidence: 0.8,
-  });
-  const highRow = high.db.get<{ review_status: string }>(
-    'SELECT review_status FROM canon_relation WHERE project_id = ?',
-    high.project.id,
-  )!;
-  assert.equal(highRow.review_status, 'provisional');
-  high.db.close();
+  assert.equal(row.review_status, 'needs_review', 'intake ignores the threshold');
+  assert.equal(row.confidence, 0.6);
+  db.close();
 });

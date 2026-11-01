@@ -123,9 +123,10 @@ test('extraction tiers at the model score', async () => {
     project.id,
   );
   const status = (kind: string) => rows.find((row) => row.kind === kind)?.review_status;
-  assert.equal(status('sister of'), 'accepted', 'at/above the threshold banks');
-  assert.equal(status('friend of'), 'provisional', 'below the threshold queues');
-  assert.equal(status('brother of'), 'accepted', 'grammar is not a tier');
+  // Intake banks nothing now: the score no longer sets a tier here.
+  assert.equal(status('sister of'), 'needs_review');
+  assert.equal(status('friend of'), 'needs_review');
+  assert.equal(status('brother of'), 'needs_review');
   assert.equal(stats.provisional, 1);
   db.close();
 });

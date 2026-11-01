@@ -121,7 +121,7 @@ test('the strict prompt is opt-in and its kind mapping prefers closed kinds', ()
   assert.equal(lorebook.strictRelationKind('advisor of | ally of'), 'ally of');
 });
 
-test('one retry repairs a partly named quote and the relation banks accepted', async () => {
+test('one retry repairs a partly named quote and the row enters review', async () => {
   const { db, project } = setup();
   const counter = { retries: 0 };
   const llm = mock([relation('Asha waited by the gate.')], JSON.stringify({ quote: "Asha is Bram's sister." }), counter);
@@ -137,7 +137,7 @@ test('one retry repairs a partly named quote and the relation banks accepted', a
     project.id,
   )!;
   assert.equal(row.evidence, "Asha is Bram's sister.");
-  assert.equal(row.review_status, 'accepted');
+  assert.equal(row.review_status, 'needs_review', 'intake banks nothing');
   db.close();
 });
 
@@ -157,7 +157,7 @@ test('a failed retry leaves the original quote, which can bank on its own', asyn
     project.id,
   )!;
   assert.equal(row.evidence, 'Asha waited by the gate.');
-  assert.equal(row.review_status, 'accepted', 'the original quote is verbatim and the model scored it; both names are no longer required');
+  assert.equal(row.review_status, 'needs_review', 'the original quote is verbatim, but intake still banks nothing');
   db.close();
 });
 

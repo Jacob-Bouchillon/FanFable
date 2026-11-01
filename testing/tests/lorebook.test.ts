@@ -171,6 +171,10 @@ test('lore can be searched and rendered as a brief', async () => {
   const project = seedProject(db, 'lore-search');
   const llm = mockProvider(() => JSON.stringify(EXTRACTION_JSON));
   await lorebook.extractLore(db, llm, project.id);
+  // Intake banks nothing; this test is about search and the brief, so stand
+  // in for the gate and accept the extracted rows.
+  db.run("UPDATE canon_entity SET review_status = 'accepted' WHERE project_id = ?", project.id);
+  db.run("UPDATE canon_fact SET review_status = 'accepted' WHERE project_id = ?", project.id);
 
   const hits = lorebook.searchLore(db, project.id, 'Serena');
   assert.ok(hits.entities.length > 0);

@@ -2368,8 +2368,8 @@ function applyEntities(
     }
     db.run(
       `INSERT OR IGNORE INTO canon_entity (project_id, kind, name, aliases, summary, attributes, role, status,
-                                 first_chunk, evidence, source_refs, mentions, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+                                 first_chunk, evidence, source_refs, mentions, review_status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'needs_review', ?, ?)`,
       projectId,
       kind,
       name,
@@ -2437,8 +2437,8 @@ function applyFacts(
       ? [{ source: span.source, locator: span.locator, chunk: span.chunkId }]
       : refsFor(chunk);
     db.run(
-      `INSERT INTO canon_fact (project_id, topic, statement, kind, certainty, subject, evidence, source_refs, subject_entity_id, modality, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO canon_fact (project_id, topic, statement, kind, certainty, subject, evidence, source_refs, subject_entity_id, modality, review_status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'needs_review', ?)`,
       projectId,
       String(raw.topic ?? '').trim(),
       statement,
@@ -3900,8 +3900,10 @@ function applyRelations(
     const assessment = readClaimAssessment(raw);
     const confidence = assessment.strength;
     const supporting = assessmentSupporting(assessment);
-    const rowReview = claimTier(confidence, minConfidence);
-    if (rowReview === 'provisional') stats.provisional++;
+    // Intake banks nothing. A verbatim quote and a confident model only put
+    // the row in the queue; accepted is earned at the gate, never here.
+    const rowReview = 'needs_review';
+    if (claimTier(confidence, minConfidence) === 'provisional') stats.provisional++;
 
     const kindSourceRaw = String(raw.kind_source ?? '').trim();
     const kindSource =
