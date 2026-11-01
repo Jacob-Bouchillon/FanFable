@@ -1002,9 +1002,17 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
         if (body.continuity !== undefined) {
           patch.continuity = body.continuity;
         }
+        if (typeof body.recognition === 'boolean') {
+          patch.recognition = body.recognition;
+        }
         const p = project();
         controller.updateProjectSettings(db, p.id, patch);
-        if (body.continuity === undefined) saveGlobalConfig(patch as never);
+        if (body.continuity === undefined) {
+          // Recognition is a project setting, not a global model setting.
+          const globalPatch = { ...patch };
+          delete globalPatch.recognition;
+          if (Object.keys(globalPatch).length) saveGlobalConfig(globalPatch as never);
+        }
         json(res, 200, {
           ok: true,
           settings: maskSettingsForOutput(controller.getProject(db, p.id)!.settings),

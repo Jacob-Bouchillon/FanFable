@@ -46,6 +46,11 @@ Embeddings are separate. `lore embed` and dense retrieval call an Ollama-style
 gateway, set `embeddingBaseUrl` (or `--embedding-base-url`) so embeddings stay
 local.
 
+Project setting `recognition` (default off) enables the recognition filter on
+dense-only retrieval seeds. Turn it on with `project settings --recognition on`
+(or `recognition: true` in POST `/api/settings`); off means the default
+retrieval path makes no judge call.
+
 ```bash
 ollama pull llama3.1:8b
 ollama pull nomic-embed-text

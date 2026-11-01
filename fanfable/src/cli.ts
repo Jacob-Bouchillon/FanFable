@@ -131,6 +131,7 @@ ${C.bold('PROJECT')}
   project list                     List projects
   project use <name>               Set the active project
   project settings [--provider p] [--model m] [--base-url u] [--temperature t]
+                   [--recognition on|off]   Show or change project settings
 
 ${C.bold('SOURCE MATERIAL')}
   import <file...>                 Import source files into canon
@@ -366,19 +367,29 @@ async function cmdProject(args: Args): Promise<void> {
       }
       const temp = flagNumber(args, 'temperature', NaN);
       if (Number.isFinite(temp)) patch.temperature = temp;
+      const recognition = flagString(args, 'recognition').toLowerCase();
+      if (recognition) {
+        if (!['on', 'off', 'true', 'false'].includes(recognition)) {
+          throw new Error('--recognition must be on or off');
+        }
+        patch.recognition = recognition === 'on' || recognition === 'true';
+      }
+      const show = (settings: Record<string, unknown>): string =>
+        JSON.stringify(
+          {
+            ...maskApiKey({ ...DEFAULT_LLM_SETTINGS, ...loadGlobalConfig(), ...settings }),
+            recognition: settings.recognition === true,
+          },
+          null,
+          2,
+        );
       if (Object.keys(patch).length) {
         const updated = controller.updateProjectSettings(db, p.id, patch);
         console.log(`Updated settings for ${C.bold(p.name)}`);
-        console.log(
-          JSON.stringify(
-            maskApiKey({ ...DEFAULT_LLM_SETTINGS, ...loadGlobalConfig(), ...updated.settings }),
-            null,
-            2,
-          ),
-        );
+        console.log(show(updated.settings));
         return;
       }
-      console.log(JSON.stringify(maskApiKey({ ...DEFAULT_LLM_SETTINGS, ...loadGlobalConfig(), ...p.settings }), null, 2));
+      console.log(show(p.settings));
       return;
     }
     default:

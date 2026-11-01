@@ -62,6 +62,11 @@ export interface RetrievalRequest {
    */
   lazyExtract?: boolean;
   /**
+   * Run the recognition filter on dense-only seeds. Off by default; opt in
+   * per call here or with project.settings.recognition === true.
+   */
+  recognition?: boolean;
+  /**
    * Seed PPR with dense cosine matches alongside the lexical triple/event
    * seeds. Defaults on for everything except the fast lookup path, which
    * pays zero embedding work. Currently takes effect on the relational path
@@ -178,6 +183,22 @@ function emptyGraphContext(): graph.GraphContext {
 }
 
 /**
+ * The effective recognition-filter setting. Off unless the caller opts in:
+ * an explicit request override wins, then project.settings.recognition ===
+ * true; anything else (including a malformed settings blob) is off.
+ */
+export function recognitionEnabled(db: Db, projectId: number, override?: boolean): boolean {
+  if (override !== undefined) return override;
+  try {
+    const row = db.get<{ settings: string }>('SELECT settings FROM project WHERE id = ?', projectId);
+    if (!row?.settings) return false;
+    return (JSON.parse(row.settings) as { recognition?: unknown }).recognition === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Retrieve everything relevant to a scene, from text and graph alike.
  */
 export async function retrieve(
@@ -195,6 +216,8 @@ export async function retrieve(
   const route = req.route ?? routeQuery(query, focus);
   const relational = route === 'relational';
   const includeGraph = req.includeGraph ?? route !== 'lookup';
+  // Off by default: the recognition filter is an explicit opt-in.
+  const recognition = recognitionEnabled(db, projectId, req.recognition);
   // A lookup needs no widening, and neither does a relational question: the
   // graph already carries the connection. Only a vague query pays for expansion.
   const skipExpansion = req.skipExpansion ?? route !== 'vague';
@@ -298,7 +321,7 @@ export async function retrieve(
             maxNodes: hops > 1 ? 70 : 45,
             maxWords: Math.round(maxWords * 0.70),
             ...(denseEmbed ? { embed: denseEmbed } : {}),
-            recognize: { llm, enabled: req.dense !== false },
+            ...(recognition ? { recognize: { llm, enabled: true } } : {}),
             web: req.web ?? false,
           })
         : graph.buildGraphContext(db, projectId, {

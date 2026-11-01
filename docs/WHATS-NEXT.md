@@ -1,5 +1,7 @@
 # What's next — ranked work, roadmap, commands, traps
 
+**Recognition filter:** off by default after the 2026-11-01 benchmark (B→C was neutral on quality and cost +439 ms pooled). See `docs/RESEARCH.md` for the numbers and limitations; opt in with `project settings --recognition on`.
+
 ## 1. Now: the judge fix (in order)
 
 1. **One prompt variant** on the same 42 rows, same model (`gpt-oss:20b`, `think: "low"`): two names for one person are not a relationship; a family title used in the passage establishes what it names. Must move: the 2 alias false positives (`Plagueis — partner — "The Muun"`, `Palpatine — colleague of — Sidious`) and most of the 6 title misses (`Aunt Petunia`/Harry twice, `Uncle Vernon`/Harry, `Uncle Vernon`+`Aunt Petunia` together, `Dudley`/`Uncle Vernon`, `Great Auntie Enid`/`Great Uncle Algie` — every establishment miss is a title). Track separately, not decisive: the 1 reinforces miss (partnership talked *about* rather than restated) and the genitive FP (`Larsh Hill`, "son of Damask's officer" — wrong-noun attachment, no identity rule fixes it). Zero regressions on rows already correct.
