@@ -2582,6 +2582,8 @@ function applyFacts(
     const refs = span.chunkId !== null
       ? [{ source: span.source, locator: span.locator, chunk: span.chunkId }]
       : refsFor(chunk);
+    // canon_fact.review_status is advisory: facts are context, never proof of a
+    // claim, and there is no promotion path by design.
     db.run(
       `INSERT INTO canon_fact (project_id, topic, statement, kind, certainty, subject, evidence, source_refs, subject_entity_id, modality, review_status, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'needs_review', ?)`,
@@ -10635,7 +10637,7 @@ export function formatLoreBrief(brief: LoreBrief): string {
   const parts: string[] = [];
   if (brief.entities) parts.push(`PEOPLE, PLACES AND THINGS:\n${brief.entities}`);
   if (brief.relations) parts.push(`RELATIONSHIPS IN THE SOURCE:\n${brief.relations}`);
-  if (brief.facts) parts.push(`ESTABLISHED BY THE SOURCE:\n${brief.facts}`);
+  if (brief.facts) parts.push(`SOURCE-DERIVED FACTS (VERIFY BEFORE ASSERTING):\n${brief.facts}`);
   if (!parts.length) return '';
   return (
     parts.join('\n\n') +

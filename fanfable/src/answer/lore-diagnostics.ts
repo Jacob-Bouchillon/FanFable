@@ -589,6 +589,8 @@ export async function enrichEntity(
         statement,
       );
       if (dup) continue;
+      // canon_fact.review_status is advisory: facts are context, never proof of
+      // a claim, and there is no promotion path by design.
       db.run(
         `INSERT INTO canon_fact (project_id, topic, statement, kind, certainty, subject, subject_entity_id, evidence, source_refs, confidence, review_status, created_at)
          VALUES (?, ?, ?, 'fact', 'inferred', ?, ?, ?, ?, ?, 'needs_review', ?)`,

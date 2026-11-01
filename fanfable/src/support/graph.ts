@@ -350,6 +350,7 @@ export function loadGraph(db: Db, projectId: number, opts: GraphLoadOptions = {}
     }
 
     if (includeFacts) {
+      // Facts are advisory context; review_status never authorises a claim.
       const facts = db.all<{
         id: number;
         topic: string;

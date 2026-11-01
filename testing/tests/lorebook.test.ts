@@ -187,7 +187,7 @@ test('lore can be searched and rendered as a brief', async () => {
 
   const text = lorebook.formatLoreBrief(brief);
   assert.match(text, /PEOPLE, PLACES AND THINGS/);
-  assert.match(text, /ESTABLISHED BY THE SOURCE/);
+  assert.match(text, /SOURCE-DERIVED FACTS \(VERIFY BEFORE ASSERTING\)/);
   db.close();
 });
 
