@@ -82,14 +82,17 @@ function insert(
     kindSource?: string;
     anchor?: string;
     supporting?: string;
+    modality?: string;
+    relationStatus?: string;
   },
 ): number {
   return Number(
     db.run(
       `INSERT INTO canon_relation
          (project_id, from_entity, to_entity, kind, description, evidence, source_refs,
-          confidence, modality, review_status, kind_source, anchor_evidence, supporting_evidence, scope, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'asserted', ?, ?, ?, ?, ?, ?)`,
+          confidence, modality, review_status, kind_source, anchor_evidence, supporting_evidence,
+          relation_status, scope, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       projectId,
       from,
       to,
@@ -98,10 +101,12 @@ function insert(
       fields.evidence,
       JSON.stringify([{ source: 'Merge', locator: `p. ${fields.chunkId}`, chunk: fields.chunkId }]),
       fields.confidence ?? 0.8,
+      fields.modality ?? 'asserted',
       fields.status ?? 'needs_review',
       fields.kindSource ?? '',
       fields.anchor ?? '',
       fields.supporting ?? '[]',
+      fields.relationStatus ?? 'unknown',
       fields.scope ?? '',
       AT,
     ).lastInsertRowid,
@@ -113,16 +118,18 @@ test('dedupe takes every primary field from one bundle and keeps the other', () 
   const mara = entity(db, project.id, 'Mara');
   const tor = entity(db, project.id, 'Tor');
   const later = chunk(db, project.id, 'Mara is the aunt of Tor and has raised him since the fire.', 2);
-  const earlier = chunk(db, project.id, 'Mara is the aunt of Tor.', 1);
+  const earlier = chunk(db, project.id, 'Mara was the aunt of Tor and raised him after the fire.', 1);
   const survivor = insert(db, project.id, mara, tor, 'aunt of', {
     evidence: 'Mara is the aunt of Tor.',
     description: 'short',
     chunkId: later,
     confidence: 0.6,
     status: 'accepted',
+    modality: 'asserted',
+    relationStatus: 'current',
   });
   const stronger = insert(db, project.id, mara, tor, 'aunt of', {
-    evidence: 'Mara is the aunt of Tor and has raised him since the fire.',
+    evidence: 'Mara was the aunt of Tor and raised him after the fire.',
     description: 'the longer account',
     chunkId: earlier,
     confidence: 0.9,
@@ -130,6 +137,8 @@ test('dedupe takes every primary field from one bundle and keeps the other', () 
     scope: 'alt',
     kindSource: 'aunt',
     anchor: "Mara was Tor's aunt.",
+    modality: 'possible',
+    relationStatus: 'past',
   });
 
   lorebook.dedupeRelations(db, project.id);
@@ -141,6 +150,8 @@ test('dedupe takes every primary field from one bundle and keeps the other', () 
     source_refs: string;
     kind_source: string;
     anchor_evidence: string;
+    modality: string;
+    relation_status: string;
     confidence: number;
     review_status: string;
     supporting_evidence: string;
@@ -148,10 +159,12 @@ test('dedupe takes every primary field from one bundle and keeps the other', () 
   assert.equal(rows.length, 1, 'one row survives');
   const row = rows[0]!;
   assert.equal(row.id, survivor, 'the earliest row stays the case id');
-  assert.equal(row.evidence, 'Mara is the aunt of Tor and has raised him since the fire.');
+  assert.equal(row.evidence, 'Mara was the aunt of Tor and raised him after the fire.');
   assert.equal(row.description, 'the longer account');
   assert.equal(row.kind_source, 'aunt');
   assert.equal(row.anchor_evidence, "Mara was Tor's aunt.");
+  assert.equal(row.modality, 'possible', 'modality follows the winning bundle');
+  assert.equal(row.relation_status, 'past', 'temporal status follows the winning quote');
   assert.equal(row.confidence, 0.9);
   assert.equal(row.review_status, 'accepted');
   assert.equal(
@@ -275,7 +288,7 @@ async function runPass(db: Db, projectId: number, rows: Record<string, unknown>[
 /* ---------------------------------------------------------------- tests */
 
 test('extraction merge takes the winning bundle whole and preserves the other', async () => {
-  const text = 'Asha is Bram’s sister. Asha has always been Bram’s sister and she raised him.';
+  const text = 'Asha is Bram’s sister. Asha was always Bram’s sister and she raised him.';
   const { db, project } = setupExtraction('merge-extract-bundle', text);
   await runPass(db, project.id, [
     relation({ evidence: 'Asha is Bram’s sister.', description: 'first', strength: 0.6 }),
@@ -283,7 +296,7 @@ test('extraction merge takes the winning bundle whole and preserves the other', 
   // A second pass over the same passage folds the stronger claim in.
   await runPass(db, project.id, [
     relation({
-      evidence: 'Asha has always been Bram’s sister and she raised him.',
+      evidence: 'Asha was always Bram’s sister and she raised him.',
       description: 'second',
       strength: 0.9,
     }),
@@ -292,13 +305,18 @@ test('extraction merge takes the winning bundle whole and preserves the other', 
   const rows = db.all<{
     description: string;
     evidence: string;
+    relation_status: string;
     confidence: number;
     supporting_evidence: string;
-  }>('SELECT description, evidence, confidence, supporting_evidence FROM canon_relation WHERE project_id = ?', project.id);
+  }>(
+    'SELECT description, evidence, relation_status, confidence, supporting_evidence FROM canon_relation WHERE project_id = ?',
+    project.id,
+  );
   assert.equal(rows.length, 1, 'one claim survives');
   const row = rows[0]!;
-  assert.equal(row.evidence, 'Asha has always been Bram’s sister and she raised him.');
+  assert.equal(row.evidence, 'Asha was always Bram’s sister and she raised him.');
   assert.equal(row.description, 'second');
+  assert.equal(row.relation_status, 'past', 'temporal status follows the winning quote');
   assert.equal(row.confidence, 0.9);
   const supporting = JSON.parse(row.supporting_evidence) as { quote?: string; reason?: string }[];
   assert.ok(

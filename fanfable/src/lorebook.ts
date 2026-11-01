@@ -1535,6 +1535,8 @@ interface EvidenceBundle {
   source_refs: string;
   kind_source: string;
   anchor_evidence: string;
+  modality: string;
+  relation_status: string;
   confidence: number;
   review_status: string;
   supporting_evidence: string;
@@ -1622,8 +1624,8 @@ export function dedupeRelations(db: Db, projectId: number): void {
   type Row = EvidenceBundle & { from_entity: number; to_entity: number; kind: string };
   const rows = db.all<Row>(
     `SELECT id, from_entity, to_entity, kind, description, evidence, source_refs,
-            kind_source, anchor_evidence, COALESCE(confidence, 0) AS confidence,
-            review_status, supporting_evidence
+            kind_source, anchor_evidence, modality, relation_status,
+            COALESCE(confidence, 0) AS confidence, review_status, supporting_evidence
        FROM canon_relation WHERE project_id = ? ORDER BY id`,
     projectId,
   );
@@ -1644,7 +1646,8 @@ export function dedupeRelations(db: Db, projectId: number): void {
       db.run(
         `UPDATE canon_relation
             SET description = ?, evidence = ?, source_refs = ?, review_status = ?,
-                kind_source = ?, anchor_evidence = ?, confidence = ?, supporting_evidence = ?
+                kind_source = ?, anchor_evidence = ?, modality = ?, relation_status = ?,
+                confidence = ?, supporting_evidence = ?
           WHERE id = ?`,
         primary.description,
         primary.evidence,
@@ -1652,6 +1655,8 @@ export function dedupeRelations(db: Db, projectId: number): void {
         primary.review_status,
         primary.kind_source,
         primary.anchor_evidence,
+        primary.modality,
+        primary.relation_status,
         primary.confidence,
         supporting,
         survivor.id,
@@ -1685,6 +1690,8 @@ export function dedupeRelations(db: Db, projectId: number): void {
     survivor.source_refs = primary.source_refs;
     survivor.kind_source = primary.kind_source;
     survivor.anchor_evidence = primary.anchor_evidence;
+    survivor.modality = primary.modality;
+    survivor.relation_status = primary.relation_status;
     survivor.confidence = primary.confidence;
     survivor.review_status = primary.review_status;
     survivor.supporting_evidence = supporting;
@@ -4157,6 +4164,8 @@ function applyRelations(
         source_refs: toJson(refs),
         kind_source: kindSource,
         anchor_evidence: anchorEvidence,
+        modality: normaliseModality(raw.modality),
+        relation_status: relationStatusOf(span.quote),
         confidence,
         review_status: rowReview,
         supporting_evidence: supporting,
@@ -4169,12 +4178,14 @@ function applyRelations(
         source_refs: string;
         kind_source: string;
         anchor_evidence: string;
+        modality: string;
+        relation_status: string;
         review_status: string;
         confidence: number;
         supporting_evidence: string;
       }>(
         `SELECT id, kind, description, evidence, source_refs, kind_source, anchor_evidence,
-                review_status, confidence, supporting_evidence
+                modality, relation_status, review_status, confidence, supporting_evidence
            FROM canon_relation
           WHERE project_id = ? AND evidence = ? AND ${pair.sql}
           ORDER BY id`,
@@ -4191,6 +4202,8 @@ function applyRelations(
           source_refs: twin.source_refs,
           kind_source: twin.kind_source,
           anchor_evidence: twin.anchor_evidence,
+          modality: twin.modality,
+          relation_status: twin.relation_status,
           confidence: Number(twin.confidence) || 0,
           review_status: twin.review_status,
           supporting_evidence: twin.supporting_evidence,
@@ -4203,7 +4216,8 @@ function applyRelations(
           db.run(
             `UPDATE canon_relation
                 SET kind = ?, description = ?, evidence = ?, source_refs = ?, review_status = ?,
-                    kind_source = ?, anchor_evidence = ?, confidence = ?, supporting_evidence = ?
+                    kind_source = ?, anchor_evidence = ?, modality = ?, relation_status = ?,
+                    confidence = ?, supporting_evidence = ?
               WHERE id = ?`,
             twin.kind,
             primary.description,
@@ -4212,6 +4226,8 @@ function applyRelations(
             primary.review_status,
             primary.kind_source,
             primary.anchor_evidence,
+            primary.modality,
+            primary.relation_status,
             primary.confidence,
             mergedSupporting,
             twin.id,
@@ -4240,12 +4256,14 @@ function applyRelations(
         source_refs: string;
         kind_source: string;
         anchor_evidence: string;
+        modality: string;
+        relation_status: string;
         review_status: string;
         confidence: number;
         supporting_evidence: string;
       }>(
         `SELECT id, kind, description, evidence, source_refs, kind_source, anchor_evidence,
-                review_status, confidence, supporting_evidence
+                modality, relation_status, review_status, confidence, supporting_evidence
            FROM canon_relation
           WHERE project_id = ? AND lower(kind) = ? AND ${pair.sql}
           ORDER BY id LIMIT 1`,
@@ -4264,6 +4282,8 @@ function applyRelations(
           source_refs: existing.source_refs,
           kind_source: existing.kind_source,
           anchor_evidence: existing.anchor_evidence,
+          modality: existing.modality,
+          relation_status: existing.relation_status,
           confidence: Number(existing.confidence) || 0,
           review_status: existing.review_status,
           supporting_evidence: existing.supporting_evidence,
@@ -4275,7 +4295,8 @@ function applyRelations(
           db.run(
             `UPDATE canon_relation
                 SET description = ?, evidence = ?, source_refs = ?, review_status = ?,
-                    kind_source = ?, anchor_evidence = ?, confidence = ?, supporting_evidence = ?
+                    kind_source = ?, anchor_evidence = ?, modality = ?, relation_status = ?,
+                    confidence = ?, supporting_evidence = ?
               WHERE id = ?`,
             primary.description,
             primary.evidence,
@@ -4283,6 +4304,8 @@ function applyRelations(
             primary.review_status,
             primary.kind_source,
             primary.anchor_evidence,
+            primary.modality,
+            primary.relation_status,
             primary.confidence,
             mergedSupporting,
             existing.id,
