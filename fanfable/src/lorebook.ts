@@ -4816,6 +4816,11 @@ function commandRosterIndex(db: Db, projectId: number): RosterIndex {
   );
 }
 
+/** Kinds that restate the question instead of answering it. Never proof. */
+const GENERIC_PROOF_KINDS = new Set([
+  'related to', 'relative of', 'relationship', 'kin', 'family', 'acquaintance', 'associate',
+]);
+
 function canonicalKind(kind: string): string {
   return (kind ?? '')
     .trim()
@@ -5077,13 +5082,17 @@ export function canPromote(row: PromoteRow, context: PromoteContext): PromoteDec
   if (sharedIdentityRows(context.db, context.projectId, row.fromId, row.toId)) {
     return { ok: false, reason: 'same-identity' };
   }
-  const entities = context.db.all<{ id: number; review_status: string }>(
-    'SELECT id, review_status FROM canon_entity WHERE project_id = ? AND id IN (?, ?)',
+  const entities = context.db.all<{ id: number; review_status: string; kind: string }>(
+    'SELECT id, review_status, kind FROM canon_entity WHERE project_id = ? AND id IN (?, ?)',
     context.projectId,
     row.fromId,
     row.toId,
   );
   if (entities.length !== 2) return { ok: false, reason: 'endpoint-unnamed' };
+  // Mechanical proof: a tie is between two persons.
+  if (entities.some((entity) => entity.kind !== 'character')) {
+    return { ok: false, reason: 'non-person-endpoint' };
+  }
   // A character held back as a probable common noun cannot hold a tie either.
   if (entities.some((entity) => entity.review_status === 'quarantined')) {
     return { ok: false, reason: 'quarantined-entity' };
@@ -5103,8 +5112,15 @@ export function canPromote(row: PromoteRow, context: PromoteContext): PromoteDec
   if (parked.some((note) => sameOrInverseKind(note.attempted_kind, row.kind))) {
     return { ok: false, reason: 'ruled-park' };
   }
+  // Mechanical proof: a kind must say something. "related to" and its friends
+  // repeat the question instead of answering it.
+  if (GENERIC_PROOF_KINDS.has(canonicalKind(row.kind))) return { ok: false, reason: 'generic-kind' };
   const quoteReason = keeperQuoteReason(row, context.chunkText, context.index);
   if (quoteReason) return { ok: false, reason: quoteReason };
+  // Mechanical proof: the sentence owns the arrow, never the candidate order.
+  if (directionOfSentence(row.evidence, row.fromName, row.toName, row.kind) === 'reverse') {
+    return { ok: false, reason: 'direction-mismatch' };
+  }
   const min = context.minConfidence ?? projectMinConfidence(context.db, context.projectId);
   if (claimTier(row.confidence ?? 1, min) !== 'accepted') return { ok: false, reason: 'below-threshold' };
   return { ok: true };

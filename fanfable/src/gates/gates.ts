@@ -20,6 +20,8 @@ export type PromoteReason =
   | 'tie-word-absent'
   | 'endpoint-unnamed'
   | 'direction-mismatch'
+  | 'generic-kind'
+  | 'non-person-endpoint'
   | 'same-identity'
   | 'quarantined-entity'
   | 'assertion-missing'
