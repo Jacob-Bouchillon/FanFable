@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createProject } from '../../fanfable/src/plan/controller.ts';
 import { flagIdentityCollisions } from '../../fanfable/src/identity/identity-check.ts';
+import * as ruling from '../../fanfable/src/court/ruling.ts';
 import { tempDb } from './helpers.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';
@@ -73,6 +74,12 @@ test('a short form and its longer name are one group', () => {
     )!;
     assert.equal(row.review_status, 'needs_review');
     assert.match(row.quarantine_reason, /^identity-collision: /);
+    const decision = ruling
+      .listRulings(db, project, { subject: ruling.entitySubject(id) })
+      .find((entry) => entry.role === 'appeal');
+    assert.ok(decision, `collision leaves an entity ruling for ${id}`);
+    assert.equal(decision!.standard, 'identity-collision');
+    assert.equal(decision!.to_status, 'needs_review');
   }
   db.close();
 });

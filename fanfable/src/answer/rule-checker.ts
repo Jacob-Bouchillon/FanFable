@@ -12,6 +12,7 @@
  */
 import type { Db } from '../core/db.ts';
 import { isClosedRoleKind, isMomentKind, isUnsupportedKind } from '../lorebook.ts';
+import { entitySubject, recordRuling } from '../court/ruling.ts';
 
 export interface RuleHit {
   id: number;
@@ -288,7 +289,25 @@ export function checkEntities(db: Db, projectId: number, opts: { ids?: number[] 
   const now = new Date().toISOString();
   for (const h of hits) {
     if (h.rule !== 'summary-identity-unproven') continue;
-    db.run(`UPDATE canon_entity SET review_status = 'needs_review', updated_at = ? WHERE id = ? AND project_id = ? AND review_status = 'accepted'`, now, h.id, projectId);
+    db.transaction(() => {
+      const result = db.run(
+        `UPDATE canon_entity SET review_status = 'needs_review', updated_at = ?
+          WHERE id = ? AND project_id = ? AND review_status = 'accepted'`,
+        now,
+        h.id,
+        projectId,
+      );
+      if (!result.changes) return;
+      recordRuling(db, projectId, {
+        subject: entitySubject(h.id),
+        role: 'appeal',
+        actor: 'guard',
+        standard: 'summary-identity',
+        fromStatus: 'accepted',
+        toStatus: 'needs_review',
+        basis: h.reason,
+      });
+    });
   }
   for (const c of claimed) {
     const claimer = rows.find((r) => r.id === c.id);

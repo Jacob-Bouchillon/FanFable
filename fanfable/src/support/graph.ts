@@ -1855,7 +1855,7 @@ export function buildGraphContext(
 
   let beforeOrder = opts.beforeOrder;
   if (opts.atEventId !== undefined) {
-    const anchor = db.get<{ story_order: number }>('SELECT story_order FROM au_event WHERE id = ?', opts.atEventId);
+    const anchor = db.get<{ story_order: number }>('SELECT story_order FROM au_event WHERE id = ? AND project_id = ?', opts.atEventId, projectId);
     if (anchor) beforeOrder = anchor.story_order;
   }
 
@@ -2177,7 +2177,7 @@ export async function buildPprGraphContext(
 
   let beforeOrder = opts.beforeOrder;
   if (opts.atEventId !== undefined) {
-    const anchor = db.get<{ story_order: number }>('SELECT story_order FROM au_event WHERE id = ?', opts.atEventId);
+    const anchor = db.get<{ story_order: number }>('SELECT story_order FROM au_event WHERE id = ? AND project_id = ?', opts.atEventId, projectId);
     if (anchor) beforeOrder = anchor.story_order;
   }
 

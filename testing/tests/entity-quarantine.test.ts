@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as controller from '../../fanfable/src/plan/controller.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
+import * as ruling from '../../fanfable/src/court/ruling.ts';
 import { tempDb } from './helpers.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';
@@ -70,6 +71,13 @@ test('a one-mention character that is also an ordinary word is quarantined', () 
   );
   assert.equal(row?.review_status, 'quarantined');
   assert.ok((row?.quarantine_reason ?? '').length > 0);
+  const decision = ruling
+    .listRulings(db, project.id, { subject: ruling.entitySubject(bill) })
+    .find((entry) => entry.role === 'appeal');
+  assert.ok(decision, 'quarantine leaves an entity ruling');
+  assert.equal(decision!.standard, 'common-noun-quarantine');
+  assert.equal(decision!.from_status, 'accepted');
+  assert.equal(decision!.to_status, 'quarantined');
   db.close();
 });
 
@@ -92,6 +100,11 @@ test('a second mention releases the character', () => {
   assert.equal(result.released, 1);
   const row = db.get<{ review_status: string }>('SELECT review_status FROM canon_entity WHERE id = ?', bill);
   assert.equal(row?.review_status, 'accepted');
+  const release = ruling
+    .listRulings(db, project.id, { subject: ruling.entitySubject(bill) })
+    .find((entry) => entry.to_status === 'accepted');
+  assert.ok(release, 'release leaves an entity ruling');
+  assert.equal(release!.from_status, 'quarantined');
   db.close();
 });
 

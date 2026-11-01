@@ -191,6 +191,8 @@ ${C.bold('SOURCE MATERIAL')}
   lore evaluate [--max n]        Judge each banked tie with understanding; failures park as notes
   lore status [--watch [secs]]     How much of the book is read, banked, and waiting
   lore correct relation <id>       Correct a relation by hand
+  lore correct entity <id> [--kind k]
+                                   Correct an entity by hand; kind is normalised
   lore remove relation <id>       Remove a relation you do not believe
   lore show [--kind k]            Show the extracted lore
   lore events [--extract]         List or build the canon event index
@@ -1715,11 +1717,13 @@ async function cmdLore(args: Args): Promise<void> {
     if (what === 'entity') {
       const id = Number(args._[3]);
       if (!Number.isFinite(id)) throw new Error('an entity id is required');
+      const kind = flagString(args, 'kind');
       lorebook.updateEntity(db, project.id, id, {
         name: flagString(args, 'name') || undefined,
         summary: flagString(args, 'summary') || undefined,
         role: flagString(args, 'role') || undefined,
         status: flagString(args, 'status') || undefined,
+        kind: kind ? (kind as never) : undefined,
       });
       console.log(C.green('Entity updated.'));
       return;

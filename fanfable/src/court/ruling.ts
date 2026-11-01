@@ -67,6 +67,11 @@ export function relationSubject(relationId: number): string {
   return `relation:${relationId}`;
 }
 
+/** The subject key for a ruling about an entity rather than a claim. */
+export function entitySubject(entityId: number): string {
+  return `entity:${entityId}`;
+}
+
 export function threadSubject(threadId: number): string {
   return `thread:${threadId}`;
 }

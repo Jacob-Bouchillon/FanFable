@@ -18,6 +18,7 @@
  */
 import { Db } from '../core/db.ts';
 import { nameRelation } from './names.ts';
+import { entitySubject, recordRuling } from '../court/ruling.ts';
 import {
   NAME_GROUP_CAP,
   containedCount,
@@ -190,14 +191,25 @@ export function flagIdentityCollisions(
       }
       result.flagged++;
       if (!write) continue;
-      db.run(
-        `UPDATE canon_entity SET review_status = 'needs_review', quarantine_reason = ?, updated_at = ?
-          WHERE id = ? AND project_id = ?`,
-        reason,
-        new Date().toISOString(),
-        entity.id,
-        projectId,
-      );
+      db.transaction(() => {
+        db.run(
+          `UPDATE canon_entity SET review_status = 'needs_review', quarantine_reason = ?, updated_at = ?
+            WHERE id = ? AND project_id = ?`,
+          reason,
+          new Date().toISOString(),
+          entity.id,
+          projectId,
+        );
+        recordRuling(db, projectId, {
+          subject: entitySubject(entity.id),
+          role: 'appeal',
+          actor: 'guard',
+          standard: 'identity-collision',
+          fromStatus: entity.review_status,
+          toStatus: 'needs_review',
+          basis: reason,
+        });
+      });
     }
   }
 

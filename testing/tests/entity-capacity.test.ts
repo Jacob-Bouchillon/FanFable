@@ -8,6 +8,7 @@ import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import * as controller from '../../fanfable/src/plan/controller.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
+import * as ruling from '../../fanfable/src/court/ruling.ts';
 import { mockProvider, tempDb } from './helpers.ts';
 
 const AT = '2026-01-01T00:00:00.000Z';
@@ -83,6 +84,13 @@ test('a no-tie single-mention lowercase noun parks', () => {
   );
   assert.equal(db.get<{ review_status: string }>('SELECT review_status FROM canon_entity WHERE id = ?', id)!.review_status, 'needs_review');
   assert.equal(db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_fact WHERE project_id = ?', project.id)!.n, 0);
+  const parkRuling = ruling
+    .listRulings(db, project.id, { subject: ruling.entitySubject(id) })
+    .find((entry) => entry.role === 'appeal');
+  assert.ok(parkRuling, 'parking leaves an entity ruling');
+  assert.equal(parkRuling!.standard, 'capacity');
+  assert.equal(parkRuling!.from_status, 'accepted');
+  assert.equal(parkRuling!.to_status, 'needs_review');
   db.close();
 });
 

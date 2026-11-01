@@ -19,7 +19,7 @@ import type { LlmClient } from './core/llm.ts';
 import { embedMissing, type EmbedFn } from './support/embeddings.ts';
 import { CORROBORATION_CAP, tripleKey, rankRows } from './support/edge-rank.ts';
 import { noteFromExtraction, starvedWindowScores } from './web/note-ingest.ts';
-import { recordRuling } from './court/ruling.ts';
+import { entitySubject, recordRuling } from './court/ruling.ts';
 import { findHeadings, lexicalScore, normalise, splitSentences, tokenize, truncate } from './core/text.ts';
 import {
   ANSWER_CUE_STOPWORDS,
@@ -1648,7 +1648,7 @@ export function dedupeRelations(db: Db, projectId: number): void {
             SET description = ?, evidence = ?, source_refs = ?, review_status = ?,
                 kind_source = ?, anchor_evidence = ?, modality = ?, relation_status = ?,
                 confidence = ?, supporting_evidence = ?
-          WHERE id = ?`,
+          WHERE id = ? AND project_id = ?`,
         primary.description,
         primary.evidence,
         primary.source_refs,
@@ -1660,6 +1660,7 @@ export function dedupeRelations(db: Db, projectId: number): void {
         primary.confidence,
         supporting,
         survivor.id,
+        projectId,
       );
       if (primary.review_status !== survivorBefore) {
         recordRuling(db, projectId, {
@@ -1683,7 +1684,7 @@ export function dedupeRelations(db: Db, projectId: number): void {
         basis: `merged into relation ${survivor.id}`,
         quote: row.evidence,
       });
-      db.run('DELETE FROM canon_relation WHERE id = ?', row.id);
+      db.run('DELETE FROM canon_relation WHERE id = ? AND project_id = ?', row.id, projectId);
     });
     survivor.description = primary.description;
     survivor.evidence = primary.evidence;
@@ -4143,7 +4144,7 @@ function applyRelations(
                   basis: `replaced by specific relation ${kind}`,
                   quote: row.evidence,
                 });
-                db.run('DELETE FROM canon_relation WHERE id = ?', row.id);
+                db.run('DELETE FROM canon_relation WHERE id = ? AND project_id = ?', row.id, projectId);
               });
             }
             stats.verification.redundant += stale.length;
@@ -6691,7 +6692,7 @@ export function persistTieNote(
   }
   if (!added) return;
   db.run(
-    'UPDATE canon_tie_note SET evidence = ?, source_refs = ? WHERE id = ?',
+    'UPDATE canon_tie_note SET evidence = ?, source_refs = ? WHERE id = ? AND project_id = ?',
     spans[0]?.quote ?? existing.evidence,
     toJson(
       spans.map((span) => ({
@@ -6703,6 +6704,7 @@ export function persistTieNote(
       })),
     ),
     existing.id,
+    projectId,
   );
   courtFor(`objection ${reason} evidence appended (note ${existing.id})`, spans[0]?.quote ?? evidence);
 }
@@ -7424,30 +7426,31 @@ export function mergeEntityPair(
       if (existing) {
         if (note.status === 'resolved' && existing.status !== 'resolved') {
           db.run(
-            "UPDATE canon_tie_note SET status = 'resolved', ruling = ?, ruled_at = ? WHERE id = ?",
+            "UPDATE canon_tie_note SET status = 'resolved', ruling = ?, ruled_at = ? WHERE id = ? AND project_id = ?",
             note.ruling,
             note.ruled_at,
             existing.id,
+            projectId,
           );
         }
-        db.run('DELETE FROM canon_tie_note WHERE id = ?', note.id);
+        db.run('DELETE FROM canon_tie_note WHERE id = ? AND project_id = ?', note.id, projectId);
         noteCounts.collapsed++;
         continue;
       }
       if (from === to) {
         if (note.status === 'resolved') {
-          db.run('UPDATE canon_tie_note SET from_entity = ?, to_entity = ? WHERE id = ?', from, to, note.id);
+          db.run('UPDATE canon_tie_note SET from_entity = ?, to_entity = ? WHERE id = ? AND project_id = ?', from, to, note.id, projectId);
           noteCounts.keptSelf++;
         } else {
-          db.run('DELETE FROM canon_tie_note WHERE id = ?', note.id);
+          db.run('DELETE FROM canon_tie_note WHERE id = ? AND project_id = ?', note.id, projectId);
           noteCounts.droppedSelf++;
         }
         continue;
       }
-      db.run('UPDATE canon_tie_note SET from_entity = ?, to_entity = ? WHERE id = ?', from, to, note.id);
+      db.run('UPDATE canon_tie_note SET from_entity = ?, to_entity = ? WHERE id = ? AND project_id = ?', from, to, note.id, projectId);
       noteCounts.moved++;
     }
-    db.run('DELETE FROM canon_entity WHERE id = ?', drop.id);
+    db.run('DELETE FROM canon_entity WHERE id = ? AND project_id = ?', drop.id, projectId);
   });
   return noteCounts;
 }
@@ -9131,7 +9134,18 @@ export function quarantineSuspectCharacters(
   for (const row of rows) {
     if (row.review_status === 'quarantined') {
       if ((row.mentions ?? 0) >= 2 || strList(row.aliases).length > 0) {
-        db.run("UPDATE canon_entity SET review_status = 'accepted', quarantine_reason = '' WHERE id = ?", row.id);
+        db.transaction(() => {
+          db.run("UPDATE canon_entity SET review_status = 'accepted', quarantine_reason = '' WHERE id = ? AND project_id = ?", row.id, projectId);
+          recordRuling(db, projectId, {
+            subject: entitySubject(row.id),
+            role: 'appeal',
+            actor: 'guard',
+            standard: 'common-noun-release',
+            fromStatus: 'quarantined',
+            toStatus: 'accepted',
+            basis: (row.mentions ?? 0) >= 2 ? 'a second mention names the character' : 'a recognised alias names the character',
+          });
+        });
         released++;
       }
       continue;
@@ -9141,11 +9155,24 @@ export function quarantineSuspectCharacters(
     if (!/^[A-Z][a-z]{2,}$/.test(row.name)) continue;
     const lower = lowerOccurrencesInText(text, row.name.toLowerCase());
     if (lower < 1) continue;
-    db.run(
-      "UPDATE canon_entity SET review_status = 'quarantined', quarantine_reason = ? WHERE id = ?",
-      `single mention; the name also occurs lowercase ${lower} time(s) in the book`,
-      row.id,
-    );
+    const reason = `single mention; the name also occurs lowercase ${lower} time(s) in the book`;
+    db.transaction(() => {
+      db.run(
+        "UPDATE canon_entity SET review_status = 'quarantined', quarantine_reason = ? WHERE id = ? AND project_id = ?",
+        reason,
+        row.id,
+        projectId,
+      );
+      recordRuling(db, projectId, {
+        subject: entitySubject(row.id),
+        role: 'appeal',
+        actor: 'guard',
+        standard: 'common-noun-quarantine',
+        fromStatus: row.review_status,
+        toStatus: 'quarantined',
+        basis: reason,
+      });
+    });
     quarantined++;
   }
   return { quarantined, released };
@@ -9378,12 +9405,23 @@ export function checkEntityCapacity(
       result.skipped++;
     }
     if (opts.write) {
-      db.run(
-        "UPDATE canon_entity SET review_status = 'needs_review', updated_at = ? WHERE project_id = ? AND id = ?",
-        nowIso(),
-        projectId,
-        entity.id,
-      );
+      db.transaction(() => {
+        db.run(
+          "UPDATE canon_entity SET review_status = 'needs_review', updated_at = ? WHERE project_id = ? AND id = ?",
+          nowIso(),
+          projectId,
+          entity.id,
+        );
+        recordRuling(db, projectId, {
+          subject: entitySubject(entity.id),
+          role: 'appeal',
+          actor: 'guard',
+          standard: 'capacity',
+          fromStatus: 'accepted',
+          toStatus: 'needs_review',
+          basis: 'unproven entity parked (single mention, no role or tie)',
+        });
+      });
     }
   }
   return result;
@@ -10467,8 +10505,8 @@ export function updateEntity(
  * removal ruling first: a deletion is a court decision, not an absence.
  */
 export function deleteEntity(db: Db, projectId: number, id: number): void {
-  const entity = db.get<{ id: number; name: string }>(
-    'SELECT id, name FROM canon_entity WHERE id = ? AND project_id = ?',
+  const entity = db.get<{ id: number; name: string; review_status: string }>(
+    'SELECT id, name, review_status FROM canon_entity WHERE id = ? AND project_id = ?',
     id,
     projectId,
   );
@@ -10480,6 +10518,17 @@ export function deleteEntity(db: Db, projectId: number, id: number): void {
     id,
   );
   db.transaction(() => {
+    // The entity's own removal is the parent decision; the relation removals
+    // below only record what the cascade took with it.
+    recordRuling(db, projectId, {
+      subject: entitySubject(id),
+      role: 'removal',
+      actor: 'human',
+      standard: 'entity-removal',
+      fromStatus: entity.review_status,
+      toStatus: 'removed',
+      basis: `entity ${entity.name} removed`,
+    });
     for (const row of relations) {
       recordRuling(db, projectId, {
         relationId: row.id,

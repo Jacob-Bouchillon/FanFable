@@ -135,6 +135,28 @@ test('a title-only thread upsert keeps its description and status', () => {
   db.close();
 });
 
+test('reopening a resolved thread clears resolved_at', () => {
+  const { db } = tempDb();
+  const project = seedProject(db, 'thread-reopen');
+  const id = memory.upsertThread(db, project.id, 'The third light', 'who carried the lantern', 'resolved');
+  const resolved = db.get<{ resolved_at: string | null }>(
+    'SELECT resolved_at FROM plot_thread WHERE id = ? AND project_id = ?',
+    id,
+    project.id,
+  )!;
+  assert.ok(resolved.resolved_at, 'a resolved thread records when it closed');
+
+  memory.upsertThread(db, project.id, 'The third light', undefined, 'open');
+  const reopened = db.get<{ status: string; resolved_at: string | null }>(
+    'SELECT status, resolved_at FROM plot_thread WHERE id = ? AND project_id = ?',
+    id,
+    project.id,
+  )!;
+  assert.equal(reopened.status, 'open');
+  assert.equal(reopened.resolved_at, null, 'reopening clears the close time');
+  db.close();
+});
+
 test('context slice returns the relevant subset, not the whole story', () => {
   const { db } = tempDb();
   const project = seedProject(db);

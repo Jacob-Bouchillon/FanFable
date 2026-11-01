@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createProject } from '../../fanfable/src/plan/controller.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
+import * as loreDiag from '../../fanfable/src/answer/lore-diagnostics.ts';
 import * as ruling from '../../fanfable/src/court/ruling.ts';
 import { tempDb } from './helpers.ts';
 
@@ -150,5 +151,84 @@ test('deleting an entity leaves a removal ruling for every cascaded relation', (
   assert.equal(removal!.standard, 'entity-removal');
   assert.equal(removal!.to_status, 'removed');
   assert.equal(removal!.from_status, 'accepted');
+  const entityRemoval = ruling
+    .listRulings(db, project.id, { subject: ruling.entitySubject(mara) })
+    .find((entry) => entry.role === 'removal');
+  assert.ok(entityRemoval, 'the entity itself has a removal ruling');
+  assert.equal(entityRemoval!.standard, 'entity-removal');
+  assert.equal(entityRemoval!.relation_id, null, 'an entity ruling names no relation');
+  assert.equal(entityRemoval!.to_status, 'removed');
+  assert.equal(entityRemoval!.from_status, 'accepted');
+  db.close();
+});
+
+test('entity edits and deletes stay inside their project', () => {
+  const { db } = tempDb();
+  const a = createProject(db, 'entity-scope-a');
+  const b = createProject(db, 'entity-scope-b');
+  const other = addEntity(db, b.id, 'Other Harbour', {
+    kind: 'location',
+    summary: 'A harbour in the other project.',
+    role: 'trade',
+    status: 'active',
+  });
+
+  // The id is real, but it belongs to another project: neither the update nor
+  // the delete may reach across the boundary.
+  lorebook.updateEntity(db, a.id, other, { name: 'Hijacked', kind: 'item' as never, summary: 'changed' });
+  const untouched = db.get<{ name: string; kind: string; summary: string }>(
+    'SELECT name, kind, summary FROM canon_entity WHERE id = ?',
+    other,
+  )!;
+  assert.deepEqual(
+    { name: untouched.name, kind: untouched.kind, summary: untouched.summary },
+    { name: 'Other Harbour', kind: 'location', summary: 'A harbour in the other project.' },
+  );
+
+  lorebook.deleteEntity(db, a.id, other);
+  assert.equal(
+    db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_entity WHERE id = ?', other)!.n,
+    1,
+    'the other project keeps its entity',
+  );
+  assert.equal(
+    ruling.listRulings(db, a.id, { subject: ruling.entitySubject(other) }).length,
+    0,
+    'no ruling is written into the wrong project',
+  );
+  db.close();
+});
+
+test('relation corrections and removals stay inside their project', () => {
+  const { db } = tempDb();
+  const a = createProject(db, 'relation-scope-a');
+  const b = createProject(db, 'relation-scope-b');
+  const mara = addEntity(db, b.id, 'Mara');
+  const tor = addEntity(db, b.id, 'Tor');
+  const relation = Number(
+    db.run(
+      `INSERT INTO canon_relation
+         (project_id, from_entity, to_entity, kind, evidence, source_refs, review_status, created_at)
+       VALUES (?, ?, ?, 'aunt of', 'Mara is the aunt of Tor.', '[]', 'accepted', ?)`,
+      b.id,
+      mara,
+      tor,
+      AT,
+    ).lastInsertRowid,
+  );
+
+  assert.equal(loreDiag.correctRelation(db, a.id, relation, { kind: 'enemy of', confirm: true }), false);
+  assert.equal(
+    db.get<{ kind: string }>('SELECT kind FROM canon_relation WHERE id = ?', relation)!.kind,
+    'aunt of',
+    'the other project keeps its relation kind',
+  );
+
+  assert.equal(loreDiag.removeRelation(db, a.id, relation), false);
+  assert.equal(
+    db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_relation WHERE id = ?', relation)!.n,
+    1,
+    'the other project keeps its relation',
+  );
   db.close();
 });

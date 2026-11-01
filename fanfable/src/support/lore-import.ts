@@ -55,7 +55,7 @@ function storeSource(
     filePath,
   );
   if (existing && !opts.overwrite) {
-    const row = db.get<RowSource>('SELECT * FROM canon_source WHERE id = ?', existing.id)!;
+    const row = db.get<RowSource>('SELECT * FROM canon_source WHERE id = ? AND project_id = ?', existing.id, projectId)!;
     return {
       source: {
         id: row.id,
@@ -111,7 +111,7 @@ function storeSource(
   db.transaction(() => {
     if (existing) {
       replaced = true;
-      db.run('DELETE FROM canon_source WHERE id = ?', existing.id);
+      db.run('DELETE FROM canon_source WHERE id = ? AND project_id = ?', existing.id, projectId);
     }
     const res = db.run(
       `INSERT INTO canon_source (project_id, path, title, author, format, sha256, byte_size, page_count, imported_at)

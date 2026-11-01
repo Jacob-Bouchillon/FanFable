@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { tempDb, seedProject } from './helpers.ts';
 import { checkEntities } from '../../fanfable/src/answer/rule-checker.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
+import * as ruling from '../../fanfable/src/court/ruling.ts';
 
 function addEntity(db: any, projectId: number, name: string, summary: string, evidence: string, role = ''): number {
   const now = new Date().toISOString();
@@ -31,6 +32,14 @@ test('summary claiming another entity without a both-endpoints quote is flagged 
     "SELECT COUNT(*) AS n FROM quarantine_alias WHERE project_id = ? AND status = 'pending'", project.id,
   )!.n;
   assert.equal(q, 1, 'quarantine candidate recorded for a human');
+  const demotion = ruling
+    .listRulings(db, project.id, { subject: ruling.entitySubject(a) })
+    .find((entry) => entry.standard === 'summary-identity');
+  assert.ok(demotion, 'the demotion leaves an entity ruling');
+  assert.equal(demotion!.role, 'appeal');
+  assert.equal(demotion!.actor, 'guard');
+  assert.equal(demotion!.from_status, 'accepted');
+  assert.equal(demotion!.to_status, 'needs_review');
   db.close();
 });
 
