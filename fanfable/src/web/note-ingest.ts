@@ -1376,8 +1376,23 @@ export function noteFromExtraction(
         source_refs: string;
         confidence: number;
       }>(
-        "SELECT id, name, kind, evidence, first_chunk, source_refs, confidence FROM canon_entity WHERE project_id = ? AND evidence <> '' AND first_chunk IN (SELECT value FROM json_each(?)) ORDER BY id",
+        `SELECT id, name, kind, evidence, first_chunk, source_refs, confidence
+           FROM canon_entity
+          WHERE project_id = ? AND evidence <> ''
+            AND (
+              first_chunk IN (SELECT value FROM json_each(?))
+              OR EXISTS (
+                SELECT 1
+                  FROM json_each(
+                    CASE WHEN json_valid(source_refs) THEN source_refs ELSE '[]' END
+                  ) AS ref
+                 WHERE CAST(json_extract(ref.value, '$.chunk') AS INTEGER)
+                       IN (SELECT value FROM json_each(?))
+              )
+            )
+          ORDER BY id`,
         projectId,
+        JSON.stringify([...windowIds]),
         JSON.stringify([...windowIds]),
       )) {
         ingestEntity(db, projectId, entity, counts, trace);
