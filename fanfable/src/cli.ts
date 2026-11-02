@@ -474,6 +474,7 @@ async function cmdLore(args: Args): Promise<void> {
     if (!question) throw new Error('question required');
     const res = await lore.answerLoreQuestion(db, a.llm, project.id, question, {
       limit: flagNumber(args, 'limit', 8),
+      trace: { enabled: true },
     });
     heading('Lore answer');
     console.log(res.answer);
@@ -481,6 +482,7 @@ async function cmdLore(args: Args): Promise<void> {
       console.log(`\n${C.dim('sources:')}`);
       res.passages.forEach((p, i) => console.log(`  [S${i + 1}] ${p.sourceTitle} :: ${p.locator}`));
     }
+    if (res.traceId) console.log(`\n${C.dim(`trace ${res.traceId}`)}`);
     return;
   }
 
@@ -2651,6 +2653,43 @@ async function cmdTrace(args: Args, dbPath: string): Promise<void> {
       console.log(`project: ${view.trace.projectId}   events: ${view.events.length}`);
       if (Object.keys(view.trace.metadata).length) {
         console.log(`metadata: ${JSON.stringify(view.trace.metadata)}`);
+      }
+      const retrievalEvents = view.events.filter((event) => event.stage === 'retrieval');
+      if (retrievalEvents.length) {
+        const completed = retrievalEvents.find((event) => event.event === 'retrieval.completed');
+        const searches = retrievalEvents.filter((event) => event.event === 'retrieval.search.completed');
+        const summaries = retrievalEvents.filter((event) => event.event === 'retrieval.summary');
+        const selected = retrievalEvents.filter(
+          (event) => event.event === 'retrieval.candidate.disposition' && event.decision === 'selected',
+        );
+        const selectedChunks = selected.filter((event) => event.subject.startsWith('chunk:')).length;
+        const selectedIndex = selected.length - selectedChunks;
+        console.log(`\n${C.bold('Retrieval handoff')}`);
+        if (completed) {
+          console.log(
+            `  outcome=${completed.reasonCode || '-'} selected=${completed.refs.count ?? selectedChunks}` +
+              (selectedIndex ? ` index=${selectedIndex}` : ''),
+          );
+        }
+        for (const event of searches) {
+          console.log(
+            `  ${event.subject}: ${event.reasonCode || '-'}` +
+              (event.refs.count !== undefined ? ` count=${event.refs.count}` : ''),
+          );
+        }
+        for (const event of summaries) {
+          console.log(
+            `  ${event.subject}: raw=${event.refs.raw_count ?? '-'}` +
+              ` dedup=${event.refs.dedup_count ?? '-'}` +
+              ` ranked=${event.refs.ranked_count ?? '-'}` +
+              ` selected=${event.refs.selected_count ?? '-'}` +
+              ` budgeted=${event.refs.budgeted_count ?? '-'}` +
+              ` excluded=${event.refs.excluded_count ?? '-'}`,
+          );
+        }
+        if (selected.length) {
+          console.log(`  selected evidence: ${selected.map((event) => event.subject).join(', ')}`);
+        }
       }
       for (const event of view.events) {
         const parent = event.parentSpanId ? ` parent=${event.parentSpanId}` : '';

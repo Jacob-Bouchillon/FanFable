@@ -24,6 +24,108 @@ export const TRACE_EVENT_REJECTED = 'claim.transition.rejected';
 export const DIAGNOSTIC_MAX_EVENTS_PER_TRACE = 200;
 export const DIAGNOSTIC_RETENTION_DAYS = 30;
 
+/** A retrieval event buffered until the ask path's mode is known. */
+export interface RetrievalTraceEvent {
+  event: string;
+  subject?: string;
+  decision?: string;
+  reasonCode?: string;
+  refs?: TraceRefs;
+  error?: string;
+  createdAt?: string;
+  stage?: string;
+}
+
+export interface RetrievalTraceSink {
+  emit(event: RetrievalTraceEvent): void;
+}
+
+export interface BufferedRetrievalTrace extends RetrievalTraceSink {
+  readonly events: RetrievalTraceEvent[];
+}
+
+/** Buffer retrieval events without writing; the caller starts the trace later. */
+export function createRetrievalTraceBuffer(): BufferedRetrievalTrace {
+  const events: RetrievalTraceEvent[] = [];
+  return {
+    events,
+    emit(event: RetrievalTraceEvent): void {
+      events.push({ ...event, createdAt: event.createdAt ?? nowIso() });
+    },
+  };
+}
+
+/**
+ * Raise a trace's dropped count to at least `minimumDropped` and mark it
+ * truncated. This is the safety net for a diagnostic write that could not
+ * update the trace itself; it never changes the retrieval result.
+ */
+function ensureTraceTruncated(db: Db, traceId: string, minimumDropped: number): void {
+  try {
+    db.run(
+      `UPDATE trace
+          SET dropped_events = CASE
+                WHEN dropped_events < ? THEN ?
+                ELSE dropped_events
+              END,
+              completeness = CASE
+                WHEN completeness = 'interrupted' THEN 'interrupted'
+                ELSE 'truncated'
+              END
+        WHERE id = ?`,
+      minimumDropped,
+      minimumDropped,
+      traceId,
+    );
+  } catch {
+    // If even the trace row cannot be updated, the command still succeeds.
+  }
+}
+
+/** Flush buffered events as diagnostic trace events, never failing retrieval. */
+export function flushRetrievalTrace(
+  db: Db,
+  projectId: number,
+  traceId: string,
+  buffer: BufferedRetrievalTrace,
+): void {
+  let initialDropped = 0;
+  try {
+    const before = db.get<{ dropped_events: number }>(
+      'SELECT dropped_events FROM trace WHERE id = ?',
+      traceId,
+    );
+    initialDropped = Number(before?.dropped_events ?? 0);
+  } catch {
+    return;
+  }
+  let failedWrites = 0;
+  for (const event of buffer.events) {
+    try {
+      const result = recordTraceEvent(db, {
+        traceId,
+        projectId,
+        stage: event.stage ?? 'retrieval',
+        event: event.event,
+        eventClass: 'diagnostic',
+        subject: event.subject,
+        decision: event.decision,
+        reasonCode: event.reasonCode,
+        refs: event.refs,
+        error: event.error,
+        createdAt: event.createdAt,
+      });
+      // Sampling is already accounted for by recordTraceEvent as 'sampled';
+      // cap/unavailable are lost diagnostic writes and must make this trace
+      // non-exhaustive.
+      if (result.dropped && result.reason !== 'sampled') failedWrites++;
+    } catch {
+      failedWrites++;
+    }
+  }
+  if (failedWrites > 0) ensureTraceTruncated(db, traceId, initialDropped + failedWrites);
+}
+
 export interface TraceRefs {
   claim_uid?: string;
   candidate_id?: string;
@@ -38,6 +140,26 @@ export interface TraceRefs {
   open_end_id?: number;
   seq?: number | null;
   period_label?: string;
+  /** Retrieval rank (1-based) within its scoring stage. */
+  rank?: number;
+  /** Retrieval score. Scores are comparable only within the same stage. */
+  score?: number;
+  /** Count for a compact retrieval summary. */
+  count?: number;
+  /** Raw retrieval candidates before deduplication. */
+  raw_count?: number;
+  /** Unique retrieval candidates after merging duplicate origins. */
+  dedup_count?: number;
+  /** Candidates that entered ranking. */
+  ranked_count?: number;
+  /** Candidates selected into the result. */
+  selected_count?: number;
+  /** Valid candidates cut by a limit. */
+  budgeted_count?: number;
+  /** Candidates rejected for a named reason. */
+  excluded_count?: number;
+  /** Short scoring/processing stage code, never prose. */
+  stage?: string;
 }
 
 export interface TraceContext {
@@ -218,7 +340,7 @@ interface TraceEventRow {
   created_at: string;
 }
 
-const REF_STRING_KEYS = ['claim_uid', 'candidate_id', 'period_label'] as const;
+const REF_STRING_KEYS = ['claim_uid', 'candidate_id', 'period_label', 'stage'] as const;
 const REF_NUMBER_KEYS = [
   'proof_id',
   'run_id',
@@ -228,6 +350,10 @@ const REF_NUMBER_KEYS = [
   'relation_id',
   'entity_id',
   'open_end_id',
+] as const;
+const REF_NONNEGATIVE_KEYS = [
+  'rank', 'score', 'count', 'raw_count', 'dedup_count', 'ranked_count',
+  'selected_count', 'budgeted_count', 'excluded_count',
 ] as const;
 const TERMINAL_DECISIONS = new Set(['applied', 'noop', 'stale', 'conflict', 'rejected']);
 
@@ -267,6 +393,12 @@ function parseRefs(text: string): TraceRefs {
       refs[key] = value;
     }
   }
+  for (const key of REF_NONNEGATIVE_KEYS) {
+    const value = Number(raw[key]);
+    if (raw[key] !== null && raw[key] !== undefined && Number.isFinite(value) && value >= 0) {
+      refs[key] = value;
+    }
+  }
   const seq = Number(raw.seq);
   if (raw.seq !== null && raw.seq !== undefined && Number.isFinite(seq) && seq >= 0) refs.seq = seq;
   if (Array.isArray(raw.entity_ids)) {
@@ -288,6 +420,10 @@ function refsJson(refs: TraceRefs | undefined): string {
   for (const key of REF_NUMBER_KEYS) {
     const value = refs[key];
     if (typeof value === 'number' && Number.isFinite(value) && value > 0) out[key] = value;
+  }
+  for (const key of REF_NONNEGATIVE_KEYS) {
+    const value = refs[key];
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) out[key] = value;
   }
   if (typeof refs.seq === 'number' && Number.isFinite(refs.seq) && refs.seq >= 0) out.seq = refs.seq;
   if (refs.entity_ids?.length) {
@@ -568,12 +704,16 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
     'every note disposition carries a recognised reason code',
     'note candidate accounting balances when the trace is exhaustive',
     'every admitted note has a required note.admitted event and stored note row',
+    'retrieval selected evidence has a valid passage citation',
+    'complete retrieval traces give every enumerated candidate one terminal disposition',
   ];
   const limitations = [
     'the audit reads current rows; it does not replay the full historical transition',
     'ruling linkage is enforced by the owner transaction but is not reconstructed from trace refs',
     'a complete trace with zero drops is the only exhaustive accounting',
     'note accounting covers only candidates inside the traced window/scope',
+    'retrieval candidate accounting covers enumerated candidates; bulk FTS pools are summaries',
+    'retrieval excluded_count is zero when filtering happens in SQL before candidates are enumerated',
   ];
 
   const appliedProofIds = new Set<number>();
@@ -842,6 +982,213 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
       parked,
       verified,
     };
+  }
+
+  const retrievalEvents = events.filter((event) => event.stage === 'retrieval');
+  if (retrievalEvents.length) {
+    const exhaustive = trace.completeness === 'complete' && trace.droppedEvents === 0;
+    if (!exhaustive) {
+      checks.push('retrieval exhaustive accounting skipped: trace is sampled, truncated or interrupted');
+    } else {
+      const generated = new Map<string, TraceEventRecord[]>();
+      const terminals = new Map<string, TraceEventRecord[]>();
+      const summaries = new Map<string, TraceEventRecord>();
+      const generatedReasons = new Set(['fts', 'bank-linked', 'supplied', 'index', 'shortcut']);
+      const terminalReasons = new Set(['selected', 'duplicate', 'no-citation', 'passage-limit', 'source-filter', 'empty-index']);
+      const searchReasons = new Set(['ok', 'empty', 'error']);
+      const completionReasons = new Set(['ok', 'empty', 'index-only', 'shortcut']);
+      for (const event of retrievalEvents) {
+        if (event.event === 'retrieval.summary' && event.subject) {
+          summaries.set(event.subject, event);
+          if (!['ok', 'empty', 'error'].includes(event.reasonCode)) {
+            violations.push({
+              code: 'retrieval_summary_reason',
+              eventId: event.id,
+              detail: `retrieval summary ${event.subject} has unrecognised reason ${event.reasonCode || '(empty)'}`,
+            });
+          }
+          const raw = event.refs.raw_count;
+          const dedup = event.refs.dedup_count;
+          const ranked = event.refs.ranked_count;
+          const selected = event.refs.selected_count;
+          const budgeted = event.refs.budgeted_count;
+          const excluded = event.refs.excluded_count;
+          if ([raw, dedup, ranked, selected, budgeted, excluded].some((value) => typeof value !== 'number' || value < 0)) {
+            violations.push({
+              code: 'retrieval_summary_counts',
+              eventId: event.id,
+              detail: `retrieval summary ${event.subject} is missing a non-negative count`,
+            });
+          } else if (
+            dedup! > raw! ||
+            ranked! > dedup! ||
+            selected! > ranked! ||
+            selected! + budgeted! > ranked! ||
+            selected! + budgeted! + excluded! > raw!
+          ) {
+            violations.push({
+              code: 'retrieval_summary_counts',
+              eventId: event.id,
+              detail: `retrieval summary ${event.subject} has inconsistent counts`,
+            });
+          }
+        }
+        if (event.event === 'retrieval.candidate.generated' && event.subject) {
+          generated.set(event.subject, [...(generated.get(event.subject) ?? []), event]);
+          if (!generatedReasons.has(event.reasonCode)) {
+            violations.push({
+              code: 'retrieval_candidate_reason',
+              eventId: event.id,
+              detail: `generated candidate ${event.subject} has unrecognised reason ${event.reasonCode || '(empty)'}`,
+            });
+          }
+        }
+        if (
+          event.event === 'retrieval.candidate.disposition' &&
+          ['selected', 'excluded', 'budgeted'].includes(event.decision) &&
+          event.subject
+        ) {
+          terminals.set(event.subject, [...(terminals.get(event.subject) ?? []), event]);
+          if (!terminalReasons.has(event.reasonCode)) {
+            violations.push({
+              code: 'retrieval_candidate_reason',
+              eventId: event.id,
+              detail: `candidate ${event.subject} has unrecognised disposition reason ${event.reasonCode || '(empty)'}`,
+            });
+          }
+        }
+        if (event.event === 'retrieval.search.completed' && !searchReasons.has(event.reasonCode)) {
+          violations.push({
+            code: 'retrieval_search_reason',
+            eventId: event.id,
+            detail: `search ${event.subject} has unrecognised reason ${event.reasonCode || '(empty)'}`,
+          });
+        }
+        if (event.event === 'retrieval.completed' && !completionReasons.has(event.reasonCode)) {
+          violations.push({
+            code: 'retrieval_completion_reason',
+            eventId: event.id,
+            detail: `retrieval completion has unrecognised reason ${event.reasonCode || '(empty)'}`,
+          });
+        }
+        if (event.event === 'retrieval.budget.cutoff') {
+          const count = event.refs.count;
+          if (!['passage-limit', 'index-limit'].includes(event.reasonCode) ||
+              typeof count !== 'number' || count < 0) {
+            violations.push({
+              code: 'retrieval_budget_cutoff',
+              eventId: event.id,
+              detail: `budget cutoff ${event.subject} has an unrecognised reason or count`,
+            });
+          }
+        }
+        if (event.event === 'retrieval.query.expanded' && !['model', 'fallback-empty'].includes(event.reasonCode)) {
+          violations.push({
+            code: 'retrieval_expansion_reason',
+            eventId: event.id,
+            detail: `query expansion has unrecognised reason ${event.reasonCode || '(empty)'}`,
+          });
+        }
+      }
+      for (const [subject, list] of generated) {
+        const terminal = terminals.get(subject) ?? [];
+        if (!terminal.length) {
+          violations.push({
+            code: 'retrieval_candidate_missing_disposition',
+            detail: `candidate ${subject} has no terminal disposition`,
+          });
+        } else if (terminal.length > 1) {
+          violations.push({
+            code: 'retrieval_candidate_multiple_dispositions',
+            detail: `candidate ${subject} has ${terminal.length} terminal dispositions`,
+          });
+        }
+      }
+      for (const [subject, list] of terminals) {
+        if (!generated.has(subject)) {
+          violations.push({
+            code: 'retrieval_disposition_without_candidate',
+            detail: `disposition ${subject} has no generated candidate`,
+          });
+        }
+        for (const event of list) {
+          if (event.decision !== 'selected' || !subject.startsWith('chunk:')) continue;
+          const chunkId = Number(event.refs.chunk_id);
+          if (!Number.isInteger(chunkId) || chunkId <= 0) {
+            violations.push({
+              code: 'retrieval_selected_without_chunk',
+              eventId: event.id,
+              detail: `selected passage ${subject} has no chunk_id`,
+            });
+            continue;
+          }
+          const row = db.get<{ locator: string; title: string; path: string }>(
+            `SELECT c.locator, s.title, s.path
+               FROM canon_chunk c JOIN canon_source s ON s.id = c.source_id
+              WHERE c.id = ? AND c.project_id = ?`,
+            chunkId,
+            trace.projectId,
+          );
+          if (!row) {
+            violations.push({
+              code: 'retrieval_selected_chunk_missing',
+              eventId: event.id,
+              detail: `selected passage ${subject} does not exist in project ${trace.projectId}`,
+            });
+          } else if (!row.locator && !row.title && !row.path) {
+            violations.push({
+              code: 'retrieval_selected_without_citation',
+              eventId: event.id,
+              detail: `selected passage ${subject} has no citation or locator`,
+            });
+          }
+        }
+      }
+      for (const event of retrievalEvents) {
+        if (event.event !== 'retrieval.budget.cutoff') continue;
+        const summarySubject = event.subject === 'budget:passages'
+          ? 'search:fts'
+          : event.subject.startsWith('budget:index:')
+            ? `search:index:${event.subject.slice('budget:index:'.length)}`
+            : '';
+        const summary = summarySubject ? summaries.get(summarySubject) : undefined;
+        if (!summary) {
+          violations.push({
+            code: 'retrieval_budget_summary_missing',
+            eventId: event.id,
+            detail: `budget cutoff ${event.subject} has no matching summary`,
+          });
+          continue;
+        }
+        if (summary.refs.budgeted_count !== event.refs.count) {
+          violations.push({
+            code: 'retrieval_budget_summary_mismatch',
+            eventId: event.id,
+            detail: `budget cutoff ${event.subject} does not match summary budgeted_count`,
+          });
+        }
+      }
+      const hasSearch = retrievalEvents.some((event) => event.event === 'retrieval.search.completed');
+      if (hasSearch && !summaries.size) {
+        violations.push({
+          code: 'retrieval_summary_missing',
+          detail: 'complete retrieval trace has search events but no retrieval.summary',
+        });
+      }
+      if (!retrievalEvents.some((event) => event.event === 'retrieval.completed')) {
+        violations.push({
+          code: 'retrieval_completion_missing',
+          detail: 'complete retrieval trace has no retrieval.completed event',
+        });
+      }
+      if (Object.prototype.hasOwnProperty.call(trace.metadata, 'query') ||
+          Object.prototype.hasOwnProperty.call(trace.metadata, 'question')) {
+        violations.push({
+          code: 'retrieval_raw_query',
+          detail: 'retrieval trace metadata must not contain raw query text',
+        });
+      }
+    }
   }
 
   if (trace.completeness !== 'complete' || trace.droppedEvents > 0) {

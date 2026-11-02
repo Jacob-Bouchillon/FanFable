@@ -3,13 +3,16 @@
  *
  * Moved mechanically from lore.ts; imports only, no logic change.
  */
-import { Db } from '../core/db.ts';
+import { createHash } from 'node:crypto';
+import { Db, nowIso } from '../core/db.ts';
 import { extractJson, toStringArray } from '../core/json.ts';
 import type { LlmClient } from '../core/llm.ts';
 import { nameMentionedExact, buildRosterIndex, deriveNameVariants, canonicalName, nameRelation, type RosterIndex } from '../identity/names.ts';
 import * as lorebook from '../lorebook.ts';
 import { expandQuery, searchCanon } from './lore-search.ts';
 import type { Passage } from './lore.ts';
+import * as traceLog from '../trace/trace.ts';
+import type { RetrievalTraceEvent } from '../trace/trace.ts';
 
 /* ------------------------------------------------------------- lore answers */
 
@@ -18,6 +21,14 @@ export interface LoreAnswer {
   passages: Passage[];
   /** True when the model had enough evidence to ground its answer. */
   grounded: boolean;
+  /** Diagnostic retrieval trace, when requested by the caller. */
+  traceId?: string;
+}
+
+/** Opt-in tracing for the lore-ask retrieval path. */
+export interface LoreAskTraceOptions {
+  enabled?: boolean;
+  sampledRate?: number;
 }
 
 const LORE_SYSTEM = `You are the Lore Researcher for a fanfiction project.
@@ -558,8 +569,39 @@ export async function answerLoreQuestion(
   llm: LlmClient,
   projectId: number,
   question: string,
-  opts: { limit?: number; sourceId?: number; search?: Passage[] } = {},
+  opts: { limit?: number; sourceId?: number; search?: Passage[]; trace?: LoreAskTraceOptions } = {},
 ): Promise<LoreAnswer> {
+  const traceStartedAt = nowIso();
+  const traceBuffer = opts.trace?.enabled === true ? traceLog.createRetrievalTraceBuffer() : undefined;
+  const queryHash = createHash('sha256').update(question, 'utf8').digest('hex');
+  const emit = (event: RetrievalTraceEvent): void => {
+    traceBuffer?.emit(event);
+  };
+  const finishTrace = (mode: string, interrupted = false): string | undefined => {
+    if (!traceBuffer) return undefined;
+    let traceId: string | undefined;
+    try {
+      const record = traceLog.startTrace(db, {
+        projectId,
+        startedAt: traceStartedAt,
+        sampledRate: opts.trace?.sampledRate ?? 1,
+        metadata: {
+          command: 'lore ask',
+          mode,
+          query_sha256: queryHash,
+          query_length: question.length,
+          limit: opts.limit ?? 8,
+          ...(opts.sourceId !== undefined ? { source_id: opts.sourceId } : {}),
+        },
+      });
+      traceId = record.id;
+      traceLog.flushRetrievalTrace(db, projectId, record.id, traceBuffer);
+      traceLog.finishTrace(db, record.id, interrupted ? { interrupted: true } : {});
+    } catch {
+      // Diagnostic tracing must never change the lore answer.
+    }
+    return traceId;
+  };
   // A user's own confirmation needs no book passage. Answer it plainly and
   // carry no citation, so it can never be mistaken for quoted canon.
   const pair = parsePairQuestion(question);
@@ -576,6 +618,21 @@ export async function answerLoreQuestion(
     const userConfirmed = keepers.filter((keeper) => keeper.confirmedByUser && !hasRefs(keeper));
     const passageBacked = keepers.filter(hasRefs);
     if (userConfirmed.length && !passageBacked.length) {
+      emit({
+        event: 'retrieval.shortcut',
+        subject: 'shortcut:pair',
+        decision: 'selected',
+        reasonCode: 'user-confirmed',
+        refs: { count: userConfirmed.length, stage: 'shortcut' },
+      });
+      emit({
+        event: 'retrieval.completed',
+        subject: 'retrieval',
+        decision: 'completed',
+        reasonCode: 'shortcut',
+        refs: { count: 0, stage: 'handoff' },
+      });
+      const traceId = finishTrace('pair-user-confirmed');
       return {
         answer:
           `### Status of ${pair.a} to ${pair.b}\n\n` +
@@ -584,6 +641,7 @@ export async function answerLoreQuestion(
           `Bank line: ${userConfirmed.map((keeper) => `${keeper.fromName} — ${keeper.kind} ${keeper.toName}`).join('; ')}`,
         passages: [],
         grounded: true,
+        ...(traceId ? { traceId } : {}),
       };
     }
     // Attested-only pairs are answered distinctly: quote plus passage scope,
@@ -606,6 +664,35 @@ export async function answerLoreQuestion(
         chunkId,
         projectId,
       );
+      const shortcutPassages = chunk
+        ? [{ chunkId: chunk.id, sourceId: chunk.source_id, sourceTitle: chunk.title, path: chunk.path, locator: chunk.locator, heading: chunk.heading, text: chunk.text, score: 1 }]
+        : [];
+      emit({
+        event: 'retrieval.shortcut',
+        subject: 'shortcut:pair',
+        decision: 'selected',
+        reasonCode: 'attested',
+        refs: { count: shortcutPassages.length, stage: 'shortcut' },
+      });
+      if (chunk) {
+        for (const event of ['retrieval.candidate.generated', 'retrieval.candidate.disposition']) {
+          emit({
+            event,
+            subject: `chunk:${chunk.id}`,
+            decision: event === 'retrieval.candidate.generated' ? 'candidate' : 'selected',
+            reasonCode: event === 'retrieval.candidate.generated' ? 'shortcut' : 'selected',
+            refs: { chunk_id: chunk.id, rank: 1, score: 1, stage: 'shortcut' },
+          });
+        }
+      }
+      emit({
+        event: 'retrieval.completed',
+        subject: 'retrieval',
+        decision: 'completed',
+        reasonCode: 'shortcut',
+        refs: { count: shortcutPassages.length, stage: 'handoff' },
+      });
+      const traceId = finishTrace('pair-attested');
       return {
         answer:
           `### Status of ${pair.a} to ${pair.b}\n\n` +
@@ -613,28 +700,102 @@ export async function answerLoreQuestion(
           `Bank line: ${cited.fromName} — ${cited.kind} ${cited.toName}\n` +
           `Quote: ${cited.evidence}\n` +
           (chunk ? `Passage: ${chunk.locator} (${chunk.title})` : 'Passage: uncited'),
-        passages: chunk
-          ? [{ chunkId: chunk.id, sourceId: chunk.source_id, sourceTitle: chunk.title, path: chunk.path, locator: chunk.locator, heading: chunk.heading, text: chunk.text, score: 1 }]
-          : [],
+        passages: shortcutPassages,
         grounded: true,
+        ...(traceId ? { traceId } : {}),
       };
     }
   }
   let passages = opts.search ?? [];
-  if (passages.length) {
-    // Callers may hand in their own candidate pool; rank it by the same bank
-    // signal the keyword path uses, without changing the pool.
-    passages = lorebook.rankWithBank(db, projectId, question, passages);
-  }
-  if (!passages.length) {
-    const expanded = await expandQuery(llm, question);
-    passages = searchCanon(db, projectId, question, { limit: opts.limit ?? 8, sourceId: opts.sourceId, expand: expanded });
-  }
+  let indexText = '';
+  let index: ReturnType<typeof lorebook.searchLore> = { entities: [], relations: [], facts: [], timeline: [] };
+  let mode = opts.search?.length ? 'supplied-search' : 'fts';
+  let traceId: string | undefined;
+  try {
+    if (passages.length) {
+      // Callers may hand in their own candidate pool; rank it by the same bank
+      // signal the keyword path uses, without changing the pool.
+      const rawSupplied = passages.length;
+      passages = lorebook.rankWithBank(db, projectId, question, passages);
+      emit({
+        event: 'retrieval.summary',
+        subject: 'search:supplied',
+        decision: 'completed',
+        reasonCode: passages.length ? 'ok' : 'empty',
+        refs: {
+          raw_count: rawSupplied,
+          dedup_count: rawSupplied,
+          ranked_count: passages.length,
+          selected_count: passages.length,
+          budgeted_count: 0,
+          excluded_count: 0,
+          stage: 'supplied',
+        },
+      });
+      emit({
+        event: 'retrieval.search.completed',
+        subject: 'search:supplied',
+        decision: 'completed',
+        reasonCode: passages.length ? 'ok' : 'empty',
+        refs: { count: passages.length, stage: 'supplied' },
+      });
+      for (let i = 0; i < passages.length; i++) {
+        const passage = passages[i]!;
+        for (const event of ['retrieval.candidate.generated', 'retrieval.candidate.disposition']) {
+          emit({
+            event,
+            subject: `chunk:${passage.chunkId}`,
+            decision: event === 'retrieval.candidate.generated' ? 'candidate' : 'selected',
+            reasonCode: event === 'retrieval.candidate.generated' ? 'supplied' : 'selected',
+            refs: { chunk_id: passage.chunkId, rank: i + 1, score: passage.score, stage: 'supplied' },
+          });
+        }
+      }
+    } else {
+      const expanded = await expandQuery(llm, question);
+      emit({
+        event: 'retrieval.query.expanded',
+        subject: `query:${queryHash}`,
+        decision: 'candidate',
+        reasonCode: expanded.length ? 'model' : 'fallback-empty',
+        refs: {
+          candidate_id: createHash('sha256').update(JSON.stringify(expanded)).digest('hex'),
+          count: expanded.length,
+          stage: 'expand',
+        },
+      });
+      passages = searchCanon(db, projectId, question, {
+        limit: opts.limit ?? 8,
+        sourceId: opts.sourceId,
+        expand: expanded,
+        trace: traceBuffer,
+      });
+    }
 
-  // The extracted index often answers the question outright, before any
-  // passage is needed.
-  const index = lorebook.searchLore(db, projectId, question, 10);
-  const indexText = formatLoreIndex(index);
+    // The extracted index often answers the question outright, before any
+    // passage is needed.
+    index = lorebook.searchLore(db, projectId, question, 10, traceBuffer);
+    indexText = formatLoreIndex(index);
+    mode = opts.search?.length ? 'supplied-search' : passages.length ? 'fts' : indexText ? 'index-only' : 'fts';
+    emit({
+      event: 'retrieval.completed',
+      subject: 'retrieval',
+      decision: 'completed',
+      reasonCode: passages.length ? 'ok' : indexText ? 'index-only' : 'empty',
+      refs: { count: passages.length, stage: 'handoff' },
+    });
+    traceId = finishTrace(mode);
+  } catch (error) {
+    emit({
+      event: 'retrieval.failed',
+      subject: 'retrieval',
+      decision: 'failed',
+      reasonCode: 'error',
+      error: error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200),
+    });
+    finishTrace(mode, true);
+    throw error;
+  }
 
   if (!passages.length && !indexText) {
     return {
@@ -644,6 +805,7 @@ export async function answerLoreQuestion(
         'Nothing can be confirmed here.',
       passages,
       grounded: false,
+      ...(traceId ? { traceId } : {}),
     };
   }
   const res = await llm.chat({
@@ -665,6 +827,7 @@ export async function answerLoreQuestion(
     answer: guarded,
     passages,
     grounded: passages.length > 0 || indexText.length > 0,
+    ...(traceId ? { traceId } : {}),
   };
 }
 

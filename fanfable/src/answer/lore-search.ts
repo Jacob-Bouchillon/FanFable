@@ -11,6 +11,7 @@ import { STOPWORDS } from '../core/vocab.ts';
 import { SEARCH_CANDIDATE_POOL, SEARCH_CANDIDATE_POOL_MAX } from '../support/search-policy.ts';
 import * as lorebook from '../lorebook.ts';
 import type { Passage } from './lore.ts';
+import type { RetrievalTraceSink } from '../trace/trace.ts';
 
 /* ---------------------------------------------------------------- searching */
 
@@ -39,6 +40,8 @@ export interface SearchOptions {
   expand?: string[];
   /** A caller-built bank profile, shared across expansion and ranking. */
   bankProfile?: lorebook.BankQueryProfile;
+  /** Optional retrieval trace sink. A null sink changes nothing. */
+  trace?: RetrievalTraceSink;
 }
 
 /**
@@ -63,8 +66,47 @@ export function searchCanon(db: Db, projectId: number, query: string, opts: Sear
   // question as asked, so an expanded synonym cannot quietly change who the
   // query names.
   const rankText = query;
+  const emit = (event: Parameters<RetrievalTraceSink['emit']>[0]): void => {
+    opts.trace?.emit({ stage: 'retrieval', ...event });
+  };
+  const emitSummary = (
+    reason: 'ok' | 'empty' | 'error',
+    counts: {
+      raw_count: number;
+      dedup_count: number;
+      ranked_count: number;
+      selected_count: number;
+      budgeted_count: number;
+      excluded_count: number;
+    },
+  ): void => {
+    emit({
+      event: 'retrieval.summary',
+      subject: 'search:fts',
+      decision: 'completed',
+      reasonCode: reason,
+      refs: { ...counts, stage: 'bm25' },
+    });
+  };
   const match = toMatchExpression(searchText);
-  if (!match) return [];
+  if (!match) {
+    emitSummary('empty', {
+      raw_count: 0,
+      dedup_count: 0,
+      ranked_count: 0,
+      selected_count: 0,
+      budgeted_count: 0,
+      excluded_count: 0,
+    });
+    emit({
+      event: 'retrieval.search.completed',
+      subject: 'search:fts',
+      decision: 'completed',
+      reasonCode: 'empty',
+      refs: { count: 0, stage: 'bm25' },
+    });
+    return [];
+  }
 
   let sql = `
     SELECT c.id AS chunk_id, c.source_id, c.locator, c.heading, c.text,
@@ -86,15 +128,33 @@ export function searchCanon(db: Db, projectId: number, query: string, opts: Sear
   try {
     rows = db.all<Record<string, unknown>>(sql, ...params);
   } catch {
+    emitSummary('error', {
+      raw_count: 0,
+      dedup_count: 0,
+      ranked_count: 0,
+      selected_count: 0,
+      budgeted_count: 0,
+      excluded_count: 0,
+    });
+    emit({
+      event: 'retrieval.search.completed',
+      subject: 'search:fts',
+      decision: 'completed',
+      reasonCode: 'error',
+      refs: { count: 0, stage: 'bm25' },
+    });
     return [];
   }
 
   // Merge chunks that are adjacent in the same source so the model sees flow.
   const passages: Passage[] = [];
+  const ftsIds = new Set<number>();
   for (const r of rows) {
     const score = lexicalScore(Number(r.rank ?? 0));
+    const chunkId = Number(r.chunk_id);
+    ftsIds.add(chunkId);
     passages.push({
-      chunkId: Number(r.chunk_id),
+      chunkId,
       sourceId: Number(r.source_id),
       sourceTitle: String(r.source_title),
       path: String(r.path),
@@ -111,12 +171,12 @@ export function searchCanon(db: Db, projectId: number, query: string, opts: Sear
   // gets `limit` passages, and ranking never filters.
   const bankProfile = opts.bankProfile ?? lorebook.buildBankProfile(db, projectId, rankText);
   const seen = new Set(passages.map((p) => p.chunkId));
-  const bankIds = lorebook
-    .bankLinkedChunkIds(db, projectId, rankText, undefined, bankProfile)
-    .filter((chunkId) => !seen.has(chunkId));
-  for (const chunk of getChunks(db, bankIds)) {
+  const bankCandidates = lorebook.bankLinkedChunkIds(db, projectId, rankText, undefined, bankProfile);
+  const bankChunks = getChunks(db, bankCandidates)
+    .filter((chunk) => !opts.sourceId || chunk.sourceId === opts.sourceId);
+  const bankSet = new Set(bankChunks.map((chunk) => chunk.chunkId));
+  for (const chunk of bankChunks) {
     if (seen.has(chunk.chunkId)) continue;
-    if (opts.sourceId && chunk.sourceId !== opts.sourceId) continue;
     chunk.score = 0;
     passages.push(chunk);
     seen.add(chunk.chunkId);
@@ -124,7 +184,66 @@ export function searchCanon(db: Db, projectId: number, query: string, opts: Sear
 
   passages.sort((a, b) => b.score - a.score);
   const ranked = lorebook.rankWithBank(db, projectId, rankText, passages, bankProfile);
-  return ranked.slice(0, limit);
+  const selected = ranked.slice(0, limit);
+  const budgeted = ranked.length - selected.length;
+  emitSummary(selected.length ? 'ok' : 'empty', {
+    raw_count: rows.length + bankCandidates.length,
+    dedup_count: passages.length,
+    ranked_count: ranked.length,
+    selected_count: selected.length,
+    budgeted_count: budgeted,
+    excluded_count: 0,
+  });
+  emit({
+    event: 'retrieval.search.completed',
+    subject: 'search:fts',
+    decision: 'completed',
+    reasonCode: selected.length ? 'ok' : 'empty',
+    refs: { count: rows.length, stage: 'bm25' },
+  });
+  for (let i = 0; i < selected.length; i++) {
+    const passage = selected[i]!;
+    const sources = [
+      ...(ftsIds.has(passage.chunkId) ? ['fts'] : []),
+      ...(bankSet.has(passage.chunkId) ? ['bank-linked'] : []),
+    ];
+    for (const source of sources) {
+      emit({
+        event: 'retrieval.candidate.generated',
+        subject: `chunk:${passage.chunkId}`,
+        decision: 'candidate',
+        reasonCode: source,
+        refs: {
+          chunk_id: passage.chunkId,
+          rank: i + 1,
+          score: passage.score,
+          stage: 'bank-rank',
+        },
+      });
+    }
+    emit({
+      event: 'retrieval.candidate.disposition',
+      subject: `chunk:${passage.chunkId}`,
+      decision: 'selected',
+      reasonCode: 'selected',
+      refs: {
+        chunk_id: passage.chunkId,
+        rank: i + 1,
+        score: passage.score,
+        stage: 'bank-rank',
+      },
+    });
+  }
+  if (budgeted > 0) {
+    emit({
+      event: 'retrieval.budget.cutoff',
+      subject: 'budget:passages',
+      decision: 'budgeted',
+      reasonCode: 'passage-limit',
+      refs: { count: budgeted, stage: 'bank-rank' },
+    });
+  }
+  return selected;
 }
 
 export function getChunk(db: Db, chunkId: number): Passage | undefined {

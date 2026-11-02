@@ -20,6 +20,7 @@ import type { LlmClient } from './core/llm.ts';
 import { embedMissing, type EmbedFn } from './support/embeddings.ts';
 import { CORROBORATION_CAP, tripleKey, rankRows } from './support/edge-rank.ts';
 import { noteFromExtraction, starvedWindowScores } from './web/note-ingest.ts';
+import type { RetrievalTraceSink } from './trace/trace.ts';
 import { entitySubject, recordRuling } from './court/ruling.ts';
 import { newClaimUid } from './court/claim-proof.ts';
 import { findHeadings, lexicalScore, normalise, splitSentences, tokenize, truncate } from './core/text.ts';
@@ -11279,14 +11280,53 @@ export function findEntity(db: Db, projectId: number, name: string): CanonEntity
  * Used by the lore researcher to answer from the extracted index first, and to
  * fill in context requests about a character.
  */
-export function searchLore(db: Db, projectId: number, query: string, limit = 10): {
+export function searchLore(db: Db, projectId: number, query: string, limit = 10, trace?: RetrievalTraceSink): {
   entities: CanonEntity[];
   relations: CanonRelation[];
   facts: CanonFact[];
   timeline: CanonTimelineEntry[];
 } {
+  const emit = (event: Parameters<RetrievalTraceSink['emit']>[0]): void => {
+    trace?.emit({ stage: 'retrieval', ...event });
+  };
+  const emitIndexSummary = (kind: string, raw: number, selected: number): void => {
+    emit({
+      event: 'retrieval.summary',
+      subject: `search:index:${kind}`,
+      decision: 'completed',
+      reasonCode: raw ? 'ok' : 'empty',
+      refs: {
+        raw_count: raw,
+        dedup_count: raw,
+        ranked_count: raw,
+        selected_count: selected,
+        budgeted_count: raw - selected,
+        excluded_count: 0,
+        stage: 'index-match',
+      },
+    });
+    if (raw > selected) {
+      emit({
+        event: 'retrieval.budget.cutoff',
+        subject: `budget:index:${kind}`,
+        decision: 'budgeted',
+        reasonCode: 'index-limit',
+        refs: { count: raw - selected, stage: 'index-match' },
+      });
+    }
+  };
   const q = query.trim().toLowerCase();
-  if (!q) return { entities: [], relations: [], facts: [], timeline: [] };
+  if (!q) {
+    for (const kind of ['entity', 'relation', 'fact', 'timeline']) emitIndexSummary(kind, 0, 0);
+    emit({
+      event: 'retrieval.search.completed',
+      subject: 'search:index',
+      decision: 'completed',
+      reasonCode: 'empty',
+      refs: { count: 0, stage: 'index-match' },
+    });
+    return { entities: [], relations: [], facts: [], timeline: [] };
+  }
   const allEntities = listEntities(db, projectId, undefined, ['accepted', 'user_confirmed']);
   const tokenDf = new Map<string, number>();
   for (const entity of allEntities) {
@@ -11299,7 +11339,17 @@ export function searchLore(db: Db, projectId: number, query: string, limit = 10)
     for (const token of tokens) tokenDf.set(token, (tokenDf.get(token) ?? 0) + 1);
   }
   const words = tokenize(q).filter((word) => (tokenDf.get(word) ?? 0) <= NAME_DF_CAP);
-  if (!words.length) return { entities: [], relations: [], facts: [], timeline: [] };
+  if (!words.length) {
+    for (const kind of ['entity', 'relation', 'fact', 'timeline']) emitIndexSummary(kind, 0, 0);
+    emit({
+      event: 'retrieval.search.completed',
+      subject: 'search:index',
+      decision: 'completed',
+      reasonCode: 'empty',
+      refs: { count: 0, stage: 'index-match' },
+    });
+    return { entities: [], relations: [], facts: [], timeline: [] };
+  }
   const matches = (hay: string): boolean => linkTokensMatch(words, textTokenSet(hay));
 
   const entities = allEntities.filter((e) => {
@@ -11319,12 +11369,58 @@ export function searchLore(db: Db, projectId: number, query: string, limit = 10)
     return matches(`${t.title} ${t.summary} ${t.participants.join(' ')} ${t.location}`);
   });
 
-  return {
+  const result = {
     entities: entities.slice(0, limit),
     relations: rels.slice(0, limit),
     facts: facts.slice(0, limit),
     timeline: timeline.slice(0, limit),
   };
+  const total = result.entities.length + result.relations.length + result.facts.length + result.timeline.length;
+  emit({
+    event: 'retrieval.search.completed',
+    subject: 'search:index',
+    decision: 'completed',
+    reasonCode: total ? 'ok' : 'empty',
+    refs: { count: total, stage: 'index-match' },
+  });
+  const groups: Array<{
+    kind: string;
+    rows: { id: number }[];
+    raw: number;
+    selected: number;
+    refKey?: 'entity_id' | 'relation_id';
+  }> = [
+    { kind: 'entity', rows: result.entities, raw: entities.length, selected: result.entities.length, refKey: 'entity_id' },
+    { kind: 'relation', rows: result.relations, raw: rels.length, selected: result.relations.length, refKey: 'relation_id' },
+    { kind: 'fact', rows: result.facts, raw: facts.length, selected: result.facts.length },
+    { kind: 'timeline', rows: result.timeline, raw: timeline.length, selected: result.timeline.length },
+  ];
+  for (const group of groups) {
+    emitIndexSummary(group.kind, group.raw, group.selected);
+    for (let i = 0; i < group.rows.length; i++) {
+      const id = Number(group.rows[i]!.id);
+      const refs: { rank: number; stage: string; entity_id?: number; relation_id?: number } = {
+        rank: i + 1,
+        stage: 'index-match',
+      };
+      if (group.refKey && Number.isFinite(id)) refs[group.refKey] = id;
+      emit({
+        event: 'retrieval.candidate.generated',
+        subject: `index:${group.kind}:${id}`,
+        decision: 'candidate',
+        reasonCode: 'index',
+        refs,
+      });
+      emit({
+        event: 'retrieval.candidate.disposition',
+        subject: `index:${group.kind}:${id}`,
+        decision: 'selected',
+        reasonCode: 'selected',
+        refs,
+      });
+    }
+  }
+  return result;
 }
 
 /** How much lore has been extracted, for the UI. */
