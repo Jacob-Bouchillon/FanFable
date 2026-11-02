@@ -128,6 +128,11 @@ export function diagnose(db: Db, projectId: number, opts: { limit?: number } = {
     if (lastRun.emptyWindows.length) {
       problems.push(`${lastRun.emptyWindows.length} window(s) produced nothing (${lastRun.emptyWindows.map((w) => w.reason).join(', ')})`);
     }
+    const windowIssues = lastRun.windowIssues ?? [];
+    if (windowIssues.length) {
+      const failed = [...new Set(windowIssues.flatMap((w) => w.failedSections))].join(', ');
+      problems.push(`${windowIssues.length} window(s) incomplete (${failed}) and left for retry`);
+    }
     if (lastRun.quarantinedAliases) problems.push(`${lastRun.quarantinedAliases} near-duplicate name(s) await review`);
     if (problems.length) {
       gaps.push({
@@ -136,7 +141,7 @@ export function diagnose(db: Db, projectId: number, opts: { limit?: number } = {
         subject: 'last extraction',
         message: `${v.verified} quotes verified, ${v.repointed} corrected to a neighbouring passage. ${problems.join('; ')}.`,
         evidence: `run at ${lastRun.at} over ${lastRun.windows} window(s); nothing was written without a quote`,
-        suggestion: 'Run "fanfable lore merge" for the names, and re-run extraction on the windows that produced nothing.',
+        suggestion: 'Run "fanfable lore merge" for the names, and re-run extraction on the windows that produced nothing or failed a section.',
       });
     }
   }

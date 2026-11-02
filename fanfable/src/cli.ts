@@ -1172,6 +1172,12 @@ async function cmdLore(args: Args): Promise<void> {
       console.log(C.dim(`  ${stats.emptyWindows.length} window(s) produced nothing:`));
       for (const w of stats.emptyWindows) console.log(C.dim(`    #${w.index} ${w.locator}: ${w.reason}`));
     }
+    if (stats.windowIssues.length) {
+      console.log(C.dim(`  ${stats.windowIssues.length} window(s) incomplete and left unmined:`));
+      for (const w of stats.windowIssues) {
+        console.log(C.dim(`    #${w.index} ${w.locator}: ${w.state} (${w.failedSections.join(', ')}) — ${w.detail}`));
+      }
+    }
     if (stats.contested && (stats.contested.facts || stats.contested.relations)) {
       console.log(
         C.dim(
@@ -1686,7 +1692,8 @@ async function cmdLore(args: Args): Promise<void> {
         console.log(`  last run: ${v.verified} verified, ${v.repointed} repointed, ${v.dropped} dropped` +
           (v.moment ? `, ${v.moment} moments` : '') +
           (v.unsupported ? `, ${v.unsupported} unsupported` : '') +
-          (v.redundant ? `, ${v.redundant} redundant` : ''));
+          (v.redundant ? `, ${v.redundant} redundant` : '') +
+          (last.windowIssues?.length ? `, ${last.windowIssues.length} incomplete window(s)` : ''));
       }
       return pct;
     };

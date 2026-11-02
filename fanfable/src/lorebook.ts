@@ -482,6 +482,37 @@ export interface EmptyWindowReport {
   detail?: string;
 }
 
+/** The three split-extractor calls. The first returns entities and facts. */
+export type ExtractionSectionName = 'entities-facts' | 'relations' | 'timeline';
+
+export interface ExtractionSectionReport {
+  section: ExtractionSectionName;
+  state: 'succeeded' | 'failed' | 'skipped';
+  /** Rows this section wrote, when it ran. */
+  wrote: number;
+  /** The call's error detail when `state` is failed. */
+  error?: string;
+}
+
+/**
+ * A window that is not complete because at least one section call failed.
+ *
+ * `partial` wrote at least one row before a later section failed; `failed`
+ * wrote nothing. Both stay unmined so a later run can retry them. This is
+ * separate from EmptyWindowReport, which explains a window that genuinely
+ * produced no rows.
+ */
+export interface WindowIssueReport {
+  index: number;
+  locator: string;
+  state: 'partial' | 'failed';
+  sections: ExtractionSectionReport[];
+  failedSections: ExtractionSectionName[];
+  succeededSections: ExtractionSectionName[];
+  wrote: { entities: number; facts: number; relations: number; timeline: number };
+  detail: string;
+}
+
 /** A pair that looks like one thing under two names but was not merged. */
 export interface QuarantinedAlias {
   name: string;
@@ -501,6 +532,8 @@ export interface ExtractLoreResult {
   /** Rows that passed the verbatim gate but failed the proven tier. */
   provisional: number;
   emptyWindows: EmptyWindowReport[];
+  /** Non-complete windows: a section call failed, so the window must retry. */
+  windowIssues: WindowIssueReport[];
   quarantinedAliases: QuarantinedAlias[];
   mergedAliases: string[];
   /** Budget selection, when a budget applied. Absent means everything ran. */
@@ -956,6 +989,7 @@ export async function extractLore(
     `entities quarantined: ${quarantinedEntities.quarantined}, released: ${quarantinedEntities.released}`,
     `quotes verified: ${stats.verification.verified}, repointed: ${stats.verification.repointed}, dropped: ${stats.verification.dropped}`,
     `empty windows: ${stats.emptyWindows.length}`,
+    `partial/failed windows: ${stats.windowIssues.length}`,
     ...loopLines,
   ], db);
 
@@ -1133,6 +1167,8 @@ export async function ensureWindowsForChunks(
     `windows visited: ${stats.windows}`,
     `ties banked: ${stats.relations}`,
     `quotes verified: ${stats.verification.verified}, repointed: ${stats.verification.repointed}, dropped: ${stats.verification.dropped}`,
+    `empty windows: ${stats.emptyWindows.length}`,
+    `partial/failed windows: ${stats.windowIssues.length}`,
   ], db);
   return stats;
 }
@@ -1181,6 +1217,7 @@ function blankResult(): ExtractLoreResult {
     verification: { claimed: 0, verified: 0, repointed: 0, dropped: 0, unresolved: 0, unrelated: 0, moment: 0, redundant: 0, unsupported: 0, hinted: 0, retried: 0, retriedFixed: 0, retriedFailed: 0, flipped: 0 },
     provisional: 0,
     emptyWindows: [],
+    windowIssues: [],
     quarantinedAliases: [],
     mergedAliases: [],
   };
@@ -1283,6 +1320,7 @@ async function runWindowBatch(
     await Promise.all(
       group.map(async ({ window, index }) => {
         const emptyBefore = stats.emptyWindows.length;
+        const issuesBefore = stats.windowIssues.length;
         try {
           if (batch.singlePrompt) {
             await extractWindowLegacy(db, llm, projectId, window, entityIdByName, stats, ctx.neighboursOf, batch.maxTokens, batch.index);
@@ -1310,11 +1348,13 @@ async function runWindowBatch(
             detail: err instanceof Error ? err.message : String(err),
           });
         }
-        // Any empty-window record for this index — including a parsed-but-empty
-        // answer — means the window produced nothing. It must stay unmined so
-        // a later pass can retry it instead of trusting a silent gap.
-        const failed = stats.emptyWindows.slice(emptyBefore).some((e) => e.index === index);
-        if (!failed) {
+        // Any empty-window or partial/failed-window record for this index
+        // means the window is not complete. It must stay unmined so a later
+        // pass can retry it instead of trusting a silent or half-written gap.
+        const incomplete =
+          stats.emptyWindows.slice(emptyBefore).some((e) => e.index === index) ||
+          stats.windowIssues.slice(issuesBefore).some((w) => w.index === index);
+        if (!incomplete) {
           for (const c of window) db.run('UPDATE canon_chunk SET lore_mined = 1 WHERE id = ?', c.id);
         }
         // Feed the evidence web from this window. Additive and fenced off: a
@@ -1362,6 +1402,7 @@ function rememberExtractionReport(db: Db, projectId: number, stats: ExtractLoreR
         windows: stats.windows,
         verification: stats.verification,
         emptyWindows: stats.emptyWindows,
+        windowIssues: stats.windowIssues,
         quarantinedAliases: stats.quarantinedAliases.length,
         mergedAliases: stats.mergedAliases.length,
         contested: stats.contested ?? { facts: 0, relations: 0 },
@@ -1414,6 +1455,8 @@ export function lastExtractionReport(
   /** Rows that passed the verbatim gate but failed the proven tier. */
   provisional: number;
   emptyWindows: EmptyWindowReport[];
+  /** Absent in reports written before window issues were recorded. */
+  windowIssues?: WindowIssueReport[];
   quarantinedAliases: number;
   mergedAliases: number;
   contested: { facts: number; relations: number };
@@ -4431,8 +4474,10 @@ async function extractWindowLegacy(
       maxTokens,
     });
     parsed = parseExtraction(res.text);
-  } catch {
-    return; // a bad window should not abort the whole extraction
+  } catch (err) {
+    // Let runWindowBatch record the failed window and leave it retryable.
+    // A bad window still must not abort the whole extraction.
+    throw err;
   }
 
   applyEntities(db, projectId, parsed.entities, window, entityIdByName, stats, neighboursOf, false);
@@ -4462,9 +4507,21 @@ async function extractWindowSplit(
 ): Promise<void> {
   const passages = passageBlock(window);
   const answers: string[] = [];
-  let failed = false;
+  const sections: ExtractionSectionReport[] = [];
+  const failures: { section: ExtractionSectionName; error: string }[] = [];
+  let accepted = 0;
+  let parsedClaims = 0;
+  let wroteEntities = 0;
+  let wroteFacts = 0;
+  let wroteRelations = 0;
+  let wroteTimeline = 0;
 
-  const ask = async (system: string, maxTok: number, temp = 0): Promise<string | null> => {
+  const ask = async (
+    section: ExtractionSectionName,
+    system: string,
+    maxTok: number,
+    temp = 0,
+  ): Promise<string | null> => {
     try {
       const res = await llm.chat({
         system,
@@ -4474,23 +4531,24 @@ async function extractWindowSplit(
       });
       answers.push(res.text);
       return res.text;
-    } catch {
-      failed = true;
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      failures.push({ section, error });
+      sections.push({ section, state: 'failed', wrote: 0, error });
       return null;
     }
   };
 
-  let accepted = 0;
-  let parsedClaims = 0;
-
   // (a) The things the passages establish, and the facts they state.
-  const first = await ask(EXTRACT_ENTITIES_SYSTEM, Math.min(1600, maxTokens));
+  const first = await ask('entities-facts', EXTRACT_ENTITIES_SYSTEM, Math.min(1600, maxTokens));
   if (first !== null) {
     const entities = parseSection(first, 'entities');
     const facts = parseSection(first, 'facts');
     parsedClaims += entities.length + facts.length;
-    accepted += applyEntities(db, projectId, entities, window, entityIdByName, stats, neighboursOf, true);
-    accepted += applyFacts(db, projectId, facts, window, stats, neighboursOf, true);
+    wroteEntities = applyEntities(db, projectId, entities, window, entityIdByName, stats, neighboursOf, true);
+    wroteFacts = applyFacts(db, projectId, facts, window, stats, neighboursOf, true);
+    accepted += wroteEntities + wroteFacts;
+    sections.push({ section: 'entities-facts', state: 'succeeded', wrote: wroteEntities + wroteFacts });
   }
 
   // (b) Relationships between names that already exist. Names go in the
@@ -4500,7 +4558,7 @@ async function extractWindowSplit(
     : windowEntityNames(db, projectId, window, roster);
   if (names.length) {
     const system = `${relationsSystemPrompt()}\n\n${formatKnownEntities(names)}`;
-    const second = await ask(system, Math.min(3000, maxTokens), 0);
+    const second = await ask('relations', system, Math.min(3000, maxTokens), 0);
     if (second !== null) {
       let relations = parseSection(second, 'relations');
       if (strictRelationsEnabled()) {
@@ -4511,26 +4569,54 @@ async function extractWindowSplit(
         await retryRelationQuotes(db, llm, projectId, window, relations, entityIdByName, stats);
       }
       parsedClaims += relations.length;
-      accepted += applyRelations(db, projectId, relations, window, entityIdByName, stats, neighboursOf, true, nameIndex);
+      wroteRelations = applyRelations(db, projectId, relations, window, entityIdByName, stats, neighboursOf, true, nameIndex);
+      accepted += wroteRelations;
+      sections.push({ section: 'relations', state: 'succeeded', wrote: wroteRelations });
     }
+  } else {
+    sections.push({ section: 'relations', state: 'skipped', wrote: 0 });
   }
 
   // (c) What happens, in order.
-  const third = await ask(EXTRACT_EVENTS_SYSTEM, Math.min(1200, maxTokens));
+  const third = await ask('timeline', EXTRACT_EVENTS_SYSTEM, Math.min(1200, maxTokens));
   if (third !== null) {
     const timeline = parseSection(third, 'timeline');
     parsedClaims += timeline.length;
-    accepted += applyTimeline(db, projectId, timeline, window, stats, neighboursOf, true);
+    wroteTimeline = applyTimeline(db, projectId, timeline, window, stats, neighboursOf, true);
+    accepted += wroteTimeline;
+    sections.push({ section: 'timeline', state: 'succeeded', wrote: wroteTimeline });
   }
 
   stats.passages += window.length;
+  // A complete window is the absence of an issue record; partial and failed
+  // windows are explicit so the batch can leave their chunks retryable.
+  const windowState: 'complete' | 'partial' | 'failed' =
+    failures.length === 0 ? 'complete' : accepted > 0 ? 'partial' : 'failed';
+  if (windowState !== 'complete') {
+    stats.windowIssues.push({
+      index,
+      locator: window[0]?.locator ?? '',
+      state: windowState,
+      sections,
+      failedSections: failures.map((f) => f.section),
+      succeededSections: sections.filter((s) => s.state === 'succeeded').map((s) => s.section),
+      wrote: {
+        entities: wroteEntities,
+        facts: wroteFacts,
+        relations: wroteRelations,
+        timeline: wroteTimeline,
+      },
+      detail: failures.map((f) => `${f.section}: ${f.error}`).join('; '),
+    });
+  }
   if (accepted > 0) return;
 
   // A window that wrote nothing must say why. A well-formed answer with empty
   // arrays is an empty window, not a truncation: only an answer that carries
-  // claims but parses to nothing (cut off mid-array) is truncated.
+  // claims but parses to nothing (cut off mid-array) is truncated. A failed
+  // section is always recorded as such, even when another section wrote rows.
   const hasContent = answers.some((t) => !answerIsEmpty(t));
-  const reason: EmptyWindowReport['reason'] = failed
+  const reason: EmptyWindowReport['reason'] = failures.length
     ? 'error'
     : answers.length === 0
       ? 'error'
@@ -4543,7 +4629,9 @@ async function extractWindowSplit(
     index,
     locator: window[0]?.locator ?? '',
     reason,
-    detail: failed ? 'a model call failed' : `parsed ${parsedClaims} claims, wrote 0 rows`,
+    detail: failures.length
+      ? `failed sections: ${failures.map((f) => `${f.section} (${f.error})`).join('; ')}`
+      : `parsed ${parsedClaims} claims, wrote 0 rows`,
   });
 }
 
