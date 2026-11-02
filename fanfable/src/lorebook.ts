@@ -4444,6 +4444,8 @@ function applyRelations(
         const chunk = chunkAt(window, raw.chunk_index);
         let quote = '';
         let refs: { source: string; locator: string; chunk?: number }[] = [];
+        // A hint needs a verified source span. With no cited chunk there is
+        // nothing to verify against, so leave the quote empty and skip it.
         if (chunk) {
           const hintSpan = gate
             ? verifySpan(raw.evidence, chunk, neighboursOf(chunk.id))
@@ -4454,8 +4456,6 @@ function applyRelations(
               ? [{ source: hintSpan.source, locator: hintSpan.locator, chunk: hintSpan.chunkId }]
               : refsFor(chunk);
           }
-        } else {
-          quote = String(raw.evidence ?? '').trim();
         }
         const rawKind = String(raw.kind ?? '').trim();
         let captured = false;
@@ -4903,10 +4903,10 @@ async function extractWindowLegacy(
     throw err;
   }
 
-  const wroteEntities = applyEntities(db, projectId, parsed.entities, window, entityIdByName, stats, neighboursOf, false);
-  const wroteRelations = applyRelations(db, projectId, parsed.relations, window, entityIdByName, stats, neighboursOf, false, nameIndex);
-  const wroteFacts = applyFacts(db, projectId, parsed.facts, window, stats, neighboursOf, false);
-  const wroteTimeline = applyTimeline(db, projectId, parsed.timeline, window, stats, neighboursOf, false);
+  const wroteEntities = applyEntities(db, projectId, parsed.entities, window, entityIdByName, stats, neighboursOf, true);
+  const wroteRelations = applyRelations(db, projectId, parsed.relations, window, entityIdByName, stats, neighboursOf, true, nameIndex);
+  const wroteFacts = applyFacts(db, projectId, parsed.facts, window, stats, neighboursOf, true);
+  const wroteTimeline = applyTimeline(db, projectId, parsed.timeline, window, stats, neighboursOf, true);
   stats.passages += window.length;
   return {
     state: 'complete',
