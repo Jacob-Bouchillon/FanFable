@@ -24,6 +24,7 @@ import * as lorebook from '../lorebook.ts';
 import { preferThin, readHandoff } from './thin-ranked.ts';
 import { truncate } from '../core/text.ts';
 import { recordRuling } from '../court/ruling.ts';
+import { newClaimUid } from '../court/claim-proof.ts';
 import { DIAGNOSTIC_RELATION_CUES } from '../core/vocab.ts';
 
 /* ------------------------------------------------------------- diagnostics */
@@ -597,9 +598,10 @@ export async function enrichEntity(
       // canon_fact.review_status is advisory: facts are context, never proof of
       // a claim, and there is no promotion path by design.
       db.run(
-        `INSERT INTO canon_fact (project_id, topic, statement, kind, certainty, subject, subject_entity_id, evidence, source_refs, confidence, review_status, created_at)
-         VALUES (?, ?, ?, 'fact', 'inferred', ?, ?, ?, ?, ?, 'needs_review', ?)`,
+        `INSERT INTO canon_fact (project_id, claim_uid, topic, statement, kind, certainty, subject, subject_entity_id, evidence, source_refs, confidence, review_status, created_at)
+         VALUES (?, ?, ?, ?, 'fact', 'inferred', ?, ?, ?, ?, ?, 'needs_review', ?)`,
         projectId,
+        newClaimUid('fact'),
         String(fact.topic ?? '').trim(),
         statement,
         entity.name,

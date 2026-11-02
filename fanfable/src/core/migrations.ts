@@ -734,6 +734,65 @@ export const MIGRATIONS: Migration[] = [
     ],
   },
   {
+    version: 29,
+    name: 'claim identity and proof history',
+    // Stable claim instances plus an append-only proof ledger. Claim UIDs are
+    // independent of SQLite rowids, so a deleted and recreated claim cannot
+    // inherit an old proof. Existing rows are backfilled before any proof is
+    // evaluated. No review status or authorization is changed here.
+    columns: [
+      ['canon_relation', 'claim_uid', 'TEXT'],
+      ['canon_entity', 'claim_uid', 'TEXT'],
+      ['canon_fact', 'claim_uid', 'TEXT'],
+    ],
+    sql: `
+      UPDATE canon_relation
+         SET claim_uid = 'rel-' || lower(hex(randomblob(16)))
+       WHERE claim_uid IS NULL OR claim_uid = '';
+      UPDATE canon_entity
+         SET claim_uid = 'ent-' || lower(hex(randomblob(16)))
+       WHERE claim_uid IS NULL OR claim_uid = '';
+      UPDATE canon_fact
+         SET claim_uid = 'fact-' || lower(hex(randomblob(16)))
+       WHERE claim_uid IS NULL OR claim_uid = '';
+
+      CREATE UNIQUE INDEX IF NOT EXISTS canon_relation_claim_uid
+        ON canon_relation(project_id, claim_uid);
+      CREATE UNIQUE INDEX IF NOT EXISTS canon_entity_claim_uid
+        ON canon_entity(project_id, claim_uid);
+      CREATE UNIQUE INDEX IF NOT EXISTS canon_fact_claim_uid
+        ON canon_fact(project_id, claim_uid);
+
+      CREATE TABLE IF NOT EXISTS claim_proof (
+        id                    INTEGER PRIMARY KEY,
+        project_id            INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        claim_type            TEXT NOT NULL,       -- relation | entity | fact
+        claim_uid             TEXT NOT NULL,
+        claim_id_at_eval      INTEGER,             -- diagnostic snapshot; not identity
+        standard              TEXT NOT NULL,       -- sentence | passage | identity | none
+        outcome               TEXT NOT NULL,       -- verified | failed | not_evaluated | legacy_unknown
+        claim_fingerprint     TEXT NOT NULL,
+        evidence_fingerprint  TEXT NOT NULL,
+        input_fingerprint     TEXT NOT NULL,
+        fingerprint_version   TEXT NOT NULL,
+        policy_version        TEXT NOT NULL,
+        gate_version          TEXT NOT NULL DEFAULT '',
+        attempt_seq           INTEGER NOT NULL,
+        checked_at            TEXT,
+        proof_run_id          INTEGER REFERENCES extraction_run(id) ON DELETE SET NULL,
+        quote_hash            TEXT NOT NULL DEFAULT '',
+        detail                TEXT NOT NULL DEFAULT '',
+        created_at            TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS claim_proof_attempt
+        ON claim_proof(project_id, claim_type, claim_uid, attempt_seq);
+      CREATE INDEX IF NOT EXISTS claim_proof_latest
+        ON claim_proof(project_id, claim_type, claim_uid, attempt_seq DESC, id DESC);
+      CREATE INDEX IF NOT EXISTS claim_proof_outcome
+        ON claim_proof(project_id, claim_type, outcome);
+    `,
+  },
+  {
     version: 28,
     name: 'durable extraction-run provenance',
     // What each extraction run and window actually did. Additive only:

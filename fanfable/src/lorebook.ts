@@ -21,6 +21,7 @@ import { embedMissing, type EmbedFn } from './support/embeddings.ts';
 import { CORROBORATION_CAP, tripleKey, rankRows } from './support/edge-rank.ts';
 import { noteFromExtraction, starvedWindowScores } from './web/note-ingest.ts';
 import { entitySubject, recordRuling } from './court/ruling.ts';
+import { newClaimUid } from './court/claim-proof.ts';
 import { findHeadings, lexicalScore, normalise, splitSentences, tokenize, truncate } from './core/text.ts';
 import {
   ANSWER_CUE_STOPWORDS,
@@ -2853,10 +2854,11 @@ function applyEntities(
       continue;
     }
     db.run(
-      `INSERT OR IGNORE INTO canon_entity (project_id, kind, name, aliases, summary, attributes, role, status,
+      `INSERT OR IGNORE INTO canon_entity (project_id, claim_uid, kind, name, aliases, summary, attributes, role, status,
                                  first_chunk, evidence, source_refs, mentions, review_status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'needs_review', ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'needs_review', ?, ?)`,
       projectId,
+      newClaimUid('entity'),
       kind,
       name,
       toJson(toStringArray(raw.aliases)),
@@ -2925,9 +2927,10 @@ function applyFacts(
     // canon_fact.review_status is advisory: facts are context, never proof of a
     // claim, and there is no promotion path by design.
     db.run(
-      `INSERT INTO canon_fact (project_id, topic, statement, kind, certainty, subject, evidence, source_refs, subject_entity_id, modality, review_status, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'needs_review', ?)`,
+      `INSERT INTO canon_fact (project_id, claim_uid, topic, statement, kind, certainty, subject, evidence, source_refs, subject_entity_id, modality, review_status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'needs_review', ?)`,
       projectId,
+      newClaimUid('fact'),
       String(raw.topic ?? '').trim(),
       statement,
       String(raw.kind ?? 'fact').trim(),
@@ -6876,9 +6879,10 @@ export function insertRelation(
   return db.transaction(() => {
     const id = Number(
       db.run(
-        `INSERT INTO canon_relation (project_id, from_entity, to_entity, kind, description, evidence, source_refs, confidence, modality, review_status, kind_source, anchor_evidence, supporting_evidence, relation_status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO canon_relation (project_id, claim_uid, from_entity, to_entity, kind, description, evidence, source_refs, confidence, modality, review_status, kind_source, anchor_evidence, supporting_evidence, relation_status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         projectId,
+        newClaimUid('relation'),
         row.fromEntity,
         row.toEntity,
         row.kind,
@@ -9802,9 +9806,10 @@ export function checkEntityCapacity(
                 if (!existing && opts.write) {
                   db.run(
                     `INSERT INTO canon_fact
-                       (project_id, topic, statement, kind, certainty, subject, evidence, source_refs, subject_entity_id, modality, created_at)
-                     VALUES (?, ?, ?, 'fact', 'confirmed', ?, ?, ?, ?, 'asserted', ?)`,
+                       (project_id, claim_uid, topic, statement, kind, certainty, subject, evidence, source_refs, subject_entity_id, modality, created_at)
+                     VALUES (?, ?, ?, ?, 'fact', 'confirmed', ?, ?, ?, ?, 'asserted', ?)`,
                     projectId,
+                    newClaimUid('fact'),
                     entity.name,
                     statement,
                     other.name,
@@ -9861,6 +9866,8 @@ export function checkEntityCapacity(
 const RULINGS_VERSION = 1 as const;
 
 export interface RulingsExportKeeper {
+  /** Stable claim instance identity, when the export carries one. */
+  claim_uid?: string;
   from_name: string;
   from_aliases: string[];
   to_name: string;
@@ -9961,6 +9968,7 @@ export function exportRulings(
 
   const keepers: RulingsExportKeeper[] = [];
   for (const row of db.all<{
+    claim_uid: string | null;
     from_entity: number;
     to_entity: number;
     kind: string;
@@ -9969,7 +9977,7 @@ export function exportRulings(
     evidence: string;
     source_refs: string;
   }>(
-    `SELECT from_entity, to_entity, kind, review_status, confirmed_by_user, evidence, source_refs
+    `SELECT claim_uid, from_entity, to_entity, kind, review_status, confirmed_by_user, evidence, source_refs
        FROM canon_relation
       WHERE project_id = ? AND review_status IN ('accepted','user_confirmed')`,
     projectId,
@@ -9982,6 +9990,7 @@ export function exportRulings(
       .map((ref) => (typeof ref?.locator === 'string' ? ref.locator.trim() : ''))
       .find(Boolean) ?? '';
     keepers.push({
+      claim_uid: row.claim_uid ?? undefined,
       from_name: from.name,
       from_aliases: sortedAliases(from.aliases),
       to_name: to.name,
@@ -10003,7 +10012,8 @@ export function exportRulings(
       compareText(a.kind, b.kind) ||
       compareText(a.review_status, b.review_status) ||
       compareText(a.evidence, b.evidence) ||
-      compareText(a.locator, b.locator),
+      compareText(a.locator, b.locator) ||
+      compareText(a.claim_uid ?? '', b.claim_uid ?? ''),
   );
 
   const noteRulings: RulingsExportNote[] = [];
@@ -10105,6 +10115,7 @@ export function parseRulingsExport(value: unknown): RulingsExport {
     if (!fromName) fail(`${where}.from_name is empty`);
     if (!toName) fail(`${where}.to_name is empty`);
     return {
+      claim_uid: typeof raw.claim_uid === 'string' && raw.claim_uid.trim() ? raw.claim_uid.trim() : undefined,
       from_name: fromName,
       from_aliases: asAliases(raw, 'from_aliases', where),
       to_name: toName,
@@ -10385,10 +10396,10 @@ export function replayRulings(
         keeperReport.applied++;
         writes.push({
           sql: `INSERT INTO canon_relation
-                  (project_id, from_entity, to_entity, kind, description, evidence, source_refs,
+                  (project_id, claim_uid, from_entity, to_entity, kind, description, evidence, source_refs,
                    confidence, review_status, confirmed_by_user, relation_status, created_at)
-                VALUES (?, ?, ?, ?, '', ?, ?, 1.0, 'needs_review', 1, 'unknown', ?)`,
-          params: [projectId, from.id, to.id, keeper.kind, verdictEvidence, JSON.stringify(verdictRefs ?? []), now],
+                VALUES (?, ?, ?, ?, ?, '', ?, ?, 1.0, 'needs_review', 1, 'unknown', ?)`,
+          params: [projectId, keeper.claim_uid ?? newClaimUid('relation'), from.id, to.id, keeper.kind, verdictEvidence, JSON.stringify(verdictRefs ?? []), now],
           court: {
             relationId: null,
             insert: true,
@@ -10437,11 +10448,12 @@ export function replayRulings(
     keeperReport.applied++;
     writes.push({
       sql: `INSERT INTO canon_relation
-              (project_id, from_entity, to_entity, kind, description, evidence, source_refs,
+              (project_id, claim_uid, from_entity, to_entity, kind, description, evidence, source_refs,
                confidence, review_status, confirmed_by_user, relation_status, created_at)
-            VALUES (?, ?, ?, ?, '', ?, ?, 1.0, ?, 0, ?, ?)`,
+            VALUES (?, ?, ?, ?, ?, '', ?, ?, 1.0, ?, 0, ?, ?)`,
       params: [
         projectId,
+        keeper.claim_uid ?? newClaimUid('relation'),
         from.id,
         to.id,
         keeper.kind,

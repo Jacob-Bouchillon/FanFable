@@ -337,13 +337,13 @@ test('starvedCandidateIndices maps the same path extract uses, capped at N', () 
 
 test('migration 25 adds the column and the conflict table, and reruns as a no-op', () => {
   const { db } = tempDb();
-  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')!.user_version, 28);
+  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')!.user_version, 29);
   const columns = db.all<{ name: string }>('PRAGMA table_info(canon_thread_note)').map((row) => row.name);
   assert.ok(columns.includes('claim_kind'));
   assert.ok(
     db.get<{ n: number }>("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'canon_thread_conflict'")!
       .n > 0,
   );
-  assert.equal(runMigrations(db.raw), 28, 'second run stays at the current version');
+  assert.equal(runMigrations(db.raw), 29, 'second run stays at the current version');
   db.close();
 });
