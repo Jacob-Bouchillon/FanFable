@@ -11174,6 +11174,12 @@ export interface LoreBrief {
   entities: string;
   relations: string;
   facts: string;
+  /** Selected row ids, for diagnostics. These do not affect the rendered brief. */
+  entityIds?: number[];
+  citedEntityIds?: number[];
+  relationIds?: number[];
+  factIds?: number[];
+  citedFactIds?: number[];
 }
 
 /**
@@ -11225,19 +11231,27 @@ export function renderBrief(
       `${bits.length ? `: ${bits.join('. ')}` : ''}${refs ? ` (${refs})` : ''}`;
   });
 
-  const relationLines = relations.slice(0, 25).map(
+  const shownRelations = relations.slice(0, 25);
+  const relationLines = shownRelations.map(
     (r) => `- ${r.fromName} → ${r.toName}: ${r.kind}${r.description ? ` — ${r.description}` : ''}`,
   );
 
-  const factLines = facts
+  const shownFacts = facts
     .filter((f) => !names.length || !f.subject || names.some((n) => f.subject.toLowerCase().includes(n)))
-    .slice(0, 25)
-    .map((f) => `- ${f.statement}${f.topic ? ` (${f.topic})` : ''}${f.certainty === 'inferred' ? ' [inferred]' : ''}`);
+    .slice(0, 25);
+  const factLines = shownFacts.map(
+    (f) => `- ${f.statement}${f.topic ? ` (${f.topic})` : ''}${f.certainty === 'inferred' ? ' [inferred]' : ''}`,
+  );
 
   return {
     entities: entityLines.join('\n'),
     relations: relationLines.join('\n'),
     facts: factLines.join('\n'),
+    entityIds: entities.map((e) => e.id),
+    citedEntityIds: entities.filter((e) => e.sourceRefs.length > 0).map((e) => e.id),
+    relationIds: shownRelations.map((r) => r.id),
+    factIds: shownFacts.map((f) => f.id),
+    citedFactIds: shownFacts.filter((f) => f.sourceRefs.length > 0).map((f) => f.id),
   };
 }
 

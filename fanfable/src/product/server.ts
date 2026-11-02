@@ -796,6 +796,7 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
           return {
             chapter: res.chapter,
             trace: res.trace,
+            contextTraceId: res.contextTraceId,
             issues: res.issues,
           };
         });
@@ -810,7 +811,7 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
           progress('extracting story state');
           const res = await controller.approveChapter(db, llm(), p.id, Number(body.number));
           progress('checking continuity');
-          return { chapter: res.chapter, issues: res.issues };
+          return { chapter: res.chapter, issues: res.issues, contextTraceId: res.contextTraceId };
         });
         json(res, 200, { jobId: id });
         return;

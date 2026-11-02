@@ -40,6 +40,9 @@ export interface RetrievalTraceEvent {
 
 export interface RetrievalTraceSink {
   emit(event: RetrievalTraceEvent): void;
+  /** Set by withRetrievalTraceSpan; absent on a plain buffer. */
+  readonly spanId?: string;
+  readonly parentSpanId?: string | null;
 }
 
 export interface BufferedRetrievalTrace extends RetrievalTraceSink {
@@ -96,8 +99,20 @@ export function withRetrievalTraceSpan(
   parentSpanId?: string | null,
 ): RetrievalTraceSink {
   return {
+    spanId,
+    parentSpanId: parentSpanId ?? null,
     emit(event: RetrievalTraceEvent): void {
-      sink.emit({ ...event, spanId, parentSpanId: parentSpanId ?? null });
+      // Inner wrappers own their events. An outer wrapper must not pull a
+      // hop or child event back onto itself.
+      if (event.spanId) {
+        sink.emit({
+          ...event,
+          spanId: event.spanId,
+          parentSpanId: event.parentSpanId ?? null,
+        });
+      } else {
+        sink.emit({ ...event, spanId, parentSpanId: parentSpanId ?? null });
+      }
     },
   };
 }
@@ -123,10 +138,13 @@ export function flushRetrievalTrace(
     buffer.events
       .filter(
         (event) =>
-          event.event === 'retrieval.candidate.disposition' &&
-          event.decision === 'selected' &&
-          event.refs?.stage === 'final-bank-rank' &&
-          event.subject,
+          (event.event === 'retrieval.candidate.disposition' &&
+            event.decision === 'selected' &&
+            event.refs?.stage === 'final-bank-rank' &&
+            event.subject) ||
+          (event.event === 'context.item.disposition' &&
+            (event.decision === 'included' || event.decision === 'truncated') &&
+            event.subject),
       )
       .map((event) => String(event.subject)),
   );
@@ -175,6 +193,23 @@ export function flushRetrievalTrace(
       createdAt: nowIso(),
     });
   }
+  // Context accounting comes first when a trace contains both ledgers.
+  // Candidate detail may be sampled, but summaries, final dispositions and
+  // coverage must not be pushed out by older retrieval detail.
+  if (eventsToWrite.some((event) => event.stage === 'context')) {
+    const priority = (event: RetrievalTraceEvent): number => {
+      if (
+        event.event === 'context.summary' ||
+        event.event === 'context.coverage' ||
+        event.event === 'context.completed' ||
+        event.event === 'context.child.completed'
+      ) return 0;
+      if (event.event === 'context.item.disposition') return 1;
+      if (event.event === 'context.item.generated') return 2;
+      return 3;
+    };
+    eventsToWrite.sort((a, b) => priority(a) - priority(b));
+  }
   let failedWrites = 0;
   for (const event of eventsToWrite) {
     try {
@@ -215,6 +250,8 @@ export interface TraceRefs {
   chunk_id?: number;
   relation_id?: number;
   entity_id?: number;
+  event_id?: number;
+  fact_id?: number;
   entity_ids?: number[];
   open_end_id?: number;
   seq?: number | null;
@@ -245,6 +282,16 @@ export interface TraceRefs {
   iteration_count?: number;
   /** Trail step count. */
   step_count?: number;
+  /** Items partially included by a context budget. */
+  truncated_count?: number;
+  /** Context-child coverage counts. */
+  required_count?: number;
+  contributing_count?: number;
+  optional_count?: number;
+  incomplete_count?: number;
+  required_incomplete_count?: number;
+  contributing_incomplete_count?: number;
+  optional_incomplete_count?: number;
   /** Short scoring/processing stage code, never prose. */
   stage?: string;
 }
@@ -436,12 +483,17 @@ const REF_NUMBER_KEYS = [
   'chunk_id',
   'relation_id',
   'entity_id',
+  'event_id',
+  'fact_id',
   'open_end_id',
 ] as const;
 const REF_NONNEGATIVE_KEYS = [
   'rank', 'score', 'count', 'raw_count', 'dedup_count', 'ranked_count',
-  'selected_count', 'budgeted_count', 'excluded_count', 'node_count',
-  'edge_count', 'iteration_count', 'step_count',
+  'selected_count', 'budgeted_count', 'excluded_count', 'truncated_count',
+  'node_count', 'edge_count', 'iteration_count', 'step_count',
+  'required_count', 'contributing_count', 'optional_count', 'incomplete_count',
+  'required_incomplete_count', 'contributing_incomplete_count',
+  'optional_incomplete_count',
 ] as const;
 const TERMINAL_DECISIONS = new Set(['applied', 'noop', 'stale', 'conflict', 'rejected']);
 
@@ -1340,6 +1392,522 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
     }
   }
 
+  const contextEvents = events.filter((event) => event.stage === 'context');
+  let contextExhaustive = true;
+  if (contextEvents.length) {
+    checks.push(
+      'context items have one terminal disposition per unique key when the trace is exhaustive',
+      'context child summaries reconcile with the final context summary',
+      'selected context citations resolve by item class',
+      'required and contributing context children are complete',
+      'brief citation slots map to source chunks; source association is not sentence entailment',
+    );
+    const contextComplete = trace.completeness === 'complete' && trace.droppedEvents === 0;
+    const generated = new Map<string, TraceEventRecord[]>();
+    const dispositions = new Map<string, TraceEventRecord[]>();
+    const childStarted = new Map<string, TraceEventRecord>();
+    const childCompleted = new Map<string, TraceEventRecord>();
+    const contextSummaries = new Map<string, TraceEventRecord>();
+    let coverageEvent: TraceEventRecord | undefined;
+    const itemDecisions = new Set(['included', 'excluded', 'budgeted', 'truncated', 'failed', 'superseded']);
+    const childStatuses = new Set(['complete', 'empty', 'failed', 'skipped', 'sampled', 'truncated', 'interrupted', 'superseded']);
+    for (const event of contextEvents) {
+      if (event.event === 'context.item.generated' && event.subject) {
+        generated.set(event.subject, [...(generated.get(event.subject) ?? []), event]);
+      }
+      if (event.event === 'context.item.disposition' && event.subject) {
+        dispositions.set(event.subject, [...(dispositions.get(event.subject) ?? []), event]);
+        if (!itemDecisions.has(event.decision)) {
+          violations.push({
+            code: 'context_item_decision',
+            eventId: event.id,
+            detail: `context item ${event.subject} has unrecognised decision ${event.decision || '(empty)'}`,
+          });
+        }
+      }
+      if (event.event === 'context.child.started' && event.subject) {
+        childStarted.set(event.subject, event);
+      }
+      if (event.event === 'context.child.completed' && event.subject) {
+        childCompleted.set(event.subject, event);
+        if (!childStatuses.has(event.reasonCode)) {
+          violations.push({
+            code: 'context_child_status',
+            eventId: event.id,
+            detail: `context child ${event.subject} has unrecognised status ${event.reasonCode || '(empty)'}`,
+          });
+        }
+      }
+      if (event.event === 'context.summary' && event.subject) {
+        contextSummaries.set(event.subject, event);
+      }
+      if (event.event === 'context.coverage') coverageEvent = event;
+    }
+
+    if (contextComplete) {
+      for (const [key, list] of generated) {
+        const terminal = dispositions.get(key) ?? [];
+        if (terminal.length === 0) {
+          violations.push({
+            code: 'context_item_missing_disposition',
+            detail: `context item ${key} has no terminal disposition`,
+          });
+        } else if (terminal.length > 1) {
+          violations.push({
+            code: 'context_item_multiple_dispositions',
+            detail: `context item ${key} has ${terminal.length} terminal dispositions`,
+          });
+        }
+      }
+      for (const [key] of dispositions) {
+        if (!generated.has(key)) {
+          violations.push({
+            code: 'context_disposition_without_origin',
+            detail: `context disposition ${key} has no generated origin`,
+          });
+        }
+      }
+      for (const [key, list] of generated) {
+        if (list.some((event) => !event.spanId || !event.parentSpanId)) {
+          violations.push({
+            code: 'context_origin_without_parent',
+            detail: `context item ${key} has an origin outside the parent span tree`,
+          });
+        }
+      }
+      if (!contextSummaries.has('context:final')) {
+        violations.push({
+          code: 'context_summary_missing',
+          detail: 'complete context trace has no context:final summary',
+        });
+      }
+      if (!contextEvents.some((event) => event.event === 'context.completed')) {
+        violations.push({
+          code: 'context_completion_missing',
+          detail: 'complete context trace has no context.completed event',
+        });
+      }
+      if (!coverageEvent) {
+        violations.push({
+          code: 'context_coverage_missing',
+          detail: 'complete context trace has no context.coverage event',
+        });
+      }
+    }
+
+    for (const [subject, summary] of contextSummaries) {
+      const raw = summary.refs.raw_count;
+      const dedup = summary.refs.dedup_count;
+      const ranked = summary.refs.ranked_count;
+      const selected = summary.refs.selected_count;
+      const budgeted = summary.refs.budgeted_count;
+      const excluded = summary.refs.excluded_count;
+      const truncated = summary.refs.truncated_count ?? 0;
+      if ([raw, dedup, ranked, selected, budgeted, excluded].some((value) => typeof value !== 'number' || value < 0)) {
+        violations.push({
+          code: 'context_summary_counts',
+          eventId: summary.id,
+          detail: `context summary ${subject} is missing a non-negative count`,
+        });
+        continue;
+      }
+      if (dedup! > raw! || ranked! > dedup! || selected! + budgeted! + excluded! !== dedup! || truncated! > selected!) {
+        violations.push({
+          code: 'context_summary_counts',
+          eventId: summary.id,
+          detail: `context summary ${subject} has inconsistent counts`,
+        });
+      }
+    }
+
+    if (coverageEvent) {
+      const required = Number(coverageEvent.refs.required_count ?? 0);
+      const contributing = Number(coverageEvent.refs.contributing_count ?? 0);
+      const optional = Number(coverageEvent.refs.optional_count ?? 0);
+      const incomplete = Number(coverageEvent.refs.incomplete_count ?? 0);
+      if (required < 0 || contributing < 0 || optional < 0 || incomplete < 0) {
+        violations.push({
+          code: 'context_coverage_counts',
+          eventId: coverageEvent.id,
+          detail: 'context coverage has a negative count',
+        });
+      }
+    }
+
+    const childNames = new Set([...childStarted.keys(), ...childCompleted.keys()]);
+    let requiredIncomplete = 0;
+    let contributingIncomplete = 0;
+    let optionalIncomplete = 0;
+    for (const subject of childNames) {
+      const started = childStarted.get(subject);
+      const completed = childCompleted.get(subject);
+      const className = String(completed?.refs.stage ?? started?.refs.stage ?? '');
+      const status = completed?.reasonCode ?? 'missing';
+      const selected = Number(completed?.refs.selected_count ?? completed?.refs.count ?? 0);
+      const isRequired = className === 'required';
+      const isOptional = className === 'best-effort';
+      const childSpan = started?.spanId ?? completed?.spanId;
+      const hasOrigins = [...generated.values()].some((list) =>
+        list.some((event) => childSpan && event.spanId === childSpan),
+      );
+      const isContributing = selected > 0 || hasOrigins;
+      const isIncomplete = !['complete', 'empty', 'superseded'].includes(status);
+      if (!isIncomplete) continue;
+      if (isRequired) {
+        requiredIncomplete++;
+        contextExhaustive = false;
+        if (contextComplete) {
+          violations.push({
+            code: 'context_required_child_incomplete',
+            eventId: completed?.id,
+            detail: `required context child ${subject} is ${status}`,
+          });
+        }
+      } else if (isOptional && isContributing) {
+        contributingIncomplete++;
+        contextExhaustive = false;
+        if (contextComplete) {
+          violations.push({
+            code: 'context_contributing_child_incomplete',
+            eventId: completed?.id,
+            detail: `contributing context child ${subject} is ${status}`,
+          });
+        }
+      } else if (isOptional) {
+        optionalIncomplete++;
+        limitations.push(
+          `optional context child ${subject} is ${status}; it contributed no selected items, so the actual context lineage is unaffected`,
+        );
+      }
+    }
+
+    if (coverageEvent && contextComplete) {
+      const overclaim = coverageEvent.reasonCode === 'complete' && (requiredIncomplete > 0 || contributingIncomplete > 0);
+      if (overclaim) {
+        contextExhaustive = false;
+        violations.push({
+          code: 'context_parent_overclaims_completeness',
+          eventId: coverageEvent.id,
+          detail: 'context coverage claims complete while a required or contributing child is incomplete',
+        });
+      }
+      const expectedIncomplete = requiredIncomplete + contributingIncomplete;
+      if (Number(coverageEvent.refs.incomplete_count ?? 0) !== expectedIncomplete) {
+        violations.push({
+          code: 'context_coverage_mismatch',
+          eventId: coverageEvent.id,
+          detail: `context coverage reports ${coverageEvent.refs.incomplete_count ?? 0} incomplete children; audit found ${expectedIncomplete}`,
+        });
+      }
+    }
+
+    // A retrieval-selected passage may legitimately be excluded during
+    // context assembly. This check records that both decisions exist; it is
+    // not a retrieval failure.
+    const retrievalSelectedChunks = new Set(
+      retrievalEvents
+        .filter(
+          (event) =>
+            event.event === 'retrieval.candidate.disposition' &&
+            event.decision === 'selected' &&
+            event.subject.startsWith('chunk:'),
+        )
+        .map((event) => event.subject),
+    );
+    let assemblyExcludedRetrieved = 0;
+    for (const [key, list] of dispositions) {
+      if (!retrievalSelectedChunks.has(key)) continue;
+      if (list.some((event) => event.decision === 'excluded' || event.decision === 'budgeted')) {
+        assemblyExcludedRetrieved++;
+      }
+    }
+    if (assemblyExcludedRetrieved) {
+      checks.push(
+        `retrieval-selected but assembly-excluded passages: ${assemblyExcludedRetrieved} (distinct decisions, not retrieval failures)`,
+      );
+    }
+
+    const chunkCache = new Map<number, { locator: string; title: string; path: string } | undefined>();
+    const chunkCitation = (chunkId: number): { locator: string; title: string; path: string } | undefined => {
+      if (!chunkCache.has(chunkId)) {
+        chunkCache.set(
+          chunkId,
+          db.get<{ locator: string; title: string; path: string }>(
+            `SELECT c.locator, s.title, s.path
+               FROM canon_chunk c JOIN canon_source s ON s.id = c.source_id
+              WHERE c.id = ? AND c.project_id = ?`,
+            chunkId,
+            trace.projectId,
+          ),
+        );
+      }
+      return chunkCache.get(chunkId);
+    };
+    const numericFrom = (key: string, re: RegExp): number | undefined => {
+      const match = re.exec(key);
+      const value = Number(match?.[1]);
+      return Number.isFinite(value) && value > 0 ? value : undefined;
+    };
+    const checkChunk = (event: TraceEventRecord, key: string): void => {
+      const chunkId = Number(event.refs.chunk_id ?? numericFrom(key, /^chunk:(\d+)$/) ?? 0);
+      if (!Number.isInteger(chunkId) || chunkId <= 0) {
+        violations.push({
+          code: 'context_selected_without_chunk',
+          eventId: event.id,
+          detail: `selected context item ${key} has no chunk_id`,
+        });
+        return;
+      }
+      const row = chunkCitation(chunkId);
+      if (!row) {
+        violations.push({
+          code: 'context_selected_chunk_missing',
+          eventId: event.id,
+          detail: `selected context item ${key} does not exist in project ${trace.projectId}`,
+        });
+      } else if (!row.locator && !row.title && !row.path) {
+        violations.push({
+          code: 'context_selected_without_citation',
+          eventId: event.id,
+          detail: `selected context item ${key} has no citation or locator`,
+        });
+      }
+    };
+    for (const [key, list] of dispositions) {
+      for (const event of list) {
+        if (event.decision !== 'included' && event.decision !== 'truncated') continue;
+        if (key.startsWith('chunk:')) {
+          checkChunk(event, key);
+          continue;
+        }
+        if (key.startsWith('brief:canon:S')) {
+          checkChunk(event, key);
+          continue;
+        }
+        if (key.startsWith('event:canon:')) {
+          const id = Number(event.refs.event_id ?? numericFrom(key, /^event:canon:(\d+)$/) ?? 0);
+          const row = Number.isInteger(id) && id > 0
+            ? db.get<{ locator: string }>(
+                'SELECT locator FROM canon_event WHERE id = ? AND project_id = ?',
+                id,
+                trace.projectId,
+              )
+            : undefined;
+          if (!row) {
+            violations.push({
+              code: 'context_selected_event_missing',
+              eventId: event.id,
+              detail: `selected context item ${key} has no canon event row`,
+            });
+          } else if (!row.locator) {
+            violations.push({
+              code: 'context_selected_without_citation',
+              eventId: event.id,
+              detail: `selected context item ${key} has no locator`,
+            });
+          }
+          continue;
+        }
+        if (key.startsWith('event:au:')) {
+          const id = Number(event.refs.event_id ?? numericFrom(key, /^event:au:(\d+)$/) ?? 0);
+          const row = Number.isInteger(id) && id > 0
+            ? db.get<{ story_time: string }>(
+                'SELECT story_time FROM au_event WHERE id = ? AND project_id = ?',
+                id,
+                trace.projectId,
+              )
+            : undefined;
+          if (!row) {
+            violations.push({
+              code: 'context_selected_event_missing',
+              eventId: event.id,
+              detail: `selected context item ${key} has no AU event row`,
+            });
+          } else if (!row.story_time) {
+            violations.push({
+              code: 'context_selected_without_citation',
+              eventId: event.id,
+              detail: `selected context item ${key} has no story time`,
+            });
+          }
+          continue;
+        }
+        if (key.startsWith('entity:canon:') || key.startsWith('brief:lore:entity:')) {
+          const id = Number(event.refs.entity_id ?? numericFrom(key, /:(\d+)$/) ?? 0);
+          const row = Number.isInteger(id) && id > 0
+            ? db.get<{ source_refs: string }>(
+                'SELECT source_refs FROM canon_entity WHERE id = ? AND project_id = ?',
+                id,
+                trace.projectId,
+              )
+            : undefined;
+          if (!row) {
+            violations.push({
+              code: 'context_selected_source_missing',
+              eventId: event.id,
+              detail: `selected context item ${key} has no canon entity row`,
+            });
+          } else if (event.reasonCode !== 'uncited-lore' && !String(row.source_refs ?? '').trim()) {
+            violations.push({
+              code: 'context_selected_without_citation',
+              eventId: event.id,
+              detail: `selected context item ${key} is not marked uncited-lore and has no source refs`,
+            });
+          }
+          continue;
+        }
+        if (key.startsWith('fact:canon:') || key.startsWith('brief:lore:fact:')) {
+          const id = Number(event.refs.fact_id ?? numericFrom(key, /:(\d+)$/) ?? 0);
+          const row = Number.isInteger(id) && id > 0
+            ? db.get<{ source_refs: string }>(
+                'SELECT source_refs FROM canon_fact WHERE id = ? AND project_id = ?',
+                id,
+                trace.projectId,
+              )
+            : undefined;
+          if (!row) {
+            violations.push({
+              code: 'context_selected_source_missing',
+              eventId: event.id,
+              detail: `selected context item ${key} has no canon fact row`,
+            });
+          } else if (event.reasonCode !== 'uncited-lore' && !String(row.source_refs ?? '').trim()) {
+            violations.push({
+              code: 'context_selected_without_citation',
+              eventId: event.id,
+              detail: `selected context item ${key} is not marked uncited-lore and has no source refs`,
+            });
+          }
+          continue;
+        }
+        if (key.startsWith('brief:lore:relation:')) {
+          const id = Number(event.refs.relation_id ?? numericFrom(key, /:(\d+)$/) ?? 0);
+          const row = Number.isInteger(id) && id > 0
+            ? db.get<{ id: number }>(
+                'SELECT id FROM canon_relation WHERE id = ? AND project_id = ?',
+                id,
+                trace.projectId,
+              )
+            : undefined;
+          if (!row) {
+            violations.push({
+              code: 'context_selected_source_missing',
+              eventId: event.id,
+              detail: `selected context item ${key} has no canon relation row`,
+            });
+          }
+          continue;
+        }
+        if (key.startsWith('entity:story:')) {
+          const id = Number(event.refs.entity_id ?? numericFrom(key, /:(\d+)$/) ?? 0);
+          const row = Number.isInteger(id) && id > 0
+            ? db.get<{ id: number }>('SELECT id FROM character WHERE id = ? AND project_id = ?', id, trace.projectId)
+            : undefined;
+          if (!row) {
+            violations.push({
+              code: 'context_selected_source_missing',
+              eventId: event.id,
+              detail: `selected context item ${key} has no story character row`,
+            });
+          }
+          continue;
+        }
+        if (key.startsWith('fact:story:')) {
+          const id = Number(event.refs.fact_id ?? numericFrom(key, /:(\d+)$/) ?? 0);
+          const row = Number.isInteger(id) && id > 0
+            ? db.get<{ id: number }>('SELECT id FROM story_fact WHERE id = ? AND project_id = ?', id, trace.projectId)
+            : undefined;
+          if (!row) {
+            violations.push({
+              code: 'context_selected_source_missing',
+              eventId: event.id,
+              detail: `selected context item ${key} has no story fact row`,
+            });
+          }
+          continue;
+        }
+        if (key.startsWith('memory:')) {
+          const match = /^memory:(character|state|knowledge|relationship|thread|event|fact|summary):(\d+)$/.exec(key);
+          const table = match?.[1] === 'character' ? 'character'
+            : match?.[1] === 'state' ? 'character_state'
+              : match?.[1] === 'knowledge' ? 'character_knowledge'
+                : match?.[1] === 'relationship' ? 'relationship'
+                  : match?.[1] === 'thread' ? 'plot_thread'
+                    : match?.[1] === 'event' ? 'au_event'
+                      : match?.[1] === 'fact' ? 'story_fact'
+                        : match?.[1] === 'summary' ? 'chapter_summary'
+                          : '';
+          const id = Number(match?.[2] ?? 0);
+          const row = table && id > 0
+            ? db.get<{ id: number }>(`SELECT id FROM ${table} WHERE id = ? AND project_id = ?`, id, trace.projectId)
+            : undefined;
+          if (!row) {
+            violations.push({
+              code: 'context_selected_source_missing',
+              eventId: event.id,
+              detail: `selected context item ${key} has no story-memory row`,
+            });
+          }
+          continue;
+        }
+        if (key.startsWith('history:chapter:')) {
+          const id = Number(numericFrom(key, /^history:chapter:(\d+)$/) ?? 0);
+          const row = Number.isInteger(id) && id > 0
+            ? db.get<{ id: number }>('SELECT id FROM chapter WHERE id = ? AND project_id = ?', id, trace.projectId)
+            : undefined;
+          if (!row) {
+            violations.push({
+              code: 'context_selected_source_missing',
+              eventId: event.id,
+              detail: `selected context item ${key} has no chapter row`,
+            });
+          }
+          continue;
+        }
+        if (key.startsWith('verdict:')) continue;
+        if (key.startsWith('edge:canon:relation:')) {
+          const id = Number(numericFrom(key, /^edge:canon:relation:(\d+)$/) ?? 0);
+          const row = Number.isInteger(id) && id > 0
+            ? db.get<{ id: number }>('SELECT id FROM canon_relation WHERE id = ? AND project_id = ?', id, trace.projectId)
+            : undefined;
+          if (!row) {
+            violations.push({
+              code: 'context_selected_source_missing',
+              eventId: event.id,
+              detail: `selected context item ${key} has no canon relation row`,
+            });
+          }
+          continue;
+        }
+        if (key.startsWith('edge:story:relationship:')) {
+          const id = Number(numericFrom(key, /^edge:story:relationship:(\d+)$/) ?? 0);
+          const row = Number.isInteger(id) && id > 0
+            ? db.get<{ id: number }>('SELECT id FROM relationship WHERE id = ? AND project_id = ?', id, trace.projectId)
+            : undefined;
+          if (!row) {
+            violations.push({
+              code: 'context_selected_source_missing',
+              eventId: event.id,
+              detail: `selected context item ${key} has no story relationship row`,
+            });
+          }
+          continue;
+        }
+      }
+    }
+
+    if ([...generated.keys()].some((key) => key.startsWith('brief:canon:S'))) {
+      limitations.push(
+        'canon-brief citation slots prove source association; they do not prove sentence-level entailment',
+      );
+    }
+    if ([...dispositions.values()].some((list) => list.some((event) => event.reasonCode === 'uncited-lore'))) {
+      limitations.push(
+        'selected uncited-lore items are recorded without a canon citation; content and admission rules are unchanged',
+      );
+    }
+  }
+
   if (trace.completeness !== 'complete' || trace.droppedEvents > 0) {
     suspicious.push({
       code: 'trace_not_exhaustive',
@@ -1359,7 +1927,7 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
   return {
     traceId: trace.id,
     completeness: trace.completeness,
-    exhaustive: trace.completeness === 'complete' && trace.droppedEvents === 0,
+    exhaustive: trace.completeness === 'complete' && trace.droppedEvents === 0 && contextExhaustive,
     droppedEvents: trace.droppedEvents,
     sampledRate: trace.sampledRate,
     finishedAt: trace.finishedAt,

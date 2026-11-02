@@ -25,6 +25,8 @@ import { detectConflicts, saveConflicts, listConflicts } from '../product/state-
 import * as memory from '../product/memory.ts';
 import * as planner from './planner.ts';
 import { buildWebBrief, renderWebBrief } from './brief.ts';
+import { ContextAssemblyTrace } from './context-trace.ts';
+import * as traceLog from '../trace/trace.ts';
 import * as writer from '../product/writer.ts';
 import * as continuity from '../product/continuity.ts';
 import { continuitySettings, filterBySeverity } from '../product/continuity-settings.ts';
@@ -239,6 +241,12 @@ export async function assembleContext(
     hops?: number;
     /** Word budget for the canon part of the context. */
     canonWords?: number;
+    /** Trace this actual assembly. Defaults on; false preserves plain behaviour for parity tests. */
+    trace?: boolean;
+    /** Receives the trace id for this actual assembly, never for a reused bundle. */
+    onTraceId?: (traceId: string) => void;
+    /** Candidate detail cap used by diagnostic sampling. */
+    traceCandidateDetailLimit?: number;
   },
 ): Promise<ContextBundle> {
   const focus = new Set<string>();
@@ -252,23 +260,6 @@ export async function assembleContext(
   }
   for (const m of toStringArray(opts.userInstructions)) focus.add(m);
 
-  const slice = memory.buildContextSlice(db, projectId, { focus: [...focus] });
-  const memoryText = memory.renderContextSlice(slice);
-
-  // The passages a canon event in the outline points at, always included.
-  const passages: lore.Passage[] = [];
-  const canonEventIds = opts.chapter?.canonEventIds ?? [];
-  for (const id of canonEventIds) {
-    const ev = db.get<{ chunk_id: number | null; source_id: number | null }>(
-      'SELECT chunk_id, source_id FROM canon_event WHERE id = ? AND project_id = ?',
-      id,
-      projectId,
-    );
-    if (!ev?.chunk_id) continue;
-    const chunk = lore.getChunk(db, ev.chunk_id);
-    if (chunk) passages.push(chunk);
-  }
-
   // The scene's names: who and what it is about.
   const loreNames = [
     ...(opts.chapter?.characters ?? []),
@@ -276,74 +267,422 @@ export async function assembleContext(
     ...(opts.chapter?.scenes.map((s) => s.pov) ?? []),
   ].filter(Boolean);
 
-  // One retrieval: FTS5 for the passages, graph traversal for the connections
-  // between them. The two are ranked and budgeted together.
-  const retrieved = await retrieval.retrieve(db, llm, projectId, {
-    query: [opts.chapter?.goal, opts.chapter?.synopsis].filter(Boolean).join(' '),
-    focus: [...loreNames, ...[...focus].filter((f) => !f.startsWith('canon:'))],
-    hops: opts.hops ?? 1,
-    maxWords: opts.canonWords ?? 1600,
-    passageLimit: 6,
-  });
-  for (const p of retrieved.passages) {
-    if (!passages.some((x) => x.chunkId === p.chunkId)) passages.push(p);
+  let contextTrace: ContextAssemblyTrace | undefined;
+  if (opts.trace !== false) {
+    try {
+      const chapter = db.get<{ id: number }>(
+        'SELECT id FROM chapter WHERE project_id = ? AND number = ?',
+        projectId,
+        opts.chapterNumber,
+      );
+      const started = traceLog.startTrace(db, {
+        projectId,
+        metadata: {
+          command: 'context assemble',
+          chapter_number: opts.chapterNumber,
+          chapter_id: chapter?.id ?? null,
+          scene_count: opts.chapter?.scenes.length ?? 0,
+          focus_count: focus.size,
+        },
+      });
+      const buffer = traceLog.createRetrievalTraceBuffer({
+        candidateDetailLimit: opts.traceCandidateDetailLimit ?? 24,
+      });
+      contextTrace = new ContextAssemblyTrace(db, projectId, started.id, buffer, {
+        focusCount: focus.size,
+        sceneCount: opts.chapter?.scenes.length ?? 0,
+      });
+      try {
+        opts.onTraceId?.(started.id);
+      } catch {
+        // A caller callback cannot affect assembly.
+      }
+    } catch {
+      contextTrace = undefined;
+    }
   }
 
-  // The writer works from a canon brief (facts and beats) rather than raw
-  // passages, so the prose stays its own. The exact source text stays one
-  // context request away.
-  let canonText = '';
-  if (passages.length) {
-    const brief = await lore.buildCanonBrief(llm, passages.slice(0, 8), {
-      goal: opts.chapter?.goal,
-      characters: opts.chapter?.characters,
-      scenes: opts.chapter?.scenes.map((s) => `${s.title}: ${s.summary}`).join('\n'),
+  let completed = false;
+  try {
+    const memorySpan = contextTrace?.span('sp-context-memory');
+    contextTrace?.childStarted('memory', 'required', 'sp-context-memory');
+    const slice = memory.buildContextSlice(db, projectId, { focus: [...focus] });
+    const memoryText = memory.renderContextSlice(slice);
+    let memoryItems = 0;
+    const includeMemory = (key: string, refs: traceLog.TraceRefs = {}): void => {
+      if (!contextTrace) return;
+      contextTrace.itemGenerated(memorySpan, 'memory', key, 'story-memory', refs);
+      contextTrace.itemDisposition(memorySpan, key, 'included', 'included', refs);
+      memoryItems++;
+    };
+    for (const c of slice.characters) includeMemory(`memory:character:${c.id}`);
+    for (const s of slice.states) includeMemory(`memory:state:${s.id}`);
+    for (const k of slice.knowledge) includeMemory(`memory:knowledge:${k.id}`);
+    for (const r of slice.relationships) includeMemory(`memory:relationship:${r.id}`, { relation_id: r.id });
+    for (const t of slice.threads) includeMemory(`memory:thread:${t.id}`, { thread_id: t.id });
+    for (const e of slice.events) includeMemory(`memory:event:${e.id}`, { event_id: e.id });
+    for (const f of slice.facts) includeMemory(`memory:fact:${f.id}`, { fact_id: f.id });
+    for (const s of slice.summaries) includeMemory(`memory:summary:${s.id}`);
+    contextTrace?.childCompleted('memory', memoryItems ? 'complete' : 'empty', memoryItems);
+
+    // The passages a canon event in the outline points at, always included.
+    const preloadSpan = contextTrace?.span('sp-context-canon-preload');
+    contextTrace?.childStarted('canon-preload', 'required', 'sp-context-canon-preload');
+    const passages: lore.Passage[] = [];
+    const canonEventIds = opts.chapter?.canonEventIds ?? [];
+    const traceChunkIds = new Set<number>();
+    const preloadChunkIds = new Set<number>();
+    for (const id of canonEventIds) {
+      const eventKey = `event:canon:${id}`;
+      contextTrace?.itemGenerated(
+        preloadSpan,
+        'canon-preload',
+        eventKey,
+        'canon-event-reference',
+        { event_id: id },
+      );
+      const ev = db.get<{ chunk_id: number | null; source_id: number | null }>(
+        'SELECT chunk_id, source_id FROM canon_event WHERE id = ? AND project_id = ?',
+        id,
+        projectId,
+      );
+      if (!ev?.chunk_id) {
+        contextTrace?.itemDisposition(
+          preloadSpan,
+          eventKey,
+          'excluded',
+          'missing-citation',
+          { event_id: id },
+        );
+        continue;
+      }
+      const chunk = lore.getChunk(db, ev.chunk_id);
+      if (!chunk) {
+        contextTrace?.itemDisposition(
+          preloadSpan,
+          eventKey,
+          'excluded',
+          'missing-citation',
+          { event_id: id },
+        );
+        continue;
+      }
+      contextTrace?.itemDisposition(
+        preloadSpan,
+        eventKey,
+        'included',
+        'included',
+        { event_id: id },
+      );
+      passages.push(chunk);
+      traceChunkIds.add(chunk.chunkId);
+      if (!preloadChunkIds.has(chunk.chunkId)) {
+        preloadChunkIds.add(chunk.chunkId);
+        contextTrace?.itemGenerated(
+          preloadSpan,
+          'canon-preload',
+          `chunk:${chunk.chunkId}`,
+          'canon-event-preload',
+          { chunk_id: chunk.chunkId },
+        );
+      }
+    }
+    contextTrace?.childCompleted(
+      'canon-preload',
+      preloadChunkIds.size ? 'complete' : 'empty',
+      preloadChunkIds.size,
+    );
+
+    // One retrieval: FTS5 for the passages, graph traversal for the connections
+    // between them. The two are ranked and budgeted together.
+    const retrieveSpan = contextTrace?.span('sp-context-retrieve');
+    contextTrace?.childStarted('retrieve', 'required', 'sp-context-retrieve');
+    const retrieved = await retrieval.retrieve(db, llm, projectId, {
+      query: [opts.chapter?.goal, opts.chapter?.synopsis].filter(Boolean).join(' '),
+      focus: [...loreNames, ...[...focus].filter((f) => !f.startsWith('canon:'))],
+      hops: opts.hops ?? 1,
+      maxWords: opts.canonWords ?? 1600,
+      passageLimit: 6,
+      ...(retrieveSpan ? { trace: retrieveSpan } : {}),
     });
-    canonText = lore.formatCanonBrief(brief);
-  }
-
-  // The extracted lore index: who and what exists, how they relate, and what
-  // the source has established. This is the grounding the writer cannot invent.
-  const loreBrief = lorebook.buildLoreBrief(db, projectId, { names: loreNames });
-  const loreText = lorebook.formatLoreBrief(loreBrief);
-  if (loreText) {
-    canonText = canonText ? `${loreText}\n\n${canonText}` : loreText;
-  }
-
-  // The connected context: what this scene touches, and how it all hangs
-  // together. The graph says what is related; the passages behind it say
-  // whether to believe it. Verdicts computed after mining ride along so the
-  // writer sees them: composed family ties, explicit strangers, gaps.
-  let connectedText = retrieved.graph.text;
-  const verdicts: string[] = [];
-  if (retrieved.stats.composedPath) {
-    verdicts.push(
-      `Family tie implied: ${loreNames.slice(0, 2).join(' / ')} via ${retrieved.stats.composedPath.via} (${retrieved.stats.composedPath.label}).`,
+    contextTrace?.childCompleted(
+      'retrieve',
+      retrieved.passages.length || retrieved.graph.nodes.length ? 'complete' : 'empty',
+      retrieved.passages.length,
     );
-  }
-  if (retrieved.stats.strangers) {
-    verdicts.push(
-      `No recorded connection between ${retrieved.stats.strangers.a} and ${retrieved.stats.strangers.b} in the extracted lore.`,
+    if (contextTrace) {
+      const hop1 = 'sp-context-retrieve-hop-1';
+      const hop2 = 'sp-context-retrieve-hop-2';
+      if (contextTrace.hasSpan(hop2)) {
+        contextTrace.childStarted('retrieve-hop-1', 'superseded', hop1, 'sp-context-retrieve');
+        contextTrace.childCompleted('retrieve-hop-1', 'superseded', 0);
+        contextTrace.childStarted('retrieve-hop-2', 'required', hop2, 'sp-context-retrieve');
+        contextTrace.childCompleted('retrieve-hop-2', 'complete', retrieved.passages.length);
+        // Keep individual candidates from the replaced stage. Those absent
+        // from the final package get one superseded terminal outcome; those
+        // that survived keep their hop-1 origin and get the later package
+        // disposition.
+        const finalPackageChunks = new Set(retrieved.passages.map((p) => p.chunkId));
+        const hopSink = contextTrace.span(hop1, 'sp-context-retrieve');
+        for (const chunkId of contextTrace.retrievalSelectedChunks(hop1)) {
+          if (finalPackageChunks.has(chunkId)) continue;
+          const key = `hop1:chunk:${chunkId}`;
+          contextTrace.itemGenerated(hopSink, 'retrieve-hop-1', key, 'retrieval-hop-1', {
+            chunk_id: chunkId,
+          });
+          contextTrace.itemDisposition(hopSink, key, 'superseded', 'superseded', {
+            chunk_id: chunkId,
+          });
+        }
+      } else if (contextTrace.hasSpan(hop1)) {
+        contextTrace.childStarted('retrieve-hop-1', 'required', hop1, 'sp-context-retrieve');
+        contextTrace.childCompleted('retrieve-hop-1', 'complete', retrieved.passages.length);
+      }
+    }
+    for (let i = 0; i < retrieved.passages.length; i++) {
+      const p = retrieved.passages[i]!;
+      traceChunkIds.add(p.chunkId);
+      contextTrace?.itemGenerated(
+        retrieveSpan,
+        'retrieve-package',
+        `chunk:${p.chunkId}`,
+        'retrieval-package',
+        { chunk_id: p.chunkId, rank: i + 1 },
+      );
+    }
+    for (const p of retrieved.passages) {
+      if (!passages.some((x) => x.chunkId === p.chunkId)) passages.push(p);
+    }
+
+    // The connected context: what this scene touches, and how it all hangs
+    // together. The graph says what is related; the passages behind it say
+    // whether to believe it.
+    const connectedSpan = contextTrace?.span('sp-context-connected');
+    contextTrace?.childStarted('connected', 'required', 'sp-context-connected');
+    const graphChunkIds = new Set<number>();
+    let connectedItems = 0;
+    const nodeKey = (node: graph.GraphNode): string => {
+      if (node.kind === 'canon-entity') return `entity:canon:${node.numericId}`;
+      if (node.kind === 'character') return `entity:story:${node.numericId}`;
+      if (node.kind === 'canon-fact') return `fact:canon:${node.numericId}`;
+      if (node.kind === 'story-fact') return `fact:story:${node.numericId}`;
+      if (node.kind === 'canon-event') return `event:canon:${node.numericId}`;
+      if (node.kind === 'au-event') return `event:au:${node.numericId}`;
+      return `node:${node.kind}:${node.numericId}`;
+    };
+    const nodeRefs = (node: graph.GraphNode): traceLog.TraceRefs => {
+      if (node.kind === 'canon-entity' || node.kind === 'character') return { entity_id: node.numericId };
+      if (node.kind === 'canon-fact' || node.kind === 'story-fact') return { fact_id: node.numericId };
+      if (node.kind === 'canon-event' || node.kind === 'au-event') return { event_id: node.numericId };
+      return {};
+    };
+    for (const node of retrieved.graph.nodes) {
+      const key = nodeKey(node);
+      const refs = nodeRefs(node);
+      contextTrace?.itemGenerated(connectedSpan, 'connected', key, 'graph-context', refs);
+      const uncited = node.kind.startsWith('canon') && node.sourceRefs.length === 0;
+      contextTrace?.itemDisposition(
+        connectedSpan,
+        key,
+        'included',
+        uncited ? 'uncited-lore' : 'included',
+        refs,
+      );
+      connectedItems++;
+    }
+    for (const edge of retrieved.graph.edges) {
+      const key = `edge:${edge.id}`;
+      contextTrace?.itemGenerated(connectedSpan, 'connected', key, 'graph-context', {});
+      const uncited = (edge.sourceRefs?.length ?? 0) === 0;
+      contextTrace?.itemDisposition(
+        connectedSpan,
+        key,
+        'included',
+        uncited ? 'uncited-lore' : 'included',
+        {},
+      );
+      connectedItems++;
+    }
+    for (const p of retrieved.graph.passages) {
+      traceChunkIds.add(p.chunkId);
+      if (graphChunkIds.has(p.chunkId)) continue;
+      graphChunkIds.add(p.chunkId);
+      contextTrace?.itemGenerated(
+        connectedSpan,
+        'connected',
+        `chunk:${p.chunkId}`,
+        'graph-passage',
+        { chunk_id: p.chunkId },
+      );
+    }
+    contextTrace?.childCompleted(
+      'connected',
+      connectedItems || graphChunkIds.size ? 'complete' : 'empty',
+      connectedItems + graphChunkIds.size,
     );
-  }
-  if (retrieved.stats.coverage?.missing?.length || retrieved.stats.truncated) {
-    verdicts.push(`Coverage incomplete: missing ${retrieved.stats.coverage.missing.join(', ') || 'none listed'}. Do not invent the missing link.`);
-  }
-  if (verdicts.length) connectedText = connectedText ? `${connectedText}\n\n${verdicts.join('\n')}` : verdicts.join('\n');
 
-  const prev = listChapters(db, projectId).filter((c) => c.number < opts.chapterNumber);
-  const last = prev[prev.length - 1];
-  const previousTail = last ? truncate(last.body.slice(-2500), 2500) : '';
+    // The writer works from a canon brief (facts and beats) rather than raw
+    // passages, so the prose stays its own. The exact source text stays one
+    // context request away.
+    const briefSpan = contextTrace?.span('sp-context-canon-brief');
+    contextTrace?.childStarted('canon-brief', 'required', 'sp-context-canon-brief');
+    const briefInput = passages.slice(0, 8);
+    let canonText = '';
+    if (passages.length) {
+      const brief = await lore.buildCanonBrief(llm, briefInput, {
+        goal: opts.chapter?.goal,
+        characters: opts.chapter?.characters,
+        scenes: opts.chapter?.scenes.map((s) => `${s.title}: ${s.summary}`).join('\n'),
+      });
+      canonText = lore.formatCanonBrief(brief);
+    }
+    for (let i = 0; i < briefInput.length; i++) {
+      const p = briefInput[i]!;
+      const key = `brief:canon:S${i + 1}`;
+      contextTrace?.itemGenerated(
+        briefSpan,
+        'canon-brief',
+        key,
+        'canon-brief-slot',
+        { chunk_id: p.chunkId, rank: i + 1 },
+      );
+      contextTrace?.itemDisposition(
+        briefSpan,
+        key,
+        canonText ? 'included' : 'excluded',
+        canonText ? 'included' : 'empty',
+        { chunk_id: p.chunkId, rank: i + 1 },
+      );
+    }
+    contextTrace?.childCompleted(
+      'canon-brief',
+      passages.length ? 'complete' : 'empty',
+      briefInput.length,
+    );
 
-  return {
-    memoryText,
-    canonText,
-    connectedText,
-    previousTail,
-    focus: [...focus],
-    requests: [],
-    retrieval: retrieved,
-  };
+    // The extracted lore index: who and what exists, how they relate, and what
+    // the source has established. This is the grounding the writer cannot invent.
+    const loreSpan = contextTrace?.span('sp-context-lore-brief');
+    contextTrace?.childStarted('lore-brief', 'required', 'sp-context-lore-brief');
+    const loreBrief = lorebook.buildLoreBrief(db, projectId, { names: loreNames });
+    const loreText = lorebook.formatLoreBrief(loreBrief);
+    if (loreText) {
+      canonText = canonText ? `${loreText}\n\n${canonText}` : loreText;
+    }
+    const citedEntities = new Set(loreBrief.citedEntityIds ?? []);
+    const citedFacts = new Set(loreBrief.citedFactIds ?? []);
+    let loreItems = 0;
+    for (const id of loreBrief.entityIds ?? []) {
+      const key = `brief:lore:entity:${id}`;
+      const refs = { entity_id: id };
+      contextTrace?.itemGenerated(loreSpan, 'lore-brief', key, 'lore-brief', refs);
+      contextTrace?.itemDisposition(
+        loreSpan,
+        key,
+        'included',
+        citedEntities.has(id) ? 'included' : 'uncited-lore',
+        refs,
+      );
+      loreItems++;
+    }
+    for (const id of loreBrief.relationIds ?? []) {
+      const key = `brief:lore:relation:${id}`;
+      const refs = { relation_id: id };
+      contextTrace?.itemGenerated(loreSpan, 'lore-brief', key, 'lore-brief', refs);
+      contextTrace?.itemDisposition(loreSpan, key, 'included', 'uncited-lore', refs);
+      loreItems++;
+    }
+    for (const id of loreBrief.factIds ?? []) {
+      const key = `brief:lore:fact:${id}`;
+      const refs = { fact_id: id };
+      contextTrace?.itemGenerated(loreSpan, 'lore-brief', key, 'lore-brief', refs);
+      contextTrace?.itemDisposition(
+        loreSpan,
+        key,
+        'included',
+        citedFacts.has(id) ? 'included' : 'uncited-lore',
+        refs,
+      );
+      loreItems++;
+    }
+    contextTrace?.childCompleted('lore-brief', loreItems ? 'complete' : 'empty', loreItems);
+
+    let connectedText = retrieved.graph.text;
+    const verdicts: string[] = [];
+    const verdictKeys: string[] = [];
+    if (retrieved.stats.composedPath) {
+      verdicts.push(
+        `Family tie implied: ${loreNames.slice(0, 2).join(' / ')} via ${retrieved.stats.composedPath.via} (${retrieved.stats.composedPath.label}).`,
+      );
+      verdictKeys.push('verdict:composed-path');
+    }
+    if (retrieved.stats.strangers) {
+      verdicts.push(
+        `No recorded connection between ${retrieved.stats.strangers.a} and ${retrieved.stats.strangers.b} in the extracted lore.`,
+      );
+      verdictKeys.push('verdict:strangers');
+    }
+    if (retrieved.stats.coverage?.missing?.length || retrieved.stats.truncated) {
+      verdicts.push(`Coverage incomplete: missing ${retrieved.stats.coverage.missing.join(', ') || 'none listed'}. Do not invent the missing link.`);
+      verdictKeys.push('verdict:coverage');
+    }
+    const verdictsSpan = contextTrace?.span('sp-context-verdicts');
+    contextTrace?.childStarted('verdicts', 'best-effort', 'sp-context-verdicts');
+    for (const key of verdictKeys) {
+      contextTrace?.itemGenerated(verdictsSpan, 'verdicts', key, 'derived-verdict');
+      contextTrace?.itemDisposition(verdictsSpan, key, 'included', 'included');
+    }
+    if (verdicts.length) connectedText = connectedText ? `${connectedText}\n\n${verdicts.join('\n')}` : verdicts.join('\n');
+    contextTrace?.childCompleted('verdicts', verdictKeys.length ? 'complete' : 'empty', verdictKeys.length);
+
+    const previousSpan = contextTrace?.span('sp-context-previous');
+    contextTrace?.childStarted('previous', 'best-effort', 'sp-context-previous');
+    const prev = listChapters(db, projectId).filter((c) => c.number < opts.chapterNumber);
+    const last = prev[prev.length - 1];
+    const previousTail = last ? truncate(last.body.slice(-2500), 2500) : '';
+    if (last) {
+      const key = `history:chapter:${last.id}`;
+      contextTrace?.itemGenerated(previousSpan, 'previous', key, 'history-tail');
+      contextTrace?.itemDisposition(
+        previousSpan,
+        key,
+        last.body.length > 2500 ? 'truncated' : 'included',
+        'history-tail',
+      );
+    }
+    contextTrace?.childCompleted('previous', last ? 'complete' : 'empty', last ? 1 : 0);
+
+    const mergeSpan = contextTrace?.span('sp-context-merge');
+    contextTrace?.childStarted('merge', 'required', 'sp-context-merge');
+    const briefChunks = new Set(briefInput.map((p) => p.chunkId));
+    for (const chunkId of traceChunkIds) {
+      const included = briefChunks.has(chunkId) || graphChunkIds.has(chunkId);
+      contextTrace?.itemDisposition(
+        mergeSpan,
+        `chunk:${chunkId}`,
+        included ? 'included' : 'excluded',
+        included ? 'included' : 'brief-input-cap',
+        { chunk_id: chunkId },
+      );
+    }
+    contextTrace?.childCompleted('merge', 'complete', contextTrace?.selectedCount() ?? 0);
+
+    completed = true;
+    return {
+      memoryText,
+      canonText,
+      connectedText,
+      previousTail,
+      focus: [...focus],
+      requests: [],
+      retrieval: retrieved,
+    };
+  } catch (err) {
+    contextTrace?.markInterrupted();
+    throw err;
+  } finally {
+    contextTrace?.finish(completed);
+  }
 }
 
 /* --------------------------------------------- dynamic context resolution */
@@ -642,6 +981,8 @@ export interface WriteChapterResult {
   trace: writer.WriteResult['trace'];
   issues: continuity.ContinuityIssue[];
   stats: writer.WriteResult['stats'];
+  /** Trace for the initial context assembly, absent when a bundle was reused. */
+  contextTraceId?: string;
 }
 
 /**
@@ -663,12 +1004,16 @@ export async function writeChapter(
     opts.chapterNumber ?? (existing.length ? Math.max(...existing.map((c) => c.number)) + 1 : 1);
   const chapterOutline = outline.chapters.find((c) => c.number === chapterNumber);
 
+  let contextTraceId: string | undefined;
   const bundle =
     opts.bundle ??
     (await assembleContext(db, opts.contextLlm ?? llm, projectId, {
       chapter: chapterOutline,
       chapterNumber,
       userInstructions: opts.userInstructions,
+      onTraceId: (id) => {
+        contextTraceId = id;
+      },
     }));
 
   const limits = opts.contextLimits ?? writer.DEFAULT_CONTEXT_LIMITS;
@@ -728,7 +1073,7 @@ export async function writeChapter(
       ? await runContinuityCheck(db, llm, projectId, chapter, outline, bundle)
       : [];
 
-  return { chapter, trace: result.trace, issues, stats: result.stats };
+  return { chapter, trace: result.trace, issues, stats: result.stats, contextTraceId };
 }
 
 /** Approve a chapter: fold it into memory and continuity state. */
@@ -741,6 +1086,7 @@ export async function approveChapter(
   chapter: Chapter;
   issues: continuity.ContinuityIssue[];
   conflicts: ReturnType<typeof listConflicts>;
+  contextTraceId?: string;
 }> {
   const chapter = getChapter(db, projectId, chapterNumber);
   if (!chapter) throw new Error(`chapter ${chapterNumber} not found`);
@@ -777,10 +1123,14 @@ export async function approveChapter(
   const updated = getChapter(db, projectId, chapterNumber)!;
   const settings = continuitySettings(getProject(db, projectId)!);
   let issues: continuity.ContinuityIssue[] = [];
+  let contextTraceId: string | undefined;
   if (settings.enabled) {
     const bundle = await assembleContext(db, llm, projectId, {
       chapter: chapterOutline,
       chapterNumber,
+      onTraceId: (id) => {
+        contextTraceId = id;
+      },
     });
     issues = await runContinuityCheck(db, llm, projectId, updated, outline, bundle);
   }
@@ -789,6 +1139,7 @@ export async function approveChapter(
     chapter: updated,
     issues,
     conflicts: conflicts.length ? listConflicts(db, projectId, { openOnly: true }) : [],
+    contextTraceId,
   };
 }
 

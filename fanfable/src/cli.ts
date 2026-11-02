@@ -2269,10 +2269,11 @@ async function cmdWrite(args: Args): Promise<void> {
     const n = Number(args._[2]);
     if (!Number.isFinite(n)) throw new Error('chapter number required');
     heading(`Approving chapter ${n}`);
-    const { chapter, issues } = await controller.approveChapter(db, a.llm, project.id, n);
+    const { chapter, issues, contextTraceId } = await controller.approveChapter(db, a.llm, project.id, n);
     console.log(`Chapter ${chapter.number} approved ${C.dim(`(${chapter.wordCount} words)`)}`);
     console.log(`Memory updated: summary, character states, knowledge, relationships, threads, timeline.`);
     printIssues(issues);
+    if (contextTraceId) console.log(`${C.dim(`trace ${contextTraceId}`)}`);
     return;
   }
 
@@ -2312,6 +2313,7 @@ function printWriteResult(result: controller.WriteChapterResult): void {
     console.log(`\n${C.bold('Continuity notes:')}`);
     printIssues(result.issues);
   }
+  if (result.contextTraceId) console.log(`${C.dim(`trace ${result.contextTraceId}`)}`);
   console.log(
     `\nReview it with ${C.bold(`fanfable write show ${result.chapter.number}`)} ` +
       `then ${C.bold(`fanfable write approve ${result.chapter.number}`)}.`,
@@ -2340,14 +2342,19 @@ async function cmdCheck(args: Args): Promise<void> {
   if (!chapter) throw new Error(`chapter ${n} not found`);
   heading(`Continuity check — chapter ${n}`);
   const outline = planner.approvedOutline(db, project.id);
+  let contextTraceId: string | undefined;
   const bundle = await controller.assembleContext(db, a.llm, project.id, {
     chapter: outline?.chapters.find((c) => c.number === n),
     chapterNumber: n,
+    onTraceId: (id) => {
+      contextTraceId = id;
+    },
   });
   const report = { droppedModelIssues: 0 };
   const issues = await controller.runContinuityCheck(db, a.llm, project.id, chapter, outline, bundle, report);
   printIssues(issues);
   console.log(C.dim(`dropped model issues: ${report.droppedModelIssues}`));
+  if (contextTraceId) console.log(`${C.dim(`trace ${contextTraceId}`)}`);
 }
 
 async function cmdIssues(args: Args): Promise<void> {
@@ -2814,6 +2821,113 @@ async function cmdTrace(args: Args, dbPath: string): Promise<void> {
         }
         if (selected.length) {
           console.log(`  selected evidence: ${selected.map((event) => event.subject).join(', ')}`);
+        }
+      }
+      const contextEvents = view.events.filter((event) => event.stage === 'context');
+      if (contextEvents.length) {
+        const contextual = view.events.filter(
+          (event) => event.stage === 'context' || event.spanId.startsWith('sp-context'),
+        );
+        const spans = new Map<string, { id: string; parent: string | null; children: string[]; events: typeof view.events }>();
+        for (const event of contextual) {
+          let span = spans.get(event.spanId);
+          if (!span) {
+            span = { id: event.spanId, parent: event.parentSpanId, children: [], events: [] };
+            spans.set(event.spanId, span);
+          }
+          span.events.push(event);
+          if (span.parent === null && event.parentSpanId) span.parent = event.parentSpanId;
+        }
+        for (const span of spans.values()) {
+          if (span.parent && spans.has(span.parent) && !spans.get(span.parent)!.children.includes(span.id)) {
+            spans.get(span.parent)!.children.push(span.id);
+          }
+        }
+        const completionFor = (id: string) =>
+          spans.get(id)?.events.find((event) => event.event === 'context.child.completed');
+        const printed = new Set<string>();
+        const printSpan = (id: string, depth: number): void => {
+          if (printed.has(id)) return;
+          printed.add(id);
+          const span = spans.get(id);
+          if (!span) return;
+          const completion = completionFor(id);
+          const label = completion
+            ? completion.subject.replace(/^child:/, '')
+            : id === 'sp-context'
+              ? 'context'
+              : id;
+          const kind = completion?.refs.stage ? ` [${completion.refs.stage}]` : '';
+          const status = completion?.reasonCode ? ` ${completion.reasonCode}` : '';
+          const selected = completion?.refs.selected_count ?? completion?.refs.count;
+          console.log(
+            `  ${'  '.repeat(depth)}${label}${kind}${status}` +
+              (selected !== undefined ? ` selected=${selected}` : ''),
+          );
+          for (const child of span.children) printSpan(child, depth + 1);
+        };
+        console.log(`\n${C.bold('Context assembly tree')}`);
+        if (spans.has('sp-context')) printSpan('sp-context', 0);
+        else {
+          for (const span of spans.values()) {
+            if (!span.parent || !spans.has(span.parent)) printSpan(span.id, 0);
+          }
+        }
+
+        const finalSummary = contextEvents.find(
+          (event) => event.event === 'context.summary' && event.subject === 'context:final',
+        );
+        const dispositions = contextEvents.filter((event) => event.event === 'context.item.disposition');
+        const included = dispositions.filter(
+          (event) => event.decision === 'included' || event.decision === 'truncated',
+        );
+        const excluded = dispositions.filter(
+          (event) => event.decision === 'budgeted' || event.decision === 'excluded' || event.decision === 'failed',
+        );
+        const coverage = contextEvents.find((event) => event.event === 'context.coverage');
+        const locatorFor = (event: (typeof contextEvents)[number]): string => {
+          const chunkId = Number(event.refs.chunk_id ?? 0);
+          if (!Number.isInteger(chunkId) || chunkId <= 0) return '';
+          const row = reader.get<{ locator: string }>(
+            'SELECT locator FROM canon_chunk WHERE id = ? AND project_id = ?',
+            chunkId,
+            view.trace.projectId,
+          );
+          return row?.locator ? ` <${row.locator}>` : '';
+        };
+        console.log(`\n${C.bold('Context handoff')}`);
+        if (finalSummary) {
+          console.log(
+            `  raw=${finalSummary.refs.raw_count ?? '-'}` +
+              ` dedup=${finalSummary.refs.dedup_count ?? '-'}` +
+              ` selected=${finalSummary.refs.selected_count ?? '-'}` +
+              ` budgeted=${finalSummary.refs.budgeted_count ?? '-'}` +
+              ` excluded=${finalSummary.refs.excluded_count ?? '-'}` +
+              ` truncated=${finalSummary.refs.truncated_count ?? '-'}`,
+          );
+        }
+        if (included.length) {
+          console.log(
+            `  final context: ${included
+              .map((event) => `${event.subject}${locatorFor(event)}`)
+              .join(', ')}`,
+          );
+        }
+        if (excluded.length) {
+          console.log(
+            `  excluded: ${excluded
+              .map((event) => `${event.subject} (${event.reasonCode || event.decision})`)
+              .join(', ')}`,
+          );
+        }
+        if (coverage) {
+          console.log(
+            `  coverage: ${coverage.reasonCode}` +
+              ` required=${coverage.refs.required_count ?? '-'}` +
+              ` contributing=${coverage.refs.contributing_count ?? '-'}` +
+              ` optional=${coverage.refs.optional_count ?? '-'}` +
+              ` incomplete=${coverage.refs.incomplete_count ?? '-'}`,
+          );
         }
       }
       for (const event of view.events) {

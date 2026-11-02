@@ -364,8 +364,13 @@ export async function retrieve(
     text: string;
     packageStats: { raw: number; dedup: number; ranked: number; selected: number; budgeted: number };
   }> => {
+    const traceSpan = trace?.spanId;
     const graphTrace = trace
-      ? withRetrievalTraceSpan(trace, `sp-retrieve-hop-${hops}`, 'sp-retrieve')
+      ? withRetrievalTraceSpan(
+          trace,
+          traceSpan ? `${traceSpan}-hop-${hops}` : `sp-retrieve-hop-${hops}`,
+          traceSpan ?? 'sp-retrieve',
+        )
       : undefined;
     const graphContext = includeGraph
       ? relational
