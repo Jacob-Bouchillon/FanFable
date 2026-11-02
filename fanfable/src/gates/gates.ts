@@ -188,6 +188,13 @@ const HEDGES = new Set([
   'seemingly', 'seemed', 'seems', 'suspected', 'suspect', 'rumoured', 'rumored',
 ]);
 
+/** Marriage terms and romantic-partner terms are never interchangeable:
+ * romance does not prove marriage, and marriage does not prove romance. */
+const MARRIAGE_TERMS =
+  /\b(?:married|marriage|spouse|spouses|husband|husbands|wife|wives|widow|widows|wed|wedding|wedded)\b/i;
+const LOVER_TERMS =
+  /\b(?:lover|lovers|paramour|paramours|mistress|concubine|romantic\s+partners?)\b/i;
+
 /** Grammatical words that cannot carry a relationship on their own. */
 const CITATION_STOP = new Set([
   'of', 'to', 'with', 'for', 'a', 'an', 'the', 'in', 'on', 'as', 'at', 'by', 'from',
@@ -556,6 +563,15 @@ export function relationEntailmentReason(row: PromoteRow, index?: RosterIndex): 
     const head = kindHeadWord(row.kind);
     const support = sourcePresent || (head !== '' && normalise(text).includes(normalise(head)));
     return support ? null : 'relationship-not-entailed';
+  }
+
+  if (family === 'spouse') {
+    const kind = normalise(row.kind);
+    const evidence = maskText(row.evidence, row, index);
+    if (/\b(?:married|marriage|spouse|husband|wife|widow)\b/i.test(kind) && !MARRIAGE_TERMS.test(evidence)) {
+      return 'relationship-not-entailed';
+    }
+    if (/\blover\b/i.test(kind) && !LOVER_TERMS.test(evidence)) return 'relationship-not-entailed';
   }
 
   const asymmetric = isAsymmetricFamily(family);
