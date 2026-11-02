@@ -31,6 +31,7 @@ import { looksAlike, sharedSpeakerScene, speakerChunksByEntity } from '../lorebo
 import { truncate } from '../core/text.ts';
 import { GRAPH_STOPWORDS } from '../core/vocab.ts';
 import { canonicalName, linkTokenMatch, nameMentionedFromTokens, nameRelation, textTokenSet } from '../identity/names.ts';
+import type { RetrievalTraceSink } from '../trace/trace.ts';
 
 /* --------------------------------------------- similarity-web weights
  *
@@ -210,6 +211,8 @@ interface GraphLoadOptions {
   web?: boolean;
   /** Leave quarantined canon entities out of the graph (retrieval context). */
   excludeQuarantined?: boolean;
+  /** Optional diagnostic trace sink. */
+  trace?: RetrievalTraceSink;
 }
 
 function addNode(graph: Graph, node: GraphNode): void {
@@ -248,6 +251,20 @@ export function loadGraph(db: Db, projectId: number, opts: GraphLoadOptions = {}
   const maxNodes = opts.maxNodes ?? 20_000;
   const excludeQuarantined = opts.excludeQuarantined === true;
   const graph: Graph = { nodes: new Map(), edges: [], adjacency: new Map(), byNumeric: new Map() };
+  const trace = opts.trace;
+  const emit = (event: Parameters<RetrievalTraceSink['emit']>[0]): void => {
+    trace?.emit({ stage: 'retrieval', ...event });
+  };
+  const quarantinedExcluded =
+    trace && excludeQuarantined
+      ? Number(
+          db.get<{ n: number }>(
+            "SELECT COUNT(*) AS n FROM canon_entity WHERE project_id = ? AND review_status = 'quarantined'",
+            projectId,
+          )?.n ?? 0,
+        )
+      : 0;
+  let statusExcluded = 0;
 
   /* ------------------------------------------------------------- canon */
   if (scope === 'canon' || scope === 'both') {
@@ -302,7 +319,10 @@ export function loadGraph(db: Db, projectId: number, opts: GraphLoadOptions = {}
     }>('SELECT * FROM canon_relation WHERE project_id = ? ORDER BY id', projectId);
     for (const r of relations) {
       const rs = r.review_status ?? 'accepted';
-      if (rs !== 'accepted' && rs !== 'user_confirmed') continue;
+      if (rs !== 'accepted' && rs !== 'user_confirmed') {
+        if (trace) statusExcluded++;
+        continue;
+      }
       addEdge(graph, {
         id: `canon:relation:${r.id}`,
         from: canonEntityId(r.from_entity),
@@ -1133,6 +1153,33 @@ export function loadGraph(db: Db, projectId: number, opts: GraphLoadOptions = {}
     }
   }
 
+  if (trace) {
+    emit({
+      event: 'retrieval.graph.loaded',
+      subject: 'graph',
+      decision: 'completed',
+      reasonCode: `scope-${scope}`,
+      refs: { node_count: graph.nodes.size, edge_count: graph.edges.length, stage: 'load' },
+    });
+    if (quarantinedExcluded > 0) {
+      emit({
+        event: 'retrieval.graph.excluded',
+        subject: 'graph:quarantined',
+        decision: 'excluded',
+        reasonCode: 'quarantined',
+        refs: { count: quarantinedExcluded, stage: 'load' },
+      });
+    }
+    if (statusExcluded > 0) {
+      emit({
+        event: 'retrieval.graph.excluded',
+        subject: 'graph:relation-status',
+        decision: 'excluded',
+        reasonCode: 'status',
+        refs: { count: statusExcluded, stage: 'load' },
+      });
+    }
+  }
   return graph;
 }
 
@@ -1156,6 +1203,8 @@ export interface TraverseOptions {
   direction?: 'both' | 'out' | 'in';
   /** Drop edges whose endpoints fall outside the temporal window. */
   temporal?: boolean;
+  /** Optional diagnostic trace sink. */
+  trace?: RetrievalTraceSink;
 }
 
 export interface TraversalResult {
@@ -1180,6 +1229,14 @@ export function traverse(graph: Graph, opts: TraverseOptions): TraversalResult {
   const maxEdges = opts.maxEdges ?? 400;
   const direction = opts.direction ?? 'both';
   const edgeTypes = opts.edgeTypes?.length ? new Set(opts.edgeTypes) : null;
+  const trace = opts.trace;
+  const emit = (event: Parameters<RetrievalTraceSink['emit']>[0]): void => {
+    trace?.emit({ stage: 'retrieval', ...event });
+  };
+  let scopeExcluded = 0;
+  let temporalExcluded = 0;
+  let nodeCapHit = false;
+  let edgeCapHit = false;
 
   const result: TraversalResult = {
     nodes: new Map(),
@@ -1190,16 +1247,28 @@ export function traverse(graph: Graph, opts: TraverseOptions): TraversalResult {
   };
 
   const inScope = (edge: GraphEdge): boolean => {
-    if (opts.scope && opts.scope !== 'both' && edge.scope !== 'both' && edge.scope !== opts.scope) return false;
+    if (opts.scope && opts.scope !== 'both' && edge.scope !== 'both' && edge.scope !== opts.scope) {
+      scopeExcluded++;
+      return false;
+    }
     if (edgeTypes && !edgeTypes.has(edge.type)) return false;
     return true;
   };
 
   const nodeAllowed = (node: GraphNode): boolean => {
-    if (opts.scope && opts.scope !== 'both' && node.scope !== opts.scope) return false;
+    if (opts.scope && opts.scope !== 'both' && node.scope !== opts.scope) {
+      scopeExcluded++;
+      return false;
+    }
     if (opts.temporal) {
-      if (opts.beforeOrder !== undefined && node.order > opts.beforeOrder) return false;
-      if (opts.afterOrder !== undefined && node.order < opts.afterOrder) return false;
+      if (opts.beforeOrder !== undefined && node.order > opts.beforeOrder) {
+        temporalExcluded++;
+        return false;
+      }
+      if (opts.afterOrder !== undefined && node.order < opts.afterOrder) {
+        temporalExcluded++;
+        return false;
+      }
     }
     return true;
   };
@@ -1207,9 +1276,11 @@ export function traverse(graph: Graph, opts: TraverseOptions): TraversalResult {
   const edgeAllowed = (edge: GraphEdge): boolean => {
     if (opts.temporal) {
       if (opts.beforeOrder !== undefined && edge.validFrom !== undefined && edge.validFrom > opts.beforeOrder) {
+        temporalExcluded++;
         return false;
       }
       if (opts.afterOrder !== undefined && edge.validTo !== undefined && edge.validTo < opts.afterOrder) {
+        temporalExcluded++;
         return false;
       }
     }
@@ -1225,6 +1296,7 @@ export function traverse(graph: Graph, opts: TraverseOptions): TraversalResult {
     if (!nodeAllowed(node)) continue;
     if (result.nodes.size >= maxNodes) {
       result.truncated = true;
+      nodeCapHit = true;
       break;
     }
     if (seen.has(root)) continue;
@@ -1255,6 +1327,7 @@ export function traverse(graph: Graph, opts: TraverseOptions): TraversalResult {
         if (!usedEdges.has(edge.id)) {
           if (result.edges.length >= maxEdges) {
             result.truncated = true;
+            edgeCapHit = true;
             break;
           }
           usedEdges.add(edge.id);
@@ -1263,6 +1336,7 @@ export function traverse(graph: Graph, opts: TraverseOptions): TraversalResult {
         if (!seen.has(otherId)) {
           if (result.nodes.size >= maxNodes) {
             result.truncated = true;
+            nodeCapHit = true;
             break;
           }
           seen.add(otherId);
@@ -1278,6 +1352,42 @@ export function traverse(graph: Graph, opts: TraverseOptions): TraversalResult {
     if (result.truncated) break;
   }
 
+  if (scopeExcluded > 0) {
+    emit({
+      event: 'retrieval.traverse.excluded',
+      subject: 'traverse:scope',
+      decision: 'excluded',
+      reasonCode: 'scope',
+      refs: { count: scopeExcluded, stage: 'traverse' },
+    });
+  }
+  if (temporalExcluded > 0) {
+    emit({
+      event: 'retrieval.traverse.excluded',
+      subject: 'traverse:temporal',
+      decision: 'excluded',
+      reasonCode: 'temporal',
+      refs: { count: temporalExcluded, stage: 'traverse' },
+    });
+  }
+  if (nodeCapHit) {
+    emit({
+      event: 'retrieval.budget.cutoff',
+      subject: 'budget:graph',
+      decision: 'budgeted',
+      reasonCode: 'graph-node-cap',
+      refs: { count: 0, stage: 'traverse' },
+    });
+  }
+  if (edgeCapHit) {
+    emit({
+      event: 'retrieval.budget.cutoff',
+      subject: 'budget:graph',
+      decision: 'budgeted',
+      reasonCode: 'graph-edge-cap',
+      refs: { count: 0, stage: 'traverse' },
+    });
+  }
   return result;
 }
 
@@ -1549,6 +1659,8 @@ export interface GraphContextOptions {
    * Absent or disabled means no extra call, exactly as before.
    */
   recognize?: { llm: LlmClient; enabled?: boolean; maxSeeds?: number };
+  /** Optional diagnostic trace sink. */
+  trace?: RetrievalTraceSink;
 }
 
 export interface TrailStep {
@@ -1781,7 +1893,67 @@ export function resolveQuerySeeds(
   graph: Graph,
   query: string,
   focus: string[] = [],
+  trace?: RetrievalTraceSink,
 ): { roots: string[]; via: 'triple' | 'event' | 'entity' } {
+  const emit = (event: Parameters<RetrievalTraceSink['emit']>[0]): void => {
+    trace?.emit({ stage: 'retrieval', ...event });
+  };
+  const subjectFor = (id: string): string => {
+    const node = graph.nodes.get(id);
+    if (!node) return `node:${id}`;
+    if (node.kind === 'canon-entity' || node.kind === 'character') return `entity:${node.numericId}`;
+    if (node.kind === 'canon-event' || node.kind === 'au-event') return `event:${node.numericId}`;
+    return `node:${node.numericId}`;
+  };
+  const emitRoots = (all: string[], via: 'triple' | 'event' | 'entity', raw: number): void => {
+    const selected = all.slice(0, 10);
+    const budgeted = Math.max(0, all.length - selected.length);
+    emit({
+      event: 'retrieval.summary',
+      subject: `seeds:${via}`,
+      decision: 'completed',
+      reasonCode: selected.length ? 'ok' : 'empty',
+      refs: {
+        raw_count: raw,
+        dedup_count: all.length,
+        ranked_count: all.length,
+        selected_count: selected.length,
+        budgeted_count: budgeted,
+        excluded_count: 0,
+        stage: 'seed',
+      },
+    });
+    for (let i = 0; i < selected.length; i++) {
+      const id = selected[i]!;
+      const subject = subjectFor(id);
+      const refs = { rank: i + 1, stage: 'seed' } as { rank: number; stage: string; entity_id?: number };
+      const node = graph.nodes.get(id);
+      if (node && (node.kind === 'canon-entity' || node.kind === 'character')) refs.entity_id = node.numericId;
+      emit({
+        event: 'retrieval.seed.generated',
+        subject,
+        decision: 'candidate',
+        reasonCode: via,
+        refs,
+      });
+      emit({
+        event: 'retrieval.seed.disposition',
+        subject,
+        decision: 'selected',
+        reasonCode: 'selected',
+        refs,
+      });
+    }
+    if (budgeted) {
+      emit({
+        event: 'retrieval.budget.cutoff',
+        subject: 'budget:seeds',
+        decision: 'budgeted',
+        reasonCode: 'seed-cap',
+        refs: { count: budgeted, stage: 'seed' },
+      });
+    }
+  };
   const queryTerms = terms((query ?? '').replace(/['’]s\b/g, ''));
   const focusNames = focus.map((f) => f.trim().toLowerCase()).filter(Boolean);
   const roots = new Set<string>();
@@ -1822,7 +1994,11 @@ export function resolveQuerySeeds(
     roots.add(edge.from);
     roots.add(edge.to);
   }
-  if (roots.size) return { roots: [...roots].slice(0, 10), via: 'triple' };
+  if (roots.size) {
+    const all = [...roots];
+    emitRoots(all, 'triple', tripleHits.length * 2);
+    return { roots: all.slice(0, 10), via: 'triple' };
+  }
 
   // 2. An event the query names.
   for (const node of graph.nodes.values()) {
@@ -1835,11 +2011,18 @@ export function resolveQuerySeeds(
     );
     if (hits >= 2 || (hits >= 1 && focusHit)) roots.add(node.id);
   }
-  if (roots.size) return { roots: [...roots].slice(0, 10), via: 'event' };
+  if (roots.size) {
+    const all = [...roots];
+    emitRoots(all, 'event', all.length);
+    return { roots: all.slice(0, 10), via: 'event' };
+  }
 
   // 3. The old path: the names in the query.
+  const matches = resolveRoots(graph, focus.length ? focus : queryTerms.slice(0, 3));
+  const all = matches.map((r) => r.node.id);
+  emitRoots(all, 'entity', matches.length);
   return {
-    roots: resolveRoots(graph, focus.length ? focus : queryTerms.slice(0, 3)).map((r) => r.node.id),
+    roots: all,
     via: 'entity',
   };
 }
@@ -1856,7 +2039,16 @@ export function buildGraphContext(
   projectId: number,
   opts: GraphContextOptions = {},
 ): GraphContext {
-  const graph = loadGraph(db, projectId, { scope: opts.scope, web: opts.web, excludeQuarantined: true });
+  const trace = opts.trace;
+  const emit = (event: Parameters<RetrievalTraceSink['emit']>[0]): void => {
+    trace?.emit({ stage: 'retrieval', ...event });
+  };
+  const graph = loadGraph(db, projectId, {
+    scope: opts.scope,
+    web: opts.web,
+    excludeQuarantined: true,
+    trace,
+  });
   const queryTerms = terms(opts.query ?? '');
   const focusNames = opts.focus ?? [];
 
@@ -1868,11 +2060,49 @@ export function buildGraphContext(
 
   const seed =
     opts.seedMode === 'triple'
-      ? resolveQuerySeeds(graph, opts.query ?? '', focusNames)
+      ? resolveQuerySeeds(graph, opts.query ?? '', focusNames, trace)
       : {
           roots: resolveRoots(graph, focusNames.length ? focusNames : queryTerms.slice(0, 3)).map((r) => r.node.id),
           via: 'entity' as const,
         };
+  if (opts.seedMode !== 'triple' && trace) {
+    emit({
+      event: 'retrieval.summary',
+      subject: 'seeds:entity',
+      decision: 'completed',
+      reasonCode: seed.roots.length ? 'ok' : 'empty',
+      refs: {
+        raw_count: seed.roots.length,
+        dedup_count: seed.roots.length,
+        ranked_count: seed.roots.length,
+        selected_count: seed.roots.length,
+        budgeted_count: 0,
+        excluded_count: 0,
+        stage: 'seed',
+      },
+    });
+    for (let i = 0; i < seed.roots.length; i++) {
+      const id = seed.roots[i]!;
+      const node = graph.nodes.get(id);
+      const subject = node && (node.kind === 'canon-entity' || node.kind === 'character')
+        ? `entity:${node.numericId}`
+        : `node:${node?.numericId ?? id}`;
+      emit({
+        event: 'retrieval.seed.generated',
+        subject,
+        decision: 'candidate',
+        reasonCode: 'entity',
+        refs: { rank: i + 1, stage: 'seed' },
+      });
+      emit({
+        event: 'retrieval.seed.disposition',
+        subject,
+        decision: 'selected',
+        reasonCode: 'selected',
+        refs: { rank: i + 1, stage: 'seed' },
+      });
+    }
+  }
   const result = traverse(graph, {
     roots: seed.roots,
     hops: opts.hops ?? 1,
@@ -1881,6 +2111,14 @@ export function buildGraphContext(
     beforeOrder,
     temporal: true,
     maxNodes: opts.maxNodes ?? 40,
+    trace,
+  });
+  emit({
+    event: 'retrieval.traverse.completed',
+    subject: 'retrieval:traverse',
+    decision: 'completed',
+    reasonCode: result.truncated ? 'truncated' : 'ok',
+    refs: { node_count: result.nodes.size, edge_count: result.edges.length, stage: 'traverse' },
   });
 
   const ranked = rankNodes(result, queryTerms);
@@ -1906,6 +2144,41 @@ export function buildGraphContext(
     if (row) passages.push({ chunkId: row.id, locator: row.locator, text: row.text });
   }
 
+  const rawPassages = chunkIds.size;
+  emit({
+    event: 'retrieval.summary',
+    subject: 'passages:graph',
+    decision: 'completed',
+    reasonCode: passages.length ? 'ok' : 'empty',
+    refs: {
+      raw_count: rawPassages,
+      dedup_count: rawPassages,
+      ranked_count: rawPassages,
+      selected_count: passages.length,
+      budgeted_count: 0,
+      excluded_count: Math.max(0, rawPassages - passages.length),
+      stage: 'graph-rank',
+    },
+  });
+  for (let i = 0; i < passages.length; i++) {
+    const passage = passages[i]!;
+    const refs = { chunk_id: passage.chunkId, rank: i + 1, stage: 'graph-rank' };
+    emit({
+      event: 'retrieval.candidate.generated',
+      subject: `chunk:${passage.chunkId}`,
+      decision: 'candidate',
+      reasonCode: 'graph-reference',
+      refs,
+    });
+    emit({
+      event: 'retrieval.candidate.disposition',
+      subject: `chunk:${passage.chunkId}`,
+      decision: 'selected',
+      reasonCode: 'selected',
+      refs,
+    });
+  }
+
   const maxWords = opts.maxWords ?? 900;
   const { text: finalText, truncated: textTruncated } = renderGraphContext(
     ranked,
@@ -1914,6 +2187,22 @@ export function buildGraphContext(
     queryTerms,
     maxWords,
   );
+  if (textTruncated) {
+    emit({
+      event: 'retrieval.budget.cutoff',
+      subject: 'budget:graph-words',
+      decision: 'budgeted',
+      reasonCode: 'graph-word-budget',
+      refs: { count: 0, stage: 'graph-render' },
+    });
+  }
+  emit({
+    event: 'retrieval.completed',
+    subject: 'retrieval:graph',
+    decision: 'completed',
+    reasonCode: passages.length ? 'ok' : 'empty',
+    refs: { count: passages.length, stage: 'graph' },
+  });
   const truncated = result.truncated || textTruncated;
 
   return {
@@ -1974,14 +2263,36 @@ export async function resolveDenseSeeds(
   graph: Graph,
   query: string,
   cfg: { embedFn?: EmbedFn; model?: string; baseUrl?: string },
+  trace?: RetrievalTraceSink,
 ): Promise<{ seeds: DenseSeed[]; passages: DensePassage[] }> {
+  const emit = (event: Parameters<RetrievalTraceSink['emit']>[0]): void => {
+    trace?.emit({ stage: 'retrieval', ...event });
+  };
   const none = { seeds: [] as DenseSeed[], passages: [] as DensePassage[] };
   const model = cfg.model ?? DEFAULT_EMBED_MODEL;
   const stored = readVectors(db, projectId, model);
-  if (!stored.length || !query.trim()) return none;
+  if (!stored.length || !query.trim()) {
+    emit({
+      event: 'retrieval.dense.completed',
+      subject: 'retrieval:dense',
+      decision: 'completed',
+      reasonCode: stored.length ? 'no-query' : 'no-vectors',
+      refs: { count: 0, stage: 'dense-cosine' },
+    });
+    return none;
+  }
   const embed = cfg.embedFn ?? ((texts: string[]) => embedTexts(texts, { baseUrl: cfg.baseUrl ?? 'http://127.0.0.1:11434', model }));
   const qvec = (await embed([query]))?.[0];
-  if (!qvec) return none;
+  if (!qvec) {
+    emit({
+      event: 'retrieval.dense.completed',
+      subject: 'retrieval:dense',
+      decision: 'completed',
+      reasonCode: 'no-embedding',
+      refs: { count: 0, stage: 'dense-cosine' },
+    });
+    return none;
+  }
 
   const scored = stored
     .map((s) => ({ ...s, score: cosine(qvec, s.vec) }))
@@ -2003,6 +2314,64 @@ export async function resolveDenseSeeds(
     const chunkId = Number(hit.ref);
     if (Number.isFinite(chunkId)) passages.push({ chunkId, score: hit.score });
   }
+  emit({
+    event: 'retrieval.dense.completed',
+    subject: 'retrieval:dense',
+    decision: 'completed',
+    reasonCode: 'ok',
+    refs: { count: seeds.length + passages.length, stage: 'dense-cosine' },
+  });
+  emit({
+    event: 'retrieval.summary',
+    subject: 'seeds:dense',
+    decision: 'completed',
+    reasonCode: seeds.length ? 'ok' : 'empty',
+    refs: {
+      raw_count: seeds.length,
+      dedup_count: seeds.length,
+      ranked_count: seeds.length,
+      selected_count: seeds.length,
+      budgeted_count: 0,
+      excluded_count: 0,
+      stage: 'dense-cosine',
+    },
+  });
+  const subjectFor = (id: string): string => {
+    const node = graph.nodes.get(id);
+    if (!node) return `node:${id}`;
+    if (node.kind === 'canon-entity' || node.kind === 'character') return `entity:${node.numericId}`;
+    return `node:${node.numericId}`;
+  };
+  for (let i = 0; i < seeds.length; i++) {
+    const seed = seeds[i]!;
+    const refs = { rank: i + 1, score: seed.w, stage: 'dense-cosine' } as {
+      rank: number; score: number; stage: string; entity_id?: number;
+    };
+    const node = graph.nodes.get(seed.id);
+    if (node && (node.kind === 'canon-entity' || node.kind === 'character')) refs.entity_id = node.numericId;
+    emit({
+      event: 'retrieval.seed.generated',
+      subject: subjectFor(seed.id),
+      decision: 'candidate',
+      reasonCode: 'dense',
+      refs,
+    });
+  }
+  emit({
+    event: 'retrieval.summary',
+    subject: 'passages:dense',
+    decision: 'completed',
+    reasonCode: passages.length ? 'ok' : 'empty',
+    refs: {
+      raw_count: passages.length,
+      dedup_count: passages.length,
+      ranked_count: passages.length,
+      selected_count: passages.length,
+      budgeted_count: 0,
+      excluded_count: 0,
+      stage: 'dense-cosine',
+    },
+  });
   return { seeds, passages };
 }
 
@@ -2177,7 +2546,16 @@ export async function buildPprGraphContext(
   projectId: number,
   opts: GraphContextOptions = {},
 ): Promise<GraphContext> {
-  const graph = loadGraph(db, projectId, { scope: opts.scope, web: opts.web, excludeQuarantined: true });
+  const trace = opts.trace;
+  const emit = (event: Parameters<RetrievalTraceSink['emit']>[0]): void => {
+    trace?.emit({ stage: 'retrieval', ...event });
+  };
+  const graph = loadGraph(db, projectId, {
+    scope: opts.scope,
+    web: opts.web,
+    excludeQuarantined: true,
+    trace,
+  });
   const edgeById = new Map(graph.edges.map((edge) => [edge.id, edge]));
   const queryTerms = terms(opts.query ?? '');
   const focusNames = opts.focus ?? [];
@@ -2189,7 +2567,7 @@ export async function buildPprGraphContext(
   }
 
   // Same triple/event seeding the hop walk uses.
-  const seed = resolveQuerySeeds(graph, opts.query ?? '', focusNames);
+  const seed = resolveQuerySeeds(graph, opts.query ?? '', focusNames, trace);
   let weights = new Map<string, number>();
   for (const root of seed.roots) weights.set(root, 1);
   // The passages the seeds mention start with a little weight of their own,
@@ -2210,7 +2588,7 @@ export async function buildPprGraphContext(
   let recognition: { checked: number; kept: number; dropped: number } | undefined;
   const lexicalIds = new Set(weights.keys());
   if (opts.embed) {
-    const dense = await resolveDenseSeeds(db, projectId, graph, opts.query ?? '', opts.embed);
+    const dense = await resolveDenseSeeds(db, projectId, graph, opts.query ?? '', opts.embed, trace);
     weights = mergeSeedWeights(weights, dense.seeds).merged;
     densePassages = dense.passages;
   }
@@ -2218,7 +2596,15 @@ export async function buildPprGraphContext(
   // backing) are checked against their passage text before PPR spreads
   // their scores. Lexical seeds are never filtered.
   const rec = opts.recognize;
-  if (rec?.enabled) {
+  if (!rec?.enabled) {
+    emit({
+      event: 'retrieval.recognition.completed',
+      subject: 'retrieval:recognition',
+      decision: 'completed',
+      reasonCode: 'disabled',
+      refs: { count: 0, stage: 'recognition' },
+    });
+  } else {
     const denseOnly = [...weights.keys()]
       .filter((id) => !lexicalIds.has(id))
       .map((id) => ({ id, w: weights.get(id)! }));
@@ -2227,9 +2613,18 @@ export async function buildPprGraphContext(
         query: opts.query ?? '',
         maxSeeds: rec.maxSeeds,
         lexicalIds,
+        trace,
       });
       for (const d of verdicts.dropped) weights.delete(d.id);
       recognition = { checked: verdicts.checked, kept: verdicts.kept.length, dropped: verdicts.dropped.length };
+    } else {
+      emit({
+        event: 'retrieval.recognition.completed',
+        subject: 'retrieval:recognition',
+        decision: 'completed',
+        reasonCode: 'no-dense-only',
+        refs: { count: 0, stage: 'recognition' },
+      });
     }
   }
   const ppr = personalizedPageRank(graph, weights);
@@ -2242,6 +2637,14 @@ export async function buildPprGraphContext(
     beforeOrder,
     temporal: true,
     maxNodes: opts.maxNodes ?? 40,
+    trace,
+  });
+  emit({
+    event: 'retrieval.traverse.completed',
+    subject: 'retrieval:traverse',
+    decision: 'completed',
+    reasonCode: result.truncated ? 'truncated' : 'ok',
+    refs: { node_count: result.nodes.size, edge_count: result.edges.length, stage: 'traverse' },
   });
 
   const ranked = rankNodes(result, queryTerms);
@@ -2281,6 +2684,7 @@ export async function buildPprGraphContext(
     if (typeof chunkId !== 'number' || pprCandidates.some((c) => c.chunkId === chunkId)) continue;
     pprCandidates.push({ chunkId, score, seeds: reach.get(id) ?? 0 });
   }
+  const pprChunkIds = new Set(pprCandidates.map((candidate) => candidate.chunkId));
   let corroborated: { passages: number; maxSeeds: number } | undefined;
   if (seed.roots.length > 1) {
     let maxSeeds = 0;
@@ -2329,6 +2733,44 @@ export async function buildPprGraphContext(
     }
     pprFallback = true;
   }
+  if (weights.size === 0) {
+    emit({
+      event: 'retrieval.ppr.skipped',
+      subject: 'retrieval:ppr',
+      decision: 'excluded',
+      reasonCode: 'no-seeds',
+      refs: { count: 0, stage: 'ppr' },
+    });
+  } else if (pprCandidates.length === 0 && densePassages.length === 0) {
+    emit({
+      event: 'retrieval.ppr.skipped',
+      subject: 'retrieval:ppr',
+      decision: 'excluded',
+      reasonCode: 'no-targets',
+      refs: { count: 0, stage: 'ppr' },
+    });
+  } else if (pprFallback) {
+    emit({
+      event: 'retrieval.ppr.fallback',
+      subject: 'retrieval:ppr',
+      decision: 'selected',
+      reasonCode: 'dense-passages',
+      refs: { count: densePassages.length, stage: 'ppr' },
+    });
+  } else {
+    emit({
+      event: 'retrieval.ppr.completed',
+      subject: 'retrieval:ppr',
+      decision: 'completed',
+      reasonCode: ppr.converged ? 'converged' : 'max-iterations',
+      refs: {
+        node_count: graph.nodes.size,
+        iteration_count: ppr.iterations,
+        count: pprCandidates.length,
+        stage: 'ppr',
+      },
+    });
+  }
   const passages: GraphContext['passages'] = [];
   for (const chunkId of orderedChunkIds) {
     const row = db.get<{ id: number; locator: string; text: string }>(
@@ -2342,6 +2784,96 @@ export async function buildPprGraphContext(
   // Receipts: the labeled chain behind each top passage. Recording only:
   // ranking, order, budgets and text are untouched.
   const trails = buildPassageTrails(graph, result, ranked, ppr, passages);
+  const denseChunkIds = new Set(densePassages.map((p) => p.chunkId));
+  for (let i = 0; i < pprCandidates.length; i++) {
+    const candidate = pprCandidates[i]!;
+    const refs = {
+      chunk_id: candidate.chunkId,
+      rank: i + 1,
+      score: candidate.score,
+      stage: 'ppr',
+    };
+    emit({
+      event: 'retrieval.candidate.generated',
+      subject: `chunk:${candidate.chunkId}`,
+      decision: 'candidate',
+      reasonCode: 'ppr',
+      refs,
+    });
+    if (!passages.some((p) => p.chunkId === candidate.chunkId)) {
+      emit({
+        event: 'retrieval.candidate.disposition',
+        subject: `chunk:${candidate.chunkId}`,
+        decision: 'budgeted',
+        reasonCode: 'ppr-top-k',
+        refs,
+      });
+    }
+  }
+  for (let i = 0; i < passages.length; i++) {
+    const passage = passages[i]!;
+    const selected = pprChunkIds.has(passage.chunkId);
+    const dense = denseChunkIds.has(passage.chunkId);
+    const refs = {
+      chunk_id: passage.chunkId,
+      rank: i + 1,
+      stage: selected ? 'ppr' : dense ? 'dense-cosine' : 'graph-rank',
+    };
+    if (!selected) {
+      emit({
+        event: 'retrieval.candidate.generated',
+        subject: `chunk:${passage.chunkId}`,
+        decision: 'candidate',
+        reasonCode: dense ? 'dense-passage' : 'graph-reference',
+        refs,
+      });
+    }
+    emit({
+      event: 'retrieval.candidate.disposition',
+      subject: `chunk:${passage.chunkId}`,
+      decision: 'selected',
+      reasonCode: 'selected',
+      refs,
+    });
+  }
+  emit({
+    event: 'retrieval.summary',
+    subject: 'passages:graph',
+    decision: 'completed',
+    reasonCode: passages.length ? 'ok' : 'empty',
+    refs: {
+      raw_count: orderedChunkIds.length,
+      dedup_count: orderedChunkIds.length,
+      ranked_count: orderedChunkIds.length,
+      selected_count: passages.length,
+      budgeted_count: 0,
+      excluded_count: Math.max(0, orderedChunkIds.length - passages.length),
+      stage: 'graph-rank',
+    },
+  });
+  if (passages.length > trails.length) {
+    emit({
+      event: 'retrieval.budget.cutoff',
+      subject: 'budget:trails',
+      decision: 'budgeted',
+      reasonCode: 'trail-cap',
+      refs: { count: passages.length - trails.length, stage: 'trail' },
+    });
+  }
+  for (const trail of trails) {
+    emit({
+      event: 'retrieval.trail.recorded',
+      subject: `chunk:${trail.chunkId}`,
+      decision: 'selected',
+      reasonCode: trail.steps.length ? 'trail' : 'word-only',
+      refs: {
+        chunk_id: trail.chunkId,
+        score: trail.score,
+        step_count: trail.steps.length,
+        stage: 'trail-score',
+      },
+    });
+  }
 
   const maxWords = opts.maxWords ?? 900;
   const { text: pprText, truncated: textTruncated } = renderGraphContext(
@@ -2351,6 +2883,22 @@ export async function buildPprGraphContext(
     queryTerms,
     maxWords,
   );
+  if (textTruncated) {
+    emit({
+      event: 'retrieval.budget.cutoff',
+      subject: 'budget:graph-words',
+      decision: 'budgeted',
+      reasonCode: 'graph-word-budget',
+      refs: { count: 0, stage: 'graph-render' },
+    });
+  }
+  emit({
+    event: 'retrieval.completed',
+    subject: 'retrieval:graph',
+    decision: 'completed',
+    reasonCode: pprFallback ? 'ppr-fallback' : passages.length ? 'ok' : 'empty',
+    refs: { count: passages.length, stage: 'graph' },
+  });
   const truncated = result.truncated || textTruncated;
 
   return {

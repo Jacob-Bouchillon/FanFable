@@ -23,6 +23,7 @@
  * index later: `RetrievalPackage` is what the rest of the program consumes,
  * not a particular search backend.
  */
+import { createHash } from 'node:crypto';
 import { Db } from '../core/db.ts';
 import type { LlmClient } from '../core/llm.ts';
 import * as lore from './lore.ts';
@@ -31,6 +32,7 @@ import * as embeddings from '../support/embeddings.ts';
 import * as graph from '../support/graph.ts';
 import { RELATION_CUES } from '../core/vocab.ts';
 import { nameMentioned } from '../identity/names.ts';
+import { withRetrievalTraceSpan, type RetrievalTraceSink } from '../trace/trace.ts';
 
 export interface RetrievalRequest {
   /** The question or the scene's subject. */
@@ -80,6 +82,8 @@ export interface RetrievalRequest {
    * leading nowhere at current index density. Set true to take it.
    */
   web?: boolean;
+  /** Optional diagnostic trace sink. A null sink changes nothing. */
+  trace?: RetrievalTraceSink;
 }
 
 /** What kind of question this is, and therefore which path answers it. */
@@ -221,6 +225,18 @@ export async function retrieve(
   // A lookup needs no widening, and neither does a relational question: the
   // graph already carries the connection. Only a vague query pays for expansion.
   const skipExpansion = req.skipExpansion ?? route !== 'vague';
+  const trace = req.trace;
+  const emit = (event: Parameters<RetrievalTraceSink['emit']>[0]): void => {
+    trace?.emit({ stage: 'retrieval', ...event });
+  };
+  const queryHash = createHash('sha256').update(query, 'utf8').digest('hex');
+  emit({
+    event: 'retrieval.route',
+    subject: `query:${queryHash}`,
+    decision: 'candidate',
+    reasonCode: route,
+    refs: { count: focus.length, stage: 'route' },
+  });
 
   /* ------------------------------------------------- passages (FTS5) */
   const searchTerms = [query, ...focus].filter(Boolean).join(' ');
@@ -228,7 +244,21 @@ export async function retrieve(
   let passages: lore.Passage[] = [];
   if (searchTerms) {
     const expand = skipExpansion ? [] : await lore.expandQuery(llm, searchTerms);
+    if (!skipExpansion) {
+      emit({
+        event: 'retrieval.query.expanded',
+        subject: `query:${queryHash}`,
+        decision: 'candidate',
+        reasonCode: expand.length ? 'model' : 'fallback-empty',
+        refs: {
+          candidate_id: createHash('sha256').update(JSON.stringify(expand)).digest('hex'),
+          count: expand.length,
+          stage: 'expand',
+        },
+      });
+    }
     passages = lore.searchCanon(db, projectId, searchTerms, {
+      trace: req.trace,
       limit: passageLimit,
       expand,
       bankProfile,
@@ -303,12 +333,40 @@ export async function retrieve(
     relational && req.dense !== false
       ? embeddings.resolveEmbedConfig(db, projectId, { fallbackBaseUrl: llm.settings.baseUrl })
       : undefined;
+  emit({
+    event: 'retrieval.settings',
+    subject: 'retrieval:settings',
+    decision: 'completed',
+    reasonCode: route,
+    refs: { count: req.hops ?? 1, stage: `hops-${req.hops ?? 1}:dense-${denseEmbed ? 'on' : 'off'}:recognition-${recognition ? 'on' : 'off'}:web-${req.web ? 'on' : 'off'}` },
+  });
+  if (!includeGraph) {
+    emit({
+      event: 'retrieval.ppr.skipped',
+      subject: 'retrieval:ppr',
+      decision: 'excluded',
+      reasonCode: 'lookup-route',
+      refs: { count: 0, stage: 'ppr' },
+    });
+  } else if (!relational) {
+    emit({
+      event: 'retrieval.ppr.skipped',
+      subject: 'retrieval:ppr',
+      decision: 'excluded',
+      reasonCode: 'hop-route',
+      refs: { count: 0, stage: 'ppr' },
+    });
+  }
   const assemble = async (hops: number): Promise<{
     graphContext: graph.GraphContext;
     keptPassages: lore.Passage[];
     supporting: lore.Passage[];
     text: string;
+    packageStats: { raw: number; dedup: number; ranked: number; selected: number; budgeted: number };
   }> => {
+    const graphTrace = trace
+      ? withRetrievalTraceSpan(trace, `sp-retrieve-hop-${hops}`, 'sp-retrieve')
+      : undefined;
     const graphContext = includeGraph
       ? relational
         ? await graph.buildPprGraphContext(db, projectId, {
@@ -323,6 +381,7 @@ export async function retrieve(
             ...(denseEmbed ? { embed: denseEmbed } : {}),
             ...(recognition ? { recognize: { llm, enabled: true } } : {}),
             web: req.web ?? false,
+            trace: graphTrace,
           })
         : graph.buildGraphContext(db, projectId, {
             query,
@@ -334,6 +393,7 @@ export async function retrieve(
             maxNodes: hops > 1 ? 70 : 45,
             maxWords: Math.round(maxWords * 0.70),
             web: req.web ?? false,
+            trace: graphTrace,
           })
       : emptyGraphContext();
 
@@ -389,7 +449,19 @@ export async function retrieve(
       parts.push(`CONNECTED CONTEXT (what this scene touches, and how):\n${graphContext.text.trim()}`);
     }
 
-    return { graphContext, keptPassages, supporting, text: parts.join('\n\n') };
+    return {
+      graphContext,
+      keptPassages,
+      supporting,
+      text: parts.join('\n\n'),
+      packageStats: {
+        raw: merged.length,
+        dedup: deduped.length,
+        ranked: ordered.length,
+        selected: keptPassages.length,
+        budgeted: Math.max(0, ordered.length - keptPassages.length),
+      },
+    };
   };
 
   let assembled = await assemble(req.hops ?? 1);
@@ -423,8 +495,39 @@ export async function retrieve(
     cov = coverage(assembled);
   }
 
-  const { graphContext, keptPassages, supporting, text } = assembled;
+  const { graphContext, keptPassages, supporting, text, packageStats } = assembled;
   const finalWords = text.split(/\s+/).length;
+  emit({
+    event: 'retrieval.summary',
+    subject: 'passages:package',
+    decision: 'completed',
+    reasonCode: packageStats.selected ? 'ok' : 'empty',
+    refs: {
+      raw_count: packageStats.raw,
+      dedup_count: packageStats.dedup,
+      ranked_count: packageStats.ranked,
+      selected_count: packageStats.selected,
+      budgeted_count: packageStats.budgeted,
+      excluded_count: 0,
+      stage: 'package',
+    },
+  });
+  if (packageStats.budgeted > 0) {
+    emit({
+      event: 'retrieval.budget.cutoff',
+      subject: 'budget:package',
+      decision: 'budgeted',
+      reasonCode: 'word-budget',
+      refs: { count: packageStats.budgeted, stage: 'package' },
+    });
+  }
+  emit({
+    event: 'retrieval.completed',
+    subject: 'retrieval:package',
+    decision: 'completed',
+    reasonCode: keptPassages.length ? 'ok' : 'empty',
+    refs: { count: keptPassages.length, stage: 'package' },
+  });
 
   return {
     passages: keptPassages,

@@ -42,6 +42,8 @@ export interface SearchOptions {
   bankProfile?: lorebook.BankQueryProfile;
   /** Optional retrieval trace sink. A null sink changes nothing. */
   trace?: RetrievalTraceSink;
+  /** Trace subject prefix, so package and trail-source searches stay distinct. */
+  traceSubject?: string;
 }
 
 /**
@@ -69,6 +71,8 @@ export function searchCanon(db: Db, projectId: number, query: string, opts: Sear
   const emit = (event: Parameters<RetrievalTraceSink['emit']>[0]): void => {
     opts.trace?.emit({ stage: 'retrieval', ...event });
   };
+  const searchSubject = opts.traceSubject ?? 'search:fts';
+  const budgetSubject = searchSubject === 'search:fts' ? 'budget:passages' : 'budget:passages:trail-source';
   const emitSummary = (
     reason: 'ok' | 'empty' | 'error',
     counts: {
@@ -82,7 +86,7 @@ export function searchCanon(db: Db, projectId: number, query: string, opts: Sear
   ): void => {
     emit({
       event: 'retrieval.summary',
-      subject: 'search:fts',
+      subject: searchSubject,
       decision: 'completed',
       reasonCode: reason,
       refs: { ...counts, stage: 'bm25' },
@@ -100,7 +104,7 @@ export function searchCanon(db: Db, projectId: number, query: string, opts: Sear
     });
     emit({
       event: 'retrieval.search.completed',
-      subject: 'search:fts',
+      subject: searchSubject,
       decision: 'completed',
       reasonCode: 'empty',
       refs: { count: 0, stage: 'bm25' },
@@ -138,7 +142,7 @@ export function searchCanon(db: Db, projectId: number, query: string, opts: Sear
     });
     emit({
       event: 'retrieval.search.completed',
-      subject: 'search:fts',
+      subject: searchSubject,
       decision: 'completed',
       reasonCode: 'error',
       refs: { count: 0, stage: 'bm25' },
@@ -196,7 +200,7 @@ export function searchCanon(db: Db, projectId: number, query: string, opts: Sear
   });
   emit({
     event: 'retrieval.search.completed',
-    subject: 'search:fts',
+    subject: searchSubject,
     decision: 'completed',
     reasonCode: selected.length ? 'ok' : 'empty',
     refs: { count: rows.length, stage: 'bm25' },
@@ -237,7 +241,7 @@ export function searchCanon(db: Db, projectId: number, query: string, opts: Sear
   if (budgeted > 0) {
     emit({
       event: 'retrieval.budget.cutoff',
-      subject: 'budget:passages',
+      subject: budgetSubject,
       decision: 'budgeted',
       reasonCode: 'passage-limit',
       refs: { count: budgeted, stage: 'bank-rank' },

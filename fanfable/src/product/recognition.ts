@@ -19,6 +19,7 @@ import { extractJson } from '../core/json.ts';
 import type { LlmClient } from '../core/llm.ts';
 import { truncate } from '../core/text.ts';
 import type { DenseSeed, Graph } from '../support/graph.ts';
+import type { RetrievalTraceSink } from '../trace/trace.ts';
 
 export interface RecognitionOptions {
   /** The query the seeds serve: the model judges support for this. */
@@ -29,6 +30,8 @@ export interface RecognitionOptions {
   maxTokens?: number;
   /** Ids with lexical backing: auto-kept, never sent to the model. */
   lexicalIds?: ReadonlySet<string>;
+  /** Optional diagnostic trace sink. */
+  trace?: RetrievalTraceSink;
 }
 
 export interface SeedVerdict {
@@ -141,6 +144,19 @@ export async function filterDenseSeeds(
   projectId: number,
   opts: RecognitionOptions = {},
 ): Promise<FilterResult> {
+  const emit = (event: Parameters<RetrievalTraceSink['emit']>[0]): void => {
+    opts.trace?.emit({ stage: 'retrieval', ...event });
+  };
+  const subjectFor = (id: string): string => {
+    const node = graph.nodes.get(id);
+    if (node) {
+      if (node.kind === 'canon-entity' || node.kind === 'character') return `entity:${node.numericId}`;
+      return `node:${node.numericId}`;
+    }
+    const edge = graph.edges.find((candidate) => candidate.id === id);
+    if (edge) return `relation:${edge.id}`;
+    return `node:${id}`;
+  };
   const kept: SeedVerdict[] = [];
   const dropped: SeedVerdict[] = [];
   const lexical = opts.lexicalIds;
@@ -151,7 +167,16 @@ export async function filterDenseSeeds(
   const maxSeeds = opts.maxSeeds ?? 10;
   const batch = checkable.slice(0, Math.max(0, maxSeeds));
   for (const s of checkable.slice(batch.length)) kept.push({ id: s.id, reason: 'over-cap' });
-  if (!batch.length) return { kept, dropped, checked: 0 };
+  if (!batch.length) {
+    emit({
+      event: 'retrieval.recognition.completed',
+      subject: 'retrieval:recognition',
+      decision: 'completed',
+      reasonCode: 'no-dense-only',
+      refs: { count: 0, stage: 'recognition' },
+    });
+    return { kept, dropped, checked: 0 };
+  }
 
   let verdicts: Map<string, boolean>;
   try {
@@ -171,6 +196,13 @@ export async function filterDenseSeeds(
     verdicts = statedVerdicts(res.text);
   } catch {
     for (const s of batch) kept.push({ id: s.id, reason: 'filter-error' });
+    emit({
+      event: 'retrieval.recognition.completed',
+      subject: 'retrieval:recognition',
+      decision: 'completed',
+      reasonCode: 'fail-open',
+      refs: { count: batch.length, stage: 'recognition' },
+    });
     return { kept, dropped, checked: 0 };
   }
 
@@ -179,5 +211,51 @@ export async function filterDenseSeeds(
     if (v === false) dropped.push({ id: s.id, reason: 'unsupported' });
     else kept.push({ id: s.id, reason: v === true ? 'supported' : 'fail-open' });
   }
+  for (let i = 0; i < kept.length; i++) {
+    const verdict = kept[i]!;
+    emit({
+      event: 'retrieval.seed.disposition',
+      subject: subjectFor(verdict.id),
+      decision: verdict.reason === 'over-cap' ? 'budgeted' : 'selected',
+      reasonCode: verdict.reason,
+      refs: { rank: i + 1, stage: 'recognition' },
+    });
+  }
+  for (let i = 0; i < dropped.length; i++) {
+    const verdict = dropped[i]!;
+    emit({
+      event: 'retrieval.seed.disposition',
+      subject: subjectFor(verdict.id),
+      decision: 'excluded',
+      reasonCode: 'recognition',
+      refs: { rank: i + 1, stage: 'recognition' },
+    });
+  }
+  emit({
+    event: 'retrieval.recognition.completed',
+    subject: 'retrieval:recognition',
+    decision: 'completed',
+    reasonCode: 'checked',
+    refs: { count: checkedCount(kept, dropped), stage: 'recognition' },
+  });
+  emit({
+    event: 'retrieval.summary',
+    subject: 'seeds:recognition',
+    decision: 'completed',
+    reasonCode: kept.length ? 'ok' : 'empty',
+    refs: {
+      raw_count: seeds.length,
+      dedup_count: seeds.length,
+      ranked_count: seeds.length,
+      selected_count: kept.filter((s) => s.reason !== 'over-cap').length,
+      budgeted_count: kept.filter((s) => s.reason === 'over-cap').length,
+      excluded_count: dropped.length,
+      stage: 'recognition',
+    },
+  });
   return { kept, dropped, checked: batch.length };
+}
+
+function checkedCount(kept: SeedVerdict[], dropped: SeedVerdict[]): number {
+  return kept.length + dropped.length;
 }

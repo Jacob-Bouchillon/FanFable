@@ -6,6 +6,7 @@
  * create/reopen a project, import sources, search lore, plan collaboratively,
  * write and approve chapters, inspect warnings and memory.
  */
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -1233,41 +1234,165 @@ async function cmdLore(args: Args): Promise<void> {
     const out = flagString(args, 'out') || `trails-${slug || 'query'}.html`;
     const web = args.flags.web === true;
     heading(`Answer trails for "${query}"`);
-    // The same retrieval the app uses; trails ride along on it. A lookup
-    // route answers from words alone, so its passages are merged with any
-    // graph passages before the shared bank ranker picks the four to draw.
-    const pkg = await retrieval.retrieve(db, a.llm, project.id, { query, web });
-    const graphTrails = pkg.graph.trails ?? [];
-    const byChunk = new Map(graphTrails.map((t) => [t.chunkId, t]));
-    const candidates: lore.Passage[] = [];
-    const seen = new Set<number>();
-    const add = (passage: lore.Passage): void => {
-      if (seen.has(passage.chunkId)) return;
-      seen.add(passage.chunkId);
-      candidates.push(passage);
-    };
-    // The package is budgeted for a prompt; trails are a diagnostic and want
-    // the keyword hits the budget trimmed away, plus every graph passage.
-    for (const passage of lore.searchCanon(db, project.id, query, { limit: 4 })) add(passage);
-    for (const passage of pkg.passages) add(passage);
-    for (const passage of pkg.graph.passages) {
-      add({ ...passage, sourceId: 0, sourceTitle: '', path: '', heading: '', score: 0 });
+    const traceStartedAt = new Date().toISOString();
+    const queryHash = createHash('sha256').update(query, 'utf8').digest('hex');
+    let traceId: string | undefined;
+    let traceBuffer: ReturnType<typeof traceLog.createRetrievalTraceBuffer> | undefined;
+    let retrieveTrace: traceLog.RetrievalTraceSink | undefined;
+    let trailsTrace: traceLog.RetrievalTraceSink | undefined;
+    try {
+      const trace = traceLog.startTrace(db, {
+        projectId: project.id,
+        startedAt: traceStartedAt,
+        metadata: {
+          command: 'lore trails',
+          query_sha256: queryHash,
+          query_length: query.length,
+          web,
+        },
+      });
+      traceId = trace.id;
+      traceBuffer = traceLog.createRetrievalTraceBuffer({ candidateDetailLimit: 24 });
+      retrieveTrace = traceLog.withRetrievalTraceSpan(traceBuffer, 'sp-retrieve');
+      trailsTrace = traceLog.withRetrievalTraceSpan(traceBuffer, 'sp-trails');
+    } catch {
+      // Diagnostic tracing must never block the trails command.
     }
-    const trails: PassageTrail[] = lorebook
-      .rankWithBank(db, project.id, query, candidates)
-      .slice(0, 4)
-      .map((passage) => {
+    const finishTrailTrace = (interrupted = false): void => {
+      if (!traceId || !traceBuffer) return;
+      const flushed = traceLog.flushRetrievalTrace(db, project.id, traceId, traceBuffer);
+      traceLog.finishTrace(
+        db,
+        traceId,
+        interrupted
+          ? { interrupted: true }
+          : flushed.sampled
+            ? { completeness: 'sampled' }
+            : {},
+      );
+    };
+    try {
+      // The same retrieval the app uses; trails ride along on it. A lookup
+      // route answers from words alone, so its passages are merged with any
+      // graph passages before the shared bank ranker picks the four to draw.
+      const pkg = await retrieval.retrieve(db, a.llm, project.id, {
+        query,
+        web,
+        trace: retrieveTrace,
+      });
+      const graphTrails = pkg.graph.trails ?? [];
+      const byChunk = new Map(graphTrails.map((t) => [t.chunkId, t]));
+      const candidates: lore.Passage[] = [];
+      const seen = new Set<number>();
+      const origins = new Map<number, Set<string>>();
+      const remember = (chunkId: number, origin: string): void => {
+        const set = origins.get(chunkId) ?? new Set<string>();
+        set.add(origin);
+        origins.set(chunkId, set);
+      };
+      const add = (passage: lore.Passage, origin: string): void => {
+        remember(passage.chunkId, origin);
+        if (seen.has(passage.chunkId)) return;
+        seen.add(passage.chunkId);
+        candidates.push(passage);
+      };
+      // The package is budgeted for a prompt; trails are a diagnostic and want
+      // the keyword hits the budget trimmed away, plus every graph passage.
+      const trailSource = lore.searchCanon(db, project.id, query, {
+        limit: 4,
+        trace: trailsTrace,
+        traceSubject: 'search:fts:trail-source',
+      });
+      for (const passage of trailSource) add(passage, 'fts-trail-source');
+      for (const passage of pkg.passages) add(passage, 'package');
+      for (const passage of pkg.graph.passages) {
+        add({ ...passage, sourceId: 0, sourceTitle: '', path: '', heading: '', score: 0 }, 'graph');
+      }
+      const ranked = lorebook.rankWithBank(db, project.id, query, candidates);
+      const trails: PassageTrail[] = ranked.slice(0, 4).map((passage) => {
         const known = byChunk.get(passage.chunkId);
         if (known) return known;
         return { chunkId: passage.chunkId, locator: passage.locator, score: 0, steps: [] };
       });
-    for (const trail of trails) {
-      console.log(`\n${C.cyan(trail.locator)} ${C.dim(`(score ${trail.score.toFixed(3)})`)}`);
-      console.log(`  ${trailText(trail) || C.dim('(no passages matched)')}`);
+      if (trailsTrace) {
+        for (let i = 0; i < trails.length; i++) {
+          const trail = trails[i]!;
+          for (const origin of origins.get(trail.chunkId) ?? []) {
+            trailsTrace.emit({
+              event: 'retrieval.candidate.generated',
+              subject: `chunk:${trail.chunkId}`,
+              decision: 'candidate',
+              reasonCode: origin,
+              refs: { chunk_id: trail.chunkId, rank: i + 1, stage: 'final-bank-rank' },
+            });
+          }
+          trailsTrace.emit({
+            event: 'retrieval.candidate.disposition',
+            subject: `chunk:${trail.chunkId}`,
+            decision: 'selected',
+            reasonCode: 'selected',
+            refs: { chunk_id: trail.chunkId, rank: i + 1, score: trail.score, stage: 'final-bank-rank' },
+          });
+          trailsTrace.emit({
+            event: 'retrieval.trail.recorded',
+            subject: `chunk:${trail.chunkId}`,
+            decision: 'selected',
+            reasonCode: trail.steps.length ? 'trail' : 'word-only',
+            refs: {
+              chunk_id: trail.chunkId,
+              rank: i + 1,
+              score: trail.score,
+              step_count: trail.steps.length,
+              stage: 'trail-score',
+            },
+          });
+        }
+        const budgeted = Math.max(0, ranked.length - trails.length);
+        if (budgeted) {
+          trailsTrace.emit({
+            event: 'retrieval.budget.cutoff',
+            subject: 'budget:trails',
+            decision: 'budgeted',
+            reasonCode: 'trail-cap',
+            refs: { count: budgeted, stage: 'final-bank-rank' },
+          });
+        }
+        trailsTrace.emit({
+          event: 'retrieval.summary',
+          subject: 'trails:final',
+          decision: 'completed',
+          reasonCode: trails.length ? 'ok' : 'empty',
+          refs: {
+            raw_count: [...origins.values()].reduce((n, set) => n + set.size, 0),
+            dedup_count: candidates.length,
+            ranked_count: ranked.length,
+            selected_count: trails.length,
+            budgeted_count: budgeted,
+            excluded_count: 0,
+            stage: 'final-bank-rank',
+          },
+        });
+        trailsTrace.emit({
+          event: 'retrieval.completed',
+          subject: 'retrieval:trails',
+          decision: 'completed',
+          reasonCode: trails.length ? 'ok' : 'empty',
+          refs: { count: trails.length, stage: 'trails' },
+        });
+      }
+      for (const trail of trails) {
+        console.log(`\n${C.cyan(trail.locator)} ${C.dim(`(score ${trail.score.toFixed(3)})`)}`);
+        console.log(`  ${trailText(trail) || C.dim('(no passages matched)')}`);
+      }
+      writeFileSync(out, buildTrailsHtml(query, trails));
+      console.log(`\n${C.green('wrote')} ${out}`);
+      finishTrailTrace();
+      if (traceId) console.log(`${C.dim(`trace ${traceId}`)}`);
+      return;
+    } catch (error) {
+      finishTrailTrace(true);
+      throw error;
     }
-    writeFileSync(out, buildTrailsHtml(query, trails));
-    console.log(`\n${C.green('wrote')} ${out}`);
-    return;
   }
 
   if (sub === 'ties') {

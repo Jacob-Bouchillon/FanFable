@@ -34,6 +34,8 @@ export interface RetrievalTraceEvent {
   error?: string;
   createdAt?: string;
   stage?: string;
+  spanId?: string;
+  parentSpanId?: string | null;
 }
 
 export interface RetrievalTraceSink {
@@ -42,13 +44,18 @@ export interface RetrievalTraceSink {
 
 export interface BufferedRetrievalTrace extends RetrievalTraceSink {
   readonly events: RetrievalTraceEvent[];
+  /** Cap on enumerated seed/candidate detail; summaries and final selections always survive. */
+  candidateDetailLimit?: number;
+  sampled?: boolean;
+  candidateDetailSkipped?: number;
 }
 
 /** Buffer retrieval events without writing; the caller starts the trace later. */
-export function createRetrievalTraceBuffer(): BufferedRetrievalTrace {
+export function createRetrievalTraceBuffer(opts: { candidateDetailLimit?: number } = {}): BufferedRetrievalTrace {
   const events: RetrievalTraceEvent[] = [];
   return {
     events,
+    candidateDetailLimit: opts.candidateDetailLimit,
     emit(event: RetrievalTraceEvent): void {
       events.push({ ...event, createdAt: event.createdAt ?? nowIso() });
     },
@@ -82,13 +89,26 @@ function ensureTraceTruncated(db: Db, traceId: string, minimumDropped: number): 
   }
 }
 
+/** Bind a trace sink to a distinct span for one retrieval layer. */
+export function withRetrievalTraceSpan(
+  sink: RetrievalTraceSink,
+  spanId: string,
+  parentSpanId?: string | null,
+): RetrievalTraceSink {
+  return {
+    emit(event: RetrievalTraceEvent): void {
+      sink.emit({ ...event, spanId, parentSpanId: parentSpanId ?? null });
+    },
+  };
+}
+
 /** Flush buffered events as diagnostic trace events, never failing retrieval. */
 export function flushRetrievalTrace(
   db: Db,
   projectId: number,
   traceId: string,
   buffer: BufferedRetrievalTrace,
-): void {
+): { sampled: boolean; candidateDetailSkipped: number } {
   let initialDropped = 0;
   try {
     const before = db.get<{ dropped_events: number }>(
@@ -97,10 +117,66 @@ export function flushRetrievalTrace(
     );
     initialDropped = Number(before?.dropped_events ?? 0);
   } catch {
-    return;
+    return { sampled: false, candidateDetailSkipped: 0 };
+  }
+  const finalSubjects = new Set(
+    buffer.events
+      .filter(
+        (event) =>
+          event.event === 'retrieval.candidate.disposition' &&
+          event.decision === 'selected' &&
+          event.refs?.stage === 'final-bank-rank' &&
+          event.subject,
+      )
+      .map((event) => String(event.subject)),
+  );
+  const detailSubjects = new Set<string>();
+  let candidateDetailSkipped = 0;
+  const eventsToWrite: RetrievalTraceEvent[] = [];
+  for (const event of buffer.events) {
+    const detail =
+      event.event.startsWith('retrieval.seed.') ||
+      event.event === 'retrieval.candidate.generated' ||
+      event.event === 'retrieval.candidate.disposition';
+    if (!detail || !event.subject) {
+      eventsToWrite.push(event);
+      continue;
+    }
+    if (finalSubjects.has(event.subject)) {
+      eventsToWrite.push(event);
+      continue;
+    }
+    const limit = buffer.candidateDetailLimit;
+    if (limit === undefined) {
+      eventsToWrite.push(event);
+      continue;
+    }
+    if (detailSubjects.has(event.subject)) {
+      eventsToWrite.push(event);
+      continue;
+    }
+    if (detailSubjects.size < limit) {
+      detailSubjects.add(event.subject);
+      eventsToWrite.push(event);
+    } else {
+      candidateDetailSkipped++;
+    }
+  }
+  const sampled = candidateDetailSkipped > 0;
+  if (sampled) {
+    buffer.sampled = true;
+    buffer.candidateDetailSkipped = candidateDetailSkipped;
+    eventsToWrite.push({
+      event: 'retrieval.coverage',
+      subject: 'retrieval:coverage',
+      decision: 'completed',
+      reasonCode: 'sampled',
+      refs: { count: candidateDetailSkipped, selected_count: finalSubjects.size, stage: 'coverage' },
+      createdAt: nowIso(),
+    });
   }
   let failedWrites = 0;
-  for (const event of buffer.events) {
+  for (const event of eventsToWrite) {
     try {
       const result = recordTraceEvent(db, {
         traceId,
@@ -114,6 +190,8 @@ export function flushRetrievalTrace(
         refs: event.refs,
         error: event.error,
         createdAt: event.createdAt,
+        spanId: event.spanId ?? 'sp-retrieval',
+        parentSpanId: event.parentSpanId,
       });
       // Sampling is already accounted for by recordTraceEvent as 'sampled';
       // cap/unavailable are lost diagnostic writes and must make this trace
@@ -124,6 +202,7 @@ export function flushRetrievalTrace(
     }
   }
   if (failedWrites > 0) ensureTraceTruncated(db, traceId, initialDropped + failedWrites);
+  return { sampled, candidateDetailSkipped };
 }
 
 export interface TraceRefs {
@@ -158,6 +237,14 @@ export interface TraceRefs {
   budgeted_count?: number;
   /** Candidates rejected for a named reason. */
   excluded_count?: number;
+  /** Graph node count. */
+  node_count?: number;
+  /** Graph edge count. */
+  edge_count?: number;
+  /** PPR iterations. */
+  iteration_count?: number;
+  /** Trail step count. */
+  step_count?: number;
   /** Short scoring/processing stage code, never prose. */
   stage?: string;
 }
@@ -353,7 +440,8 @@ const REF_NUMBER_KEYS = [
 ] as const;
 const REF_NONNEGATIVE_KEYS = [
   'rank', 'score', 'count', 'raw_count', 'dedup_count', 'ranked_count',
-  'selected_count', 'budgeted_count', 'excluded_count',
+  'selected_count', 'budgeted_count', 'excluded_count', 'node_count',
+  'edge_count', 'iteration_count', 'step_count',
 ] as const;
 const TERMINAL_DECISIONS = new Set(['applied', 'noop', 'stale', 'conflict', 'rejected']);
 
@@ -987,16 +1075,30 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
   const retrievalEvents = events.filter((event) => event.stage === 'retrieval');
   if (retrievalEvents.length) {
     const exhaustive = trace.completeness === 'complete' && trace.droppedEvents === 0;
-    if (!exhaustive) {
-      checks.push('retrieval exhaustive accounting skipped: trace is sampled, truncated or interrupted');
+    const sampledCoverage = trace.completeness === 'sampled' && trace.droppedEvents === 0;
+    if (!exhaustive && !sampledCoverage) {
+      checks.push('retrieval exhaustive accounting skipped: trace is truncated, interrupted or has dropped events');
     } else {
+      if (sampledCoverage) {
+        checks.push('retrieval candidate detail is sampled; summary, citation, trail and PPR checks remain observable');
+      }
       const generated = new Map<string, TraceEventRecord[]>();
       const terminals = new Map<string, TraceEventRecord[]>();
       const summaries = new Map<string, TraceEventRecord>();
-      const generatedReasons = new Set(['fts', 'bank-linked', 'supplied', 'index', 'shortcut']);
-      const terminalReasons = new Set(['selected', 'duplicate', 'no-citation', 'passage-limit', 'source-filter', 'empty-index']);
+      const generatedReasons = new Set([
+        'fts', 'bank-linked', 'supplied', 'index', 'shortcut', 'ppr', 'graph-reference',
+        'dense-passage', 'fts-trail-source', 'package', 'graph',
+      ]);
+      const terminalReasons = new Set([
+        'selected', 'duplicate', 'no-citation', 'passage-limit', 'source-filter', 'empty-index',
+        'ppr-top-k', 'trail-cap',
+      ]);
       const searchReasons = new Set(['ok', 'empty', 'error']);
-      const completionReasons = new Set(['ok', 'empty', 'index-only', 'shortcut']);
+      const completionReasons = new Set(['ok', 'empty', 'index-only', 'shortcut', 'ppr-fallback']);
+      const budgetReasons = new Set([
+        'passage-limit', 'index-limit', 'seed-cap', 'graph-node-cap', 'graph-edge-cap',
+        'graph-word-budget', 'word-budget', 'trail-cap', 'ppr-top-k', 'dense-top-k',
+      ]);
       for (const event of retrievalEvents) {
         if (event.event === 'retrieval.summary' && event.subject) {
           summaries.set(event.subject, event);
@@ -1034,7 +1136,8 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
           }
         }
         if (event.event === 'retrieval.candidate.generated' && event.subject) {
-          generated.set(event.subject, [...(generated.get(event.subject) ?? []), event]);
+          const key = `${event.spanId ?? ''}:${event.refs.stage ?? ''}:${event.subject}`;
+          generated.set(key, [...(generated.get(key) ?? []), event]);
           if (!generatedReasons.has(event.reasonCode)) {
             violations.push({
               code: 'retrieval_candidate_reason',
@@ -1048,7 +1151,8 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
           ['selected', 'excluded', 'budgeted'].includes(event.decision) &&
           event.subject
         ) {
-          terminals.set(event.subject, [...(terminals.get(event.subject) ?? []), event]);
+          const key = `${event.spanId ?? ''}:${event.refs.stage ?? ''}:${event.subject}`;
+          terminals.set(key, [...(terminals.get(key) ?? []), event]);
           if (!terminalReasons.has(event.reasonCode)) {
             violations.push({
               code: 'retrieval_candidate_reason',
@@ -1073,7 +1177,7 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
         }
         if (event.event === 'retrieval.budget.cutoff') {
           const count = event.refs.count;
-          if (!['passage-limit', 'index-limit'].includes(event.reasonCode) ||
+          if (!budgetReasons.has(event.reasonCode) ||
               typeof count !== 'number' || count < 0) {
             violations.push({
               code: 'retrieval_budget_cutoff',
@@ -1090,29 +1194,31 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
           });
         }
       }
-      for (const [subject, list] of generated) {
-        const terminal = terminals.get(subject) ?? [];
-        if (!terminal.length) {
-          violations.push({
-            code: 'retrieval_candidate_missing_disposition',
-            detail: `candidate ${subject} has no terminal disposition`,
-          });
-        } else if (terminal.length > 1) {
-          violations.push({
-            code: 'retrieval_candidate_multiple_dispositions',
-            detail: `candidate ${subject} has ${terminal.length} terminal dispositions`,
-          });
+      if (exhaustive) {
+        for (const [subject, list] of generated) {
+          const terminal = terminals.get(subject) ?? [];
+          if (!terminal.length) {
+            violations.push({
+              code: 'retrieval_candidate_missing_disposition',
+              detail: `candidate ${subject} has no terminal disposition`,
+            });
+          } else if (terminal.length > 1) {
+            violations.push({
+              code: 'retrieval_candidate_multiple_dispositions',
+              detail: `candidate ${subject} has ${terminal.length} terminal dispositions`,
+            });
+          }
         }
       }
       for (const [subject, list] of terminals) {
-        if (!generated.has(subject)) {
+        if (exhaustive && !generated.has(subject)) {
           violations.push({
             code: 'retrieval_disposition_without_candidate',
             detail: `disposition ${subject} has no generated candidate`,
           });
         }
         for (const event of list) {
-          if (event.decision !== 'selected' || !subject.startsWith('chunk:')) continue;
+          if (event.decision !== 'selected' || !event.subject.startsWith('chunk:')) continue;
           const chunkId = Number(event.refs.chunk_id);
           if (!Number.isInteger(chunkId) || chunkId <= 0) {
             violations.push({
@@ -1144,14 +1250,57 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
           }
         }
       }
+      const trailByChunk = new Set(
+        retrievalEvents
+          .filter((event) => event.event === 'retrieval.trail.recorded')
+          .map((event) => event.subject),
+      );
+      for (const event of retrievalEvents) {
+        if (
+          event.event === 'retrieval.candidate.disposition' &&
+          event.decision === 'selected' &&
+          event.refs.stage === 'final-bank-rank' &&
+          !trailByChunk.has(event.subject)
+        ) {
+          violations.push({
+            code: 'retrieval_trail_missing',
+            eventId: event.id,
+            detail: `final selected trail ${event.subject} has no trail or word-only record`,
+          });
+        }
+      }
+      const pprCompleted = retrievalEvents.some((event) => event.event === 'retrieval.ppr.completed');
+      const pprFallback = retrievalEvents.some((event) => event.event === 'retrieval.ppr.fallback');
+      if (pprCompleted && pprFallback) {
+        violations.push({
+          code: 'retrieval_ppr_state',
+          detail: 'trace records both PPR completion and PPR fallback',
+        });
+      }
+      if (sampledCoverage) {
+        const coverage = retrievalEvents.find((event) => event.event === 'retrieval.coverage');
+        if (!coverage || coverage.reasonCode !== 'sampled') {
+          violations.push({
+            code: 'retrieval_coverage_missing',
+            detail: 'sampled retrieval trace has no sampled coverage marker',
+          });
+        }
+      }
       for (const event of retrievalEvents) {
         if (event.event !== 'retrieval.budget.cutoff') continue;
         const summarySubject = event.subject === 'budget:passages'
           ? 'search:fts'
-          : event.subject.startsWith('budget:index:')
-            ? `search:index:${event.subject.slice('budget:index:'.length)}`
-            : '';
-        const summary = summarySubject ? summaries.get(summarySubject) : undefined;
+          : event.subject === 'budget:passages:trail-source'
+            ? 'search:fts:trail-source'
+            : event.subject === 'budget:trails'
+              ? 'trails:final'
+              : event.subject === 'budget:package'
+                ? 'passages:package'
+                : event.subject.startsWith('budget:index:')
+                  ? `search:index:${event.subject.slice('budget:index:'.length)}`
+                  : '';
+        if (!summarySubject) continue;
+        const summary = summaries.get(summarySubject);
         if (!summary) {
           violations.push({
             code: 'retrieval_budget_summary_missing',
