@@ -2107,15 +2107,126 @@ interface SpanCheck {
 }
 
 /**
+ * Normalized text plus a map from each normalized character back to its raw
+ * source character. The transform matches `normalise`: lowercase, keep ASCII
+ * letters/digits/apostrophe, collapse everything else to one space, trim.
+ */
+function normalisedWithMap(raw: string): { text: string; starts: number[]; ends: number[] } {
+  let text = '';
+  const starts: number[] = [];
+  const ends: number[] = [];
+  let pendingSpace = false;
+  let pendingStart = 0;
+  for (let i = 0; i < raw.length; i++) {
+    const lowered = raw[i]!.toLowerCase();
+    const cleaned = lowered.replace(/[^a-z0-9' ]+/g, ' ');
+    for (const ch of cleaned) {
+      if (ch === ' ') {
+        if (text.length) {
+          pendingSpace = true;
+          pendingStart = i;
+        }
+        continue;
+      }
+      if (pendingSpace) {
+        text += ' ';
+        starts.push(pendingStart);
+        ends.push(pendingStart + 1);
+        pendingSpace = false;
+      }
+      text += ch;
+      starts.push(i);
+      ends.push(i + 1);
+    }
+  }
+  return { text, starts, ends };
+}
+
+const CANONICAL_BOUNDARY = new Set([
+  '"', "'", '\u2018', '\u2019', '\u201c', '\u201d', '\u00ab', '\u00bb',
+  '.', ',', ';', ':', '!', '?', '(', ')', '[', ']', '{', '}', '<', '>', '\u2026',
+]);
+
+interface CanonicalSpan {
+  quote: string;
+  start: number;
+  end: number;
+}
+
+/**
+ * Expand a raw match over immediately adjacent boundary punctuation/quote
+ * marks, but only while the normalized form still equals the evidence.
+ * Whitespace and word characters stop the expansion.
+ */
+function canonicalBoundarySpan(
+  raw: string,
+  start: number,
+  end: number,
+  needle: string,
+): CanonicalSpan | null {
+  let left = start;
+  let right = end;
+  while (left > 0 && CANONICAL_BOUNDARY.has(raw[left - 1]!)) {
+    const candidate = raw.slice(left - 1, right);
+    if (normalise(candidate) !== needle) break;
+    left--;
+  }
+  while (right < raw.length && CANONICAL_BOUNDARY.has(raw[right]!)) {
+    const candidate = raw.slice(left, right + 1);
+    if (normalise(candidate) !== needle) break;
+    right++;
+  }
+  const quote = raw.slice(left, right);
+  return normalise(quote) === needle ? { quote, start: left, end: right } : null;
+}
+
+/** Every distinct canonical raw span for one normalized needle in a chunk. */
+function canonicalSpans(raw: string, needle: string, exactText = ''): CanonicalSpan[] {
+  if (!needle) return [];
+  const map = normalisedWithMap(raw);
+  // A mapping mismatch would be an unsafe guess; fail closed.
+  if (map.text !== normalise(raw)) return [];
+  const occurrences: number[] = [];
+  let at = map.text.indexOf(needle);
+  while (at >= 0) {
+    occurrences.push(at);
+    at = map.text.indexOf(needle, at + 1);
+  }
+  if (!occurrences.length) return [];
+
+  // Exact raw substring fast path. Repeated exact text is the same evidence
+  // string, not a normalized-only guess; return its first canonical source
+  // span. Normalized variants that are not raw-exact still fall through to the
+  // ambiguity check below.
+  if (exactText && raw.includes(exactText)) {
+    const exactAt = raw.indexOf(exactText);
+    const exact = canonicalBoundarySpan(raw, exactAt, exactAt + exactText.length, needle);
+    if (exact) return [exact];
+  }
+
+  const spans = new Map<string, CanonicalSpan>();
+  for (const occurrence of occurrences) {
+    const start = map.starts[occurrence];
+    const end = map.ends[occurrence + needle.length - 1];
+    if (start === undefined || end === undefined) return [];
+    const span = canonicalBoundarySpan(raw, start, end, needle);
+    if (!span) return [];
+    spans.set(`${span.start}:${span.end}`, span);
+  }
+  return [...spans.values()];
+}
+
+/**
  * Check a claim's quote against the passage it cites and the passages around it.
  *
  * A quote that is in the cited passage is verified. A quote that is in a
  * neighbouring passage is repointed: the model read the right words and cited
- * the wrong window. A quote that appears nowhere is dropped, because an
- * unbacked claim in the index is worse than a missing one.
+ * the wrong window. A quote that appears nowhere, or is ambiguous, is dropped,
+ * because an unbacked claim in the index is worse than a missing one.
  *
- * Normalisation ignores case, punctuation and line breaks, so a quote copied
- * across a line wrap still verifies.
+ * Normalisation ignores case, punctuation and line breaks. When a normalized
+ * match is accepted, the stored quote is canonicalized to the actual contiguous
+ * raw source span, so later raw-exact consumers see source text.
  */
 export function verifySpan(
   raw: unknown,
@@ -2132,23 +2243,28 @@ export function verifySpan(
   const needle = normalise(text);
   if (!needle) return { ...cited, quote: '', status: 'dropped' };
 
-  const contains = (target: ChunkRow | undefined): boolean =>
-    !!target && normalise(target.text).includes(needle);
+  const citedSpans = canonicalSpans(chunk.text, needle, text);
+  if (citedSpans.length > 1) return { ...cited, quote: '', status: 'dropped' };
+  if (citedSpans.length === 1) {
+    return { ...cited, quote: citedSpans[0]!.quote, status: 'verified' };
+  }
 
-  if (contains(chunk)) return { ...cited, quote: text, status: 'verified' };
+  const neighbourMatches: { candidate: ChunkRow; span: CanonicalSpan }[] = [];
   for (const candidate of neighbours) {
     if (candidate.id === chunk.id) continue;
-    if (contains(candidate)) {
-      return {
-        quote: text,
-        chunkId: candidate.id,
-        source: candidate.source_title,
-        locator: candidate.locator,
-        status: 'repointed',
-      };
-    }
+    const spans = canonicalSpans(candidate.text, needle, text);
+    for (const span of spans) neighbourMatches.push({ candidate, span });
+    if (neighbourMatches.length > 1) return { ...cited, quote: '', status: 'dropped' };
   }
-  return { ...cited, quote: '', status: 'dropped' };
+  if (neighbourMatches.length !== 1) return { ...cited, quote: '', status: 'dropped' };
+  const match = neighbourMatches[0]!;
+  return {
+    quote: match.span.quote,
+    chunkId: match.candidate.id,
+    source: match.candidate.source_title,
+    locator: match.candidate.locator,
+    status: 'repointed',
+  };
 }
 
 /**
