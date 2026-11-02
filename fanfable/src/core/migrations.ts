@@ -733,6 +733,60 @@ export const MIGRATIONS: Migration[] = [
       ['canon_relation', 'relation_status', "TEXT NOT NULL DEFAULT 'unknown'"],
     ],
   },
+  {
+    version: 28,
+    name: 'durable extraction-run provenance',
+    // What each extraction run and window actually did. Additive only:
+    // proof, promotion and lore_mined remain authoritative. A window row is
+    // committed as the window finishes, so a crash leaves completed and
+    // partial windows visible instead of rolling them back.
+    sql: `
+      CREATE TABLE IF NOT EXISTS extraction_run (
+        id              INTEGER PRIMARY KEY,
+        project_id      INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        started_at      TEXT NOT NULL,
+        finished_at     TEXT,
+        provider        TEXT NOT NULL DEFAULT '',
+        model           TEXT NOT NULL DEFAULT '',
+        prompt_hash     TEXT NOT NULL DEFAULT '',
+        seed            INTEGER,
+        window_size     INTEGER NOT NULL DEFAULT 0,
+        max_tokens      INTEGER NOT NULL DEFAULT 0,
+        status          TEXT NOT NULL DEFAULT 'running',  -- running | completed | partial | failed
+        windows_total   INTEGER NOT NULL DEFAULT 0,
+        windows_complete INTEGER NOT NULL DEFAULT 0,
+        windows_partial INTEGER NOT NULL DEFAULT 0,
+        windows_failed  INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS extraction_run_project
+        ON extraction_run(project_id, id);
+
+      CREATE TABLE IF NOT EXISTS extraction_window_run (
+        id              INTEGER PRIMARY KEY,
+        run_id          INTEGER NOT NULL REFERENCES extraction_run(id) ON DELETE CASCADE,
+        project_id      INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        window_index    INTEGER NOT NULL,
+        locator         TEXT NOT NULL DEFAULT '',
+        state           TEXT NOT NULL,                    -- complete | partial | failed
+        sections        TEXT NOT NULL DEFAULT '[]',       -- JSON ExtractionSectionReport[]
+        failed_sections TEXT NOT NULL DEFAULT '[]',       -- JSON section names
+        wrote_entities  INTEGER NOT NULL DEFAULT 0,
+        wrote_facts     INTEGER NOT NULL DEFAULT 0,
+        wrote_relations INTEGER NOT NULL DEFAULT 0,
+        wrote_timeline  INTEGER NOT NULL DEFAULT 0,
+        error           TEXT NOT NULL DEFAULT '',
+        chunk_ids       TEXT NOT NULL DEFAULT '[]',       -- JSON chunk ids
+        started_at      TEXT NOT NULL,
+        finished_at     TEXT
+      );
+      CREATE INDEX IF NOT EXISTS extraction_window_run_run
+        ON extraction_window_run(run_id);
+      -- One provenance row per window per run: a retry is a new run, so this
+      -- is idempotent within a run without collapsing runs across retries.
+      CREATE UNIQUE INDEX IF NOT EXISTS extraction_window_run_window
+        ON extraction_window_run(run_id, window_index);
+    `,
+  },
 ];
 
 /**

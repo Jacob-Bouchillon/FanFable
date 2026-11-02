@@ -11,6 +11,7 @@
  * than in a wall of retrieved text.
  */
 import { Db, fromJson, nowIso, strList, toJson } from './core/db.ts';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -513,6 +514,40 @@ export interface WindowIssueReport {
   detail: string;
 }
 
+export type ExtractionRunStatus = 'running' | 'completed' | 'partial' | 'failed';
+
+/** A durable run that is not complete, with its retryable windows. */
+export interface UnfinishedExtractionRun {
+  runId: number;
+  projectId: number;
+  status: ExtractionRunStatus;
+  startedAt: string;
+  finishedAt: string | null;
+  windowsTotal: number;
+  windowsComplete: number;
+  windowsPartial: number;
+  windowsFailed: number;
+  /** Planned windows with no provenance row (for example after a crash). */
+  missingWindows: number;
+  /** Recorded windows whose state is partial or failed. */
+  retryableWindows: Array<{ windowIndex: number; locator: string; state: 'partial' | 'failed' }>;
+}
+
+/** How a mined chunk's completion is known, or that it predates provenance. */
+export interface MinedChunkProvenance {
+  chunkId: number;
+  locator: string;
+  state: 'legacy-unknown' | 'complete' | 'partial' | 'failed';
+}
+
+interface WindowOutcome {
+  state: 'complete' | 'partial' | 'failed';
+  sections: Array<{ section: string; state: 'succeeded' | 'failed' | 'skipped'; wrote: number; error?: string }>;
+  failedSections: string[];
+  wrote: { entities: number; facts: number; relations: number; timeline: number };
+  error: string;
+}
+
 /** A pair that looks like one thing under two names but was not merged. */
 export interface QuarantinedAlias {
   name: string;
@@ -784,6 +819,7 @@ export async function extractLore(
   opts: ExtractOptions = {},
 ): Promise<ExtractLoreResult> {
   const windowSize = opts.windowSize ?? 8;
+  const maxTokens = opts.maxTokens ?? 3000;
   const chunks = loadOrderedChunks(db, projectId, opts.sourceId);
   const stats = blankResult();
   if (!chunks.length) return stats;
@@ -923,17 +959,34 @@ export async function extractLore(
     };
   }
 
-  await runWindowBatch(db, llm, projectId, runList, ctx, entityIdByName, stats, {
-    concurrency: Math.max(1, Math.min(opts.concurrency ?? 3, 4)),
-    maxTokens: opts.maxTokens ?? 3000,
-    singlePrompt: opts.singlePrompt === true,
+  const runId = startExtractionRun(db, projectId, runList.length, {
+    provider: llm.settings.provider,
+    model: llm.settings.model,
+    seed: opts.seed ?? null,
     windowSize,
-    totalChunks: chunks.length,
-    onProgress: opts.onProgress,
-    onWindow: opts.onWindow,
-    roster,
-    index: nameIndex,
+    maxTokens,
+    singlePrompt: opts.singlePrompt === true,
   });
+  let aborted = false;
+  try {
+    await runWindowBatch(db, llm, projectId, runList, ctx, entityIdByName, stats, {
+      concurrency: Math.max(1, Math.min(opts.concurrency ?? 3, 4)),
+      maxTokens,
+      singlePrompt: opts.singlePrompt === true,
+      windowSize,
+      totalChunks: chunks.length,
+      runId,
+      onProgress: opts.onProgress,
+      onWindow: opts.onWindow,
+      roster,
+      index: nameIndex,
+    });
+  } catch (err) {
+    aborted = true;
+    throw err;
+  } finally {
+    finalizeExtractionRun(db, runId, runList.length, aborted);
+  }
 
   // Fold any duplicates left by earlier runs into one row per pair.
   dedupeRelations(db, projectId);
@@ -1117,6 +1170,7 @@ export async function ensureWindowsForChunks(
   if (!wanted.size) return stats;
 
   const windowSize = opts.windowSize ?? 8;
+  const maxTokens = opts.maxTokens ?? 3000;
   const chunks = loadOrderedChunks(db, projectId, opts.sourceId);
   if (!chunks.length) return stats;
   const mined = loadMinedSet(db, projectId);
@@ -1133,17 +1187,34 @@ export async function ensureWindowsForChunks(
   const ctx = loadChunkContext(db, projectId);
   const roster = buildNameRoster(db, projectId, chunks);
   const nameIndex = commandRosterIndex(db, projectId);
-  await runWindowBatch(db, llm, projectId, targets, ctx, new Map<string, number>(), stats, {
-    concurrency: Math.max(1, Math.min(opts.concurrency ?? 3, 4)),
-    maxTokens: opts.maxTokens ?? 3000,
-    singlePrompt: opts.singlePrompt === true,
+  const runId = startExtractionRun(db, projectId, targets.length, {
+    provider: llm.settings.provider,
+    model: llm.settings.model,
+    seed: null,
     windowSize,
-    totalChunks: chunks.length,
-    onProgress: opts.onProgress,
-    onWindow: opts.onWindow,
-    roster,
-    index: nameIndex,
+    maxTokens,
+    singlePrompt: opts.singlePrompt === true,
   });
+  let aborted = false;
+  try {
+    await runWindowBatch(db, llm, projectId, targets, ctx, new Map<string, number>(), stats, {
+      concurrency: Math.max(1, Math.min(opts.concurrency ?? 3, 4)),
+      maxTokens,
+      singlePrompt: opts.singlePrompt === true,
+      windowSize,
+      totalChunks: chunks.length,
+      runId,
+      onProgress: opts.onProgress,
+      onWindow: opts.onWindow,
+      roster,
+      index: nameIndex,
+    });
+  } catch (err) {
+    aborted = true;
+    throw err;
+  } finally {
+    finalizeExtractionRun(db, runId, targets.length, aborted);
+  }
 
   dedupeRelations(db, projectId);
   const contested = markContestedClaims(db, projectId);
@@ -1223,6 +1294,215 @@ function blankResult(): ExtractLoreResult {
   };
 }
 
+/** Stable hash of the extraction prompts and knobs. No provider secrets. */
+function extractionPromptHash(singlePrompt: boolean, windowSize: number, maxTokens: number): string {
+  const prompts = singlePrompt
+    ? [EXTRACT_SYSTEM]
+    : [EXTRACT_ENTITIES_SYSTEM, relationsSystemPrompt(), EXTRACT_EVENTS_SYSTEM];
+  return createHash('sha256')
+    .update(
+      JSON.stringify({
+        kind: 'fanfable-extraction',
+        version: 1,
+        singlePrompt,
+        windowSize,
+        maxTokens,
+        strictRelations: strictRelationsEnabled(),
+        relationRoster: process.env.FANFABLE_REL_ROSTER === '1',
+        prompts,
+      }),
+    )
+    .digest('hex');
+}
+
+/** Insert the durable run row. Autocommit: it survives a later crash. */
+function startExtractionRun(
+  db: Db,
+  projectId: number,
+  plannedTotal: number,
+  config: { provider: string; model: string; seed: number | null; windowSize: number; maxTokens: number; singlePrompt: boolean },
+): number {
+  return db.run(
+    `INSERT INTO extraction_run
+       (project_id, started_at, provider, model, prompt_hash, seed, window_size, max_tokens,
+        status, windows_total, windows_complete, windows_partial, windows_failed)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, 0, 0, 0)`,
+    projectId,
+    nowIso(),
+    config.provider,
+    config.model,
+    extractionPromptHash(config.singlePrompt, config.windowSize, config.maxTokens),
+    config.seed,
+    config.windowSize,
+    config.maxTokens,
+    plannedTotal,
+  ).lastInsertRowid;
+}
+
+/** Commit one window's outcome as soon as the window finishes. */
+function recordExtractionWindow(
+  db: Db,
+  runId: number,
+  projectId: number,
+  window: ChunkRow[],
+  index: number,
+  outcome: WindowOutcome,
+  startedAt: string,
+  finishedAt: string,
+): void {
+  db.run(
+    `INSERT OR REPLACE INTO extraction_window_run
+       (run_id, project_id, window_index, locator, state, sections, failed_sections,
+        wrote_entities, wrote_facts, wrote_relations, wrote_timeline, error, chunk_ids,
+        started_at, finished_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    runId,
+    projectId,
+    index,
+    window[0]?.locator ?? '',
+    outcome.state,
+    toJson(outcome.sections),
+    toJson(outcome.failedSections),
+    outcome.wrote.entities,
+    outcome.wrote.facts,
+    outcome.wrote.relations,
+    outcome.wrote.timeline,
+    outcome.error,
+    toJson(window.map((chunk) => chunk.id)),
+    startedAt,
+    finishedAt,
+  );
+}
+
+/** Finalize counts and status from the committed window rows. */
+function finalizeExtractionRun(db: Db, runId: number, plannedTotal: number, aborted: boolean): void {
+  const counts = db.get<{ complete: number; partial: number; failed: number }>(
+    `SELECT
+       COALESCE(SUM(CASE WHEN state = 'complete' THEN 1 ELSE 0 END), 0) AS complete,
+       COALESCE(SUM(CASE WHEN state = 'partial'  THEN 1 ELSE 0 END), 0) AS partial,
+       COALESCE(SUM(CASE WHEN state = 'failed'   THEN 1 ELSE 0 END), 0) AS failed
+     FROM extraction_window_run WHERE run_id = ?`,
+    runId,
+  );
+  const complete = Number(counts?.complete ?? 0);
+  const partial = Number(counts?.partial ?? 0);
+  const failed = Number(counts?.failed ?? 0);
+  const recorded = complete + partial + failed;
+  let status: ExtractionRunStatus;
+  if (aborted) status = 'failed';
+  else if (plannedTotal === 0) status = 'completed';
+  else if (recorded < plannedTotal) status = complete > 0 || partial > 0 ? 'partial' : 'failed';
+  else if (complete === plannedTotal) status = 'completed';
+  else if (complete === 0 && partial === 0) status = 'failed';
+  else status = 'partial';
+  db.run(
+    `UPDATE extraction_run
+        SET finished_at = ?, status = ?, windows_total = ?,
+            windows_complete = ?, windows_partial = ?, windows_failed = ?
+      WHERE id = ?`,
+    nowIso(),
+    status,
+    plannedTotal,
+    complete,
+    partial,
+    failed,
+    runId,
+  );
+}
+
+/** Read-only: runs that are still running or have retryable windows. */
+export function unfinishedExtractionRuns(db: Db, projectId?: number): UnfinishedExtractionRun[] {
+  const runs = db.all<{
+    id: number;
+    project_id: number;
+    status: string;
+    started_at: string;
+    finished_at: string | null;
+    windows_total: number;
+    windows_complete: number;
+    windows_partial: number;
+    windows_failed: number;
+  }>(
+    `SELECT id, project_id, status, started_at, finished_at,
+            windows_total, windows_complete, windows_partial, windows_failed
+       FROM extraction_run
+      ${projectId === undefined ? '' : 'WHERE project_id = ?'}
+      ORDER BY id`,
+    ...(projectId === undefined ? [] : [projectId]),
+  );
+  const out: UnfinishedExtractionRun[] = [];
+  for (const run of runs) {
+    const windows = db.all<{ window_index: number; locator: string; state: 'complete' | 'partial' | 'failed' }>(
+      'SELECT window_index, locator, state FROM extraction_window_run WHERE run_id = ? ORDER BY window_index',
+      run.id,
+    );
+    const missingWindows = Math.max(0, run.windows_total - windows.length);
+    // Rows are authoritative for a running/crashed run; the run's counters
+    // are only finalized at the end.
+    const complete = windows.filter((w) => w.state === 'complete').length;
+    const partial = windows.filter((w) => w.state === 'partial').length;
+    const failed = windows.filter((w) => w.state === 'failed').length;
+    const unfinished =
+      run.status === 'running' ||
+      run.status === 'partial' ||
+      run.status === 'failed' ||
+      !run.finished_at ||
+      missingWindows > 0;
+    if (!unfinished) continue;
+    out.push({
+      runId: run.id,
+      projectId: run.project_id,
+      status: run.status as ExtractionRunStatus,
+      startedAt: run.started_at,
+      finishedAt: run.finished_at,
+      windowsTotal: run.windows_total,
+      windowsComplete: complete,
+      windowsPartial: partial,
+      windowsFailed: failed,
+      missingWindows,
+      retryableWindows: windows.flatMap((w) =>
+        w.state === 'partial' || w.state === 'failed'
+          ? [{ windowIndex: w.window_index, locator: w.locator, state: w.state }]
+          : [],
+      ),
+    });
+  }
+  return out;
+}
+
+/** Read-only: how each mined chunk's completion is known. Mined chunks with
+ * no window provenance are `legacy-unknown`, never presented as complete. */
+export function minedChunkProvenance(db: Db, projectId: number): MinedChunkProvenance[] {
+  const windows = db.all<{ chunk_ids: string; state: string }>(
+    `SELECT w.chunk_ids, w.state
+       FROM extraction_window_run w
+       JOIN extraction_run r ON r.id = w.run_id
+      WHERE w.project_id = ?
+      ORDER BY r.id, w.id`,
+    projectId,
+  );
+  const byChunk = new Map<number, 'complete' | 'partial' | 'failed'>();
+  for (const window of windows) {
+    const state: 'complete' | 'partial' | 'failed' =
+      window.state === 'complete' || window.state === 'partial' || window.state === 'failed'
+        ? window.state
+        : 'failed';
+    for (const id of fromJson<number[]>(window.chunk_ids, [])) {
+      if (Number.isFinite(id)) byChunk.set(id, state);
+    }
+  }
+  return db
+    .all<{ id: number; locator: string }>(
+      'SELECT id, locator FROM canon_chunk WHERE project_id = ? AND lore_mined = 1 ORDER BY seq, id',
+      projectId,
+    )
+    .map((chunk) => ({
+      chunkId: chunk.id,
+      locator: chunk.locator,
+      state: byChunk.get(chunk.id) ?? 'legacy-unknown',
+    }));
+}
+
 /** Every passage of a project (or one source), in window order. */
 function loadOrderedChunks(db: Db, projectId: number, sourceId?: number): ChunkRow[] {
   const params: unknown[] = [projectId];
@@ -1295,6 +1575,8 @@ interface RunBatchOpts {
   singlePrompt: boolean;
   windowSize: number;
   totalChunks: number;
+  /** Durable extraction-run row for this batch. */
+  runId: number;
   onProgress?: (message: string) => void;
   onWindow?: (progress: ExtractWindowProgress) => void;
   /** Book-wide capitalization roster, built once per extraction. */
@@ -1321,40 +1603,53 @@ async function runWindowBatch(
       group.map(async ({ window, index }) => {
         const emptyBefore = stats.emptyWindows.length;
         const issuesBefore = stats.windowIssues.length;
+        const windowStartedAt = nowIso();
+        let outcome: WindowOutcome;
         try {
-          if (batch.singlePrompt) {
-            await extractWindowLegacy(db, llm, projectId, window, entityIdByName, stats, ctx.neighboursOf, batch.maxTokens, batch.index);
-          } else {
-            await extractWindowSplit(
-              db,
-              llm,
-              projectId,
-              window,
-              entityIdByName,
-              stats,
-              ctx.neighboursOf,
-              batch.maxTokens,
-              index,
-              batch.roster,
-              batch.index,
-            );
-          }
+          outcome = batch.singlePrompt
+            ? await extractWindowLegacy(db, llm, projectId, window, entityIdByName, stats, ctx.neighboursOf, batch.maxTokens, batch.index)
+            : await extractWindowSplit(
+                db,
+                llm,
+                projectId,
+                window,
+                entityIdByName,
+                stats,
+                ctx.neighboursOf,
+                batch.maxTokens,
+                index,
+                batch.roster,
+                batch.index,
+              );
         } catch (err) {
           // One bad window must not abort the run, but it must not be silent.
+          const detail = err instanceof Error ? err.message : String(err);
           stats.emptyWindows.push({
             index,
             locator: window[0]?.locator ?? '',
             reason: 'error',
-            detail: err instanceof Error ? err.message : String(err),
+            detail,
           });
+          outcome = {
+            state: 'failed',
+            sections: batch.singlePrompt
+              ? [{ section: 'legacy', state: 'failed', wrote: 0, error: detail }]
+              : [],
+            failedSections: batch.singlePrompt ? ['legacy'] : [],
+            wrote: { entities: 0, facts: 0, relations: 0, timeline: 0 },
+            error: detail,
+          };
         }
+        // Durable provenance is written per window, not in a run-wide
+        // transaction: a later crash must leave this row behind.
+        recordExtractionWindow(db, batch.runId, projectId, window, index, outcome, windowStartedAt, nowIso());
         // Any empty-window or partial/failed-window record for this index
         // means the window is not complete. It must stay unmined so a later
         // pass can retry it instead of trusting a silent or half-written gap.
         const incomplete =
           stats.emptyWindows.slice(emptyBefore).some((e) => e.index === index) ||
           stats.windowIssues.slice(issuesBefore).some((w) => w.index === index);
-        if (!incomplete) {
+        if (outcome.state === 'complete' && !incomplete) {
           for (const c of window) db.run('UPDATE canon_chunk SET lore_mined = 1 WHERE id = ?', c.id);
         }
         // Feed the evidence web from this window. Additive and fenced off: a
@@ -4459,7 +4754,7 @@ async function extractWindowLegacy(
   neighboursOf: (id: number | undefined) => ChunkRow[] = () => [],
   maxTokens = 3000,
   nameIndex?: RosterIndex,
-): Promise<void> {
+): Promise<WindowOutcome> {
   let parsed: {
     entities: Record<string, unknown>[];
     relations: Record<string, unknown>[];
@@ -4480,11 +4775,29 @@ async function extractWindowLegacy(
     throw err;
   }
 
-  applyEntities(db, projectId, parsed.entities, window, entityIdByName, stats, neighboursOf, false);
-  applyRelations(db, projectId, parsed.relations, window, entityIdByName, stats, neighboursOf, false, nameIndex);
-  applyFacts(db, projectId, parsed.facts, window, stats, neighboursOf, false);
-  applyTimeline(db, projectId, parsed.timeline, window, stats, neighboursOf, false);
+  const wroteEntities = applyEntities(db, projectId, parsed.entities, window, entityIdByName, stats, neighboursOf, false);
+  const wroteRelations = applyRelations(db, projectId, parsed.relations, window, entityIdByName, stats, neighboursOf, false, nameIndex);
+  const wroteFacts = applyFacts(db, projectId, parsed.facts, window, stats, neighboursOf, false);
+  const wroteTimeline = applyTimeline(db, projectId, parsed.timeline, window, stats, neighboursOf, false);
   stats.passages += window.length;
+  return {
+    state: 'complete',
+    sections: [
+      {
+        section: 'legacy',
+        state: 'succeeded',
+        wrote: wroteEntities + wroteFacts + wroteRelations + wroteTimeline,
+      },
+    ],
+    failedSections: [],
+    wrote: {
+      entities: wroteEntities,
+      facts: wroteFacts,
+      relations: wroteRelations,
+      timeline: wroteTimeline,
+    },
+    error: '',
+  };
 }
 
 /**
@@ -4504,7 +4817,7 @@ async function extractWindowSplit(
   index: number,
   roster?: NameRoster,
   nameIndex?: RosterIndex,
-): Promise<void> {
+): Promise<WindowOutcome> {
   const passages = passageBlock(window);
   const answers: string[] = [];
   const sections: ExtractionSectionReport[] = [];
@@ -4592,6 +4905,18 @@ async function extractWindowSplit(
   // windows are explicit so the batch can leave their chunks retryable.
   const windowState: 'complete' | 'partial' | 'failed' =
     failures.length === 0 ? 'complete' : accepted > 0 ? 'partial' : 'failed';
+  const outcome: WindowOutcome = {
+    state: windowState,
+    sections,
+    failedSections: failures.map((f) => f.section),
+    wrote: {
+      entities: wroteEntities,
+      facts: wroteFacts,
+      relations: wroteRelations,
+      timeline: wroteTimeline,
+    },
+    error: failures.map((f) => `${f.section}: ${f.error}`).join('; '),
+  };
   if (windowState !== 'complete') {
     stats.windowIssues.push({
       index,
@@ -4600,16 +4925,11 @@ async function extractWindowSplit(
       sections,
       failedSections: failures.map((f) => f.section),
       succeededSections: sections.filter((s) => s.state === 'succeeded').map((s) => s.section),
-      wrote: {
-        entities: wroteEntities,
-        facts: wroteFacts,
-        relations: wroteRelations,
-        timeline: wroteTimeline,
-      },
-      detail: failures.map((f) => `${f.section}: ${f.error}`).join('; '),
+      wrote: outcome.wrote,
+      detail: outcome.error,
     });
   }
-  if (accepted > 0) return;
+  if (accepted > 0) return outcome;
 
   // A window that wrote nothing must say why. A well-formed answer with empty
   // arrays is an empty window, not a truncation: only an answer that carries
@@ -4633,6 +4953,7 @@ async function extractWindowSplit(
       ? `failed sections: ${failures.map((f) => `${f.section} (${f.error})`).join('; ')}`
       : `parsed ${parsedClaims} claims, wrote 0 rows`,
   });
+  return outcome;
 }
 
 /** Is an extraction answer well-formed but empty (all arrays empty)? */

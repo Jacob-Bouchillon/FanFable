@@ -722,7 +722,7 @@ test('a changed resolution appends and marks the earlier one superseded', () => 
 
 test('migration 21 is additive on a v20 database and reruns as a no-op', () => {
   const { db } = tempDb();
-  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')!.user_version, 27);
+  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')!.user_version, 28);
   for (const table of ['canon_meeting', 'canon_meeting_exchange', 'canon_meeting_resolution', 'canon_birth', 'canon_thread_note_ref']) {
     assert.ok(tableExists(db.raw, table), `fresh bank has ${table}`);
   }
@@ -761,7 +761,7 @@ test('migration 21 is additive on a v20 database and reruns as a no-op', () => {
   db.raw.exec('PRAGMA foreign_keys = ON');
   assert.equal(tableExists(db.raw, 'canon_meeting'), false);
 
-  assert.equal(runMigrations(db.raw), 27);
+  assert.equal(runMigrations(db.raw), 28);
   for (const table of ['canon_meeting', 'canon_meeting_exchange', 'canon_meeting_resolution', 'canon_birth', 'canon_thread_note_ref']) {
     assert.ok(tableExists(db.raw, table), `${table} is recreated additively`);
   }
@@ -775,7 +775,7 @@ test('migration 21 is additive on a v20 database and reruns as a no-op', () => {
   );
   assert.ok(db.get<{ id: number }>('SELECT id FROM canon_entity WHERE id = ?', mara));
   assert.ok(db.get<{ id: number }>('SELECT id FROM canon_entity WHERE id = ?', corin));
-  assert.equal(runMigrations(db.raw), 27, 'second run stays at 25');
+  assert.equal(runMigrations(db.raw), 28, 'second run stays at the current version');
   db.close();
 });
 

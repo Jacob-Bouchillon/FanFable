@@ -53,11 +53,11 @@ function finder(sentence: string) {
 
 test('fresh DB is v15 with the supporting column, and rerunning is a no-op', () => {
   const { db } = tempDb();
-  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')!.user_version, 27);
+  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')!.user_version, 28);
   const columns = db.all<{ name: string }>('PRAGMA table_info(canon_relation)').map((row) => row.name);
   assert.ok(columns.includes('supporting_evidence'));
-  assert.equal(runMigrations(db.raw), 27);
-  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')!.user_version, 27);
+  assert.equal(runMigrations(db.raw), 28);
+  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')!.user_version, 28);
   db.close();
 });
 
