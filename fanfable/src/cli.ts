@@ -796,7 +796,7 @@ async function cmdLore(args: Args): Promise<void> {
     const counts = noteIngest.backfillThreadNotes(db, project.id, { dryRun });
     console.log(
       `notes ${counts.notes} (pair ${counts.pairNotes}, identity ${counts.identityNotes}, ` +
-        `context ${counts.contextNotes}); open ends ${counts.openEnds}`,
+        `context ${counts.contextNotes}); deduplicated ${counts.deduplicated}; open ends ${counts.openEnds}`,
     );
     console.log(
       `strength source: assessed ${counts.strengthSource.assessed}, derived ${counts.strengthSource.derived}, ` +
@@ -811,6 +811,7 @@ async function cmdLore(args: Args): Promise<void> {
     console.log(
       `skipped: ${skipped.length ? skipped.map(([reason, n]) => `${reason} ${n}`).join(', ') : 'none'}`,
     );
+    if (counts.traceId) console.log(`trace ${counts.traceId}`);
     if (dryRun) console.log(C.dim('dry run: nothing written. Re-run without --dry-run to store the notes.'));
     return;
   }
@@ -2691,6 +2692,15 @@ async function cmdTrace(args: Args, dbPath: string): Promise<void> {
         ? C.green('This trace is an exhaustive account of the events it contains.')
         : C.yellow('This trace is NOT an exhaustive account; events were sampled, dropped or interrupted.'),
     );
+    if (audit.noteAccounting) {
+      const accounting = audit.noteAccounting;
+      console.log(
+        `note accounting: generated ${accounting.generated} = ` +
+          `admitted ${accounting.admitted} + deduplicated ${accounting.deduplicated} + ` +
+          `rejected ${accounting.rejected} + parked ${accounting.parked} ` +
+          `(${accounting.verified ? 'verified' : 'not verified'})`,
+      );
+    }
     console.log(`\n${C.bold('Provable violations')}: ${audit.violations.length}`);
     for (const item of audit.violations) {
       const event = item.eventId === undefined ? '' : ` event #${item.eventId}`;

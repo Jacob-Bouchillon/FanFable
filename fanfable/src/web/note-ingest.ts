@@ -19,6 +19,7 @@ import { Db, fromJson, nowIso } from '../core/db.ts';
 import { pickPeriodThread } from './threads.ts';
 import { isClosedRoleKind, projectMinConfidence, storedAssessment } from '../lorebook.ts';
 import { recordRuling } from '../court/ruling.ts';
+import { finishTrace, recordTraceEvent, startTrace, type TraceRefs } from '../trace/trace.ts';
 
 /** Why a candidate note was not written. */
 export type SkipReason =
@@ -41,6 +42,48 @@ export type StrengthSource = 'assessed' | 'derived' | 'context' | 'default';
 /** A relation kind that asserts nothing about two people. */
 const VERB_KINDS: ReadonlySet<string> = new Set(['', 'was', 'had', 'is', 'has']);
 
+export const NOTE_TRACE_STAGE = 'note.formation';
+export const NOTE_EVENT_GENERATED = 'note.candidate.generated';
+export const NOTE_EVENT_DISPOSITION = 'note.candidate.disposition';
+export const NOTE_EVENT_THREAD = 'note.thread.assigned';
+export const NOTE_EVENT_ADMITTED = 'note.admitted';
+
+interface NoteTrace {
+  traceId: string;
+}
+
+interface CandidateTrace {
+  subject: string;
+  refs: TraceRefs;
+  disposed: boolean;
+}
+
+type NoteWriteReason =
+  | 'inserted'
+  | 'dedupe-key-match'
+  | 'not-verbatim'
+  | 'empty-claim'
+  | 'no-assertable-claim'
+  | 'no-identity-evidence';
+
+interface NoteWriteOutcome {
+  noteId: number | null;
+  inserted: boolean;
+  deduplicated: boolean;
+  reason: NoteWriteReason;
+}
+
+interface ThreadAssignment {
+  threadId: number;
+  decision: 'created' | 'reused' | 'period-selected';
+  periodLabel?: string;
+}
+
+interface OpenEndResult {
+  created: boolean;
+  id: number | null;
+}
+
 export interface IngestCounts {
   /** Notes actually written (or, on a dry run, that would be written). */
   notes: number;
@@ -55,6 +98,10 @@ export interface IngestCounts {
   strengthBands: { '0.0-0.2': number; '0.2-0.5': number; '0.5-0.8': number; '0.8-1.0': number };
   /** Notes that recorded which concept they asserted. */
   claimKinds: Record<string, number>;
+  /** Repeat candidates that matched an existing note key. */
+  deduplicated: number;
+  /** The trace for this run, or null on a dry run / empty extraction window. */
+  traceId: string | null;
   /** True when nothing was inserted. */
   dryRun: boolean;
 }
@@ -81,6 +128,8 @@ export function blankIngestCounts(dryRun = false): IngestCounts {
     strengthSource: { assessed: 0, derived: 0, context: 0, default: 0 },
     strengthBands: { '0.0-0.2': 0, '0.2-0.5': 0, '0.5-0.8': 0, '0.8-1.0': 0 },
     claimKinds: {},
+    deduplicated: 0,
+    traceId: null,
     dryRun,
   };
 }
@@ -218,6 +267,119 @@ interface NoteInput {
   claimKind?: string;
   /** The relation this note came from, when it came from one. */
   relationId?: number | null;
+  /** The entity this identity note came from, when it came from one. */
+  entityId?: number;
+}
+
+function candidateGenerated(
+  db: Db,
+  projectId: number,
+  trace: NoteTrace | null,
+  subject: string,
+  reason: string,
+  refs: TraceRefs,
+): CandidateTrace | null {
+  if (!trace) return null;
+  recordTraceEvent(db, {
+    traceId: trace.traceId,
+    spanId: subject,
+    projectId,
+    stage: NOTE_TRACE_STAGE,
+    event: NOTE_EVENT_GENERATED,
+    eventClass: 'diagnostic',
+    subject,
+    decision: 'candidate',
+    reasonCode: reason,
+    refs,
+    committed: false,
+  });
+  return { subject, refs, disposed: false };
+}
+
+function threadAssigned(
+  db: Db,
+  projectId: number,
+  trace: NoteTrace | null,
+  candidate: CandidateTrace | null,
+  assignment: ThreadAssignment,
+  refs: TraceRefs = {},
+): void {
+  if (!trace || !candidate) return;
+  recordTraceEvent(db, {
+    traceId: trace.traceId,
+    spanId: candidate.subject,
+    projectId,
+    stage: NOTE_TRACE_STAGE,
+    event: NOTE_EVENT_THREAD,
+    eventClass: 'diagnostic',
+    subject: candidate.subject,
+    decision: assignment.decision,
+    reasonCode: assignment.decision,
+    refs: {
+      ...candidate.refs,
+      ...refs,
+      thread_id: assignment.threadId,
+      ...(assignment.periodLabel ? { period_label: assignment.periodLabel } : {}),
+    },
+    committed: false,
+  });
+}
+
+function candidateDisposition(
+  db: Db,
+  projectId: number,
+  trace: NoteTrace | null,
+  candidate: CandidateTrace | null,
+  decision: 'admitted' | 'deduplicated' | 'rejected' | 'parked',
+  reason: string,
+  refs: TraceRefs = {},
+): void {
+  if (!trace || !candidate || candidate.disposed) return;
+  candidate.disposed = true;
+  recordTraceEvent(db, {
+    traceId: trace.traceId,
+    spanId: candidate.subject,
+    projectId,
+    stage: NOTE_TRACE_STAGE,
+    event: NOTE_EVENT_DISPOSITION,
+    eventClass: 'diagnostic',
+    subject: candidate.subject,
+    decision,
+    reasonCode: reason,
+    refs: { ...candidate.refs, ...refs },
+    committed: false,
+  });
+}
+
+function noteAdmitted(
+  db: Db,
+  projectId: number,
+  trace: NoteTrace | null,
+  candidate: CandidateTrace | null,
+  input: NoteInput,
+  noteId: number,
+): void {
+  if (!trace || !candidate) return;
+  recordTraceEvent(db, {
+    traceId: trace.traceId,
+    spanId: candidate.subject,
+    projectId,
+    stage: NOTE_TRACE_STAGE,
+    event: NOTE_EVENT_ADMITTED,
+    eventClass: 'required',
+    subject: `note:${noteId}`,
+    decision: 'applied',
+    reasonCode: 'inserted',
+    refs: {
+      candidate_id: candidate.subject,
+      note_id: noteId,
+      thread_id: input.threadId,
+      chunk_id: input.chunkId,
+      ...(input.relationId ? { relation_id: input.relationId } : {}),
+      ...(input.entityId ? { entity_id: input.entityId } : {}),
+    },
+    committed: true,
+  });
 }
 
 /**
@@ -226,18 +388,26 @@ interface NoteInput {
  * Insert-only, exactly as M1 made it: there is no update path, and the dedupe
  * key makes a repeat a no-op rather than a duplicate.
  */
-function writeNote(db: Db, projectId: number, input: NoteInput, counts: IngestCounts): number | null {
+function writeNote(
+  db: Db,
+  projectId: number,
+  input: NoteInput,
+  counts: IngestCounts,
+  trace: NoteTrace | null = null,
+  candidate: CandidateTrace | null = null,
+): NoteWriteOutcome {
   // The gate comes first: a quote that is not in its chunk never becomes a
   // note, whatever could have been said about it.
   const text = chunkText(db, projectId, input.chunkId);
   if (!isVerbatimInChunk(text, input.quote)) {
     counts.skipped['not-verbatim']++;
-    return null;
+    return { noteId: null, inserted: false, deduplicated: false, reason: 'not-verbatim' };
   }
   const claim = (input.claim ?? '').trim();
   if (!claim) {
-    counts.skipped[input.claimMiss ?? 'empty-claim']++;
-    return null;
+    const reason = input.claimMiss ?? 'empty-claim';
+    counts.skipped[reason]++;
+    return { noteId: null, inserted: false, deduplicated: false, reason };
   }
   const key = noteDedupeKey(input.quote, claim);
   const existing = db.get<{ id: number }>(
@@ -245,13 +415,21 @@ function writeNote(db: Db, projectId: number, input: NoteInput, counts: IngestCo
     input.threadId,
     key,
   );
-  if (existing) return existing.id;
+  if (existing) {
+    counts.deduplicated++;
+    return {
+      noteId: existing.id,
+      inserted: false,
+      deduplicated: true,
+      reason: 'dedupe-key-match',
+    };
+  }
   if (counts.dryRun) {
     counts.notes++;
     if (input.isContext) counts.contextNotes++;
     counts.strengthSource[input.strengthSource ?? 'default']++;
     counts.strengthBands[strengthBand(input.strength)]++;
-    return null;
+    return { noteId: null, inserted: true, deduplicated: false, reason: 'inserted' };
   }
   const id = Number(
     db.run(
@@ -291,7 +469,8 @@ function writeNote(db: Db, projectId: number, input: NoteInput, counts: IngestCo
     basis: `note ${id} quote verbatim in chunk ${input.chunkId}`,
     quote: input.quote,
   });
-  return id;
+  noteAdmitted(db, projectId, trace, candidate, input, id);
+  return { noteId: id, inserted: true, deduplicated: false, reason: 'inserted' };
 }
 
 /** Open-end dedupe is by thread and question, so a rerun adds nothing. */
@@ -303,26 +482,28 @@ function ensureOpenEnd(
   origin: string,
   wouldResolve: string,
   counts: IngestCounts,
-): boolean {
+): OpenEndResult {
   const existing = db.get<{ id: number }>(
     'SELECT id FROM canon_open_end WHERE thread_id = ? AND question = ?',
     threadId,
     question,
   );
-  if (existing) return false;
+  if (existing) return { created: false, id: existing.id };
   counts.openEnds++;
-  if (counts.dryRun) return true;
-  db.run(
-    `INSERT INTO canon_open_end (project_id, thread_id, question, origin, would_resolve, status, created_at)
-     VALUES (?, ?, ?, ?, ?, 'open', ?)`,
-    projectId,
-    threadId,
-    question,
-    origin,
-    wouldResolve,
-    nowIso(),
+  if (counts.dryRun) return { created: true, id: null };
+  const id = Number(
+    db.run(
+      `INSERT INTO canon_open_end (project_id, thread_id, question, origin, would_resolve, status, created_at)
+       VALUES (?, ?, ?, ?, ?, 'open', ?)`,
+      projectId,
+      threadId,
+      question,
+      origin,
+      wouldResolve,
+      nowIso(),
+    ).lastInsertRowid,
   );
-  return true;
+  return { created: true, id };
 }
 
 function pairThreadId(db: Db, projectId: number, a: number, b: number): number | null {
@@ -359,22 +540,30 @@ function personThreadId(db: Db, projectId: number, entityId: number): number | n
  * make, and its identity key keeps the two from racing into duplicates.
  * A dry run never writes, and reports the missing thread as a skip instead.
  */
-function ensurePersonThread(db: Db, projectId: number, entityId: number, counts: IngestCounts): number | null {
+function ensurePersonThread(
+  db: Db,
+  projectId: number,
+  entityId: number,
+  counts: IngestCounts,
+): ThreadAssignment | null {
   const found = personThreadId(db, projectId, entityId);
-  if (found !== null) return found;
+  if (found !== null) return { threadId: found, decision: 'reused' };
   if (counts.dryRun) return null;
   const at = nowIso();
-  return Number(
-    db.run(
-      `INSERT INTO canon_thread
-         (project_id, kind, a_entity, b_entity, pair_thread_id, status, birth_reason, created_at, updated_at)
-       VALUES (?, 'person', ?, NULL, NULL, 'open', '', ?, ?)`,
-      projectId,
-      entityId,
-      at,
-      at,
-    ).lastInsertRowid,
-  );
+  return {
+    threadId: Number(
+      db.run(
+        `INSERT INTO canon_thread
+           (project_id, kind, a_entity, b_entity, pair_thread_id, status, birth_reason, created_at, updated_at)
+         VALUES (?, 'person', ?, NULL, NULL, 'open', '', ?, ?)`,
+        projectId,
+        entityId,
+        at,
+        at,
+      ).lastInsertRowid,
+    ),
+    decision: 'created',
+  };
 }
 
 function ensurePairThread(
@@ -384,7 +573,7 @@ function ensurePairThread(
   b: number,
   seq: number | null,
   counts: IngestCounts,
-): number | null {
+): ThreadAssignment | null {
   const lo = Math.min(a, b);
   const hi = Math.max(a, b);
   const threads = db
@@ -405,7 +594,14 @@ function ensurePairThread(
   // One thread for the pair behaves exactly as before; several means the
   // passage decides which period of the pair the clue belongs to.
   const picked = pickPeriodThread(threads, seq);
-  if (picked !== null) return picked;
+  if (picked !== null) {
+    const selected = threads.find((thread) => thread.id === picked);
+    return {
+      threadId: picked,
+      decision: threads.length > 1 ? 'period-selected' : 'reused',
+      periodLabel: threads.length > 1 ? selected?.periodLabel ?? '' : undefined,
+    };
+  }
   if (counts.dryRun) return null;
   const structural =
     db.get<{ id: number }>(
@@ -415,22 +611,25 @@ function ensurePairThread(
       hi,
     )?.id ?? null;
   const at = nowIso();
-  return Number(
-    db.run(
-      `INSERT INTO canon_thread
-         (project_id, kind, a_entity, b_entity, pair_thread_id, status, birth_reason,
-          period_label, period_from_seq, period_to_seq, temporal_status, created_at, updated_at)
-       VALUES (?, 'pair', ?, ?, ?, 'open', '', '', ?, ?, 'unknown', ?, ?)`,
-      projectId,
-      lo,
-      hi,
-      structural,
-      seq,
-      seq,
-      at,
-      at,
-    ).lastInsertRowid,
-  );
+  return {
+    threadId: Number(
+      db.run(
+        `INSERT INTO canon_thread
+           (project_id, kind, a_entity, b_entity, pair_thread_id, status, birth_reason,
+            period_label, period_from_seq, period_to_seq, temporal_status, created_at, updated_at)
+         VALUES (?, 'pair', ?, ?, ?, 'open', '', '', ?, ?, 'unknown', ?, ?)`,
+        projectId,
+        lo,
+        hi,
+        structural,
+        seq,
+        seq,
+        at,
+        at,
+      ).lastInsertRowid,
+    ),
+    decision: 'created',
+  };
 }
 
 function threadLabel(db: Db, projectId: number, threadId: number): string {
@@ -552,7 +751,13 @@ export function deriveStrength(rel: RelationRow, quote: string): DerivedStrength
   return { strength: 0.2, strengthSource: 'context', isContext: true };
 }
 
-function ingestRelation(db: Db, projectId: number, rel: RelationRow, counts: IngestCounts): void {
+function ingestRelation(
+  db: Db,
+  projectId: number,
+  rel: RelationRow,
+  counts: IngestCounts,
+  trace: NoteTrace | null,
+): void {
   const chunkId = firstChunkId(rel.source_refs);
   const seq =
     chunkId === null
@@ -585,9 +790,29 @@ function ingestRelation(db: Db, projectId: number, rel: RelationRow, counts: Ing
             kind: rel.kind,
           }) || 'held for review'
         : '';
+
   /** File the same observation on one person's thread. */
-  const writeIdentity = (entityId: number, reason: string): void => {
-    if (!quote || chunkId === null) return;
+  const writeIdentity = (entityId: number, reason: 'non-person-endpoint' | 'verb-kind'): void => {
+    const candidate = candidateGenerated(
+      db,
+      projectId,
+      trace,
+      `relation:${rel.id}:identity:${entityId}`,
+      reason,
+      {
+        relation_id: rel.id,
+        entity_id: entityId,
+        ...(chunkId !== null ? { chunk_id: chunkId } : {}),
+      },
+    );
+    if (!quote) {
+      candidateDisposition(db, projectId, trace, candidate, 'rejected', 'no-quote');
+      return;
+    }
+    if (chunkId === null) {
+      candidateDisposition(db, projectId, trace, candidate, 'rejected', 'no-chunk');
+      return;
+    }
     const claim = assertableClaim({
       fromName: rel.from_name,
       toName: rel.to_name,
@@ -595,17 +820,22 @@ function ingestRelation(db: Db, projectId: number, rel: RelationRow, counts: Ing
       why,
       quote,
     });
-    const thread = ensurePersonThread(db, projectId, entityId, counts);
-    if (thread === null) {
+    const assignment = ensurePersonThread(db, projectId, entityId, counts);
+    if (assignment === null) {
       counts.skipped['no-thread']++;
+      candidateDisposition(db, projectId, trace, candidate, 'rejected', 'no-thread');
       return;
     }
+    threadAssigned(db, projectId, trace, candidate, assignment, {
+      entity_ids: [entityId],
+      ...(seq !== null ? { seq } : {}),
+    });
     const before = counts.notes;
-    writeNote(
+    const outcome = writeNote(
       db,
       projectId,
       {
-        threadId: thread,
+        threadId: assignment.threadId,
         chunkId,
         locator: firstLocator(rel.source_refs),
         quote,
@@ -619,10 +849,26 @@ function ingestRelation(db: Db, projectId: number, rel: RelationRow, counts: Ing
         strengthSource,
         claimKind: kindLower,
         relationId: rel.id,
+        entityId,
       },
       counts,
+      trace,
+      candidate,
     );
     if (counts.notes > before) counts.identityNotes++;
+    candidateDisposition(
+      db,
+      projectId,
+      trace,
+      candidate,
+      outcome.inserted ? 'admitted' : outcome.deduplicated ? 'deduplicated' : 'rejected',
+      outcome.reason,
+      {
+        thread_id: assignment.threadId,
+        chunk_id: chunkId,
+        ...(outcome.noteId !== null ? { note_id: outcome.noteId } : {}),
+      },
+    );
   };
 
   // Attribute routing: a species, faction or item is not a relationship
@@ -631,7 +877,19 @@ function ingestRelation(db: Db, projectId: number, rel: RelationRow, counts: Ing
   const toIsPerson = rel.to_kind === 'character';
   if (!fromIsPerson || !toIsPerson) {
     if (!fromIsPerson && !toIsPerson) {
+      const candidate = candidateGenerated(
+        db,
+        projectId,
+        trace,
+        `relation:${rel.id}:pair`,
+        'no-character-endpoint',
+        {
+          relation_id: rel.id,
+          ...(chunkId !== null ? { chunk_id: chunkId } : {}),
+        },
+      );
       counts.skipped['no-character-endpoint']++;
+      candidateDisposition(db, projectId, trace, candidate, 'rejected', 'no-character-endpoint');
       return;
     }
     counts.skipped['non-person-endpoint']++;
@@ -651,26 +909,86 @@ function ingestRelation(db: Db, projectId: number, rel: RelationRow, counts: Ing
     return;
   }
 
-  const threadId = ensurePairThread(db, projectId, rel.from_entity, rel.to_entity, seq, counts);
+  const candidate = candidateGenerated(
+    db,
+    projectId,
+    trace,
+    `relation:${rel.id}:pair`,
+    'relation-pair',
+    {
+      relation_id: rel.id,
+      ...(chunkId !== null ? { chunk_id: chunkId } : {}),
+    },
+  );
+  const assignment = ensurePairThread(db, projectId, rel.from_entity, rel.to_entity, seq, counts);
 
-  if (threadId === null) {
+  if (assignment === null) {
     counts.skipped['no-thread']++;
     // Attach the want to a known endpoint rather than losing it.
     const fallback =
       ensurePersonThread(db, projectId, rel.from_entity, counts) ??
       ensurePersonThread(db, projectId, rel.to_entity, counts);
-    if (fallback !== null) ensureOpenEnd(db, projectId, fallback, question, `relation ${rel.id}`, wouldResolve, counts);
+    if (fallback !== null) {
+      threadAssigned(db, projectId, trace, candidate, fallback, {
+        entity_ids: [rel.from_entity, rel.to_entity],
+        ...(seq !== null ? { seq } : {}),
+      });
+      const openEnd = ensureOpenEnd(
+        db,
+        projectId,
+        fallback.threadId,
+        question,
+        `relation ${rel.id}`,
+        wouldResolve,
+        counts,
+      );
+      candidateDisposition(db, projectId, trace, candidate, 'parked', 'no-thread', {
+        thread_id: fallback.threadId,
+        ...(openEnd.id !== null ? { open_end_id: openEnd.id } : {}),
+      });
+    } else {
+      candidateDisposition(db, projectId, trace, candidate, 'rejected', 'no-thread');
+    }
     return;
   }
 
+  threadAssigned(db, projectId, trace, candidate, assignment, {
+    entity_ids: [rel.from_entity, rel.to_entity],
+    ...(seq !== null ? { seq } : {}),
+  });
+
   if (!quote) {
     counts.skipped['no-quote']++;
-    ensureOpenEnd(db, projectId, threadId, question, `relation ${rel.id}`, wouldResolve, counts);
+    const openEnd = ensureOpenEnd(
+      db,
+      projectId,
+      assignment.threadId,
+      question,
+      `relation ${rel.id}`,
+      wouldResolve,
+      counts,
+    );
+    candidateDisposition(db, projectId, trace, candidate, 'parked', 'no-quote', {
+      thread_id: assignment.threadId,
+      ...(openEnd.id !== null ? { open_end_id: openEnd.id } : {}),
+    });
     return;
   }
   if (chunkId === null) {
     counts.skipped['no-chunk']++;
-    ensureOpenEnd(db, projectId, threadId, question, `relation ${rel.id}`, wouldResolve, counts);
+    const openEnd = ensureOpenEnd(
+      db,
+      projectId,
+      assignment.threadId,
+      question,
+      `relation ${rel.id}`,
+      wouldResolve,
+      counts,
+    );
+    candidateDisposition(db, projectId, trace, candidate, 'parked', 'no-chunk', {
+      thread_id: assignment.threadId,
+      ...(openEnd.id !== null ? { open_end_id: openEnd.id } : {}),
+    });
     return;
   }
 
@@ -683,11 +1001,11 @@ function ingestRelation(db: Db, projectId: number, rel: RelationRow, counts: Ing
   });
 
   const before = counts.notes;
-  const noteId = writeNote(
+  const outcome = writeNote(
     db,
     projectId,
     {
-      threadId,
+      threadId: assignment.threadId,
       chunkId,
       locator: firstLocator(rel.source_refs),
       quote,
@@ -703,20 +1021,36 @@ function ingestRelation(db: Db, projectId: number, rel: RelationRow, counts: Ing
       relationId: rel.id,
     },
     counts,
+    trace,
+    candidate,
   );
   if (counts.notes > before) counts.pairNotes++;
 
-  if (held) {
-    ensureOpenEnd(
-      db,
-      projectId,
-      threadId,
-      question,
-      noteId !== null ? `note ${noteId}` : `relation ${rel.id}`,
-      wouldResolve,
-      counts,
-    );
-  }
+  const openEnd = held
+    ? ensureOpenEnd(
+        db,
+        projectId,
+        assignment.threadId,
+        question,
+        outcome.noteId !== null ? `note ${outcome.noteId}` : `relation ${rel.id}`,
+        wouldResolve,
+        counts,
+      )
+    : null;
+
+  const decision = outcome.inserted
+    ? 'admitted'
+    : outcome.deduplicated
+      ? 'deduplicated'
+      : held && openEnd?.id !== null
+        ? 'parked'
+        : 'rejected';
+  candidateDisposition(db, projectId, trace, candidate, decision, outcome.reason, {
+    thread_id: assignment.threadId,
+    chunk_id: chunkId,
+    ...(outcome.noteId !== null ? { note_id: outcome.noteId } : {}),
+    ...(openEnd?.id !== null && openEnd?.id !== undefined ? { open_end_id: openEnd.id } : {}),
+  });
 }
 
 const RELATION_SQL = `
@@ -731,29 +1065,52 @@ const RELATION_SQL = `
    ORDER BY r.id`;
 
 /** Entity evidence becomes an identity note on that person's thread. */
-function ingestEntity(db: Db, projectId: number, entity: {
-  id: number;
-  name: string;
-  kind: string;
-  evidence: string;
-  first_chunk: number | null;
-  source_refs: string;
-  confidence: number;
-}, counts: IngestCounts): void {
-  const threadId = ensurePersonThread(db, projectId, entity.id, counts);
-  if (threadId === null) {
+function ingestEntity(
+  db: Db,
+  projectId: number,
+  entity: {
+    id: number;
+    name: string;
+    kind: string;
+    evidence: string;
+    first_chunk: number | null;
+    source_refs: string;
+    confidence: number;
+  },
+  counts: IngestCounts,
+  trace: NoteTrace | null,
+): void {
+  const quote = entity.evidence.trim();
+  const chunkId = entity.first_chunk ?? firstChunkId(entity.source_refs);
+  const candidate = candidateGenerated(
+    db,
+    projectId,
+    trace,
+    `entity:${entity.id}:identity`,
+    'entity-identity',
+    {
+      entity_id: entity.id,
+      ...(chunkId !== null ? { chunk_id: chunkId } : {}),
+    },
+  );
+  const assignment = ensurePersonThread(db, projectId, entity.id, counts);
+  if (assignment === null) {
     counts.skipped['no-thread']++;
+    candidateDisposition(db, projectId, trace, candidate, 'rejected', 'no-thread');
     return;
   }
-  const quote = entity.evidence.trim();
+  threadAssigned(db, projectId, trace, candidate, assignment, {
+    entity_ids: [entity.id],
+  });
   if (!quote) {
     // No quote means no note: the verbatim gate applies to identity notes too.
     counts.skipped['no-identity-evidence']++;
+    candidateDisposition(db, projectId, trace, candidate, 'rejected', 'no-identity-evidence');
     return;
   }
-  const chunkId = entity.first_chunk ?? firstChunkId(entity.source_refs);
   if (chunkId === null) {
     counts.skipped['no-chunk']++;
+    candidateDisposition(db, projectId, trace, candidate, 'rejected', 'no-chunk');
     return;
   }
   const before = counts.notes;
@@ -766,13 +1123,14 @@ function ingestEntity(db: Db, projectId: number, entity: {
         : null;
   if (!claim) {
     counts.skipped['no-identity-evidence']++;
+    candidateDisposition(db, projectId, trace, candidate, 'rejected', 'no-identity-evidence');
     return;
   }
-  writeNote(
+  const outcome = writeNote(
     db,
     projectId,
     {
-      threadId,
+      threadId: assignment.threadId,
       chunkId,
       locator: firstLocator(entity.source_refs),
       quote,
@@ -784,10 +1142,26 @@ function ingestEntity(db: Db, projectId: number, entity: {
       isContext: false,
       kind: 'observation',
       strengthSource: 'derived',
+      entityId: entity.id,
     },
     counts,
+    trace,
+    candidate,
   );
   if (counts.notes > before) counts.identityNotes++;
+  candidateDisposition(
+    db,
+    projectId,
+    trace,
+    candidate,
+    outcome.inserted ? 'admitted' : outcome.deduplicated ? 'deduplicated' : 'rejected',
+    outcome.reason,
+    {
+      thread_id: assignment.threadId,
+      chunk_id: chunkId,
+      ...(outcome.noteId !== null ? { note_id: outcome.noteId } : {}),
+    },
+  );
 }
 
 const ENTITY_SQL = `
@@ -834,24 +1208,47 @@ function openEndsForEmptyThreads(db: Db, projectId: number, counts: IngestCounts
  */
 export function backfillThreadNotes(db: Db, projectId: number, opts: { dryRun?: boolean } = {}): IngestCounts {
   const counts = blankIngestCounts(opts.dryRun === true);
+  let trace: NoteTrace | null = null;
+  if (!counts.dryRun) {
+    const started = startTrace(db, {
+      projectId,
+      metadata: { scope: 'note.backfill' },
+    });
+    counts.traceId = started.id;
+    trace = { traceId: started.id };
+  }
   const run = counts.dryRun ? <T>(fn: () => T): T => fn() : <T>(fn: () => T): T => db.transaction(fn);
-  run(() => {
-    for (const rel of db.all<RelationRow>(RELATION_SQL, projectId)) ingestRelation(db, projectId, rel, counts);
-    for (const entity of db.all<{
-      id: number;
-      name: string;
-      kind: string;
-      evidence: string;
-      first_chunk: number | null;
-      source_refs: string;
-      confidence: number;
-    }>(ENTITY_SQL, projectId)) {
-      ingestEntity(db, projectId, entity, counts);
+  try {
+    run(() => {
+      for (const rel of db.all<RelationRow>(RELATION_SQL, projectId)) {
+        ingestRelation(db, projectId, rel, counts, trace);
+      }
+      for (const entity of db.all<{
+        id: number;
+        name: string;
+        kind: string;
+        evidence: string;
+        first_chunk: number | null;
+        source_refs: string;
+        confidence: number;
+      }>(ENTITY_SQL, projectId)) {
+        ingestEntity(db, projectId, entity, counts, trace);
+      }
+      openEndsForEmptyThreads(db, projectId, counts);
+      // Opposition between notes on one thread is recorded, never judged.
+      if (!counts.dryRun) markContradictions(db, projectId);
+    });
+    if (counts.traceId) finishTrace(db, counts.traceId);
+  } catch (error) {
+    if (counts.traceId) {
+      try {
+        finishTrace(db, counts.traceId, { interrupted: true });
+      } catch {
+        /* preserve the original ingestion failure */
+      }
     }
-    openEndsForEmptyThreads(db, projectId, counts);
-    // Opposition between notes on one thread is recorded, never judged.
-    if (!counts.dryRun) markContradictions(db, projectId);
-  });
+    throw error;
+  }
   return counts;
 }
 
@@ -865,43 +1262,75 @@ export function backfillThreadNotes(db: Db, projectId: number, opts: { dryRun?: 
  * Context notes are co-presence records: two named people inside one passage.
  * They carry `is_context = 1` and are never relationship evidence.
  */
+export interface NoteExtractionTraceOptions {
+  runId?: number;
+  windowIndex?: number;
+}
+
 export function noteFromExtraction(
   db: Db,
   projectId: number,
   window: { id: number }[],
-  stats?: { notesIngested?: number },
+  stats?: { notesIngested?: number; noteTraceIds?: string[] },
+  opts: NoteExtractionTraceOptions = {},
 ): IngestCounts {
   const counts = blankIngestCounts(false);
   const windowIds = new Set(window.map((chunk) => chunk.id));
+  // An empty window has no candidate and therefore no trace to account for.
   if (!windowIds.size) return counts;
 
-  db.transaction(() => {
-    // Relations whose cited passage sits in this window.
-    for (const rel of db.all<RelationRow>(RELATION_SQL, projectId)) {
-      const chunkId = firstChunkId(rel.source_refs);
-      if (chunkId === null || !windowIds.has(chunkId)) continue;
-      ingestRelation(db, projectId, rel, counts);
-    }
-    // Entities whose evidence sits in this window.
-    for (const entity of db.all<{
-      id: number;
-      name: string;
-      kind: string;
-      evidence: string;
-      first_chunk: number | null;
-      source_refs: string;
-      confidence: number;
-    }>(
-      "SELECT id, name, kind, evidence, first_chunk, source_refs, confidence FROM canon_entity WHERE project_id = ? AND evidence <> '' AND first_chunk IN (SELECT value FROM json_each(?)) ORDER BY id",
-      projectId,
-      JSON.stringify([...windowIds]),
-    )) {
-      ingestEntity(db, projectId, entity, counts);
-    }
-    writeContextNotes(db, projectId, windowIds, counts);
+  const started = startTrace(db, {
+    projectId,
+    metadata: {
+      scope: 'note.extraction-window',
+      chunk_ids: [...windowIds],
+      ...(opts.runId !== undefined ? { run_id: opts.runId } : {}),
+      ...(opts.windowIndex !== undefined ? { window_index: opts.windowIndex } : {}),
+    },
   });
+  counts.traceId = started.id;
+  const trace: NoteTrace = { traceId: started.id };
 
-  if (stats) stats.notesIngested = (stats.notesIngested ?? 0) + counts.notes;
+  try {
+    db.transaction(() => {
+      // Relations whose cited passage sits in this window.
+      for (const rel of db.all<RelationRow>(RELATION_SQL, projectId)) {
+        const chunkId = firstChunkId(rel.source_refs);
+        if (chunkId === null || !windowIds.has(chunkId)) continue;
+        ingestRelation(db, projectId, rel, counts, trace);
+      }
+      // Entities whose evidence sits in this window.
+      for (const entity of db.all<{
+        id: number;
+        name: string;
+        kind: string;
+        evidence: string;
+        first_chunk: number | null;
+        source_refs: string;
+        confidence: number;
+      }>(
+        "SELECT id, name, kind, evidence, first_chunk, source_refs, confidence FROM canon_entity WHERE project_id = ? AND evidence <> '' AND first_chunk IN (SELECT value FROM json_each(?)) ORDER BY id",
+        projectId,
+        JSON.stringify([...windowIds]),
+      )) {
+        ingestEntity(db, projectId, entity, counts, trace);
+      }
+      writeContextNotes(db, projectId, windowIds, counts, trace);
+    });
+    finishTrace(db, started.id);
+  } catch (error) {
+    try {
+      finishTrace(db, started.id, { interrupted: true });
+    } catch {
+      /* preserve the original ingestion failure */
+    }
+    throw error;
+  }
+
+  if (stats) {
+    stats.notesIngested = (stats.notesIngested ?? 0) + counts.notes;
+    if (counts.traceId) (stats.noteTraceIds ??= []).push(counts.traceId);
+  }
   return counts;
 }
 
@@ -927,9 +1356,23 @@ function bothNamesSentence(text: string, a: string, b: string): string | null {
  * Deliberately a plain substring test rather than the derived-variant matcher:
  * a context note must never claim more than the literal names show.
  */
-function writeContextNotes(db: Db, projectId: number, windowIds: Set<number>, counts: IngestCounts): void {
-  const rows = db.all<{ id: number; shared_chunks: string; a_name: string; b_name: string }>(
-    `SELECT t.id, p.shared_chunks, ea.name AS a_name, eb.name AS b_name
+function writeContextNotes(
+  db: Db,
+  projectId: number,
+  windowIds: Set<number>,
+  counts: IngestCounts,
+  trace: NoteTrace | null,
+): void {
+  const rows = db.all<{
+    id: number;
+    shared_chunks: string;
+    a_name: string;
+    b_name: string;
+    a_entity: number;
+    b_entity: number;
+  }>(
+    `SELECT t.id, p.shared_chunks, ea.name AS a_name, eb.name AS b_name,
+            t.a_entity, t.b_entity
        FROM canon_thread t
        JOIN canon_pair_thread p ON p.id = t.pair_thread_id
        JOIN canon_entity ea ON ea.id = t.a_entity
@@ -940,19 +1383,51 @@ function writeContextNotes(db: Db, projectId: number, windowIds: Set<number>, co
   );
   let written = 0;
   for (const row of rows) {
-    if (written >= MAX_CONTEXT_NOTES) break;
     const shared = fromJson<number[]>(row.shared_chunks, []);
     const chunkId = shared.find((id) => windowIds.has(Number(id)));
     if (chunkId === undefined) continue;
+    const candidate = candidateGenerated(
+      db,
+      projectId,
+      trace,
+      `context:${row.id}:${Number(chunkId)}`,
+      'context-pair',
+      {
+        thread_id: row.id,
+        chunk_id: Number(chunkId),
+        entity_ids: [row.a_entity, row.b_entity],
+      },
+    );
+    threadAssigned(
+      db,
+      projectId,
+      trace,
+      candidate,
+      { threadId: row.id, decision: 'reused' },
+      { entity_ids: [row.a_entity, row.b_entity] },
+    );
+    if (written >= MAX_CONTEXT_NOTES) {
+      candidateDisposition(db, projectId, trace, candidate, 'rejected', 'context-cap', {
+        thread_id: row.id,
+        chunk_id: Number(chunkId),
+      });
+      continue;
+    }
     const text = chunkText(db, projectId, Number(chunkId));
     const sentence = text ? bothNamesSentence(text, row.a_name, row.b_name) : null;
-    if (!sentence) continue;
+    if (!sentence) {
+      candidateDisposition(db, projectId, trace, candidate, 'rejected', 'context-no-both-names', {
+        thread_id: row.id,
+        chunk_id: Number(chunkId),
+      });
+      continue;
+    }
     const locator = db.get<{ locator: string }>(
       'SELECT locator FROM canon_chunk WHERE id = ?',
       Number(chunkId),
     )?.locator ?? '';
     const before = counts.notes;
-    writeNote(
+    const outcome = writeNote(
       db,
       projectId,
       {
@@ -968,8 +1443,23 @@ function writeContextNotes(db: Db, projectId: number, windowIds: Set<number>, co
         kind: 'context',
       },
       counts,
+      trace,
+      candidate,
     );
-    if (counts.notes > before) written++;
+    if (outcome.inserted || counts.notes > before) written++;
+    candidateDisposition(
+      db,
+      projectId,
+      trace,
+      candidate,
+      outcome.inserted ? 'admitted' : outcome.deduplicated ? 'deduplicated' : 'rejected',
+      outcome.reason,
+      {
+        thread_id: row.id,
+        chunk_id: Number(chunkId),
+        ...(outcome.noteId !== null ? { note_id: outcome.noteId } : {}),
+      },
+    );
   }
 }
 

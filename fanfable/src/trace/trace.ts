@@ -26,11 +26,18 @@ export const DIAGNOSTIC_RETENTION_DAYS = 30;
 
 export interface TraceRefs {
   claim_uid?: string;
+  candidate_id?: string;
   proof_id?: number;
   run_id?: number;
   note_id?: number;
   thread_id?: number;
   chunk_id?: number;
+  relation_id?: number;
+  entity_id?: number;
+  entity_ids?: number[];
+  open_end_id?: number;
+  seq?: number | null;
+  period_label?: string;
 }
 
 export interface TraceContext {
@@ -138,6 +145,15 @@ export interface TraceSuspicion {
   detail: string;
 }
 
+export interface NoteAccounting {
+  generated: number;
+  admitted: number;
+  deduplicated: number;
+  rejected: number;
+  parked: number;
+  verified: boolean;
+}
+
 export interface TraceAuditResult {
   traceId: string;
   completeness: TraceCompleteness;
@@ -149,7 +165,25 @@ export interface TraceAuditResult {
   suspicious: TraceSuspicion[];
   checks: string[];
   limitations: string[];
+  noteAccounting: NoteAccounting | null;
 }
+
+const NOTE_DISPOSITION_REASONS = new Set([
+  'inserted',
+  'dedupe-key-match',
+  'not-verbatim',
+  'empty-claim',
+  'no-assertable-claim',
+  'no-identity-evidence',
+  'no-quote',
+  'no-chunk',
+  'no-thread',
+  'no-character-endpoint',
+  'verb-kind',
+  'endpoint-not-mentioned',
+  'context-no-both-names',
+  'context-cap',
+]);
 
 interface TraceRow {
   id: string;
@@ -184,7 +218,17 @@ interface TraceEventRow {
   created_at: string;
 }
 
-const REF_KEYS = ['claim_uid', 'proof_id', 'run_id', 'note_id', 'thread_id', 'chunk_id'] as const;
+const REF_STRING_KEYS = ['claim_uid', 'candidate_id', 'period_label'] as const;
+const REF_NUMBER_KEYS = [
+  'proof_id',
+  'run_id',
+  'note_id',
+  'thread_id',
+  'chunk_id',
+  'relation_id',
+  'entity_id',
+  'open_end_id',
+] as const;
 const TERMINAL_DECISIONS = new Set(['applied', 'noop', 'stale', 'conflict', 'rejected']);
 
 export function newTraceId(): string {
@@ -213,26 +257,42 @@ function parseObject(text: string): Record<string, unknown> {
 function parseRefs(text: string): TraceRefs {
   const raw = parseObject(text);
   const refs: TraceRefs = {};
-  for (const key of REF_KEYS) {
+  for (const key of REF_STRING_KEYS) {
     const value = raw[key];
-    if (key === 'claim_uid' && typeof value === 'string' && value) refs.claim_uid = value;
-    else if (key !== 'claim_uid' && Number.isFinite(Number(value)) && Number(value) > 0) {
-      (refs as Record<string, string | number>)[key] = Number(value);
+    if (typeof value === 'string' && value) refs[key] = value;
+  }
+  for (const key of REF_NUMBER_KEYS) {
+    const value = Number(raw[key]);
+    if (raw[key] !== null && raw[key] !== undefined && Number.isFinite(value) && value > 0) {
+      refs[key] = value;
     }
+  }
+  const seq = Number(raw.seq);
+  if (raw.seq !== null && raw.seq !== undefined && Number.isFinite(seq) && seq >= 0) refs.seq = seq;
+  if (Array.isArray(raw.entity_ids)) {
+    const ids = raw.entity_ids
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value) && value > 0);
+    if (ids.length) refs.entity_ids = [...new Set(ids)];
   }
   return refs;
 }
 
 function refsJson(refs: TraceRefs | undefined): string {
   if (!refs) return '{}';
-  const out: Record<string, string | number> = {};
-  for (const key of REF_KEYS) {
+  const out: Record<string, unknown> = {};
+  for (const key of REF_STRING_KEYS) {
     const value = refs[key];
-    if (value === undefined || value === null) continue;
-    if (key === 'claim_uid' && typeof value === 'string' && value) out[key] = value;
-    else if (key !== 'claim_uid' && Number.isFinite(Number(value)) && Number(value) > 0) {
-      out[key] = Number(value);
-    }
+    if (typeof value === 'string' && value) out[key] = value;
+  }
+  for (const key of REF_NUMBER_KEYS) {
+    const value = refs[key];
+    if (typeof value === 'number' && Number.isFinite(value) && value > 0) out[key] = value;
+  }
+  if (typeof refs.seq === 'number' && Number.isFinite(refs.seq) && refs.seq >= 0) out.seq = refs.seq;
+  if (refs.entity_ids?.length) {
+    const ids = [...new Set(refs.entity_ids.filter((value) => Number.isFinite(value) && value > 0))];
+    if (ids.length) out.entity_ids = ids;
   }
   return JSON.stringify(out);
 }
@@ -504,11 +564,16 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
     'promotion events reference a verified proof',
     'owner attempt events carry a terminal decision',
     'verified proofs created during the trace window have a required event',
+    'every generated note candidate has one terminal disposition',
+    'every note disposition carries a recognised reason code',
+    'note candidate accounting balances when the trace is exhaustive',
+    'every admitted note has a required note.admitted event and stored note row',
   ];
   const limitations = [
     'the audit reads current rows; it does not replay the full historical transition',
     'ruling linkage is enforced by the owner transaction but is not reconstructed from trace refs',
     'a complete trace with zero drops is the only exhaustive accounting',
+    'note accounting covers only candidates inside the traced window/scope',
   ];
 
   const appliedProofIds = new Set<number>();
@@ -573,7 +638,7 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
       });
     }
 
-    if (event.decision === 'applied') {
+    if (ownerAttempt && event.decision === 'applied') {
       const claimUid = event.refs.claim_uid;
       if (!claimUid) {
         violations.push({
@@ -653,6 +718,132 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
     }
   }
 
+  const noteEvents = events.filter((event) => event.event.startsWith('note.'));
+  let noteAccounting: NoteAccounting | null = null;
+  if (noteEvents.length) {
+    const generated = new Set<string>();
+    const dispositions = new Map<string, TraceEventRecord[]>();
+    const admissions = noteEvents.filter((event) => event.event === 'note.admitted');
+    for (const event of noteEvents) {
+      if (event.event === 'note.candidate.generated') generated.add(event.subject);
+      if (event.event === 'note.candidate.disposition') {
+        const list = dispositions.get(event.subject) ?? [];
+        list.push(event);
+        dispositions.set(event.subject, list);
+      }
+    }
+    let admitted = 0;
+    let deduplicated = 0;
+    let rejected = 0;
+    let parked = 0;
+    for (const list of dispositions.values()) {
+      for (const event of list) {
+        if (event.decision === 'admitted') admitted++;
+        else if (event.decision === 'deduplicated') deduplicated++;
+        else if (event.decision === 'rejected') rejected++;
+        else if (event.decision === 'parked') parked++;
+      }
+    }
+
+    const unfinished = !trace.finishedAt;
+    const notExhaustive = trace.completeness !== 'complete' || trace.droppedEvents > 0;
+    if (unfinished) {
+      suspicious.push({
+        code: 'note_trace_unfinished',
+        detail: 'note candidate accounting cannot be verified because the trace is unfinished',
+      });
+    }
+    if (notExhaustive) {
+      suspicious.push({
+        code: 'note_trace_not_exhaustive',
+        detail:
+          `note candidate accounting cannot be verified: completeness=${trace.completeness}, ` +
+          `dropped_events=${trace.droppedEvents}`,
+      });
+    }
+
+    let verified = false;
+    if (!unfinished && !notExhaustive) {
+      const before = violations.length;
+      for (const subject of generated) {
+        const list = dispositions.get(subject) ?? [];
+        if (!list.length) {
+          violations.push({
+            code: 'note_candidate_missing_disposition',
+            detail: `candidate ${subject} has no terminal disposition`,
+          });
+        } else if (list.length > 1) {
+          violations.push({
+            code: 'note_candidate_multiple_dispositions',
+            detail: `candidate ${subject} has ${list.length} terminal dispositions`,
+          });
+        }
+      }
+      for (const list of dispositions.values()) {
+        for (const event of list) {
+          if (!['admitted', 'deduplicated', 'rejected', 'parked'].includes(event.decision)) {
+            violations.push({
+              code: 'note_candidate_unexplained',
+              eventId: event.id,
+              detail: `candidate ${event.subject} has unknown disposition ${event.decision || '(empty)'}`,
+            });
+          }
+          if (!NOTE_DISPOSITION_REASONS.has(event.reasonCode)) {
+            violations.push({
+              code: 'note_candidate_unexplained',
+              eventId: event.id,
+              detail: `candidate ${event.subject} has unrecognised reason ${event.reasonCode || '(empty)'}`,
+            });
+          }
+        }
+      }
+      const sum = admitted + deduplicated + rejected + parked;
+      if (generated.size !== sum) {
+        violations.push({
+          code: 'note_candidate_accounting_mismatch',
+          detail: `generated=${generated.size} but dispositions=${sum} ` +
+            `(admitted=${admitted}, deduplicated=${deduplicated}, rejected=${rejected}, parked=${parked})`,
+        });
+      }
+      for (const [subject, list] of dispositions) {
+        if (!list.some((event) => event.decision === 'admitted')) continue;
+        if (!admissions.some((event) => event.refs.candidate_id === subject)) {
+          violations.push({
+            code: 'note_admission_missing_required_event',
+            detail: `admitted candidate ${subject} has no required note.admitted event`,
+          });
+        }
+      }
+      for (const event of admissions) {
+        const noteId = Number(event.refs.note_id);
+        const stored = Number.isFinite(noteId) && noteId > 0
+          ? db.get<{ id: number }>(
+              'SELECT id FROM canon_thread_note WHERE id = ? AND project_id = ?',
+              noteId,
+              trace.projectId,
+            )
+          : undefined;
+        if (!stored) {
+          violations.push({
+            code: 'note_admission_missing_note',
+            eventId: event.id,
+            detail: `note.admitted references missing note ${event.refs.note_id ?? '(none)'}`,
+          });
+        }
+      }
+      verified = violations.length === before;
+    }
+
+    noteAccounting = {
+      generated: generated.size,
+      admitted,
+      deduplicated,
+      rejected,
+      parked,
+      verified,
+    };
+  }
+
   if (trace.completeness !== 'complete' || trace.droppedEvents > 0) {
     suspicious.push({
       code: 'trace_not_exhaustive',
@@ -680,5 +871,6 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
     suspicious,
     checks,
     limitations,
+    noteAccounting,
   };
 }

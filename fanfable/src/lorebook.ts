@@ -578,6 +578,8 @@ export interface ExtractLoreResult {
   contested?: { facts: number; relations: number };
   /** Clue notes this run added to the evidence web, when ingestion ran. */
   notesIngested?: number;
+  /** One note-formation trace id per non-empty extraction window. */
+  noteTraceIds?: string[];
   /** Windows reserved for starved threads, and the threads they covered. */
   starvedReserved?: number;
   starvedUsed?: number;
@@ -1656,9 +1658,16 @@ async function runWindowBatch(
         // Feed the evidence web from this window. Additive and fenced off: a
         // failure here is logged and never fails the extraction.
         try {
-          const ingested = noteFromExtraction(db, projectId, window, stats);
-          if (ingested.notes) {
-            batch.onProgress?.(`  notes: +${ingested.notes} from window ${index}`);
+          const ingested = noteFromExtraction(db, projectId, window, stats, {
+            runId: batch.runId,
+            windowIndex: index,
+          });
+          if (ingested.traceId || ingested.notes) {
+            const deduplicated = ingested.deduplicated ? `, deduplicated ${ingested.deduplicated}` : '';
+            const trace = ingested.traceId ? ` (trace ${ingested.traceId})` : '';
+            batch.onProgress?.(
+              `  notes: +${ingested.notes}${deduplicated} from window ${index}${trace}`,
+            );
           }
         } catch (err) {
           batch.onProgress?.(
