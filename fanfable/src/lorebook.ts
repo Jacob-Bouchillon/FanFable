@@ -2180,6 +2180,52 @@ function canonicalBoundarySpan(
   return normalise(quote) === needle ? { quote, start: left, end: right } : null;
 }
 
+/**
+ * Is this normalized match bounded by words rather than sitting inside one?
+ *
+ * Normalization keeps only letters, digits, apostrophes and spaces. A match
+ * can start or end at a space/edge, but not next to a letter/digit. An
+ * apostrophe next to a letter/digit is an internal possessive/contraction;
+ * an apostrophe at a word edge is quote punctuation and does not block.
+ *
+ * A normalized space that came from a hyphen between word characters is also
+ * an internal compound boundary. The raw offsets distinguish `Force` inside
+ * `Force-sensitive` from `Force` beside a spaced punctuation hyphen.
+ */
+function internalCompoundHyphen(
+  raw: string,
+  map: { starts: number[]; ends: number[] },
+  space: number,
+): boolean {
+  const left = map.ends[space - 1];
+  const right = map.starts[space + 1];
+  if (left === undefined || right === undefined) return false;
+  const segment = raw.slice(left, right);
+  return /[\u2010-\u2015\u2212-]/.test(segment) && !/\s/.test(segment);
+}
+
+function lexicalBoundary(
+  raw: string,
+  map: { text: string; starts: number[]; ends: number[] },
+  start: number,
+  end: number,
+): boolean {
+  const word = (ch: string | undefined): boolean => ch !== undefined && /[a-z0-9]/.test(ch);
+  if (start > 0) {
+    const before = map.text[start - 1];
+    if (word(before)) return false;
+    if (before === "'" && word(map.text[start - 2])) return false;
+    if (before === ' ' && internalCompoundHyphen(raw, map, start - 1)) return false;
+  }
+  if (end < map.text.length) {
+    const after = map.text[end];
+    if (word(after)) return false;
+    if (after === "'" && word(map.text[end + 1])) return false;
+    if (after === ' ' && internalCompoundHyphen(raw, map, end)) return false;
+  }
+  return true;
+}
+
 /** Every distinct canonical raw span for one normalized needle in a chunk. */
 function canonicalSpans(raw: string, needle: string, exactText = ''): CanonicalSpan[] {
   if (!needle) return [];
@@ -2194,18 +2240,13 @@ function canonicalSpans(raw: string, needle: string, exactText = ''): CanonicalS
   }
   if (!occurrences.length) return [];
 
-  // Exact raw substring fast path. Repeated exact text is the same evidence
-  // string, not a normalized-only guess; return its first canonical source
-  // span. Normalized variants that are not raw-exact still fall through to the
-  // ambiguity check below.
-  if (exactText && raw.includes(exactText)) {
-    const exactAt = raw.indexOf(exactText);
-    const exact = canonicalBoundarySpan(raw, exactAt, exactAt + exactText.length, needle);
-    if (exact) return [exact];
-  }
+  // A normalized hit inside a larger word is not evidence. Exact and
+  // normalized-only matches go through the same lexical filter.
+  const aligned = occurrences.filter((occurrence) => lexicalBoundary(raw, map, occurrence, occurrence + needle.length));
+  if (!aligned.length) return [];
 
   const spans = new Map<string, CanonicalSpan>();
-  for (const occurrence of occurrences) {
+  for (const occurrence of aligned) {
     const start = map.starts[occurrence];
     const end = map.ends[occurrence + needle.length - 1];
     if (start === undefined || end === undefined) return [];
@@ -2213,7 +2254,22 @@ function canonicalSpans(raw: string, needle: string, exactText = ''): CanonicalS
     if (!span) return [];
     spans.set(`${span.start}:${span.end}`, span);
   }
-  return [...spans.values()];
+  const candidates = [...spans.values()];
+
+  // Exact raw substring fast path. Repeated exact text is the same evidence
+  // string, not a normalized-only guess; return its first boundary-aligned
+  // canonical source span. Normalized variants that are not raw-exact still
+  // fall through to the ambiguity check in the caller.
+  if (exactText) {
+    let exactAt = raw.indexOf(exactText);
+    while (exactAt >= 0) {
+      const exactEnd = exactAt + exactText.length;
+      const exact = candidates.find((span) => span.start <= exactAt && exactEnd <= span.end);
+      if (exact) return [exact];
+      exactAt = raw.indexOf(exactText, exactAt + 1);
+    }
+  }
+  return candidates;
 }
 
 /**

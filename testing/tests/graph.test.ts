@@ -439,11 +439,11 @@ test('a kind that is really the prompt example list is not stored', () => {
   const llm = mockProvider(() =>
     JSON.stringify({
       entities: [
-        { kind: 'character', name: 'A', aliases: [], summary: '', attributes: {}, role: '', status: '', chunk_index: 0, evidence: 'A' },
-        { kind: 'character', name: 'B', aliases: [], summary: '', attributes: {}, role: '', status: '', chunk_index: 0, evidence: 'B' },
+        { kind: 'character', name: 'A', aliases: [], summary: '', attributes: {}, role: '', status: '', chunk_index: 0, evidence: 'bridge' },
+        { kind: 'character', name: 'B', aliases: [], summary: '', attributes: {}, role: '', status: '', chunk_index: 0, evidence: 'bridge' },
       ],
       relations: [
-        { from: 'A', to: 'B', kind: 'sibling of | serves | suspects | owes | married to | leads', description: 'x', chunk_index: 0, evidence: 'A' },
+        { from: 'A', to: 'B', kind: 'sibling of | serves | suspects | owes | married to | leads', description: 'x', chunk_index: 0, evidence: 'bridge' },
       ],
       facts: [],
       timeline: [],
