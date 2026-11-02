@@ -52,7 +52,7 @@ export class Db {
     return { changes: Number(r.changes), lastInsertRowid: Number(r.lastInsertRowid) };
   }
 
-  transaction<T>(fn: () => T): T {
+  transaction<T>(fn: () => T, opts: { immediate?: boolean } = {}): T {
     // Re-entrant: a nested call joins the transaction already in progress.
     if (this.depth > 0) {
       this.depth++;
@@ -63,7 +63,7 @@ export class Db {
       }
     }
     this.depth = 1;
-    this.raw.exec('BEGIN');
+    this.raw.exec(opts.immediate ? 'BEGIN IMMEDIATE' : 'BEGIN');
     try {
       const out = fn();
       this.raw.exec('COMMIT');
