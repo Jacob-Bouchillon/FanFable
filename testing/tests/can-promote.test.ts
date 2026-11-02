@@ -102,7 +102,7 @@ const RULED_PARK = 'PARK (user: he only had 1; 2026-10-27)';
  * as data so the difference is visible; only the one whose quote names both
  * people still banks.
  */
-const OLD_REFUSALS: { fixture: Fixture; reason?: 'endpoint-unnamed' }[] = [
+const OLD_REFUSALS: { fixture: Fixture; reason?: lorebook.PromoteReason }[] = [
   {
     fixture: {
       from: 'Maa Kaap', to: 'Doo Zuto', kind: 'appears_with',
@@ -136,6 +136,7 @@ const OLD_REFUSALS: { fixture: Fixture; reason?: 'endpoint-unnamed' }[] = [
       from: 'Darth Plagueis', to: 'Darth Sidious', kind: 'challenged',
       evidence: 'This being who had survived assassinations and killed countless opponents merely gazed at Sidious, until it struck him that Plagueis was challenging him!',
     },
+    reason: 'relationship-not-entailed',
   },
 ];
 
@@ -221,7 +222,7 @@ test('a quote that names only one endpoint is refused without an anchor', () => 
   assert.deepEqual(decision, { ok: false, reason: 'endpoint-unnamed' });
 });
 
-test('an anchor naming the other endpoint completes a one-name quote', () => {
+test('an anchor that only adds the other name is not relationship proof', () => {
   const decision = decide({
     from: 'Asha',
     to: 'Bram',
@@ -229,7 +230,7 @@ test('an anchor naming the other endpoint completes a one-name quote', () => {
     evidence: 'Asha waited by the gate.',
     anchorEvidence: 'Bram came down the road to meet her.',
   });
-  assert.deepEqual(decision, { ok: true });
+  assert.deepEqual(decision, { ok: false, reason: 'relationship-not-entailed' });
 });
 
 test('a pronoun-only quote banks when its anchor names both people', () => {
@@ -243,11 +244,11 @@ test('a pronoun-only quote banks when its anchor names both people', () => {
   assert.deepEqual(decision, { ok: true });
 });
 
-test('a missing tie word is not a promotion requirement', () => {
+test('a missing tie word fails closed', () => {
   const decision = decide({
     from: 'Asha', to: 'Bram', kind: 'apprentice of', evidence: "Asha and Bram's lanterns met at the gate.",
   });
-  assert.deepEqual(decision, { ok: true });
+  assert.deepEqual(decision, { ok: false, reason: 'relationship-not-entailed' });
 });
 
 test('a moment label is not a guard veto', () => {
@@ -264,11 +265,11 @@ test('a claim below the threshold stays provisional', () => {
   assert.deepEqual(decision, { ok: false, reason: 'below-threshold' });
 });
 
-test('a claim at or above the threshold passes', () => {
+test('a claim at or above the threshold still needs entailment', () => {
   const decision = decide({
     from: 'Asha', to: 'Bram', kind: 'friend of', evidence: 'Asha and Bram came in together.', confidence: 0.7,
   });
-  assert.deepEqual(decision, { ok: true });
+  assert.deepEqual(decision, { ok: false, reason: 'relationship-not-entailed' });
 });
 
 test('a label outside the concept set can bank but stays unqueryable as a concept', () => {

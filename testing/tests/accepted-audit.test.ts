@@ -88,7 +88,7 @@ function statusOf(db: Db, id: number): string {
   return db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', id)!.review_status;
 }
 
-test('the three cited shapes now pass the mechanical guard', () => {
+test('the three co-mention shapes fail the entailment guard', () => {
   const { db } = tempDb();
   const project = createProject(db, 'audit-shapes');
   const chunk = addChunk(
@@ -117,11 +117,11 @@ test('the three cited shapes now pass the mechanical guard', () => {
 
   const result = lorebook.auditAcceptedRelations(db, project.id, { write: true });
   assert.equal(result.audited, 3);
-  assert.deepEqual(result.failing, {});
+  assert.deepEqual(result.failing, { 'relationship-not-entailed': 3 });
   for (const id of [coordinated, action, titleInsideName]) {
-    assert.equal(result.rows.find((row) => row.id === id)?.guard, 'ok');
-    assert.equal(result.rows.find((row) => row.id === id)?.action, 'keep');
-    assert.equal(statusOf(db, id), 'accepted');
+    assert.equal(result.rows.find((row) => row.id === id)?.guard, 'relationship-not-entailed');
+    assert.equal(result.rows.find((row) => row.id === id)?.action, 'demote');
+    assert.equal(statusOf(db, id), 'provisional');
   }
   db.close();
 });
@@ -172,7 +172,7 @@ test('a missing or non-verbatim quote fails', () => {
   db.close();
 });
 
-test('a quote naming both people but asserting nothing passes the mechanical guard', () => {
+test('a quote naming both people but asserting nothing fails the entailment guard', () => {
   const { db } = tempDb();
   const project = createProject(db, 'audit-cooccurrence');
   const chunk = addChunk(db, project.id, 'Mara and Tor spoke about their aunt.');
@@ -184,9 +184,9 @@ test('a quote naming both people but asserting nothing passes the mechanical gua
   });
 
   const result = lorebook.auditAcceptedRelations(db, project.id, { write: true });
-  assert.deepEqual(result.failing, {});
-  assert.equal(result.passing, 1);
-  assert.equal(statusOf(db, row), 'accepted');
+  assert.deepEqual(result.failing, { 'relationship-not-entailed': 1 });
+  assert.equal(result.passing, 0);
+  assert.equal(statusOf(db, row), 'provisional');
   db.close();
 });
 

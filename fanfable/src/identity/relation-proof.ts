@@ -190,6 +190,11 @@ export type FamilyOfKind = RelationFamily | typeof OTHER_FAMILY;
 /** Families whose arrow is not the same claim in either order. */
 const ASYMMETRIC = new Set<RelationFamily>(['parent', 'child', 'master', 'servant', 'employer']);
 
+/** True when the family's arrow is not the same claim in either order. */
+export function isAsymmetricFamily(family: RelationFamily): boolean {
+  return ASYMMETRIC.has(family);
+}
+
 const BY_NAME = new Map<string, FamilyRule>(RELATION_FAMILIES.map((f) => [f.family, f]));
 
 const HEAD_FAMILY = new Map<string, RelationFamily>();
@@ -303,7 +308,7 @@ function escapeRx(value: string): string {
  * A name the sentence never places returns nothing; guessing is how a mentor
  * becomes the mentee.
  */
-function familiesOfName(sentence: string, name: string): Set<RelationFamily> {
+export function familiesHeldByName(sentence: string, name: string): Set<RelationFamily> {
   const out = new Set<RelationFamily>();
   const clean = String(name ?? '').trim();
   if (!clean) return out;
@@ -350,8 +355,8 @@ export function directionOfSentence(
   if (family === OTHER_FAMILY) return 'none';
   if (!ASYMMETRIC.has(family)) return 'none';
   const inverse = inverseFamilyOf(family);
-  const fromFamilies = familiesOfName(sentence, fromName);
-  const toFamilies = familiesOfName(sentence, toName);
+  const fromFamilies = familiesHeldByName(sentence, fromName);
+  const toFamilies = familiesHeldByName(sentence, toName);
   let forward = 0;
   let reverse = 0;
   if (fromFamilies.has(family)) forward++;

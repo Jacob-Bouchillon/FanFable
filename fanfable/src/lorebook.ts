@@ -86,6 +86,7 @@ export {
   keeperQuoteReason,
   namesBothDistinctly,
   provenRelation,
+  relationEntailmentReason,
   type AttestedReason,
   type PromoteContext,
   type PromoteDecision,
@@ -101,6 +102,7 @@ import {
   keeperQuoteReason,
   mentionSpans,
   provenRelation,
+  relationEntailmentReason,
   type AttestedReason,
   type PromoteContext,
   type PromoteDecision,
@@ -5327,6 +5329,8 @@ export function canPromote(row: PromoteRow, context: PromoteContext): PromoteDec
   }
   const min = context.minConfidence ?? projectMinConfidence(context.db, context.projectId);
   if (claimTier(row.confidence ?? 1, min) !== 'accepted') return { ok: false, reason: 'below-threshold' };
+  const entailment = relationEntailmentReason(row, context.index);
+  if (entailment) return { ok: false, reason: entailment };
   return { ok: true };
 }
 

@@ -11,6 +11,14 @@ import type { Db } from '../core/db.ts';
 import { canonicalName, deriveNameVariants, type RosterIndex } from '../identity/names.ts';
 import { normalise, splitSentences } from '../core/text.ts';
 import { KIND_FILLER, headForms, kindHeadWord } from '../core/vocab.ts';
+import {
+  RELATION_FAMILIES,
+  familiesHeldByName,
+  familyOfKind,
+  inverseFamilyOf,
+  isAsymmetricFamily,
+  type RelationFamily,
+} from '../identity/relation-proof.ts';
 
 export type PromoteReason =
   | 'open-vocab'
@@ -25,6 +33,7 @@ export type PromoteReason =
   | 'same-identity'
   | 'quarantined-entity'
   | 'assertion-missing'
+  | 'relationship-not-entailed'
   | 'below-threshold'
   | 'moment';
 
@@ -243,6 +252,344 @@ export function leadingDenialOrHedge(sentence: string, row: PromoteRow, index?: 
   return words.slice(Math.max(0, at - 4), at).some((word) => NEGATORS.has(word) || HEDGES.has(word));
 }
 
+
+/* ------------------------------------------------------- relationship entailment */
+
+/**
+ * The entailment floor: a verbatim quote may only bank when its own words
+ * express the claimed relation family, in the claimed direction, between the
+ * two endpoints. The quote, endpoint, alias, hedge and confidence rules stay
+ * in keeperQuoteReason; this rule answers the separate question the old gate
+ * never asked: does the sentence say the relationship, or merely name both
+ * people?
+ *
+ * It reuses the production family grammar (familiesHeldByName /
+ * directionOfSentence vocabulary) rather than a book-specific word list:
+ * copular and appositive forms, possessives, coordinated symmetric forms,
+ * dialogue vocatives, and family heads/keys outside the endpoint names.
+ */
+
+function rx(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function variantsFor(row: PromoteRow, side: 'from' | 'to', index?: RosterIndex): string[] {
+  return explicitVariants(
+    side === 'from' ? row.fromName : row.toName,
+    side === 'from' ? row.fromAliases ?? [] : row.toAliases ?? [],
+    index,
+  );
+}
+
+function citationText(row: PromoteRow): string {
+  const anchor = (row.anchorEvidence ?? '').trim();
+  return anchor ? `${row.evidence} ${anchor}` : row.evidence;
+}
+
+function maskedCitation(row: PromoteRow, index?: RosterIndex): string {
+  let text = citationText(row);
+  for (const side of ['from', 'to'] as const) {
+    for (const variant of variantsFor(row, side, index)) {
+      if (!variant.trim()) continue;
+      text = text.replace(new RegExp(`\\b${rx(variant)}\\b`, 'gi'), ' ');
+    }
+  }
+  return text;
+}
+
+function familyRule(family: RelationFamily) {
+  return RELATION_FAMILIES.find((rule) => rule.family === family);
+}
+
+function familyHeadForms(family: RelationFamily): Set<string> {
+  const out = new Set<string>();
+  const rule = familyRule(family);
+  if (!rule) return out;
+  for (const head of rule.heads) {
+    out.add(head);
+    for (const form of headForms(head)) out.add(form);
+  }
+  for (const key of rule.keys) {
+    if (/^[a-z]+$/i.test(key)) {
+      out.add(key);
+      for (const form of headForms(key)) out.add(form);
+    } else {
+      out.add(key);
+    }
+  }
+  return out;
+}
+
+function familyTermPresent(text: string, family: RelationFamily): boolean {
+  const forms = [...familyHeadForms(family)].sort((a, b) => b.length - a.length);
+  return forms.some((form) => new RegExp(`\\b${rx(form)}\\b`, 'i').test(text));
+}
+
+function heldFamilies(row: PromoteRow, side: 'from' | 'to', text: string, index?: RosterIndex): Set<RelationFamily> {
+  const out = new Set<RelationFamily>();
+  for (const variant of variantsFor(row, side, index)) {
+    if (!variant.trim()) continue;
+    for (const family of familiesHeldByName(text, variant)) out.add(family);
+  }
+  return out;
+}
+
+function aliasAlt(row: PromoteRow, side: 'from' | 'to', index?: RosterIndex): string {
+  return variantsFor(row, side, index).map(rx).join('|');
+}
+
+function possessiveDirection(row: PromoteRow, family: RelationFamily, index?: RosterIndex): 'forward' | 'reverse' | 'none' {
+  const inverse = inverseFamilyOf(family);
+  const from = aliasAlt(row, 'from', index);
+  const to = aliasAlt(row, 'to', index);
+  const fHeads = [...familyHeadForms(family)].map(rx).join('|');
+  const iHeads = [...familyHeadForms(inverse)].map(rx).join('|');
+  const text = citationText(row);
+  if (!from || !to || !fHeads || !iHeads) return 'none';
+  const patterns: Array<[RegExp, 'forward' | 'reverse']> = [
+    [new RegExp(`\\b(?:${from})\\b\\s+(?:is|was|became)\\s+(?:${to})(?:'s|’s|s')\\s+(?:${fHeads})\\b`, 'i'), 'forward'],
+    [new RegExp(`\\b(?:${from})\\b\\s+(?:is|was|became)\\s+(?:${to})(?:'s|’s|s')\\s+(?:${iHeads})\\b`, 'i'), 'reverse'],
+    [new RegExp(`\\b(?:${to})\\b\\s+(?:is|was|became)\\s+(?:${from})(?:'s|’s|s')\\s+(?:${fHeads})\\b`, 'i'), 'reverse'],
+    [new RegExp(`\\b(?:${to})\\b\\s+(?:is|was|became)\\s+(?:${from})(?:'s|’s|s')\\s+(?:${iHeads})\\b`, 'i'), 'forward'],
+    [new RegExp(`\\b(?:${to})(?:'s|’s|s')\\s+(?:${fHeads})\\b\\s+(?:is|was)\\s+(?:${from})\\b`, 'i'), 'forward'],
+    [new RegExp(`\\b(?:${from})(?:'s|’s|s')\\s+(?:${iHeads})\\b\\s+(?:is|was)\\s+(?:${to})\\b`, 'i'), 'forward'],
+  ];
+  for (const [re, dir] of patterns) if (re.test(text)) return dir;
+  return 'none';
+}
+
+
+function firstMention(text: string, row: PromoteRow, side: 'from' | 'to', index?: RosterIndex): number {
+  let best = Infinity;
+  for (const variant of variantsFor(row, side, index)) {
+    if (!variant.trim()) continue;
+    const at = text.search(new RegExp(`\\b${rx(variant)}\\b`, 'i'));
+    if (at >= 0 && at < best) best = at;
+  }
+  return best;
+}
+
+function verbOrderDirection(row: PromoteRow, family: RelationFamily, index?: RosterIndex): 'forward' | 'reverse' | 'none' {
+  const inverse = inverseFamilyOf(family);
+  const text = citationText(row);
+  const masked = maskText(text, row, index);
+  const forms = [...familyHeadForms(family), ...familyHeadForms(inverse)];
+  const fromAt = firstMention(text, row, 'from', index);
+  const toAt = firstMention(text, row, 'to', index);
+  if (!Number.isFinite(fromAt) || !Number.isFinite(toAt)) return 'none';
+  for (const form of forms.sort((a, b) => b.length - a.length)) {
+    const re = new RegExp(`\\b${rx(form)}\\b`, 'gi');
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(masked)) !== null) {
+      const at = m.index;
+      if (fromAt < at && at < toAt) return 'forward';
+      if (toAt < at && at < fromAt) return 'reverse';
+    }
+  }
+  return 'none';
+}
+
+function coordinatedSymmetric(row: PromoteRow, family: RelationFamily, index?: RosterIndex): boolean {
+  if (isAsymmetricFamily(family)) return false;
+  const from = aliasAlt(row, 'from', index);
+  const to = aliasAlt(row, 'to', index);
+  const heads = [...familyHeadForms(family)].map(rx).join('|');
+  if (!from || !to || !heads) return false;
+  const text = citationText(row);
+  return [
+    new RegExp(`\\b(?:${from})\\b\\s*(?:and|,)\\s*(?:${to})\\b\\s*(?:are|were|became|remain)\\s+(?:[a-z]+\\s+){0,3}(?:${heads})\\b`, 'i'),
+    new RegExp(`\\b(?:${to})\\b\\s*(?:and|,)\\s*(?:${from})\\b\\s*(?:are|were|became|remain)\\s+(?:[a-z]+\\s+){0,3}(?:${heads})\\b`, 'i'),
+  ].some((re) => re.test(text));
+}
+
+function vocativeDirection(row: PromoteRow, family: RelationFamily, index?: RosterIndex): 'forward' | 'reverse' | 'none' {
+  const inverse = inverseFamilyOf(family);
+  const text = citationText(row);
+  const headFamilies = new Map<string, RelationFamily>();
+  for (const rule of RELATION_FAMILIES) {
+    for (const head of rule.heads) headFamilies.set(head.toLowerCase(), rule.family);
+    for (const form of rule.heads.flatMap((head) => [...headForms(head)])) headFamilies.set(form.toLowerCase(), rule.family);
+  }
+  const heads = [...headFamilies.keys()].sort((a, b) => b.length - a.length).map(rx).join('|');
+  if (!heads) return 'none';
+  const vocative = new RegExp(`[,;]\\s*(?:${heads})\\s*[,.;!?"”]`, 'i').exec(text);
+  if (!vocative) return 'none';
+  const head = vocative[0].replace(/^[,;\s]+|[,.;!?"”\s]+$/g, '').toLowerCase();
+  const headFamily = headFamilies.get(head);
+  if (!headFamily) return 'none';
+  const after = text.slice(vocative.index, vocative.index + 320);
+  const fromAlt = aliasAlt(row, 'from', index);
+  const toAlt = aliasAlt(row, 'to', index);
+  if (!fromAlt || !toAlt) return 'none';
+  // The speaker is the endpoint nearest an attribution verb, not any endpoint
+  // within a wide window: "Tenebrous strained to say. 'I'm dying, Plagueis'"
+  // must choose Tenebrous, not the addressee named in the next sentence.
+  const endpointPositions: Array<{ side: 'from' | 'to'; at: number }> = [];
+  for (const [side, alt] of [['from', fromAlt], ['to', toAlt]] as const) {
+    const re = new RegExp(`\\b(?:${alt})\\b`, 'gi');
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(after)) !== null) endpointPositions.push({ side, at: m.index });
+  }
+  const attribution = /\b(?:said|says|say|strain\w*|replied|asked|whispered|answered|muttered|growled)\b/gi;
+  let speakerSide: 'from' | 'to' | null = null;
+  let best = Infinity;
+  let m: RegExpExecArray | null;
+  while ((m = attribution.exec(after)) !== null) {
+    for (const endpoint of endpointPositions) {
+      const distance = Math.abs(endpoint.at - m.index);
+      if (distance <= 120 && distance < best) {
+        best = distance;
+        speakerSide = endpoint.side;
+      }
+    }
+  }
+  if (!speakerSide) return 'none';
+  const fromIsSpeaker = speakerSide === 'from';
+  const addresseeFamily = headFamily;
+  const speakerFamily = inverseFamilyOf(headFamily);
+  const fromFamily = fromIsSpeaker ? speakerFamily : addresseeFamily;
+  const toFamily = fromIsSpeaker ? addresseeFamily : speakerFamily;
+  if (fromFamily === family && toFamily === inverse) return 'forward';
+  if (fromFamily === inverse && toFamily === family) return 'reverse';
+  return 'none';
+}
+
+
+function maskText(text: string, row: PromoteRow, index?: RosterIndex): string {
+  let out = text;
+  for (const side of ['from', 'to'] as const) {
+    for (const variant of variantsFor(row, side, index)) {
+      if (!variant.trim()) continue;
+      out = out.replace(new RegExp(`\\b${rx(variant)}\\b`, 'gi'), ' ');
+    }
+  }
+  return out;
+}
+
+function clausesOf(text: string): string[] {
+  return text
+    .split(/[,;]|\band\b|\bbut\b|\bwhile\b/i)
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function bothEndpointsIn(text: string, row: PromoteRow, index?: RosterIndex): boolean {
+  const has = (side: 'from' | 'to'): boolean =>
+    variantsFor(row, side, index).some((variant) => variant.trim() !== '' && new RegExp(`\\b${rx(variant)}\\b`, 'i').test(text));
+  return has('from') && has('to');
+}
+
+function sameClauseWithBothEndpoints(row: PromoteRow, family: RelationFamily, index?: RosterIndex): boolean {
+  const source = (row.kindSource ?? '').trim();
+  for (const clause of clausesOf(citationText(row))) {
+    if (!bothEndpointsIn(clause, row, index)) continue;
+    const masked = maskText(clause, row, index);
+    if (familyTermPresent(masked, family)) return true;
+    if (source && normalise(masked).includes(normalise(source))) return true;
+  }
+  return false;
+}
+
+function definiteDescriptionAnchor(row: PromoteRow, family: RelationFamily, index?: RosterIndex): boolean {
+  const evidence = row.evidence;
+  const anchor = (row.anchorEvidence ?? '').trim();
+  if (!anchor || !bothEndpointsIn(citationText(row), row, index)) return false;
+  const evidenceHas = (side: 'from' | 'to'): boolean =>
+    variantsFor(row, side, index).some((variant) => variant.trim() !== '' && new RegExp(`\\b${rx(variant)}\\b`, 'i').test(evidence));
+  const hasFrom = evidenceHas('from');
+  const hasTo = evidenceHas('to');
+  // The evidence must supply one endpoint plus the relation word; the anchor
+  // supplies only the missing endpoint. If both endpoints are already in the
+  // evidence, use the same-clause rule, not a distant anchor.
+  if (hasFrom === hasTo) return false;
+  const missing: 'from' | 'to' = hasFrom ? 'to' : 'from';
+  const anchorHasMissing = variantsFor(row, missing, index).some(
+    (variant) => variant.trim() !== '' && new RegExp(`\\b${rx(variant)}\\b`, 'i').test(anchor),
+  );
+  if (!anchorHasMissing) return false;
+  const maskedEvidence = maskText(evidence, row, index);
+  if (!familyTermPresent(maskedEvidence, family)) return false;
+  if (!/\b(?:he|she|him|her|his|the\s+(?:man|woman|person|mother|father|son|daughter|wife|husband))\b/i.test(evidence)) {
+    return false;
+  }
+  return true;
+}
+
+
+function sentenceHas(row: PromoteRow, text: string, side: 'from' | 'to', index?: RosterIndex): boolean {
+  return variantsFor(row, side, index).some(
+    (variant) => variant.trim() !== '' && new RegExp(`\\b${rx(variant)}\\b`, 'i').test(text),
+  );
+}
+
+function contiguousDefiniteDescription(row: PromoteRow, family: RelationFamily, index?: RosterIndex): boolean {
+  const evidence = row.evidence;
+  if (!bothEndpointsIn(evidence, row, index)) return false;
+  const sentences = splitSentences(evidence).map((sentence) => sentence.trim()).filter(Boolean);
+  if (sentences.length < 2) return false;
+  const pronoun = /\b(?:he|she|him|her|his|the\s+(?:man|woman|person|mother|father|son|daughter|wife|husband))\b/i;
+  for (const sentence of sentences) {
+    const masked = maskText(sentence, row, index);
+    if (!familyTermPresent(masked, family) || !pronoun.test(sentence)) continue;
+    const hasFrom = sentenceHas(row, sentence, 'from', index);
+    const hasTo = sentenceHas(row, sentence, 'to', index);
+    if (hasFrom === hasTo) continue;
+    const missing: 'from' | 'to' = hasFrom ? 'to' : 'from';
+    if (sentences.some((other) => other !== sentence && sentenceHas(row, other, missing, index))) return true;
+  }
+  return false;
+}
+
+/**
+ * Fail-closed entailment reason. Null means the citation's own words express
+ * the relation family and direction. Every other answer is a refusal; the row
+ * stays provisional/needs_review under the existing lifecycle.
+ */
+export function relationEntailmentReason(row: PromoteRow, index?: RosterIndex): PromoteReason | null {
+  const family = familyOfKind(row.kind);
+  const text = maskedCitation(row, index);
+  const citation = citationText(row);
+  const source = (row.kindSource ?? '').trim();
+  const sourcePresent = source !== '' && normalise(text).includes(normalise(source));
+
+  if (family === 'other') {
+    const head = kindHeadWord(row.kind);
+    const support = sourcePresent || (head !== '' && normalise(text).includes(normalise(head)));
+    return support ? null : 'relationship-not-entailed';
+  }
+
+  const asymmetric = isAsymmetricFamily(family);
+  const inverse = inverseFamilyOf(family);
+  const term = familyTermPresent(text, family) || (asymmetric && familyTermPresent(text, inverse)) || sourcePresent;
+  if (!term) return 'relationship-not-entailed';
+
+  if (asymmetric) {
+    const fromFamilies = heldFamilies(row, 'from', citation, index);
+    const toFamilies = heldFamilies(row, 'to', citation, index);
+    if (fromFamilies.has(family) && toFamilies.has(inverse)) return null;
+    if (fromFamilies.has(inverse) && toFamilies.has(family)) return 'direction-mismatch';
+    const possessive = possessiveDirection(row, family, index);
+    if (possessive === 'forward') return null;
+    if (possessive === 'reverse') return 'direction-mismatch';
+    const vocative = vocativeDirection(row, family, index);
+    if (vocative === 'forward') return null;
+    if (vocative === 'reverse') return 'direction-mismatch';
+    const verb = verbOrderDirection(row, family, index);
+    if (verb === 'forward') return null;
+    if (verb === 'reverse') return 'direction-mismatch';
+    return 'relationship-not-entailed';
+  }
+
+  const fromFamilies = heldFamilies(row, 'from', citation, index);
+  const toFamilies = heldFamilies(row, 'to', citation, index);
+  if (fromFamilies.has(family) && toFamilies.has(family)) return null;
+  if (coordinatedSymmetric(row, family, index)) return null;
+  if (sameClauseWithBothEndpoints(row, family, index)) return null;
+  if (definiteDescriptionAnchor(row, family, index)) return null;
+  if (contiguousDefiniteDescription(row, family, index)) return null;
+  return 'relationship-not-entailed';
+}
+
 /**
  * The verbatim floor both tiers stand on: the quote and any anchor must sit
  * word-for-word in the cited passage. Taught by invented quotes banked as
@@ -316,5 +663,7 @@ export function provenRelation(
   if (quoteReason) return { ok: false, reason: quoteReason };
   const min = context.minConfidence ?? DEFAULT_MIN_CONFIDENCE;
   if (claimTier(row.confidence ?? 1, min) !== 'accepted') return { ok: false, reason: 'below-threshold' };
+  const entailment = relationEntailmentReason(row, context.index);
+  if (entailment) return { ok: false, reason: entailment };
   return { ok: true };
 }

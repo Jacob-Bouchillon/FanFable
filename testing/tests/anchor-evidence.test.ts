@@ -72,7 +72,7 @@ test('an anchor that asserts the tie carries it', () => {
   db.close();
 });
 
-test('an anchor that only names both people is still a valid citation', () => {
+test('an anchor that only names both people is not relationship proof', () => {
   const { db, project, mara, tor } = setup('anchor-citation', 'Tor walked in with him. Mara and Tor went to town.');
   const decision = lorebook.canPromote(
     {
@@ -86,7 +86,7 @@ test('an anchor that only names both people is still a valid citation', () => {
     },
     { db, projectId: project.id, chunkText: 'Tor walked in with him. Mara and Tor went to town.' },
   );
-  assert.equal(decision.ok, true, 'the anchor is checked for existence, not for asserting the tie');
+  assert.deepEqual(decision, { ok: false, reason: 'relationship-not-entailed' });
   db.close();
 });
 

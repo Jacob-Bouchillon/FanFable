@@ -7,9 +7,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
 
-const decide = (sentence: string, kind = 'aunt of', confidence = 0.9) =>
+const decide = (sentence: string, kind = 'aunt of', confidence = 0.9, kindSource = '') =>
   lorebook.provenRelation(
-    { fromId: 1, toId: 2, fromName: 'Mara', toName: 'Tor', kind, evidence: sentence, confidence },
+    { fromId: 1, toId: 2, fromName: 'Mara', toName: 'Tor', kind, evidence: sentence, kindSource, confidence },
     { chunkText: sentence, minConfidence: 0.7 },
   );
 
@@ -17,16 +17,16 @@ test('a title-shaped sentence is banked at the model score', () => {
   assert.deepEqual(decide('Aunt Mara took Tor to the market.'), { ok: true });
 });
 
-test('a co-occurrence sentence is not vetoed by grammar', () => {
-  assert.deepEqual(decide('Mara and Tor came in together.'), { ok: true });
+test('a co-occurrence sentence is not relationship proof', () => {
+  assert.deepEqual(decide('Mara and Tor came in together.'), { ok: false, reason: 'relationship-not-entailed' });
 });
 
 test('a sentence about a third person is not vetoed by grammar', () => {
   assert.deepEqual(decide("Bran said Mara was Tor's mentor.", 'mentor of'), { ok: true });
 });
 
-test('a bare action verb is not vetoed by grammar', () => {
-  assert.deepEqual(decide('Mara joined Tor.', 'member of'), { ok: true });
+test('a family word supplied by the model can support member-of', () => {
+  assert.deepEqual(decide('Mara joined Tor.', 'member of', 0.9, 'joined'), { ok: true });
 });
 
 test('a confident claim still needs a verbatim quote', () => {

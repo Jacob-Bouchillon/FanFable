@@ -84,11 +84,11 @@ test('an insert without an explicit status enters review, never accepted', () =>
   db.close();
 });
 
-test('without the words, the same quote still passes: kind_source is provenance', () => {
+test('without the supporting words, the paraphrase fails closed', () => {
   const quote = 'Mara threw in with Tor before the vote.';
   const { db, project, id } = setup('kind-source-absent', quote);
   const decision = lorebook.canPromoteRelation(db, project.id, id);
-  assert.equal(decision.ok, true);
+  assert.deepEqual(decision, { ok: false, reason: 'relationship-not-entailed' });
   db.close();
 });
 
@@ -100,10 +100,10 @@ test('with the words, the same quote passes', () => {
   db.close();
 });
 
-test('foreign words are not a promotion check either', () => {
+test('foreign supporting words do not rescue a paraphrase', () => {
   const quote = 'Mara threw in with Tor before the vote.';
   const { db, project, id } = setup('kind-source-foreign', quote, 'backed');
   const decision = lorebook.canPromoteRelation(db, project.id, id);
-  assert.equal(decision.ok, true, 'the quote is verbatim; kind_source is stored for audit');
+  assert.deepEqual(decision, { ok: false, reason: 'relationship-not-entailed' });
   db.close();
 });

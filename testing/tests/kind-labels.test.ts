@@ -30,8 +30,11 @@ test('a concept proved by other wording passes with its citation', () => {
   assert.deepEqual(decide('Mara', 'Tor', 'disliked', 'Mara loathed Tor in a quiet way.', 'loathed'), { ok: true });
 });
 
-test('a missing citation is no longer a promotion failure', () => {
-  assert.deepEqual(decide('Mara', 'Tor', 'disliked', 'Mara loathed Tor in a quiet way.'), { ok: true });
+test('a paraphrase with no supporting kind word fails closed', () => {
+  assert.deepEqual(decide('Mara', 'Tor', 'disliked', 'Mara loathed Tor in a quiet way.'), {
+    ok: false,
+    reason: 'relationship-not-entailed',
+  });
 });
 
 test('direction is the model\'s, not a guard verdict', () => {
@@ -39,11 +42,17 @@ test('direction is the model\'s, not a guard verdict', () => {
   assert.deepEqual(decide('Bram', 'Asha', 'sister of', "Asha is Bram's sister.", 'sister'), { ok: true });
 });
 
-test('a three-character passage is not forced to one pair by the guard', () => {
+test('a three-character passage does not turn a bystander into a relationship', () => {
   const quote = 'Mara loathed Tor, and Corin watched from the doorway.';
-  for (const [from, to] of [['Mara', 'Tor'], ['Mara', 'Corin'], ['Tor', 'Corin']] as const) {
-    assert.deepEqual(decide(from, to, 'disliked', quote, 'loathed'), { ok: true });
-  }
+  assert.deepEqual(decide('Mara', 'Tor', 'disliked', quote, 'loathed'), { ok: true });
+  assert.deepEqual(decide('Mara', 'Corin', 'disliked', quote, 'loathed'), {
+    ok: false,
+    reason: 'relationship-not-entailed',
+  });
+  assert.deepEqual(decide('Tor', 'Corin', 'disliked', quote, 'loathed'), {
+    ok: false,
+    reason: 'relationship-not-entailed',
+  });
 });
 
 test('a symmetric concept accepts either order and extraction stores one pair', async () => {
