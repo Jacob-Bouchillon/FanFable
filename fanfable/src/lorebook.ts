@@ -5321,16 +5321,18 @@ export function canPromote(row: PromoteRow, context: PromoteContext): PromoteDec
   // Mechanical proof: a kind must say something. "related to" and its friends
   // repeat the question instead of answering it.
   if (GENERIC_PROOF_KINDS.has(canonicalKind(row.kind))) return { ok: false, reason: 'generic-kind' };
-  const quoteReason = keeperQuoteReason(row, context.chunkText, context.index);
-  if (quoteReason) return { ok: false, reason: quoteReason };
+  // The pure proven gate resolves the holding sentence and its antecedent;
+  // canPromote uses the same guarded citation so both tiers agree.
+  const proven = provenRelation(row, {
+    chunkText: context.chunkText,
+    index: context.index,
+    minConfidence: context.minConfidence ?? projectMinConfidence(context.db, context.projectId),
+  });
+  if (!proven.ok) return proven;
   // Mechanical proof: the sentence owns the arrow, never the candidate order.
   if (directionOfSentence(row.evidence, row.fromName, row.toName, row.kind) === 'reverse') {
     return { ok: false, reason: 'direction-mismatch' };
   }
-  const min = context.minConfidence ?? projectMinConfidence(context.db, context.projectId);
-  if (claimTier(row.confidence ?? 1, min) !== 'accepted') return { ok: false, reason: 'below-threshold' };
-  const entailment = relationEntailmentReason(row, context.index);
-  if (entailment) return { ok: false, reason: entailment };
   return { ok: true };
 }
 

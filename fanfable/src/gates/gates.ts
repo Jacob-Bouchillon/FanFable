@@ -649,6 +649,142 @@ export function attestedQuoteReason(row: PromoteRow, chunkText?: string | null, 
   return null;
 }
 
+
+/**
+ * A third-person subject that can continue a person introduced one sentence
+ * earlier. Possessive forms ("his arm", "her lover") are deliberately absent:
+ * their antecedent may be a different person than the nearest name.
+ */
+const SUBJECT_REFERENCE =
+  /\b(?:he|she)\s+(?:was|is|had|has|would|could|seemed|appeared|remained|became)\b|\bthe\s+(?:man|woman|person|mother|father|son|daughter|wife|husband)\s+(?:was|is|had|has|would|could|seemed|appeared|remained|became)\b/i;
+
+/** A sentence that introduces a person by name. A bare mention is not an
+ * introduction, so "…and Dooku was elsewhere" cannot bind a later pronoun. */
+function introductionNames(sentence: string, variants: string[]): boolean {
+  const text = canonicalName(sentence);
+  const raw = sentence.replace(/[\u2018\u2019]/g, "'");
+  return variants.some((variant) => {
+    const form = canonicalName(variant);
+    if (!form) return false;
+    const intro = new RegExp(
+      `\\b(?:you remember|do you remember|this is|meet|say hello to)\\s+(?:the\\s+)?${rx(form)}\\b`,
+      'i',
+    );
+    if (!intro.test(text)) return false;
+    // "This is Jobal's house" introduces a house, not Jobal.
+    const possessive = new RegExp(
+      `\\b(?:you remember|do you remember|this is|meet|say hello to)\\s+(?:the\\s+)?${rx(form)}'s\\b`,
+      'i',
+    );
+    return !possessive.test(raw);
+  });
+}
+
+/** Sentences for context. Line breaks are flattened first because a book
+ * chunk often breaks a sentence across lines, and the chunker's sentence
+ * spans treat a bare newline as a boundary without keeping the partial line.
+ * A lowercase continuation is then joined to the sentence it continues. */
+function contextSentences(text: string): string[] {
+  const out: string[] = [];
+  const flat = (text ?? '').replace(/\s*\n+\s*/g, ' ');
+  for (const sentence of splitSentences(flat).map((part) => part.trim()).filter(Boolean)) {
+    const previous = out[out.length - 1];
+    if (previous && /^[a-z]/.test(sentence) && !/[.!?]["'”’)]?$/.test(previous)) {
+      out[out.length - 1] = `${previous} ${sentence}`;
+    } else {
+      out.push(sentence);
+    }
+  }
+  return out;
+}
+
+/** True when the sentence names any roster entity other than the two
+ * endpoints, so a definite-description chain cannot skip over a third person. */
+function namesOtherEntity(text: string, row: PromoteRow, index?: RosterIndex): boolean {
+  if (!index) return false;
+  const source = canonicalName(text);
+  for (const other of index.rows) {
+    if (other.name === row.fromName || other.name === row.toName) continue;
+    for (const variant of explicitVariants(other.name, other.aliases, index)) {
+      const form = canonicalName(variant);
+      if (form && new RegExp(`\\b${rx(form)}\\b`, 'i').test(source)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Ground a definite description in the passage that introduces it. The
+ * holding sentence must name one endpoint and refer to the other with a
+ * third-person subject; the missing endpoint must be introduced by name one
+ * or two sentences earlier ("You remember Jobal?"). A two-sentence gap is
+ * allowed only across a pure description of that same person: a sentence that
+ * names another roster entity breaks the chain. This is identity grounding,
+ * never relationship proof, and it refuses bare co-mention.
+ */
+function introducedReferentAnchor(
+  row: PromoteRow,
+  holding: string,
+  sentences: string[],
+  at: number,
+  index?: RosterIndex,
+): string | null {
+  const hasFrom = variantsFor(row, 'from', index).some(
+    (variant) => variant.trim() !== '' && new RegExp(`\\b${rx(variant)}\\b`, 'i').test(holding),
+  );
+  const hasTo = variantsFor(row, 'to', index).some(
+    (variant) => variant.trim() !== '' && new RegExp(`\\b${rx(variant)}\\b`, 'i').test(holding),
+  );
+  if (hasFrom === hasTo) return null;
+  if (!SUBJECT_REFERENCE.test(holding)) return null;
+  const missing: 'from' | 'to' = hasFrom ? 'to' : 'from';
+  for (const back of [1, 2]) {
+    const j = at - back;
+    if (j < 0) continue;
+    const anchor = sentences[j]!;
+    if (!introductionNames(anchor, variantsFor(row, missing, index))) continue;
+    // The introduction must not name a third person whose antecedent could be
+    // the later pronoun.
+    if (namesOtherEntity(anchor, row, index)) continue;
+    if (back === 2) {
+      const between = sentences[at - 1]!;
+      if (!SUBJECT_REFERENCE.test(between)) continue;
+      if (namesOtherEntity(between, row, index)) continue;
+    }
+    return anchor;
+  }
+  return null;
+}
+
+/**
+ * Endpoint context from the quoted sentence itself. A stored relation often
+ * quotes a sub-span of the sentence that introduces both people ("Married to
+ * Ruwee by arrangement" from "…she was…", with "You remember Jobal?" just
+ * before). Identity grounding may use that introduction and a pure description
+ * between it and the quote. It never treats a nearby named character as the
+ * antecedent, and it never decides the relationship; entailment remains a
+ * separate check.
+ */
+function contextualEvidence(
+  row: PromoteRow,
+  chunkText: string | null | undefined,
+  index?: RosterIndex,
+): PromoteRow | null {
+  if (!chunkText || (row.anchorEvidence ?? '').trim()) return null;
+  const sentences = contextSentences(chunkText);
+  const source = normalise(row.evidence);
+  if (!source) return null;
+  for (let i = 0; i < sentences.length; i += 1) {
+    const holding = sentences[i]!;
+    if (!normalise(holding).includes(source)) continue;
+    const anchor = introducedReferentAnchor(row, holding, sentences, i, index);
+    if (!anchor) continue;
+    const withAnchor = { ...row, evidence: holding, anchorEvidence: anchor };
+    if (citationNamesBothEndpoints(withAnchor, index)) return withAnchor;
+  }
+  return null;
+}
+
 /**
  * The proven-tie verdict: verbatim quote, honest sentence, model score at
  * the bar. Pure and database-free. Taught by the second-definition-of-truth
@@ -659,11 +795,12 @@ export function provenRelation(
   row: PromoteRow,
   context: { chunkText?: string | null; index?: RosterIndex; minConfidence?: number },
 ): PromoteDecision {
-  const quoteReason = keeperQuoteReason(row, context.chunkText, context.index);
+  const guarded = contextualEvidence(row, context.chunkText, context.index) ?? row;
+  const quoteReason = keeperQuoteReason(guarded, context.chunkText, context.index);
   if (quoteReason) return { ok: false, reason: quoteReason };
   const min = context.minConfidence ?? DEFAULT_MIN_CONFIDENCE;
-  if (claimTier(row.confidence ?? 1, min) !== 'accepted') return { ok: false, reason: 'below-threshold' };
-  const entailment = relationEntailmentReason(row, context.index);
+  if (claimTier(guarded.confidence ?? 1, min) !== 'accepted') return { ok: false, reason: 'below-threshold' };
+  const entailment = relationEntailmentReason(guarded, context.index);
   if (entailment) return { ok: false, reason: entailment };
   return { ok: true };
 }
