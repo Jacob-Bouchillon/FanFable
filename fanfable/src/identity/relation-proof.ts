@@ -85,7 +85,7 @@ export const RELATION_FAMILIES: readonly FamilyRule[] = [
     canonical: 'ally_of',
     inverseFamily: 'ally',
     keys: [
-      'ally', 'friend', 'partner', 'acquaintance', 'peer', 'colleague', 'companion', 'associate',
+      'ally', 'friend', 'partner', 'partnership', 'acquaintance', 'peer', 'colleague', 'companion', 'associate',
       'contact', 'contacted', 'meeting', 'met with', 'collaborator', 'interacted', 'communicating', 'contacting',
       'congratulating', 'introduced', 'invited', 'linked', 'relationship', 'concerned about',
       // Moving and acting together is companionship.
@@ -136,7 +136,10 @@ export const RELATION_FAMILIES: readonly FamilyRule[] = [
     family: 'spouse',
     canonical: 'spouse_of',
     inverseFamily: 'spouse',
-    keys: ['married', 'spouse', 'husband', 'wife', 'lover', 'widow', 'betrothed', 'partner of'],
+    // "partner of" is not here: a partner is not necessarily a spouse, and a
+    // romantic partner must not be promoted to marriage. It remains an ally
+    // kind through the "partner" key.
+    keys: ['married', 'spouse', 'husband', 'wife', 'lover', 'widow', 'betrothed'],
     heads: ['spouse', 'husband', 'wife', 'lover', 'widow'],
   },
   {
