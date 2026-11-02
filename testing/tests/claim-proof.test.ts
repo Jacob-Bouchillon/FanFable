@@ -183,7 +183,7 @@ function freshClaim(db: Db, projectId: number, index: number): {
 
 test('migration 29 creates claim UIDs and the append-only proof table', () => {
   const { db } = tempDb();
-  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')?.user_version, 29);
+  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')?.user_version, 30);
   for (const table of ['canon_relation', 'canon_entity', 'canon_fact']) {
     const columns = db.all<{ name: string }>(`PRAGMA table_info(${table})`).map((row) => row.name);
     assert.ok(columns.includes('claim_uid'), `${table}.claim_uid`);
@@ -298,7 +298,7 @@ test('migration backfills every legacy claim before proof evaluation', async () 
   db.close();
 
   const copy = new SqliteDb(path);
-  assert.equal(copy.get<{ user_version: number }>('PRAGMA user_version')?.user_version, 29);
+  assert.equal(copy.get<{ user_version: number }>('PRAGMA user_version')?.user_version, 30);
   assert.ok(copy.get("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'claim_proof'"));
   for (const name of ['canon_relation_claim_uid', 'canon_entity_claim_uid', 'canon_fact_claim_uid']) {
     assert.ok(

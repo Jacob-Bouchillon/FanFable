@@ -31,6 +31,16 @@ import {
   type StoredProofOutcome,
 } from './claim-proof.ts';
 import { recordRuling, type RulingActor, type RulingRole } from './ruling.ts';
+import {
+  TRACE_EVENT_APPLIED,
+  TRACE_EVENT_CONFLICT,
+  TRACE_EVENT_NOOP,
+  TRACE_EVENT_REJECTED,
+  TRACE_EVENT_STALE,
+  TRACE_STAGE_COURT_TRANSITION,
+  recordTraceEvent,
+  type TraceContext,
+} from '../trace/trace.ts';
 
 export type TransitionIntent = 'initial' | 'promotion' | 'demotion' | 'administrative';
 export type Authorization = 'none' | 'user_confirmed';
@@ -85,6 +95,11 @@ export interface TransitionClaimInput {
   standard: string;
   basis: string;
   quote?: string;
+  /**
+   * Optional trace/span. A real applied transition writes a required event in
+   * the same transaction. Shadow evaluation ignores this context entirely.
+   */
+  trace?: TraceContext;
 }
 
 export interface ClaimStateSnapshot {
@@ -618,6 +633,31 @@ function runTransition(
     quote: input.quote,
   });
 
+  if (input.trace) {
+    // Required and in the same transaction: if this fails, status, proof and
+    // ruling roll back together.
+    recordTraceEvent(db, {
+      traceId: input.trace.traceId,
+      spanId: input.trace.spanId,
+      parentSpanId: input.trace.parentSpanId,
+      projectId,
+      stage: input.trace.stage ?? TRACE_STAGE_COURT_TRANSITION,
+      event: TRACE_EVENT_APPLIED,
+      eventClass: 'required',
+      subject: claimTraceSubject(input.claim),
+      decision: 'applied',
+      reasonCode: appliedTraceReason(input, plan),
+      refs: {
+        ...input.trace.refs,
+        claim_uid: input.claim.uid,
+        ...(proof ? { proof_id: proof.id } : {}),
+      },
+      model: input.trace.model,
+      promptHash: input.trace.promptHash,
+      committed: true,
+    });
+  }
+
   const to: ClaimStateSnapshot = {
     reviewStatus: plan.nextStatus,
     authorization: authorizationOf(plan.nextStatus, plan.nextConfirmedByUser),
@@ -638,6 +678,64 @@ function runTransition(
   };
 }
 
+function claimTraceSubject(claim: ClaimRef): string {
+  return `claim:${claim.type}:${claim.uid}`;
+}
+
+function appliedTraceReason(input: TransitionClaimInput, plan: Plan): string {
+  if (input.intent === 'promotion') return 'promotion_applied';
+  if (input.intent === 'demotion') return 'demotion_applied';
+  if (input.intent === 'initial') return 'initial_applied';
+  return plan.authChanged && !plan.statusChanged ? 'authorization_applied' : 'administrative_applied';
+}
+
+function recordOutcomeTrace(
+  db: Db,
+  projectId: number,
+  input: TransitionClaimInput,
+  result: Exclude<TransitionResult, { kind: 'applied' }>,
+): void {
+  if (!input.trace) return;
+  const event = result.kind === 'noop'
+    ? TRACE_EVENT_NOOP
+    : result.kind === 'stale'
+      ? TRACE_EVENT_STALE
+      : result.kind === 'conflict'
+        ? TRACE_EVENT_CONFLICT
+        : TRACE_EVENT_REJECTED;
+  const reasonCode = result.kind === 'noop'
+    ? 'already_in_target'
+    : result.kind === 'stale'
+      ? `stale_${result.reason}`
+      : result.kind === 'conflict'
+        ? `conflict_${result.reason}`
+        : result.reason;
+  try {
+    recordTraceEvent(db, {
+      traceId: input.trace.traceId,
+      spanId: input.trace.spanId,
+      parentSpanId: input.trace.parentSpanId,
+      projectId,
+      stage: input.trace.stage ?? TRACE_STAGE_COURT_TRANSITION,
+      event,
+      eventClass: 'diagnostic',
+      subject: claimTraceSubject(input.claim),
+      decision: result.kind,
+      reasonCode,
+      refs: {
+        ...input.trace.refs,
+        claim_uid: input.claim.uid,
+      },
+      model: input.trace.model,
+      promptHash: input.trace.promptHash,
+      error: result.kind === 'rejected' ? result.detail : '',
+      committed: false,
+    });
+  } catch {
+    // Diagnostic trace recording is best-effort by contract.
+  }
+}
+
 /**
  * Apply one relation transition. The only function in this module that writes.
  *
@@ -650,35 +748,50 @@ export function transitionClaim(
   input: TransitionClaimInput,
 ): TransitionResult {
   const invalid = preValidate(input);
-  if (invalid) return invalid;
+  if (invalid) {
+    recordOutcomeTrace(db, projectId, input, invalid);
+    return invalid;
+  }
 
   try {
-    return db.transaction(() => runTransition(db, projectId, input), { immediate: true });
+    const result = db.transaction(() => runTransition(db, projectId, input), { immediate: true });
+    if (result.kind !== 'applied') recordOutcomeTrace(db, projectId, input, result);
+    return result;
   } catch (error) {
     if (error instanceof AttemptConflictError) {
       const current = readRelationClaimState(db, projectId, input.claim.uid);
-      if (!current) return { kind: 'stale', reason: 'claim_missing', targetAlreadyCurrent: false };
-      return { kind: 'conflict', reason: 'attempt_seq_taken', current, retryable: true };
+      const result: TransitionResult = current
+        ? { kind: 'conflict', reason: 'attempt_seq_taken', current, retryable: true }
+        : { kind: 'stale', reason: 'claim_missing', targetAlreadyCurrent: false };
+      recordOutcomeTrace(db, projectId, input, result);
+      return result;
     }
     if (error instanceof ProofRejectedError) {
       const current = readRelationClaimState(db, projectId, input.claim.uid);
-      return current
+      const result: TransitionResult = current
         ? { kind: 'rejected', reason: 'proof_rejected', detail: error.detail, current }
         : { kind: 'rejected', reason: 'proof_rejected', detail: error.detail };
+      recordOutcomeTrace(db, projectId, input, result);
+      return result;
     }
     if (error instanceof WriteRaceError) {
       const current = readRelationClaimState(db, projectId, input.claim.uid);
-      if (!current) return { kind: 'stale', reason: 'claim_missing', targetAlreadyCurrent: false };
-      const stale = staleReason(current, input.expect);
-      if (stale) {
-        return {
-          kind: 'stale',
-          reason: stale,
-          current,
-          targetAlreadyCurrent: targetAlreadyCurrent(current, input.target),
-        };
+      if (!current) {
+        const result: TransitionResult = { kind: 'stale', reason: 'claim_missing', targetAlreadyCurrent: false };
+        recordOutcomeTrace(db, projectId, input, result);
+        return result;
       }
-      return { kind: 'conflict', reason: 'write_race', current, retryable: true };
+      const stale = staleReason(current, input.expect);
+      const result: TransitionResult = stale
+        ? {
+            kind: 'stale',
+            reason: stale,
+            current,
+            targetAlreadyCurrent: targetAlreadyCurrent(current, input.target),
+          }
+        : { kind: 'conflict', reason: 'write_race', current, retryable: true };
+      recordOutcomeTrace(db, projectId, input, result);
+      return result;
     }
     throw error;
   }

@@ -846,6 +846,61 @@ export const MIGRATIONS: Migration[] = [
         ON extraction_window_run(run_id, window_index);
     `,
   },
+  {
+    version: 30,
+    name: 'trace ledger',
+    // Observability only: a trace records what a pipeline stage decided, not
+    // the prompt or the passage. Required events are written in the same
+    // transaction as the decision they describe; diagnostic events are
+    // best-effort and may be sampled, capped or pruned.
+    sql: `
+      CREATE TABLE IF NOT EXISTS trace (
+        id              TEXT PRIMARY KEY,
+        project_id      INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        started_at      TEXT NOT NULL,
+        finished_at     TEXT,
+        completeness    TEXT NOT NULL DEFAULT 'complete'
+                        CHECK (completeness IN ('complete','sampled','truncated','interrupted')),
+        sampled_rate    REAL NOT NULL DEFAULT 1.0,
+        dropped_events  INTEGER NOT NULL DEFAULT 0,
+        metadata        TEXT NOT NULL DEFAULT '{}',
+        created_at      TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS trace_project_started
+        ON trace(project_id, started_at);
+
+      CREATE TABLE IF NOT EXISTS trace_event (
+        id              INTEGER PRIMARY KEY,
+        trace_id        TEXT NOT NULL REFERENCES trace(id) ON DELETE CASCADE,
+        span_id         TEXT NOT NULL,
+        parent_span_id  TEXT,
+        project_id      INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        stage           TEXT NOT NULL,
+        event           TEXT NOT NULL,
+        event_class     TEXT NOT NULL CHECK (event_class IN ('required','diagnostic')),
+        subject         TEXT NOT NULL DEFAULT '',
+        decision        TEXT NOT NULL DEFAULT '',
+        reason_code     TEXT NOT NULL DEFAULT '',
+        refs            TEXT NOT NULL DEFAULT '{}',
+        model           TEXT NOT NULL DEFAULT '',
+        prompt_hash     TEXT NOT NULL DEFAULT '',
+        duration_ms     REAL,
+        error           TEXT NOT NULL DEFAULT '',
+        committed       INTEGER NOT NULL DEFAULT 0 CHECK (committed IN (0,1)),
+        created_at      TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS trace_event_trace_span
+        ON trace_event(trace_id, span_id);
+      CREATE INDEX IF NOT EXISTS trace_event_project_stage
+        ON trace_event(project_id, stage);
+      CREATE INDEX IF NOT EXISTS trace_event_subject
+        ON trace_event(subject);
+      CREATE INDEX IF NOT EXISTS trace_event_class
+        ON trace_event(event_class);
+      CREATE INDEX IF NOT EXISTS trace_event_created
+        ON trace_event(created_at);
+    `,
+  },
 ];
 
 /**

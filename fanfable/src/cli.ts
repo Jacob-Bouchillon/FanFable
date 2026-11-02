@@ -34,6 +34,8 @@ import * as controller from './plan/controller.ts';
 import * as retrieval from './answer/retrieval.ts';
 import * as sweep from './extract/sweep.ts';
 import * as ruling from './court/ruling.ts';
+import * as traceLog from './trace/trace.ts';
+import { openTraceReadConnection } from './trace/trace-readonly.ts';
 import * as pairThreads from './web/pair-threads.ts';
 import * as threadWeb from './web/threads.ts';
 import * as meetingWeb from './web/meetings.ts';
@@ -249,6 +251,10 @@ ${C.bold('MEMORY')}
   state set-character <name> [--location l] [--condition c] [--emotional e]
   state set-event <id> [--order n] [--kind flashback] [--note "changed from canon: ..."]
   state add-fact --content "..." [--kind fact] [--subject s]
+
+${C.bold('TRACE')}
+  trace show <trace-id> [--json]   Show one trace chain, completeness and drops
+  trace audit <trace-id> [--json]  Audit required events, proof refs and outcomes
 
 ${C.bold('MODEL')}
   llm status                       Check that the model server is reachable
@@ -2615,6 +2621,96 @@ async function cmdLlm(args: Args): Promise<void> {
   throw new Error(`unknown llm subcommand "${sub}"`);
 }
 
+/* ------------------------------------------------------------------ trace */
+
+async function cmdTrace(args: Args, dbPath: string): Promise<void> {
+  const sub = args._[1];
+  const traceId = args._[2];
+  if (!sub || !traceId || (sub !== 'show' && sub !== 'audit')) {
+    throw new Error('usage: fanfable trace show|audit <trace-id> [--json]');
+  }
+  const asJson = args.flags.json === true;
+  const reader = openTraceReadConnection(dbPath);
+
+  try {
+    if (sub === 'show') {
+      const view = traceLog.showTrace(reader, traceId);
+      if (!view) throw new Error(`no trace "${traceId}"`);
+      if (asJson) {
+        console.log(JSON.stringify(view, null, 2));
+        return;
+      }
+      console.log(`\n${C.bold('Trace')} ${view.trace.id}`);
+      console.log(
+        `completeness: ${view.trace.completeness}` +
+          `   dropped_events: ${view.trace.droppedEvents}` +
+          `   sampled_rate: ${view.trace.sampledRate}`,
+      );
+      console.log(`started: ${view.trace.startedAt}   finished: ${view.trace.finishedAt ?? '(unfinished)'}`);
+      console.log(`project: ${view.trace.projectId}   events: ${view.events.length}`);
+      if (Object.keys(view.trace.metadata).length) {
+        console.log(`metadata: ${JSON.stringify(view.trace.metadata)}`);
+      }
+      for (const event of view.events) {
+        const parent = event.parentSpanId ? ` parent=${event.parentSpanId}` : '';
+        console.log(
+          `\n#${event.id} span=${event.spanId}${parent} ${event.stage} ${event.event}` +
+            ` [${event.eventClass}]`,
+        );
+        console.log(
+          `  decision=${event.decision || '-'} reason=${event.reasonCode || '-'}` +
+            ` committed=${event.committed ? 'yes' : 'no'}`,
+        );
+        if (event.subject) console.log(`  subject=${event.subject}`);
+        const refs = Object.entries(event.refs).map(([key, value]) => `${key}=${String(value)}`);
+        if (refs.length) console.log(`  refs: ${refs.join(' ')}`);
+        if (event.model || event.promptHash) {
+          console.log(`  model=${event.model || '-'} prompt_hash=${event.promptHash || '-'}`);
+        }
+        if (event.durationMs !== null) console.log(`  duration_ms=${event.durationMs}`);
+        if (event.error) console.log(`  error: ${event.error}`);
+      }
+      return;
+    }
+
+    const audit = traceLog.auditTrace(reader, traceId);
+    if (!audit) throw new Error(`no trace "${traceId}"`);
+    if (asJson) {
+      console.log(JSON.stringify(audit, null, 2));
+      return;
+    }
+    console.log(`\n${C.bold('Trace audit')} ${audit.traceId}`);
+    console.log(
+      `completeness: ${audit.completeness}` +
+        `   exhaustive: ${audit.exhaustive ? 'yes' : 'no'}` +
+        `   dropped_events: ${audit.droppedEvents}` +
+        `   sampled_rate: ${audit.sampledRate}`,
+    );
+    console.log(
+      audit.exhaustive
+        ? C.green('This trace is an exhaustive account of the events it contains.')
+        : C.yellow('This trace is NOT an exhaustive account; events were sampled, dropped or interrupted.'),
+    );
+    console.log(`\n${C.bold('Provable violations')}: ${audit.violations.length}`);
+    for (const item of audit.violations) {
+      const event = item.eventId === undefined ? '' : ` event #${item.eventId}`;
+      const claim = item.claimUid ? ` claim ${item.claimUid}` : '';
+      console.log(`  ${C.red(item.code)}${event}${claim}: ${item.detail}`);
+    }
+    console.log(`\n${C.bold('Suspicious patterns')}: ${audit.suspicious.length}`);
+    for (const item of audit.suspicious) {
+      const event = item.eventId === undefined ? '' : ` event #${item.eventId}`;
+      console.log(`  ${C.yellow(item.code)}${event}: ${item.detail}`);
+    }
+    console.log(`\n${C.bold('Checks')}`);
+    for (const check of audit.checks) console.log(`  - ${check}`);
+    console.log(`\n${C.bold('Limitations')}`);
+    for (const limitation of audit.limitations) console.log(`  - ${limitation}`);
+  } finally {
+    reader.close();
+  }
+}
+
 /* ------------------------------------------------------------------- main */
 
 let db: Db;
@@ -2638,6 +2734,15 @@ async function main(): Promise<void> {
   }
 
   const dbPath = resolve(flagString(args, 'db') || defaultDbPath());
+
+  // Trace inspection must not use Db: Db creates directories, runs migrations,
+  // normalises rows and writes schema_meta. Open a genuinely read-only
+  // connection and never fall back to the writable path.
+  if (command === 'trace') {
+    await cmdTrace(args, dbPath);
+    return;
+  }
+
   db = new Db(dbPath);
 
   try {

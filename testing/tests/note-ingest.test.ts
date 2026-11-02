@@ -538,7 +538,7 @@ test('starvedThreads returns threads with nothing gathered, oldest first', () =>
 
 test('migration 22 is additive on a v21 database and reruns as a no-op', () => {
   const { db } = tempDb();
-  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')!.user_version, 29);
+  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')!.user_version, 30);
   assert.ok(
     db.all<{ name: string }>('PRAGMA table_info(canon_thread_note)').some((row) => row.name === 'dedupe_key'),
     'the dedupe column exists',
@@ -563,7 +563,7 @@ test('migration 22 is additive on a v21 database and reruns as a no-op', () => {
   db.raw.exec('PRAGMA foreign_keys = ON');
   assert.equal(tableExists(db.raw, 'canon_thread_note'), true);
 
-  assert.equal(runMigrations(db.raw), 29);
+  assert.equal(runMigrations(db.raw), 30);
   assert.ok(
     db.all<{ name: string }>('PRAGMA table_info(canon_thread_note)').some((row) => row.name === 'dedupe_key'),
     'the column is recreated',
@@ -577,7 +577,7 @@ test('migration 22 is additive on a v21 database and reruns as a no-op', () => {
     'existing data survives',
   );
   assert.ok(db.get<{ id: number }>('SELECT id FROM canon_entity WHERE id = ?', mara));
-  assert.equal(runMigrations(db.raw), 29, 'second run stays at the current version');
+  assert.equal(runMigrations(db.raw), 30, 'second run stays at the current version');
   db.close();
 });
 
