@@ -10,9 +10,10 @@
  * back in. Requests are de-duplicated and capped so a model cannot loop.
  */
 import { extractJson } from '../core/json.ts';
-import type { LlmClient } from '../core/llm.ts';
+import type { ChatRequest, LlmClient } from '../core/llm.ts';
 import type { ChapterOutline, Outline, OutlinePreferences } from '../plan/planner.ts';
 import { dedupeParagraphs, wordCount } from '../core/text.ts';
+import type { RequestTraceContext, WriteTrace } from '../trace/write-trace.ts';
 
 /* ------------------------------------------------------------ context protocol */
 
@@ -345,6 +346,8 @@ export interface WriteOptions {
    * gives the model a smaller thing to hold in mind.
    */
   segments?: number;
+  /** Optional diagnostic write trace. Tracing never changes writing behavior. */
+  trace?: WriteTrace;
 }
 
 export interface WriteResult {
@@ -367,6 +370,7 @@ export interface WriteResult {
 
 export type RequestResolver = (
   req: ContextRequest,
+  trace?: RequestTraceContext,
 ) => Promise<ResolvedContext | null>;
 
 /**
@@ -404,9 +408,14 @@ export async function writeChapter(
   const answered = new Map<string, ResolvedContext>();
   const trace: { request: ContextRequest; answer: ResolvedContext }[] = [];
   let rounds = 0;
+  let requestSeq = 0;
   let meta: Record<string, unknown> | null = null;
   let prose = '';
   let requests: ContextRequest[] = [];
+  const traceSink = opts.trace;
+
+  const mainOutputs: { callId: string; text: string; part: number; round: number }[] = [];
+  const continuationOutputs: { callId: string; text: string; attempt: number }[] = [];
 
   const target = opts.targetWords ?? opts.chapter?.targetWords ?? 2500;
   // The chapter is written in one go by default: a single coherent generation
@@ -418,10 +427,15 @@ export async function writeChapter(
 
   for (let part = 0; part < segments; part++) {
    const partTarget = Math.round(target / segments);
+   const partNumber = part + 1;
+   traceSink?.partStarted(partNumber, segments, target, partTarget);
+   let partCalls = 0;
    // Within a part, the writer may ask for context and carry on. The loop is
    // bounded by the round cap and the distinct-request cap.
    while (rounds <= limits.maxRounds) {
     rounds++;
+    const partPrevious = segments > 1 && prose ? stripProtocolBlocks(prose).slice(-2400) : '';
+    const partBeats = segments > 1 ? beatsSoFar(prose) : [];
     const prompt = buildWriterPrompt({
       chapter: opts.chapter,
       chapterNumber: opts.chapterNumber,
@@ -436,22 +450,53 @@ export async function writeChapter(
       part:
         segments > 1
           ? {
-              index: part + 1,
+              index: partNumber,
               total: segments,
               target: partTarget,
-              previous: prose ? stripProtocolBlocks(prose).slice(-2400) : '',
-              beats: beatsSoFar(prose),
+              previous: partPrevious,
+              beats: partBeats,
             }
           : undefined,
     });
 
+    const roundSpan = traceSink?.roundStarted(partNumber, rounds);
+    traceSink?.promptBuilt(roundSpan!, prompt, {
+      part: partNumber,
+      total: segments,
+      round: rounds,
+      messageCount: messages.length,
+      previousChars: partPrevious.length,
+      beatCount: partBeats.length,
+    });
     messages.push({ role: 'user', content: prompt });
-    const res = await llm.chat({
+    traceSink?.promptMessage(roundSpan!, messages.length - 1, 'user', 'built', prompt, {
+      part: partNumber,
+      round: rounds,
+    });
+    const request: ChatRequest = {
       system: WRITER_SYSTEM,
       messages,
       temperature: 0.85,
       maxTokens: Math.max(1200, Math.ceil(partTarget * 1.8)),
+    };
+    const callId = traceSink?.modelStarted(request, {
+      role: 'writer',
+      part: partNumber,
+      round: rounds,
+      parentSpanId: roundSpan ?? 'sp-write',
+      llm,
     });
+    let res;
+    try {
+      res = await llm.chat(request);
+      if (callId) traceSink?.modelCompleted(callId, res);
+    } catch (err) {
+      if (callId) traceSink?.modelFailed(callId, err);
+      throw err;
+    }
+    traceSink?.roundCompleted(partNumber, rounds);
+    partCalls++;
+    if (callId) mainOutputs.push({ callId, text: res.text, part: partNumber, round: rounds });
     messages.push({ role: 'assistant', content: res.text });
 
     const parsedMeta = parseMeta(res.text);
@@ -461,50 +506,88 @@ export async function writeChapter(
 
     if (!requests.length) break;
 
-    const fresh = requests.filter((r) => !answered.has(requestKey(r)));
+    const parsed = requests.map((req) => {
+      const seq = ++requestSeq;
+      const ctx = traceSink
+        ? {
+            requestId: traceSink.requestKey(req),
+            seq,
+            part: partNumber,
+            round: rounds,
+            spanId: traceSink.requestSpan(partNumber, rounds, seq),
+          }
+        : undefined;
+      if (ctx) traceSink?.requestParsed(ctx, req);
+      return { req, ctx };
+    });
+    const fresh = parsed.filter(({ req }) => !answered.has(requestKey(req)));
     if (!fresh.length) {
       // The model is repeating itself: tell it the answers and move on.
-      messages.push({
-        role: 'user',
-        content: `Those requests were already answered. Here are the answers again:\n${[...answered.values()]
+      for (const { req, ctx } of parsed) {
+        if (ctx) traceSink?.requestDisposition(ctx, req, 'duplicate', 'already-answered');
+      }
+      const message =
+        `Those requests were already answered. Here are the answers again:\n${[...answered.values()]
           .map((a) => `--- ${a.label} ---\n${a.content}`)
-          .join('\n\n')}\n\nContinue the scene now using this information.`,
+          .join('\n\n')}\n\nContinue the scene now using this information.`;
+      messages.push({ role: 'user', content: message });
+      traceSink?.promptMessage(roundSpan!, messages.length - 1, 'user', 'duplicate-answers', message, {
+        part: partNumber,
+        round: rounds,
       });
       continue;
     }
     if (answered.size >= limits.maxRequests) {
-      messages.push({
-        role: 'user',
-        content:
-          'You have reached the context request limit for this scene. Continue with what you have ' +
-          'and do not make any more requests.',
+      for (const { req, ctx } of fresh) {
+        if (ctx) traceSink?.requestDisposition(ctx, req, 'over-limit', 'request-limit');
+      }
+      const message =
+        'You have reached the context request limit for this scene. Continue with what you have ' +
+        'and do not make any more requests.';
+      messages.push({ role: 'user', content: message });
+      traceSink?.promptMessage(roundSpan!, messages.length - 1, 'user', 'request-limit', message, {
+        part: partNumber,
+        round: rounds,
       });
       continue;
     }
 
+    const processable = fresh.slice(0, Math.max(0, limits.maxRequests - answered.size));
+    const notProcessed = fresh.slice(processable.length);
+    for (const { req, ctx } of notProcessed) {
+      if (ctx) traceSink?.requestDisposition(ctx, req, 'not-processed', 'request-slot-limit');
+    }
+
     const chunks: string[] = [];
-    for (const req of fresh.slice(0, Math.max(0, limits.maxRequests - answered.size))) {
+    for (const { req, ctx } of processable) {
       const key = requestKey(req);
-      const answer = await resolve(req);
+      const answer = await resolve(req, ctx);
       if (!answer) continue;
       answered.set(key, answer);
       trace.push({ request: req, answer });
       chunks.push(`--- ${answer.label} ---\n${answer.content}`);
+      if (ctx) traceSink?.answerQueued(ctx, answer);
     }
     if (!chunks.length) {
-      messages.push({
-        role: 'user',
-        content: 'No matching information was found. Continue with the information you already have.',
+      const message = 'No matching information was found. Continue with the information you already have.';
+      messages.push({ role: 'user', content: message });
+      traceSink?.promptMessage(roundSpan!, messages.length - 1, 'user', 'no-matching-information', message, {
+        part: partNumber,
+        round: rounds,
       });
       continue;
     }
-    messages.push({
-      role: 'user',
-      content:
-        `Here is the information you requested. Use it and continue the scene from where you stopped.\n\n` +
-        chunks.join('\n\n'),
+    const message =
+      `Here is the information you requested. Use it and continue the scene from where you stopped.\n\n` +
+      chunks.join('\n\n');
+    messages.push({ role: 'user', content: message });
+    traceSink?.promptMessage(roundSpan!, messages.length - 1, 'user', 'context-answer', message, {
+      part: partNumber,
+      round: rounds,
     });
    }
+   if (partCalls === 0) traceSink?.partSkipped(partNumber, segments, 'round-cap');
+   else traceSink?.partCompleted(partNumber, wordCount(prose), partCalls);
   }
 
   let body = stripTrailingMeta(stripProtocolBlocks(prose));
@@ -536,7 +619,9 @@ export async function writeChapter(
       body = swept.text;
     }
     continuations++;
-    const res = await llm.chat({
+    const reason = wasRepetitive ? 'repetitive' : 'too-short';
+    const continuationSpan = traceSink?.continuationStarted(continuations, reason, have, target);
+    const continuationRequest: ChatRequest = {
       system: WRITER_SYSTEM,
       messages: [
         ...messages,
@@ -556,10 +641,31 @@ export async function writeChapter(
       ],
       temperature: 0.85,
       maxTokens: Math.max(1200, Math.ceil((target - have) * 1.8)),
+    };
+    const callId = traceSink?.modelStarted(continuationRequest, {
+      role: 'continuation',
+      attempt: continuations,
+      parentSpanId: continuationSpan ?? 'sp-write',
+      llm,
     });
+    let res;
+    try {
+      res = await llm.chat(continuationRequest);
+      if (callId) traceSink?.modelCompleted(callId, res);
+    } catch (err) {
+      if (callId) traceSink?.modelFailed(callId, err);
+      throw err;
+    }
+    if (callId) continuationOutputs.push({ callId, text: res.text, attempt: continuations });
     messages.push({ role: 'assistant', content: res.text });
     const more = stripTrailingMeta(stripProtocolBlocks(res.text));
-    if (!more) break;
+    if (!more) {
+      if (callId) traceSink?.outputDisposition(callId, 'empty', 'continuation-empty');
+      traceSink?.continuationEmpty(continuations);
+      break;
+    }
+    if (callId) traceSink?.outputDisposition(callId, 'included', 'continuation');
+    traceSink?.continuationCompleted(continuations, more);
     body = `${body}\n\n${more}`;
     prose = body;
   }
@@ -570,6 +676,26 @@ export async function writeChapter(
   if (removed) {
     body = swept.text;
     prose = body;
+  }
+  traceSink?.pendingNotIncluded('round-limit');
+  traceSink?.outputDedupe(removed);
+  traceSink?.outputFinal(body);
+
+  // Emit output provenance after the final body is known. Single-part writes
+  // replace prose with each response; earlier responses remain in messages but
+  // are not persisted as the chapter body.
+  for (const output of mainOutputs) {
+    if (segments > 1) {
+      traceSink?.outputDisposition(output.callId, 'included', 'part-output');
+    } else if (output !== mainOutputs[mainOutputs.length - 1]) {
+      traceSink?.outputDisposition(output.callId, 'superseded', 'single-part-overwrite');
+    } else {
+      traceSink?.outputDisposition(
+        output.callId,
+        stripTrailingMeta(stripProtocolBlocks(output.text)) ? 'included' : 'empty',
+        'single-part-final',
+      );
+    }
   }
 
   return {

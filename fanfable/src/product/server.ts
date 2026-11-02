@@ -797,6 +797,7 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
             chapter: res.chapter,
             trace: res.trace,
             contextTraceId: res.contextTraceId,
+            writeTraceId: res.writeTraceId,
             issues: res.issues,
           };
         });

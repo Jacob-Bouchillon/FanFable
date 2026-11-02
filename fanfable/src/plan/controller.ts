@@ -27,6 +27,7 @@ import * as planner from './planner.ts';
 import { buildWebBrief, renderWebBrief } from './brief.ts';
 import { ContextAssemblyTrace } from './context-trace.ts';
 import * as traceLog from '../trace/trace.ts';
+import { WriteTrace } from '../trace/write-trace.ts';
 import * as writer from '../product/writer.ts';
 import * as continuity from '../product/continuity.ts';
 import { continuitySettings, filterBySeverity } from '../product/continuity-settings.ts';
@@ -692,6 +693,8 @@ export interface RequestLogEntry {
   query: string;
   resultCount: number;
   status: string;
+  /** Durable context_request row, for trace correlation. */
+  rowId?: number;
 }
 
 /**
@@ -707,7 +710,11 @@ export async function resolveContextRequest(
   req: writer.ContextRequest,
   chapterId: number | null,
   limits: { maxRequests: number },
-  opts: { lazyExtract?: boolean } = {},
+  opts: {
+    lazyExtract?: boolean;
+    /** Trace-only observer factory; must return a transparent LlmClient. */
+    llmForRole?: (role: 'context-expand' | 'context-mining') => LlmClient;
+  } = {},
 ): Promise<{ answer: writer.ResolvedContext | null; log: RequestLogEntry }> {
   const prior = db.get<{ n: number }>(
     'SELECT COUNT(*) AS n FROM context_request WHERE project_id = ? AND chapter_id IS ?',
@@ -716,7 +723,7 @@ export async function resolveContextRequest(
   );
   const already = prior?.n ?? 0;
   if (already >= limits.maxRequests) {
-    db.run(
+    const denied = db.run(
       'INSERT INTO context_request (project_id, chapter_id, requester, kind, query, result_count, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       projectId,
       chapterId,
@@ -729,7 +736,13 @@ export async function resolveContextRequest(
     );
     return {
       answer: null,
-      log: { kind: req.kind, query: req.query, resultCount: 0, status: 'denied' },
+      log: {
+        kind: req.kind,
+        query: req.query,
+        resultCount: 0,
+        status: 'denied',
+        rowId: Number(denied.lastInsertRowid),
+      },
     };
   }
 
@@ -738,7 +751,8 @@ export async function resolveContextRequest(
 
   switch (req.kind) {
     case 'lore': {
-      const expanded = await lore.expandQuery(llm, req.query);
+      const expandLlm = opts.llmForRole?.('context-expand') ?? llm;
+      const expanded = await lore.expandQuery(expandLlm, req.query);
       const passages = lore.searchCanon(db, projectId, req.query, {
         limit: req.limit ?? 6,
         expand: expanded,
@@ -748,7 +762,7 @@ export async function resolveContextRequest(
       if (opts.lazyExtract !== false) {
         await lorebook.mineUnminedHits(
           db,
-          llm,
+          opts.llmForRole?.('context-mining') ?? llm,
           projectId,
           passages.map((p) => p.chunkId),
         );
@@ -929,7 +943,7 @@ export async function resolveContextRequest(
     }
   }
 
-  db.run(
+  const inserted = db.run(
     'INSERT INTO context_request (project_id, chapter_id, requester, kind, query, result_count, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
     projectId,
     chapterId,
@@ -941,7 +955,16 @@ export async function resolveContextRequest(
     nowIso(),
   );
 
-  return { answer, log: { kind: req.kind, query: req.query, resultCount, status: answer ? 'resolved' : 'empty' } };
+  return {
+    answer,
+    log: {
+      kind: req.kind,
+      query: req.query,
+      resultCount,
+      status: answer ? 'resolved' : 'empty',
+      rowId: Number(inserted.lastInsertRowid),
+    },
+  };
 }
 
 /* ------------------------------------------------------------------ writing */
@@ -954,6 +977,8 @@ export interface WriteChapterOptions {
   targetWords?: number;
   /** How similar two paragraphs must be before the second counts as a repeat. */
   dedupeThreshold?: number;
+  /** Maximum continuation calls for a single-part chapter. */
+  maxContinuations?: number;
   /** Write the chapter in this many parts, to control length and repetition. */
   segments?: number;
   /**
@@ -974,6 +999,10 @@ export interface WriteChapterOptions {
   bundle?: ContextBundle;
   /** Do not run the continuity checker over the draft. */
   skipContinuity?: boolean;
+  /** Trace this write invocation. Defaults on; false preserves plain behaviour for parity tests. */
+  trace?: boolean;
+  /** Receives the write trace id for an actual invocation. */
+  onWriteTraceId?: (traceId: string) => void;
 }
 
 export interface WriteChapterResult {
@@ -983,6 +1012,8 @@ export interface WriteChapterResult {
   stats: writer.WriteResult['stats'];
   /** Trace for the initial context assembly, absent when a bundle was reused. */
   contextTraceId?: string;
+  /** Trace for this write execution. */
+  writeTraceId?: string;
 }
 
 /**
@@ -1003,69 +1034,163 @@ export async function writeChapter(
   const chapterNumber =
     opts.chapterNumber ?? (existing.length ? Math.max(...existing.map((c) => c.number)) + 1 : 1);
   const chapterOutline = outline.chapters.find((c) => c.number === chapterNumber);
+  const hadExisting = existing.some((c) => c.number === chapterNumber);
 
   let contextTraceId: string | undefined;
-  const bundle =
-    opts.bundle ??
-    (await assembleContext(db, opts.contextLlm ?? llm, projectId, {
-      chapter: chapterOutline,
-      chapterNumber,
-      userInstructions: opts.userInstructions,
-      onTraceId: (id) => {
-        contextTraceId = id;
-      },
-    }));
-
-  const limits = opts.contextLimits ?? writer.DEFAULT_CONTEXT_LIMITS;
-  const contextLlm = opts.contextLlm ?? llm;
-
-  // Create the chapter row first so context requests can be attributed to it.
-  // If the model fails, a newly created placeholder is removed so numbering never skips.
-  const hadExisting = existing.some((c) => c.number === chapterNumber);
-  const placeholder = saveChapter(db, projectId, chapterNumber, {
-    title: chapterOutline?.title ?? `Chapter ${chapterNumber}`,
-    ...(hadExisting ? {} : { body: '', status: 'draft' }),
-    outlineId: outline.id,
-  });
-
-  let result: Awaited<ReturnType<typeof writer.writeChapter>>;
-  try {
-    result = await writer.writeChapter(
-    llm,
-    {
-      chapterNumber,
-      chapter: chapterOutline,
-      outline,
-      memoryText: bundle.memoryText,
-      canonText: bundle.canonText,
-      connectedText: bundle.connectedText,
-      previousChapterTail: bundle.previousTail,
-      userInstructions: opts.userInstructions,
-      sceneSummary: opts.sceneSummary,
-      preferences: outline.preferences,
-      targetWords: opts.targetWords,
-      dedupeThreshold: opts.dedupeThreshold,
-      segments: opts.segments,
-    },
-    async (req) => {
-      const { answer } = await resolveContextRequest(db, contextLlm, projectId, req, placeholder.id, limits);
-      return answer;
-    },
-    limits,
-  );
-  } catch (err) {
-    if (!hadExisting) {
-      db.run('DELETE FROM chapter WHERE project_id = ? AND number = ?', projectId, chapterNumber);
+  let writeTraceId: string | undefined;
+  let writeTrace: WriteTrace | undefined;
+  if (opts.trace !== false) {
+    try {
+      const started = traceLog.startTrace(db, {
+        projectId,
+        metadata: {
+          command: 'write chapter',
+          chapter_number: chapterNumber,
+          existing: hadExisting,
+        },
+      });
+      writeTraceId = started.id;
+      writeTrace = new WriteTrace(db, projectId, started.id, {
+        chapterNumber,
+        mode: hadExisting ? 'regenerate' : 'write',
+        existing: hadExisting,
+        targetWords: opts.targetWords ?? chapterOutline?.targetWords ?? 2500,
+      });
+      try {
+        opts.onWriteTraceId?.(started.id);
+      } catch {
+        // A caller callback cannot affect writing.
+      }
+    } catch {
+      writeTrace = undefined;
+      writeTraceId = undefined;
     }
-    throw err;
   }
 
-  const chapter = saveChapter(db, projectId, chapterNumber, {
-    title: chapterOutline?.title ?? `Chapter ${chapterNumber}`,
-    body: result.prose,
-    status: 'draft',
-    outlineId: outline.id,
-  });
+  const prior = existing.find((c) => c.number === chapterNumber);
+  if (writeTrace && prior) {
+    writeTrace.regeneratePrior({
+      chapterId: prior.id,
+      chapterNumber: prior.number,
+      status: prior.status,
+      body: prior.body,
+    });
+  }
+
+  let bundle: ContextBundle;
+  let placeholder: Chapter | undefined;
+  let result: Awaited<ReturnType<typeof writer.writeChapter>>;
+  let chapter: Chapter;
+  let stage: 'context' | 'placeholder' | 'writer' | 'store' = 'context';
+  try {
+    if (opts.bundle) {
+      bundle = opts.bundle;
+      writeTrace?.contextSupplied();
+    } else {
+      bundle = await assembleContext(db, opts.contextLlm ?? llm, projectId, {
+        chapter: chapterOutline,
+        chapterNumber,
+        userInstructions: opts.userInstructions,
+        onTraceId: (id) => {
+          contextTraceId = id;
+        },
+      });
+      if (contextTraceId) writeTrace?.contextLinked(contextTraceId);
+      else writeTrace?.contextAssemblyMissing();
+    }
+
+    const limits = opts.contextLimits ?? writer.DEFAULT_CONTEXT_LIMITS;
+    const contextLlm = opts.contextLlm ?? llm;
+
+    stage = 'placeholder';
+    writeTrace?.storeRequested({ chapterNumber, existing: hadExisting });
+    placeholder = saveChapter(db, projectId, chapterNumber, {
+      title: chapterOutline?.title ?? `Chapter ${chapterNumber}`,
+      ...(hadExisting ? {} : { body: '', status: 'draft' }),
+      outlineId: outline.id,
+    });
+
+    stage = 'writer';
+    result = await writer.writeChapter(
+      llm,
+      {
+        chapterNumber,
+        chapter: chapterOutline,
+        outline,
+        memoryText: bundle.memoryText,
+        canonText: bundle.canonText,
+        connectedText: bundle.connectedText,
+        previousChapterTail: bundle.previousTail,
+        userInstructions: opts.userInstructions,
+        sceneSummary: opts.sceneSummary,
+        preferences: outline.preferences,
+        targetWords: opts.targetWords,
+        dedupeThreshold: opts.dedupeThreshold,
+        maxContinuations: opts.maxContinuations,
+        segments: opts.segments,
+        ...(writeTrace ? { trace: writeTrace } : {}),
+      },
+      async (req, requestTrace) => {
+        const traced =
+          writeTrace && requestTrace
+            ? (role: 'context-expand' | 'context-mining') =>
+                writeTrace!.wrapLlm(contextLlm, role, requestTrace)
+            : undefined;
+        const { answer, log } = await resolveContextRequest(
+          db,
+          contextLlm,
+          projectId,
+          req,
+          placeholder!.id,
+          limits,
+          traced ? { llmForRole: traced } : {},
+        );
+        if (writeTrace && requestTrace) {
+          const status = log.status === 'resolved' || log.status === 'empty' || log.status === 'denied'
+            ? log.status
+            : 'empty';
+          writeTrace.requestOutcome(requestTrace, req, status, answer, {
+            status,
+            resultCount: log.resultCount,
+            rowId: log.rowId,
+          });
+        }
+        return answer;
+      },
+      limits,
+    );
+
+    stage = 'store';
+    chapter = saveChapter(db, projectId, chapterNumber, {
+      title: chapterOutline?.title ?? `Chapter ${chapterNumber}`,
+      body: result.prose,
+      status: 'draft',
+      outlineId: outline.id,
+    });
+    writeTrace?.stored({
+      chapterId: chapter.id,
+      chapterNumber,
+      status: chapter.status,
+      body: chapter.body,
+      existing: hadExisting,
+    });
+    writeTrace?.completed({
+      calls: writeTrace.getCallCount(),
+      words: chapter.wordCount,
+      continuations: result.stats.continuations,
+      droppedParagraphs: result.stats.droppedParagraphs,
+    });
+    writeTrace?.finish(false);
+  } catch (err) {
+    writeTrace?.storeFailed('write-error');
+    if (stage === 'writer' && placeholder && !hadExisting) {
+      db.run('DELETE FROM chapter WHERE project_id = ? AND number = ?', projectId, chapterNumber);
+      writeTrace?.placeholderRemoved();
+    }
+    writeTrace?.failed('write-error', err);
+    writeTrace?.finish(true);
+    throw err;
+  }
 
   const settings = continuitySettings(getProject(db, projectId)!);
   const issues =
@@ -1073,7 +1198,14 @@ export async function writeChapter(
       ? await runContinuityCheck(db, llm, projectId, chapter, outline, bundle)
       : [];
 
-  return { chapter, trace: result.trace, issues, stats: result.stats, contextTraceId };
+  return {
+    chapter,
+    trace: result.trace,
+    issues,
+    stats: result.stats,
+    contextTraceId,
+    writeTraceId,
+  };
 }
 
 /** Approve a chapter: fold it into memory and continuity state. */

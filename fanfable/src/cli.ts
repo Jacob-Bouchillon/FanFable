@@ -2313,7 +2313,8 @@ function printWriteResult(result: controller.WriteChapterResult): void {
     console.log(`\n${C.bold('Continuity notes:')}`);
     printIssues(result.issues);
   }
-  if (result.contextTraceId) console.log(`${C.dim(`trace ${result.contextTraceId}`)}`);
+  if (result.contextTraceId) console.log(`${C.dim(`context trace ${result.contextTraceId}`)}`);
+  if (result.writeTraceId) console.log(`${C.dim(`write trace ${result.writeTraceId}`)}`);
   console.log(
     `\nReview it with ${C.bold(`fanfable write show ${result.chapter.number}`)} ` +
       `then ${C.bold(`fanfable write approve ${result.chapter.number}`)}.`,
@@ -2927,6 +2928,149 @@ async function cmdTrace(args: Args, dbPath: string): Promise<void> {
               ` contributing=${coverage.refs.contributing_count ?? '-'}` +
               ` optional=${coverage.refs.optional_count ?? '-'}` +
               ` incomplete=${coverage.refs.incomplete_count ?? '-'}`,
+          );
+        }
+      }
+      const writeEvents = view.events.filter((event) => event.stage === 'write');
+      if (writeEvents.length) {
+        const contextual = view.events.filter(
+          (event) => event.stage === 'write' || event.spanId.startsWith('sp-write'),
+        );
+        const spans = new Map<string, { id: string; parent: string | null; children: string[]; events: typeof view.events }>();
+        for (const event of contextual) {
+          let span = spans.get(event.spanId);
+          if (!span) {
+            span = { id: event.spanId, parent: event.parentSpanId, children: [], events: [] };
+            spans.set(event.spanId, span);
+          }
+          span.events.push(event);
+          if (span.parent === null && event.parentSpanId) span.parent = event.parentSpanId;
+        }
+        for (const span of spans.values()) {
+          if (span.parent && spans.has(span.parent) && !spans.get(span.parent)!.children.includes(span.id)) {
+            spans.get(span.parent)!.children.push(span.id);
+          }
+        }
+        const terminalFor = (id: string) =>
+          spans.get(id)?.events.find((event) =>
+            event.event === 'write.model.completed' ||
+            event.event === 'write.model.failed' ||
+            event.event === 'write.part.completed' ||
+            event.event === 'write.part.skipped' ||
+            event.event === 'write.completed' ||
+            event.event === 'write.failed' ||
+            event.event === 'write.stored' ||
+            (event.event.startsWith('write.request.') && event.event !== 'write.request.parsed'),
+          );
+        const printed = new Set<string>();
+        const printSpan = (id: string, depth: number): void => {
+          if (printed.has(id)) return;
+          printed.add(id);
+          const span = spans.get(id);
+          if (!span) return;
+          const started = span.events.find((event) => event.event === 'write.model.started');
+          const terminal = terminalFor(id);
+          const label = id === 'sp-write'
+            ? 'write'
+            : started
+              ? `${started.reasonCode || 'model'} ${started.subject}`
+              : id.replace(/^sp-write-/, '');
+          const status = terminal ? `${terminal.event.replace(/^write\./, '')} ${terminal.reasonCode || ''}`.trim() : '';
+          console.log(`  ${'  '.repeat(depth)}${label}${status ? ` — ${status}` : ''}`);
+          for (const child of span.children) printSpan(child, depth + 1);
+        };
+        console.log(`\n${C.bold('Write execution tree')}`);
+        if (spans.has('sp-write')) printSpan('sp-write', 0);
+        else {
+          for (const span of spans.values()) {
+            if (!span.parent || !spans.has(span.parent)) printSpan(span.id, 0);
+          }
+        }
+
+        const sections = writeEvents
+          .filter((event) => event.event === 'write.prompt.section')
+          .sort((a, b) => Number(a.refs.rank ?? 0) - Number(b.refs.rank ?? 0));
+        if (sections.length) {
+          console.log(`\n${C.bold('Prompt sections')}`);
+          for (const event of sections) {
+            console.log(
+              `  ${event.subject.replace(/^section:/, '')}: chars=${event.refs.section_chars ?? '-'}` +
+                ` words=${event.refs.section_words ?? '-'} hash=${String(event.refs.content_hash ?? '').slice(0, 12)}`,
+            );
+          }
+        }
+
+        const calls = writeEvents.filter((event) => event.event === 'write.model.started');
+        if (calls.length) {
+          console.log(`\n${C.bold('Model calls')}`);
+          for (const call of calls) {
+            const completed = writeEvents.find(
+              (event) =>
+                (event.event === 'write.model.completed' || event.event === 'write.model.failed') &&
+                event.subject === call.subject,
+            );
+            console.log(
+              `  ${call.subject} ${call.reasonCode} model=${call.model || '-'}` +
+                ` part=${call.refs.part ?? '-'} round=${call.refs.round ?? '-'}` +
+                ` messages=${call.refs.message_count ?? '-'}` +
+                ` prompt=${call.refs.prompt_chars ?? '-'} chars` +
+                ` response=${completed?.refs.response_chars ?? '-'} chars` +
+                ` ${completed?.event.replace(/^write\./, '') ?? 'unfinished'}`,
+            );
+          }
+        }
+
+        const requests = writeEvents.filter((event) => event.event === 'write.request.parsed');
+        if (requests.length) {
+          console.log(`\n${C.bold('Context requests')}`);
+          for (const request of requests) {
+            const terminal = writeEvents.find(
+              (event) =>
+                event.subject === request.subject &&
+                event.refs.seq === request.refs.seq &&
+                event.event.startsWith('write.request.') &&
+                event.event !== 'write.request.parsed',
+            );
+            const consumed = writeEvents.some(
+              (event) =>
+                event.event === 'write.answer.consumed' &&
+                event.subject === request.subject &&
+                event.refs.seq === request.refs.seq,
+            );
+            const notIncluded = writeEvents.some(
+              (event) =>
+                event.event === 'write.answer.not-included' &&
+                event.subject === request.subject &&
+                event.refs.seq === request.refs.seq,
+            );
+            console.log(
+              `  ${request.subject} kind=${request.refs.request_kind ?? '-'}` +
+                ` status=${terminal?.event.replace(/^write\.request\./, '') ?? 'unfinished'}` +
+                ` answer=${consumed ? 'consumed' : notIncluded ? 'not-included' : '-'}`,
+            );
+          }
+        }
+
+        const finalOutput = writeEvents.find((event) => event.event === 'write.output.final');
+        const stored = writeEvents.find((event) => event.event === 'write.stored');
+        const linked = writeEvents.find((event) => event.event === 'write.context.linked');
+        const supplied = writeEvents.find((event) => event.event === 'write.context.supplied');
+        console.log(`\n${C.bold('Write handoff')}`);
+        if (linked) console.log(`  context trace: ${linked.refs.context_trace_id ?? '-'}`);
+        else if (supplied) console.log('  context source: supplied-bundle');
+        if (finalOutput) {
+          console.log(
+            `  output: chars=${finalOutput.refs.body_chars ?? '-'}` +
+              ` words=${finalOutput.refs.body_words ?? '-'}` +
+              ` hash=${String(finalOutput.refs.body_hash ?? '').slice(0, 12)}`,
+          );
+        }
+        if (stored) {
+          console.log(
+            `  stored chapter: ${stored.refs.chapter_number ?? '-'}` +
+              ` id=${stored.refs.chapter_id ?? '-'}` +
+              ` chars=${stored.refs.body_chars ?? '-'}` +
+              ` words=${stored.refs.body_words ?? '-'}`,
           );
         }
       }

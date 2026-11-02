@@ -292,6 +292,43 @@ export interface TraceRefs {
   required_incomplete_count?: number;
   contributing_incomplete_count?: number;
   optional_incomplete_count?: number;
+  /** Model/prompt coordination identifiers and hashes. */
+  response_hash?: string;
+  body_hash?: string;
+  content_hash?: string;
+  system_hash?: string;
+  context_trace_id?: string;
+  model_provider?: string;
+  message_role?: string;
+  request_kind?: string;
+  status?: string;
+  /** Write execution counters. */
+  part?: number;
+  round?: number;
+  attempt?: number;
+  message_index?: number;
+  prompt_chars?: number;
+  response_chars?: number;
+  answer_chars?: number;
+  section_chars?: number;
+  section_words?: number;
+  previous_chars?: number;
+  beat_count?: number;
+  system_chars?: number;
+  message_count?: number;
+  max_tokens?: number;
+  temperature?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  body_chars?: number;
+  body_words?: number;
+  chapter_number?: number;
+  chapter_id?: number;
+  request_row_id?: number;
+  revision_row_id?: number;
+  call_count?: number;
+  continuation_count?: number;
+  dropped_paragraphs?: number;
   /** Short scoring/processing stage code, never prose. */
   stage?: string;
 }
@@ -474,7 +511,11 @@ interface TraceEventRow {
   created_at: string;
 }
 
-const REF_STRING_KEYS = ['claim_uid', 'candidate_id', 'period_label', 'stage'] as const;
+const REF_STRING_KEYS = [
+  'claim_uid', 'candidate_id', 'period_label', 'stage',
+  'response_hash', 'body_hash', 'content_hash', 'system_hash', 'context_trace_id',
+  'model_provider', 'message_role', 'request_kind', 'status',
+] as const;
 const REF_NUMBER_KEYS = [
   'proof_id',
   'run_id',
@@ -494,6 +535,11 @@ const REF_NONNEGATIVE_KEYS = [
   'required_count', 'contributing_count', 'optional_count', 'incomplete_count',
   'required_incomplete_count', 'contributing_incomplete_count',
   'optional_incomplete_count',
+  'part', 'round', 'attempt', 'message_index', 'prompt_chars', 'response_chars',
+  'answer_chars', 'section_chars', 'section_words', 'previous_chars', 'beat_count', 'system_chars',
+  'message_count', 'max_tokens', 'temperature', 'prompt_tokens', 'completion_tokens',
+  'body_chars', 'body_words', 'chapter_number', 'chapter_id', 'request_row_id',
+  'revision_row_id', 'call_count', 'continuation_count', 'dropped_paragraphs',
 ] as const;
 const TERMINAL_DECISIONS = new Set(['applied', 'noop', 'stale', 'conflict', 'rejected']);
 
@@ -1908,6 +1954,367 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
     }
   }
 
+  const writeEvents = events.filter((event) => event.stage === 'write');
+  let writeExhaustive = true;
+  if (writeEvents.length) {
+    checks.push(
+      'write required lifecycle, prompt, model-call and storage events are present',
+      'write model calls preserve actual request and response hashes',
+      'write requests have terminal dispositions and answer consumption',
+      'write parts are completed or explicitly skipped',
+      'final stored body matches the write output hash',
+      'write context links point at the originating context trace',
+    );
+    const writeComplete = trace.completeness === 'complete' && trace.droppedEvents === 0;
+    const writeEvent = (name: string): TraceEventRecord[] =>
+      writeEvents.filter((event) => event.event === name);
+    const first = (name: string): TraceEventRecord | undefined => writeEvent(name)[0];
+    const writeStarted = first('write.started');
+    const writeFailed = first('write.failed');
+    const writeCompleted = first('write.completed');
+    const contextLinked = first('write.context.linked');
+    const contextSupplied = first('write.context.supplied');
+    const contextMissing = first('write.context.missing');
+    const finalOutput = first('write.output.final');
+    const stored = first('write.stored');
+
+    if (!writeStarted) {
+      violations.push({
+        code: 'write_started_missing',
+        detail: 'write trace has no write.started event',
+      });
+      writeExhaustive = false;
+    }
+    if (contextMissing) {
+      violations.push({
+        code: 'write_context_missing',
+        eventId: contextMissing.id,
+        detail: 'write claims an assembled context but has no context trace link',
+      });
+      writeExhaustive = false;
+    }
+    if (!contextLinked && !contextSupplied && writeComplete) {
+      violations.push({
+        code: 'write_context_link_missing',
+        detail: 'write trace has neither a linked context trace nor a supplied-bundle marker',
+      });
+      writeExhaustive = false;
+    }
+    if (contextLinked && contextLinked.refs.context_trace_id) {
+      const linked = db.get<{ completeness: string; dropped_events: number }>(
+        'SELECT completeness, dropped_events FROM trace WHERE id = ?',
+        contextLinked.refs.context_trace_id,
+      );
+      if (!linked) {
+        violations.push({
+          code: 'write_context_trace_missing',
+          eventId: contextLinked.id,
+          detail: `linked context trace ${contextLinked.refs.context_trace_id} does not exist`,
+        });
+        writeExhaustive = false;
+      } else if (linked.completeness !== 'complete' || Number(linked.dropped_events) > 0) {
+        limitations.push(
+          `linked context trace ${contextLinked.refs.context_trace_id} is ${linked.completeness} with ${linked.dropped_events} dropped events`,
+        );
+      }
+    }
+
+    const partStarted = new Map<number, TraceEventRecord>();
+    const partTerminal = new Map<number, TraceEventRecord>();
+    for (const event of writeEvents) {
+      if (event.event === 'write.part.started') {
+        const part = Number(event.refs.part);
+        if (Number.isInteger(part) && part > 0) partStarted.set(part, event);
+      }
+      if (event.event === 'write.part.completed' || event.event === 'write.part.skipped') {
+        const part = Number(event.refs.part);
+        if (Number.isInteger(part) && part > 0) partTerminal.set(part, event);
+        if (event.event === 'write.part.skipped') {
+          violations.push({
+            code: 'write_part_skipped',
+            eventId: event.id,
+            detail: `part ${event.refs.part ?? '?'} received no model call: ${event.reasonCode || 'skipped'}`,
+          });
+          writeExhaustive = false;
+        }
+      }
+    }
+    for (const [part, event] of partStarted) {
+      if (!partTerminal.has(part)) {
+        violations.push({
+          code: 'write_part_missing_terminal',
+          eventId: event.id,
+          detail: `part ${part} has no completed/skipped terminal event`,
+        });
+        writeExhaustive = false;
+      }
+    }
+
+    const calls = new Map<string, {
+      started: TraceEventRecord;
+      completed?: TraceEventRecord;
+      failed?: TraceEventRecord;
+      role: string;
+    }>();
+    const promptByRound = new Set(
+      writeEvents
+        .filter((event) => event.event === 'write.prompt.built')
+        .map((event) => `${event.refs.part ?? ''}:${event.refs.round ?? ''}`),
+    );
+    for (const event of writeEvents) {
+      if (event.event === 'write.model.started') {
+        const id = event.subject;
+        calls.set(id, { started: event, role: event.reasonCode });
+        if (!event.promptHash) {
+          violations.push({
+            code: 'write_model_request_hash_missing',
+            eventId: event.id,
+            detail: `model call ${id} has no actual request hash`,
+          });
+          writeExhaustive = false;
+        }
+        if (!event.refs.system_hash || typeof event.refs.message_count !== 'number') {
+          violations.push({
+            code: 'write_model_provenance_missing',
+            eventId: event.id,
+            detail: `model call ${id} is missing system/message provenance`,
+          });
+          writeExhaustive = false;
+        }
+        const messageEvents = writeEvents.filter(
+          (candidate) =>
+            candidate.event === 'write.model.message' &&
+            candidate.spanId === event.spanId,
+        );
+        if (Number(event.refs.message_count ?? -1) !== messageEvents.length) {
+          violations.push({
+            code: 'write_model_message_count',
+            eventId: event.id,
+            detail: `model call ${id} reports ${event.refs.message_count ?? '?'} messages; ${messageEvents.length} message events found`,
+          });
+          writeExhaustive = false;
+        }
+        if (event.reasonCode === 'writer' || event.reasonCode === 'continuation') {
+          const key = `${event.refs.part ?? ''}:${event.refs.round ?? ''}`;
+          if (event.reasonCode === 'writer' && !promptByRound.has(key)) {
+            violations.push({
+              code: 'write_prompt_missing',
+              eventId: event.id,
+              detail: `writer call ${id} has no prompt.built event for part/round ${key}`,
+            });
+            writeExhaustive = false;
+          }
+        }
+      }
+      if (event.event === 'write.model.completed') {
+        const call = calls.get(event.subject);
+        if (call) call.completed = event;
+        if (!event.refs.response_hash || typeof event.refs.response_chars !== 'number') {
+          violations.push({
+            code: 'write_model_response_missing',
+            eventId: event.id,
+            detail: `model call ${event.subject} has no response hash/length`,
+          });
+          writeExhaustive = false;
+        }
+      }
+      if (event.event === 'write.model.failed') {
+        const call = calls.get(event.subject);
+        if (call) call.failed = event;
+        if (event.refs.stage === 'best-effort') {
+          limitations.push(`optional context model call ${event.subject} failed; the writer continued`);
+        } else {
+          writeExhaustive = false;
+        }
+      }
+    }
+    for (const [id, call] of calls) {
+      if (!call.completed && !call.failed) {
+        violations.push({
+          code: 'write_model_call_missing_terminal',
+          eventId: call.started.id,
+          detail: `model call ${id} has no completed/failed terminal event`,
+        });
+        writeExhaustive = false;
+      }
+    }
+
+    const outputDispositions = new Map<string, TraceEventRecord[]>();
+    for (const event of writeEvents) {
+      if (event.event === 'write.output.disposition') {
+        const list = outputDispositions.get(event.subject) ?? [];
+        list.push(event);
+        outputDispositions.set(event.subject, list);
+      }
+    }
+    for (const [id, call] of calls) {
+      if (call.role !== 'writer' && call.role !== 'continuation') continue;
+      if (!call.completed) continue;
+      const list = outputDispositions.get(id) ?? [];
+      if (list.length !== 1) {
+        violations.push({
+          code: 'write_output_disposition',
+          eventId: call.completed.id,
+          detail: `model call ${id} has ${list.length} output dispositions`,
+        });
+        writeExhaustive = false;
+      }
+    }
+
+    if (writeFailed) {
+      writeExhaustive = false;
+    } else if (writeCompleted) {
+      if (!finalOutput) {
+        violations.push({
+          code: 'write_output_missing',
+          detail: 'successful write trace has no final output event',
+        });
+        writeExhaustive = false;
+      }
+      if (!stored) {
+        violations.push({
+          code: 'write_storage_missing',
+          detail: 'successful write trace has no stored chapter event',
+        });
+        writeExhaustive = false;
+      }
+      if (finalOutput && stored) {
+        if (finalOutput.refs.body_hash !== stored.refs.body_hash) {
+          violations.push({
+            code: 'write_storage_hash_mismatch',
+            eventId: stored.id,
+            detail: 'stored body hash does not match the write output hash',
+          });
+          writeExhaustive = false;
+        }
+        if (finalOutput.refs.body_words !== stored.refs.body_words) {
+          violations.push({
+            code: 'write_storage_word_mismatch',
+            eventId: stored.id,
+            detail: 'stored body word count does not match the write output',
+          });
+          writeExhaustive = false;
+        }
+        const chapterId = Number(stored.refs.chapter_id);
+        const chapter = Number.isInteger(chapterId) && chapterId > 0
+          ? db.get<{ body: string }>(
+              'SELECT body FROM chapter WHERE id = ? AND project_id = ?',
+              chapterId,
+              trace.projectId,
+            )
+          : undefined;
+        if (!chapter) {
+          violations.push({
+            code: 'write_storage_chapter_missing',
+            eventId: stored.id,
+            detail: `stored chapter ${stored.refs.chapter_id ?? '(none)'} does not exist`,
+          });
+          writeExhaustive = false;
+        } else {
+          const currentHash = createHash('sha256').update(chapter.body, 'utf8').digest('hex');
+          if (currentHash !== String(stored.refs.body_hash ?? '')) {
+            limitations.push('stored chapter body changed after the write trace; storage hash describes the trace-time body');
+          }
+        }
+      }
+    } else if (writeComplete) {
+      violations.push({
+        code: 'write_completion_missing',
+        detail: 'complete write trace has neither write.completed nor write.failed',
+      });
+      writeExhaustive = false;
+    }
+
+    const parsedRequests = new Map<string, TraceEventRecord[]>();
+    const requestTerminals = new Map<string, TraceEventRecord[]>();
+    const consumedAnswers = new Set<string>();
+    const notIncludedAnswers = new Set<string>();
+    const requestEventNames = new Set([
+      'write.request.resolved',
+      'write.request.empty',
+      'write.request.denied',
+      'write.request.duplicate',
+      'write.request.over-limit',
+      'write.request.not-processed',
+    ]);
+    for (const event of writeEvents) {
+      if (event.event === 'write.request.parsed') {
+        const key = `${event.subject}:${event.refs.seq ?? ''}`;
+        parsedRequests.set(key, [...(parsedRequests.get(key) ?? []), event]);
+      }
+      if (requestEventNames.has(event.event)) {
+        const key = `${event.subject}:${event.refs.seq ?? ''}`;
+        requestTerminals.set(key, [...(requestTerminals.get(key) ?? []), event]);
+      }
+      if (event.event === 'write.answer.consumed') {
+        consumedAnswers.add(`${event.subject}:${event.refs.seq ?? ''}`);
+      }
+      if (event.event === 'write.answer.not-included') {
+        notIncludedAnswers.add(`${event.subject}:${event.refs.seq ?? ''}`);
+      }
+    }
+    for (const [key, parsed] of parsedRequests) {
+      const terminal = requestTerminals.get(key) ?? [];
+      if (terminal.length !== 1) {
+        violations.push({
+          code: 'write_request_terminal',
+          eventId: parsed[0]?.id,
+          detail: `request ${key} has ${terminal.length} terminal dispositions`,
+        });
+        writeExhaustive = false;
+        continue;
+      }
+      const outcome = terminal[0]!;
+      if (outcome.event === 'write.request.resolved') {
+        if (consumedAnswers.has(key) === notIncludedAnswers.has(key)) {
+          violations.push({
+            code: 'write_answer_consumption',
+            eventId: outcome.id,
+            detail: `resolved request ${key} must be either consumed or explicitly not included`,
+          });
+          writeExhaustive = false;
+        }
+      }
+    }
+    for (const [key, terminal] of requestTerminals) {
+      if (!parsedRequests.has(key)) {
+        violations.push({
+          code: 'write_request_without_parse',
+          eventId: terminal[0]?.id,
+          detail: `request terminal ${key} has no parsed request`,
+        });
+        writeExhaustive = false;
+      }
+    }
+
+    const continuationStarted = new Map<number, TraceEventRecord>();
+    const continuationTerminal = new Map<number, TraceEventRecord>();
+    for (const event of writeEvents) {
+      if (event.event === 'write.continuation.started') {
+        const attempt = Number(event.refs.attempt);
+        if (Number.isInteger(attempt)) continuationStarted.set(attempt, event);
+      }
+      if (event.event === 'write.continuation.completed' || event.event === 'write.continuation.empty') {
+        const attempt = Number(event.refs.attempt);
+        if (Number.isInteger(attempt)) continuationTerminal.set(attempt, event);
+      }
+    }
+    for (const [attempt, event] of continuationStarted) {
+      if (!continuationTerminal.has(attempt)) {
+        violations.push({
+          code: 'write_continuation_missing_terminal',
+          eventId: event.id,
+          detail: `continuation ${attempt} has no completed/empty terminal`,
+        });
+        writeExhaustive = false;
+      }
+    }
+
+    if (writeComplete && !writeCompleted && !writeFailed) {
+      writeExhaustive = false;
+    }
+  }
+
   if (trace.completeness !== 'complete' || trace.droppedEvents > 0) {
     suspicious.push({
       code: 'trace_not_exhaustive',
@@ -1927,7 +2334,7 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
   return {
     traceId: trace.id,
     completeness: trace.completeness,
-    exhaustive: trace.completeness === 'complete' && trace.droppedEvents === 0 && contextExhaustive,
+    exhaustive: trace.completeness === 'complete' && trace.droppedEvents === 0 && contextExhaustive && writeExhaustive,
     droppedEvents: trace.droppedEvents,
     sampledRate: trace.sampledRate,
     finishedAt: trace.finishedAt,
