@@ -205,6 +205,62 @@ export function isVerbatimInChunk(text: string | null, quote: string): boolean {
   return q.trim().length > 0 && text.includes(q);
 }
 
+interface CitedChunk {
+  chunkId: number;
+  locator: string;
+}
+
+/** Ordered, de-duplicated cited chunks: first_chunk first, then source refs. */
+function citedChunks(firstChunk: number | null, sourceRefs: unknown): CitedChunk[] {
+  const refs = fromJson<RefLike[]>(sourceRefs as string, []);
+  const chunks: CitedChunk[] = [];
+  const seen = new Set<number>();
+  const add = (chunk: unknown, locator: unknown): void => {
+    const chunkId = Number(chunk);
+    if (!Number.isInteger(chunkId) || chunkId <= 0 || seen.has(chunkId)) return;
+    seen.add(chunkId);
+    chunks.push({ chunkId, locator: String(locator ?? '').trim() });
+  };
+  if (firstChunk !== null) {
+    const matching = refs.find((ref) => Number(ref?.chunk) === firstChunk);
+    add(firstChunk, matching?.locator);
+  }
+  for (const ref of refs) add(ref?.chunk, ref?.locator);
+  return chunks;
+}
+
+/**
+ * Choose the first cited chunk that contains the evidence verbatim.
+ *
+ * The candidate set is exactly first_chunk plus the source_refs chunks; no
+ * other chunk is considered. If none contains the quote, keep the old fallback
+ * (first_chunk, else the first cited ref) so a genuine mismatch still reaches
+ * the not-verbatim gate.
+ */
+function citedChunkForQuote(
+  db: Db,
+  projectId: number,
+  quote: string,
+  firstChunk: number | null,
+  sourceRefs: unknown,
+): CitedChunk | null {
+  const chunks = citedChunks(firstChunk, sourceRefs);
+  if (quote.trim()) {
+    for (const candidate of chunks) {
+      if (isVerbatimInChunk(chunkText(db, projectId, candidate.chunkId), quote)) {
+        return {
+          ...candidate,
+          locator: candidate.locator || firstLocator(sourceRefs),
+        };
+      }
+    }
+  }
+  const fallback = chunks[0];
+  return fallback
+    ? { ...fallback, locator: fallback.locator || firstLocator(sourceRefs) }
+    : null;
+}
+
 /** Longest claim a note may carry; the rest is noise for a one-line clue. */
 const MAX_CLAIM_CHARS = 200;
 
@@ -758,6 +814,9 @@ function ingestRelation(
   counts: IngestCounts,
   trace: NoteTrace | null,
 ): void {
+  // Relation rows use the first cited chunk (and it drives period-thread
+  // selection). Multi-ref relations have the same theoretical ambiguity; that
+  // is deferred to a separate follow-up so this change stays entity-only.
   const chunkId = firstChunkId(rel.source_refs);
   const seq =
     chunkId === null
@@ -1081,7 +1140,15 @@ function ingestEntity(
   trace: NoteTrace | null,
 ): void {
   const quote = entity.evidence.trim();
-  const chunkId = entity.first_chunk ?? firstChunkId(entity.source_refs);
+  const cited = citedChunkForQuote(
+    db,
+    projectId,
+    quote,
+    entity.first_chunk,
+    entity.source_refs,
+  );
+  const chunkId = cited?.chunkId ?? null;
+  const locator = cited?.locator || firstLocator(entity.source_refs);
   const candidate = candidateGenerated(
     db,
     projectId,
@@ -1132,7 +1199,7 @@ function ingestEntity(
     {
       threadId: assignment.threadId,
       chunkId,
-      locator: firstLocator(entity.source_refs),
+      locator,
       quote,
       claim,
       claimMiss: 'no-identity-evidence',
