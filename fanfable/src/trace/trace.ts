@@ -21,7 +21,38 @@ export const TRACE_EVENT_STALE = 'claim.transition.stale';
 export const TRACE_EVENT_CONFLICT = 'claim.transition.conflict';
 export const TRACE_EVENT_REJECTED = 'claim.transition.rejected';
 
+/**
+ * Extraction tracing starts at the parsed JSON candidates. It never claims to
+ * observe what the model did not emit, and every event is diagnostic: the
+ * extraction transaction never depends on a trace write.
+ */
+export const EXTRACTION_TRACE_STAGE = 'extraction';
+export const EXTRACTION_EVENT_STARTED = 'extraction.started';
+export const EXTRACTION_EVENT_WINDOW_STARTED = 'extraction.window.started';
+export const EXTRACTION_EVENT_WINDOW_FINISHED = 'extraction.window.finished';
+export const EXTRACTION_EVENT_SECTION = 'extraction.section';
+export const EXTRACTION_EVENT_CANDIDATE = 'extraction.relation.candidate';
+export const EXTRACTION_EVENT_ENDPOINT = 'extraction.relation.endpoint';
+export const EXTRACTION_EVENT_RETRY = 'extraction.relation.retry';
+export const EXTRACTION_EVENT_CITATION = 'extraction.relation.citation';
+export const EXTRACTION_EVENT_DIRECTION = 'extraction.relation.direction';
+export const EXTRACTION_EVENT_CLAIM = 'extraction.relation.claim';
+export const EXTRACTION_EVENT_DISPOSITION = 'extraction.relation.disposition';
+export const EXTRACTION_EVENT_RUN_FINALIZED = 'extraction.run.finalized';
+
+export type ExtractionTerminalDecision =
+  | 'inserted'
+  | 'merged'
+  | 'mixed'
+  | 'hinted'
+  | 'noted'
+  | 'dropped'
+  | 'error';
+
 export const DIAGNOSTIC_MAX_EVENTS_PER_TRACE = 200;
+/** Hard ceiling for an explicit per-trace diagnostic cap. */
+export const DIAGNOSTIC_MAX_EVENTS_CEILING = 1024;
+const DIAGNOSTIC_MAX_EVENTS_KEY = 'diagnostic_max_events';
 export const DIAGNOSTIC_RETENTION_DAYS = 30;
 
 /** A retrieval event buffered until the ask path's mode is known. */
@@ -248,12 +279,15 @@ export interface TraceRefs {
   note_id?: number;
   thread_id?: number;
   chunk_id?: number;
+  chunk_ids?: number[];
   relation_id?: number;
   entity_id?: number;
   event_id?: number;
   fact_id?: number;
   entity_ids?: number[];
+  hint_id?: number;
   open_end_id?: number;
+  window_index?: number;
   seq?: number | null;
   period_label?: string;
   /** Retrieval rank (1-based) within its scoring stage. */
@@ -297,6 +331,20 @@ export interface TraceRefs {
   body_hash?: string;
   content_hash?: string;
   system_hash?: string;
+  /** Hashes of model-emitted labels and quotes; the text itself is not stored. */
+  kind_hash?: string;
+  evidence_hash?: string;
+  anchor_hash?: string;
+  /** Safe parser-route code for an extraction section; never raw JSON. */
+  parse_route?: string;
+  evidence_chars?: number;
+  anchor_chars?: number;
+  raw_entries?: number;
+  accepted_entries?: number;
+  filtered_entries?: number;
+  salvaged_entries?: number;
+  /** IDs are recorded when the decision is made; later cleanup may replace them. */
+  lineage?: 'at-decision';
   context_trace_id?: string;
   model_provider?: string;
   message_role?: string;
@@ -329,6 +377,24 @@ export interface TraceRefs {
   call_count?: number;
   continuation_count?: number;
   dropped_paragraphs?: number;
+  /** Extraction candidate and terminal accounting. */
+  kind_count?: number;
+  claim_count?: number;
+  inserted_count?: number;
+  merged_count?: number;
+  hinted_count?: number;
+  noted_count?: number;
+  dropped_count?: number;
+  completed_count?: number;
+  partial_count?: number;
+  failed_count?: number;
+  skipped_count?: number;
+  contributed_chars?: number;
+  contributed_words?: number;
+  overlap_chars?: number;
+  deduped_chars?: number;
+  ambiguous_chars?: number;
+  unanswered_requests?: number;
   /** Short scoring/processing stage code, never prose. */
   stage?: string;
 }
@@ -355,6 +421,8 @@ export interface StartTraceInput {
   sampledRate?: number;
   /** Small facts/counts only. Never put prompts, responses or passages here. */
   metadata?: Record<string, unknown>;
+  /** Optional per-trace diagnostic cap; other traces keep the global cap. */
+  maxEvents?: number;
   startedAt?: string;
 }
 
@@ -447,6 +515,50 @@ export interface NoteAccounting {
   verified: boolean;
 }
 
+/** Parsed relationship candidates and their terminal dispositions. */
+export interface ExtractionAccounting {
+  parsedCandidates: number;
+  terminalDispositions: number;
+  /**
+   * Counts of candidate terminal dispositions, not individual claim events.
+   * A mixed candidate may contain several claims of different decisions.
+   */
+  candidateOutcomes: {
+    inserted: number;
+    merged: number;
+    hinted: number;
+    noted: number;
+    dropped: number;
+    mixed: number;
+    errors: number;
+  };
+  /** Recorded claim events by decision; null when the trace is not complete. */
+  claimEvents: {
+    inserted: number;
+    merged: number;
+    hinted: number;
+    noted: number;
+    dropped: number;
+  } | null;
+  /** Distinct hint ids referenced by hinted claim events; null when incomplete. */
+  uniqueHints: number | null;
+  /** Candidate accounting covers parsed extraction windows only. */
+  pipelineScope: 'window-candidates-only';
+  /** Inline close-the-loop enrichment is not candidate-traced. */
+  pipelineLineage: 'non-exhaustive';
+  runStatus: string;
+  windows: number;
+  incompleteWindows: number;
+  failedSections: number;
+  missingSections: number;
+  partialSections: number;
+  unparsedSections: number;
+  skippedSections: number;
+  abortedCandidates: number;
+  candidateAccountingVerified: boolean;
+  verified: boolean;
+}
+
 export interface TraceAuditResult {
   traceId: string;
   completeness: TraceCompleteness;
@@ -459,6 +571,7 @@ export interface TraceAuditResult {
   checks: string[];
   limitations: string[];
   noteAccounting: NoteAccounting | null;
+  extractionAccounting: ExtractionAccounting | null;
 }
 
 const NOTE_DISPOSITION_REASONS = new Set([
@@ -514,6 +627,7 @@ interface TraceEventRow {
 const REF_STRING_KEYS = [
   'claim_uid', 'candidate_id', 'period_label', 'stage',
   'response_hash', 'body_hash', 'content_hash', 'system_hash', 'context_trace_id',
+  'kind_hash', 'evidence_hash', 'anchor_hash', 'parse_route',
   'model_provider', 'message_role', 'request_kind', 'status',
 ] as const;
 const REF_NUMBER_KEYS = [
@@ -526,6 +640,7 @@ const REF_NUMBER_KEYS = [
   'entity_id',
   'event_id',
   'fact_id',
+  'hint_id',
   'open_end_id',
 ] as const;
 const REF_NONNEGATIVE_KEYS = [
@@ -535,11 +650,15 @@ const REF_NONNEGATIVE_KEYS = [
   'required_count', 'contributing_count', 'optional_count', 'incomplete_count',
   'required_incomplete_count', 'contributing_incomplete_count',
   'optional_incomplete_count',
-  'part', 'round', 'attempt', 'message_index', 'prompt_chars', 'response_chars',
+  'part', 'round', 'attempt', 'message_index', 'window_index', 'prompt_chars', 'response_chars',
   'answer_chars', 'section_chars', 'section_words', 'previous_chars', 'beat_count', 'system_chars',
   'message_count', 'max_tokens', 'temperature', 'prompt_tokens', 'completion_tokens',
   'body_chars', 'body_words', 'chapter_number', 'chapter_id', 'request_row_id',
   'revision_row_id', 'call_count', 'continuation_count', 'dropped_paragraphs',
+  'kind_count', 'claim_count', 'inserted_count', 'merged_count', 'hinted_count', 'noted_count',
+  'dropped_count', 'completed_count', 'partial_count', 'failed_count', 'skipped_count',
+  'evidence_chars', 'anchor_chars', 'raw_entries', 'accepted_entries', 'filtered_entries', 'salvaged_entries',
+  'contributed_chars', 'contributed_words', 'overlap_chars', 'deduped_chars', 'ambiguous_chars', 'unanswered_requests',
 ] as const;
 const TERMINAL_DECISIONS = new Set(['applied', 'noop', 'stale', 'conflict', 'rejected']);
 
@@ -585,6 +704,7 @@ function parseRefs(text: string): TraceRefs {
       refs[key] = value;
     }
   }
+  if (raw.lineage === 'at-decision') refs.lineage = 'at-decision';
   const seq = Number(raw.seq);
   if (raw.seq !== null && raw.seq !== undefined && Number.isFinite(seq) && seq >= 0) refs.seq = seq;
   if (Array.isArray(raw.entity_ids)) {
@@ -592,6 +712,12 @@ function parseRefs(text: string): TraceRefs {
       .map((value) => Number(value))
       .filter((value) => Number.isFinite(value) && value > 0);
     if (ids.length) refs.entity_ids = [...new Set(ids)];
+  }
+  if (Array.isArray(raw.chunk_ids)) {
+    const ids = raw.chunk_ids
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value) && value > 0);
+    if (ids.length) refs.chunk_ids = [...new Set(ids)];
   }
   return refs;
 }
@@ -611,10 +737,15 @@ function refsJson(refs: TraceRefs | undefined): string {
     const value = refs[key];
     if (typeof value === 'number' && Number.isFinite(value) && value >= 0) out[key] = value;
   }
+  if (refs.lineage === 'at-decision') out.lineage = 'at-decision';
   if (typeof refs.seq === 'number' && Number.isFinite(refs.seq) && refs.seq >= 0) out.seq = refs.seq;
   if (refs.entity_ids?.length) {
     const ids = [...new Set(refs.entity_ids.filter((value) => Number.isFinite(value) && value > 0))];
     if (ids.length) out.entity_ids = ids;
+  }
+  if (refs.chunk_ids?.length) {
+    const ids = [...new Set(refs.chunk_ids.filter((value) => Number.isFinite(value) && value > 0))];
+    if (ids.length) out.chunk_ids = ids;
   }
   return JSON.stringify(out);
 }
@@ -670,6 +801,16 @@ export function startTrace(db: Db, input: StartTraceInput): TraceRecord {
   const traceId = input.traceId?.trim() || newTraceId();
   const startedAt = input.startedAt ?? nowIso();
   const createdAt = nowIso();
+  const metadata = { ...(input.metadata ?? {}) };
+  // The cap is an explicit trace option only. Ordinary caller metadata must
+  // not be able to raise it.
+  delete metadata[DIAGNOSTIC_MAX_EVENTS_KEY];
+  if (input.maxEvents !== undefined && Number.isFinite(input.maxEvents)) {
+    metadata[DIAGNOSTIC_MAX_EVENTS_KEY] = Math.min(
+      DIAGNOSTIC_MAX_EVENTS_CEILING,
+      Math.max(1, Math.floor(input.maxEvents)),
+    );
+  }
   db.transaction(() => {
     db.run(
       `INSERT INTO trace
@@ -680,7 +821,7 @@ export function startTrace(db: Db, input: StartTraceInput): TraceRecord {
       input.projectId,
       startedAt,
       sampledRate,
-      JSON.stringify(input.metadata ?? {}),
+      JSON.stringify(metadata),
       createdAt,
     );
   }, { immediate: true });
@@ -757,7 +898,8 @@ function recordDiagnostic(db: Db, input: RecordTraceEventInput): RecordTraceEven
         id: string;
         project_id: number;
         sampled_rate: number;
-      }>('SELECT id, project_id, sampled_rate FROM trace WHERE id = ?', input.traceId);
+        metadata: string;
+      }>('SELECT id, project_id, sampled_rate, metadata FROM trace WHERE id = ?', input.traceId);
       if (!trace) return { recorded: false, dropped: true, reason: 'unavailable' };
       if (input.projectId !== undefined && input.projectId !== trace.project_id) {
         return { recorded: false, dropped: true, reason: 'unavailable' };
@@ -783,7 +925,16 @@ function recordDiagnostic(db: Db, input: RecordTraceEventInput): RecordTraceEven
           WHERE trace_id = ? AND event_class = 'diagnostic'`,
         trace.id,
       )?.n ?? 0;
-      if (count >= DIAGNOSTIC_MAX_EVENTS_PER_TRACE) {
+      let cap = DIAGNOSTIC_MAX_EVENTS_PER_TRACE;
+      try {
+        const requested = Number(JSON.parse(trace.metadata)?.[DIAGNOSTIC_MAX_EVENTS_KEY]);
+        if (Number.isFinite(requested) && requested > 0) {
+          cap = Math.min(DIAGNOSTIC_MAX_EVENTS_CEILING, Math.max(1, Math.floor(requested)));
+        }
+      } catch {
+        // A malformed metadata object keeps the global cap.
+      }
+      if (count >= cap) {
         bumpDropped(db, trace.id, 1, 'truncated');
         return { recorded: false, dropped: true, reason: 'cap', pruned };
       }
@@ -822,6 +973,19 @@ export function recordTraceEvent(db: Db, input: RecordTraceEventInput): RecordTr
     return { recorded: true, dropped: false, eventId };
   }
   return recordDiagnostic(db, input);
+}
+
+/**
+ * Account for diagnostic events a producer suppressed locally after the cap was
+ * reached. Best-effort: never fails the producing operation.
+ */
+export function markDroppedTraceEvents(db: Db, traceId: string, count: number): void {
+  if (!Number.isFinite(count) || count <= 0) return;
+  try {
+    bumpDropped(db, traceId, Math.floor(count), 'truncated');
+  } catch {
+    // A trace that cannot record its own drops stays unavailable/truncated.
+  }
 }
 
 /** Finish a trace without ever pretending a sampled/truncated trace is complete. */
@@ -1046,6 +1210,8 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
 
   const noteEvents = events.filter((event) => event.event.startsWith('note.'));
   let noteAccounting: NoteAccounting | null = null;
+  let extractionAccounting: ExtractionAccounting | null = null;
+  let extractionExhaustive = true;
   if (noteEvents.length) {
     const generated = new Set<string>();
     const dispositions = new Map<string, TraceEventRecord[]>();
@@ -1961,6 +2127,10 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
       'write required lifecycle, prompt, model-call and storage events are present',
       'write model calls preserve actual request and response hashes',
       'write requests have terminal dispositions and answer consumption',
+      'write requests arriving after the additional-call budget are recorded unanswered',
+      'writer and continuation requests end with a user message and have no consecutive same-role messages',
+      'write output dispositions reflect final-body survival or explicit ambiguity',
+      'write dedupe counts agree between output and completion',
       'write parts are completed or explicitly skipped',
       'final stored body matches the write output hash',
       'write context links point at the originating context trace',
@@ -2056,10 +2226,11 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
       failed?: TraceEventRecord;
       role: string;
     }>();
-    const promptByRound = new Set(
+    const promptByPart = new Set(
       writeEvents
         .filter((event) => event.event === 'write.prompt.built')
-        .map((event) => `${event.refs.part ?? ''}:${event.refs.round ?? ''}`),
+        .map((event) => Number(event.refs.part))
+        .filter((part) => Number.isInteger(part) && part > 0),
     );
     for (const event of writeEvents) {
       if (event.event === 'write.model.started') {
@@ -2095,14 +2266,41 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
           writeExhaustive = false;
         }
         if (event.reasonCode === 'writer' || event.reasonCode === 'continuation') {
-          const key = `${event.refs.part ?? ''}:${event.refs.round ?? ''}`;
-          if (event.reasonCode === 'writer' && !promptByRound.has(key)) {
-            violations.push({
-              code: 'write_prompt_missing',
-              eventId: event.id,
-              detail: `writer call ${id} has no prompt.built event for part/round ${key}`,
-            });
-            writeExhaustive = false;
+          if (event.reasonCode === 'writer') {
+            const part = Number(event.refs.part);
+            if (!Number.isInteger(part) || !promptByPart.has(part)) {
+              violations.push({
+                code: 'write_prompt_missing',
+                eventId: event.id,
+                detail: `writer call ${id} has no prompt.built event for part ${event.refs.part ?? '?'}`,
+              });
+              writeExhaustive = false;
+            }
+          }
+          if (Number(event.refs.message_count ?? -1) === messageEvents.length) {
+            const roles = messageEvents.map((candidate) => String(candidate.refs.message_role ?? ''));
+            if (roles.length && roles[roles.length - 1] !== 'user') {
+              violations.push({
+                code: 'write_history_last_role',
+                eventId: event.id,
+                detail: `model call ${id} does not end with a user message`,
+              });
+              writeExhaustive = false;
+            }
+            for (let i = 0; i + 1 < roles.length; i++) {
+              if (
+                roles[i] === roles[i + 1] &&
+                (roles[i] === 'user' || roles[i] === 'assistant')
+              ) {
+                violations.push({
+                  code: `write_history_consecutive_${roles[i]}`,
+                  eventId: event.id,
+                  detail: `model call ${id} has consecutive ${roles[i]} messages; the intervening turn is missing`,
+                });
+                writeExhaustive = false;
+                break;
+              }
+            }
           }
         }
       }
@@ -2225,6 +2423,23 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
       writeExhaustive = false;
     }
 
+    const dedupeEvents = writeEvents.filter((event) => event.event === 'write.output.dedupe');
+    const dedupeCount = dedupeEvents.length
+      ? Number(dedupeEvents[dedupeEvents.length - 1]!.refs.dropped_paragraphs ?? 0)
+      : 0;
+    if (
+      writeCompleted &&
+      typeof writeCompleted.refs.dropped_paragraphs === 'number' &&
+      Number(writeCompleted.refs.dropped_paragraphs) !== dedupeCount
+    ) {
+      violations.push({
+        code: 'write_dedupe_count_mismatch',
+        eventId: writeCompleted.id,
+        detail: `write.completed reports ${writeCompleted.refs.dropped_paragraphs} dropped paragraphs; output.dedupe reports ${dedupeCount}`,
+      });
+      writeExhaustive = false;
+    }
+
     const parsedRequests = new Map<string, TraceEventRecord[]>();
     const requestTerminals = new Map<string, TraceEventRecord[]>();
     const consumedAnswers = new Set<string>();
@@ -2236,6 +2451,7 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
       'write.request.duplicate',
       'write.request.over-limit',
       'write.request.not-processed',
+      'write.request.unanswered',
     ]);
     for (const event of writeEvents) {
       if (event.event === 'write.request.parsed') {
@@ -2275,6 +2491,16 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
           writeExhaustive = false;
         }
       }
+      if (outcome.event === 'write.request.unanswered') {
+        if (consumedAnswers.has(key) || notIncludedAnswers.has(key)) {
+          violations.push({
+            code: 'write_unanswered_request_consumed',
+            eventId: outcome.id,
+            detail: `unanswered request ${key} has an answer consumption event`,
+          });
+          writeExhaustive = false;
+        }
+      }
     }
     for (const [key, terminal] of requestTerminals) {
       if (!parsedRequests.has(key)) {
@@ -2285,6 +2511,42 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
         });
         writeExhaustive = false;
       }
+    }
+
+    const unansweredEvents = writeEvents.filter((event) => event.event === 'write.request.unanswered');
+    if (unansweredEvents.length) {
+      limitations.push(
+        `${unansweredEvents.length} context request(s) were recorded unanswered because the chapter-wide additional-call budget was exhausted`,
+      );
+    }
+    const notProcessedEvents = writeEvents.filter((event) => event.event === 'write.request.not-processed');
+    if (notProcessedEvents.length) {
+      limitations.push(
+        `${notProcessedEvents.length} context request(s) were not processed because the distinct-request slot limit was reached`,
+      );
+    }
+    if (
+      writeCompleted &&
+      typeof writeCompleted.refs.unanswered_requests === 'number' &&
+      Number(writeCompleted.refs.unanswered_requests) !== unansweredEvents.length
+    ) {
+      violations.push({
+        code: 'write_unanswered_count_mismatch',
+        eventId: writeCompleted.id,
+        detail: `write.completed reports ${writeCompleted.refs.unanswered_requests} unanswered requests; ${unansweredEvents.length} unanswered events found`,
+      });
+      writeExhaustive = false;
+    }
+
+    const ambiguousOutputs = writeEvents.filter(
+      (event) =>
+        event.event === 'write.output.disposition' &&
+        (event.decision === 'ambiguous' || Number(event.refs.ambiguous_chars ?? 0) > 0),
+    );
+    if (ambiguousOutputs.length) {
+      limitations.push(
+        `${ambiguousOutputs.length} output(s) have unproven final attribution; surviving/removed text could not be matched exactly`,
+      );
     }
 
     const continuationStarted = new Map<number, TraceEventRecord>();
@@ -2315,6 +2577,457 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
     }
   }
 
+  const extractionEvents = events.filter((event) => event.stage === EXTRACTION_TRACE_STAGE);
+  if (extractionEvents.length) {
+    checks.push(
+      'extraction relation candidates have one terminal disposition when the trace is exhaustive',
+      'extraction parsed counts reconcile with candidate, claim and terminal events per window',
+      'extraction claims carry the IDs required by their decision',
+      'every finished extraction window has one relation-section report',
+      'extraction events are diagnostic and never claim committed canon writes',
+      'extraction coverage begins at parsed JSON candidates, not at the prompt',
+      'extraction top-level exhaustive is false because the inline close-loop phase is not candidate-traced',
+    );
+    limitations.push(
+      'extraction coverage begins at parsed JSON candidates; claims the model omitted are not observable and are never invented',
+      'extraction relation/hint/note/event IDs are recorded at decision time; later kinship dedupe or entity merge may replace or delete them, and the audit checks presence/type in the trace rather than project ownership, claim provenance or final database lineage',
+      'extraction hashes are unsalted SHA-256 fingerprints, not anonymisation; a short guessed label or quote can be confirmed by hashing it',
+      'the extraction trace privacy contract covers trace events only; extraction_run and extraction_window_run may contain raw error text or settings',
+      'dropped_events is a lower bound when the ledger itself cannot persist an event; completeness is then truncated or interrupted and audit never verifies the trace',
+      'inline close-the-loop enrichment runs after extraction trace finalization; its model calls, candidates and final ties are untraced, so this is not full-pipeline or final-lineage coverage',
+    );
+
+    const sectionEvents = extractionEvents.filter((event) => event.event === EXTRACTION_EVENT_SECTION);
+    const relationSections = sectionEvents.filter((event) => event.refs.request_kind === 'relations');
+    const parsedCandidates = relationSections
+      .filter((event) => event.decision === 'parsed' || event.decision === 'partial')
+      .reduce((sum, event) => sum + Number(event.refs.count ?? 0), 0);
+    const candidates = new Map<string, TraceEventRecord>();
+    const candidateCountByWindow = new Map<number, number>();
+    const claimsByCandidate = new Map<string, TraceEventRecord[]>();
+    const dispositions = new Map<string, TraceEventRecord[]>();
+    const terminalCounts = {
+      inserted: 0,
+      merged: 0,
+      hinted: 0,
+      noted: 0,
+      dropped: 0,
+      mixed: 0,
+      errors: 0,
+    };
+    let terminalDispositions = 0;
+    let abortedCandidates = 0;
+    const claimDecisions = new Set(['inserted', 'merged', 'hinted', 'noted', 'dropped']);
+    const terminalDecisions = new Set([
+      'inserted', 'merged', 'mixed', 'hinted', 'noted', 'dropped', 'error',
+    ]);
+
+    for (const event of extractionEvents) {
+      if (event.eventClass === 'required' || event.committed) {
+        violations.push({
+          code: 'extraction_event_durability',
+          eventId: event.id,
+          detail: 'extraction trace events are best-effort diagnostics and must not claim a committed canon write',
+        });
+        extractionExhaustive = false;
+      }
+      if (event.event === EXTRACTION_EVENT_CANDIDATE) {
+        if (candidates.has(event.subject)) {
+          violations.push({
+            code: 'extraction_candidate_duplicate',
+            eventId: event.id,
+            detail: `candidate ${event.subject} was registered more than once`,
+          });
+          extractionExhaustive = false;
+        }
+        candidates.set(event.subject, event);
+        const windowIndex = Number(event.refs.window_index);
+        if (!Number.isInteger(windowIndex) || windowIndex < 0) {
+          violations.push({
+            code: 'extraction_candidate_window_missing',
+            eventId: event.id,
+            detail: `candidate ${event.subject} has no valid window_index`,
+          });
+          extractionExhaustive = false;
+        } else {
+          candidateCountByWindow.set(windowIndex, (candidateCountByWindow.get(windowIndex) ?? 0) + 1);
+        }
+        if (typeof event.refs.kind_hash !== 'string' || !event.refs.kind_hash) {
+          violations.push({
+            code: 'extraction_candidate_kind_missing',
+            eventId: event.id,
+            detail: `candidate ${event.subject} has no kind_hash`,
+          });
+          extractionExhaustive = false;
+        }
+      }
+      if (event.event === EXTRACTION_EVENT_CLAIM) {
+        if (!claimDecisions.has(event.decision)) {
+          violations.push({
+            code: 'extraction_claim_unexplained',
+            eventId: event.id,
+            detail: `extraction claim has unknown decision ${event.decision || '(empty)'}`,
+          });
+          extractionExhaustive = false;
+        }
+        if (!event.reasonCode) {
+          violations.push({
+            code: 'extraction_claim_unexplained',
+            eventId: event.id,
+            detail: `extraction claim for ${event.subject} has no reason code`,
+          });
+          extractionExhaustive = false;
+        }
+        const hasRelation = typeof event.refs.relation_id === 'number' && event.refs.relation_id > 0;
+        const hasHint = typeof event.refs.hint_id === 'number' && event.refs.hint_id > 0;
+        const hasNote = typeof event.refs.note_id === 'number' && event.refs.note_id > 0;
+        if (
+          (event.decision === 'inserted' && !hasRelation) ||
+          (event.decision === 'merged' && (!hasRelation || (event.refs.status !== 'primary' && event.refs.status !== 'supporting'))) ||
+          (event.decision === 'hinted' && !hasHint) ||
+          (event.decision === 'noted' && !hasNote)
+        ) {
+          violations.push({
+            code: 'extraction_claim_missing_reference',
+            eventId: event.id,
+            detail: `claim ${event.subject} (${event.decision}) does not carry its required downstream id/status`,
+          });
+          extractionExhaustive = false;
+        }
+        const list = claimsByCandidate.get(event.subject) ?? [];
+        list.push(event);
+        claimsByCandidate.set(event.subject, list);
+      }
+      if (event.event !== EXTRACTION_EVENT_DISPOSITION) continue;
+      const list = dispositions.get(event.subject) ?? [];
+      list.push(event);
+      dispositions.set(event.subject, list);
+      terminalDispositions++;
+      if (event.reasonCode === 'candidate-aborted') abortedCandidates++;
+      if (!terminalDecisions.has(event.decision)) {
+        violations.push({
+          code: 'extraction_candidate_unexplained',
+          eventId: event.id,
+          detail: `candidate ${event.subject} has unknown disposition ${event.decision || '(empty)'}`,
+        });
+        extractionExhaustive = false;
+        continue;
+      }
+      if (!event.reasonCode) {
+        violations.push({
+          code: 'extraction_candidate_unexplained',
+          eventId: event.id,
+          detail: `candidate ${event.subject} has no reason code`,
+        });
+        extractionExhaustive = false;
+      }
+      if (event.decision === 'inserted') terminalCounts.inserted++;
+      else if (event.decision === 'merged') terminalCounts.merged++;
+      else if (event.decision === 'hinted') terminalCounts.hinted++;
+      else if (event.decision === 'noted') terminalCounts.noted++;
+      else if (event.decision === 'dropped') terminalCounts.dropped++;
+      else if (event.decision === 'mixed') terminalCounts.mixed++;
+      else if (event.decision === 'error') terminalCounts.errors++;
+    }
+
+    const runFinal = [...extractionEvents]
+      .reverse()
+      .find((event) => event.event === EXTRACTION_EVENT_RUN_FINALIZED);
+    const runStatus = runFinal?.decision ?? 'unknown';
+    const windowEvents = extractionEvents.filter((event) => event.event === EXTRACTION_EVENT_WINDOW_FINISHED);
+    const windowIndices = new Set<number>();
+    const incompleteWindows = windowEvents.filter(
+      (event) => event.decision === 'partial' || event.decision === 'failed',
+    ).length;
+    for (const event of windowEvents) {
+      const windowIndex = Number(event.refs.window_index);
+      if (Number.isInteger(windowIndex) && windowIndex >= 0) windowIndices.add(windowIndex);
+    }
+    const relationSectionsByWindow = new Map<number, TraceEventRecord[]>();
+    for (const event of relationSections) {
+      const windowIndex = Number(event.refs.window_index);
+      if (!Number.isInteger(windowIndex) || windowIndex < 0) {
+        violations.push({
+          code: 'extraction_section_window_missing',
+          eventId: event.id,
+          detail: 'relation-section event has no valid window_index',
+        });
+        extractionExhaustive = false;
+        continue;
+      }
+      const list = relationSectionsByWindow.get(windowIndex) ?? [];
+      list.push(event);
+      relationSectionsByWindow.set(windowIndex, list);
+    }
+    const failedSectionEvents = sectionEvents.filter((event) => event.decision === 'failed');
+    const missingSectionEvents = sectionEvents.filter((event) => event.decision === 'missing');
+    const partialSectionEvents = sectionEvents.filter((event) => event.decision === 'partial');
+    const unparsedSectionEvents = sectionEvents.filter((event) => event.decision === 'unparsed');
+    const skippedSectionEvents = sectionEvents.filter((event) => event.decision === 'skipped');
+    const traceComplete =
+      trace.completeness === 'complete' &&
+      trace.droppedEvents === 0 &&
+      trace.sampledRate === 1 &&
+      !!trace.finishedAt;
+
+    if (!runFinal) {
+      limitations.push('extraction run has no finalization event; its run status is unknown');
+      extractionExhaustive = false;
+    } else if (runStatus !== 'completed') {
+      limitations.push(`extraction run finished with status ${runStatus}; the trace is not a complete extraction account`);
+      extractionExhaustive = false;
+    }
+    if (failedSectionEvents.length) {
+      limitations.push(
+        `${failedSectionEvents.length} extraction section call(s) failed: ` +
+          [...new Set(failedSectionEvents.map((event) => String(event.refs.request_kind ?? 'unknown')))].join(', '),
+      );
+      extractionExhaustive = false;
+    }
+    if (missingSectionEvents.length) {
+      limitations.push(
+        `${missingSectionEvents.length} extraction section key(s) were absent from a parsed answer; ` +
+          'absence is not treated as a confident empty section',
+      );
+      extractionExhaustive = false;
+    }
+    if (partialSectionEvents.length) {
+      limitations.push(
+        `${partialSectionEvents.length} extraction section answer(s) were only partially parsed; ` +
+          'salvaged candidates are accounted, but the answer is not treated as complete',
+      );
+      extractionExhaustive = false;
+    }
+    if (unparsedSectionEvents.length) {
+      limitations.push(
+        `${unparsedSectionEvents.length} extraction section answer(s) contained content but parsed no candidate; ` +
+          'truncation and malformed JSON are not distinguishable at this layer',
+      );
+      extractionExhaustive = false;
+    }
+    if (skippedSectionEvents.length) {
+      limitations.push(
+        `${skippedSectionEvents.length} extraction section(s) were skipped; zero candidates there is not treated as a verified extraction`,
+      );
+      extractionExhaustive = false;
+    }
+    if (!relationSections.length) {
+      limitations.push('no relation-section parse event was recorded; candidate coverage cannot be verified');
+      extractionExhaustive = false;
+    }
+    const plannedWindows = Number(trace.metadata.planned_windows);
+    if (
+      Number.isInteger(plannedWindows) &&
+      plannedWindows >= 0 &&
+      windowEvents.length !== plannedWindows
+    ) {
+      limitations.push(
+        `trace records ${windowEvents.length} finished window(s) but the extraction planned ${plannedWindows}`,
+      );
+      extractionExhaustive = false;
+    }
+
+    if (!traceComplete) {
+      suspicious.push({
+        code: 'extraction_accounting_unavailable',
+        detail:
+          `completeness=${trace.completeness}, dropped_events=${trace.droppedEvents}, ` +
+          `sampled_rate=${trace.sampledRate}, finished=${!!trace.finishedAt}`,
+      });
+      extractionExhaustive = false;
+    } else {
+      const before = violations.length;
+      for (const candidate of candidates.keys()) {
+        const terminal = dispositions.get(candidate) ?? [];
+        if (!terminal.length) {
+          violations.push({
+            code: 'extraction_candidate_missing_disposition',
+            detail: `candidate ${candidate} has no terminal disposition`,
+          });
+        } else if (terminal.length > 1) {
+          violations.push({
+            code: 'extraction_candidate_multiple_dispositions',
+            detail: `candidate ${candidate} has ${terminal.length} terminal dispositions`,
+          });
+        }
+      }
+      for (const [candidate, terminal] of dispositions) {
+        if (!candidates.has(candidate)) {
+          violations.push({
+            code: 'extraction_disposition_without_candidate',
+            eventId: terminal[0]?.id,
+            detail: `disposition ${candidate} has no parsed candidate`,
+          });
+        }
+        const claims = claimsByCandidate.get(candidate) ?? [];
+        const claimCounts = {
+          inserted: claims.filter((claim) => claim.decision === 'inserted').length,
+          merged: claims.filter((claim) => claim.decision === 'merged').length,
+          hinted: claims.filter((claim) => claim.decision === 'hinted').length,
+          noted: claims.filter((claim) => claim.decision === 'noted').length,
+          dropped: claims.filter((claim) => claim.decision === 'dropped').length,
+        };
+        for (const disposition of terminal) {
+          const expected = {
+            inserted: Number(disposition.refs.inserted_count ?? -1),
+            merged: Number(disposition.refs.merged_count ?? -1),
+            hinted: Number(disposition.refs.hinted_count ?? -1),
+            noted: Number(disposition.refs.noted_count ?? -1),
+            dropped: Number(disposition.refs.dropped_count ?? -1),
+          };
+          if (
+            Object.entries(expected).some(([key, value]) =>
+              !Number.isInteger(value) || value < 0 || claimCounts[key as keyof typeof claimCounts] !== value,
+            ) ||
+            Number(disposition.refs.claim_count ?? -1) !== claims.length
+          ) {
+            violations.push({
+              code: 'extraction_claim_count_mismatch',
+              eventId: disposition.id,
+              detail: `candidate ${candidate} disposition counts do not match its claim events`,
+            });
+          }
+          if (disposition.decision === 'inserted' && claimCounts.inserted === 0) {
+            violations.push({
+              code: 'extraction_claim_missing_for_disposition',
+              eventId: disposition.id,
+              detail: `candidate ${candidate} is inserted without an inserted claim`,
+            });
+          }
+          if (disposition.decision === 'merged' && claimCounts.merged === 0) {
+            violations.push({
+              code: 'extraction_claim_missing_for_disposition',
+              eventId: disposition.id,
+              detail: `candidate ${candidate} is merged without a merged claim`,
+            });
+          }
+          if (disposition.decision === 'hinted' && claimCounts.hinted === 0) {
+            violations.push({
+              code: 'extraction_claim_missing_for_disposition',
+              eventId: disposition.id,
+              detail: `candidate ${candidate} is hinted without a hinted claim`,
+            });
+          }
+          if (disposition.decision === 'noted' && claimCounts.noted === 0) {
+            violations.push({
+              code: 'extraction_claim_missing_for_disposition',
+              eventId: disposition.id,
+              detail: `candidate ${candidate} is noted without a noted claim`,
+            });
+          }
+          if (disposition.decision === 'dropped' && claimCounts.dropped === 0) {
+            violations.push({
+              code: 'extraction_claim_missing_for_disposition',
+              eventId: disposition.id,
+              detail: `candidate ${candidate} is dropped without a dropped claim`,
+            });
+          }
+        }
+      }
+      for (const [candidate, claims] of claimsByCandidate) {
+        if (!candidates.has(candidate)) {
+          violations.push({
+            code: 'extraction_claim_without_candidate',
+            eventId: claims[0]?.id,
+            detail: `claim ${candidate} has no parsed candidate`,
+          });
+        }
+      }
+      for (const windowIndex of windowIndices) {
+        const sections = relationSectionsByWindow.get(windowIndex) ?? [];
+        if (sections.length !== 1) {
+          violations.push({
+            code: 'extraction_window_section_missing',
+            detail: `window ${windowIndex} has ${sections.length} relation-section report(s), expected one`,
+          });
+        }
+      }
+      for (const windowIndex of relationSectionsByWindow.keys()) {
+        if (!windowIndices.has(windowIndex)) {
+          violations.push({
+            code: 'extraction_section_without_window',
+            detail: `relation section ${windowIndex} has no finished window event`,
+          });
+        }
+      }
+      for (const windowIndex of candidateCountByWindow.keys()) {
+        if (!windowIndices.has(windowIndex)) {
+          violations.push({
+            code: 'extraction_candidate_without_window',
+            detail: `candidate window ${windowIndex} has no finished window event`,
+          });
+        }
+      }
+      for (const [windowIndex, sections] of relationSectionsByWindow) {
+        for (const section of sections) {
+          if (section.decision !== 'parsed' && section.decision !== 'partial') continue;
+          const expected = Number(section.refs.count ?? -1);
+          const observed = candidateCountByWindow.get(windowIndex) ?? 0;
+          if (!Number.isInteger(expected) || expected < 0 || observed !== expected) {
+            violations.push({
+              code: 'extraction_window_candidate_mismatch',
+              eventId: section.id,
+              detail: `window ${windowIndex} parsed ${expected} candidate(s) but recorded ${observed}`,
+            });
+          }
+        }
+      }
+      if (parsedCandidates !== candidates.size) {
+        violations.push({
+          code: 'extraction_candidate_accounting_mismatch',
+          detail: `parsed ${parsedCandidates} relation candidate(s) but observed ${candidates.size} candidate event(s)`,
+        });
+      }
+      if (violations.length > before) extractionExhaustive = false;
+    }
+
+    const claimEvents = traceComplete
+      ? {
+          inserted: extractionEvents.filter((event) => event.event === EXTRACTION_EVENT_CLAIM && event.decision === 'inserted').length,
+          merged: extractionEvents.filter((event) => event.event === EXTRACTION_EVENT_CLAIM && event.decision === 'merged').length,
+          hinted: extractionEvents.filter((event) => event.event === EXTRACTION_EVENT_CLAIM && event.decision === 'hinted').length,
+          noted: extractionEvents.filter((event) => event.event === EXTRACTION_EVENT_CLAIM && event.decision === 'noted').length,
+          dropped: extractionEvents.filter((event) => event.event === EXTRACTION_EVENT_CLAIM && event.decision === 'dropped').length,
+        }
+      : null;
+    const uniqueHints = traceComplete
+      ? new Set(
+          extractionEvents
+            .filter((event) => event.event === EXTRACTION_EVENT_CLAIM && event.decision === 'hinted')
+            .map((event) => Number(event.refs.hint_id))
+            .filter((id) => Number.isInteger(id) && id > 0),
+        ).size
+      : null;
+    extractionAccounting = {
+      parsedCandidates,
+      terminalDispositions,
+      candidateOutcomes: {
+        inserted: terminalCounts.inserted,
+        merged: terminalCounts.merged,
+        hinted: terminalCounts.hinted,
+        noted: terminalCounts.noted,
+        dropped: terminalCounts.dropped,
+        mixed: terminalCounts.mixed,
+        errors: terminalCounts.errors,
+      },
+      claimEvents,
+      uniqueHints,
+      pipelineScope: 'window-candidates-only',
+      pipelineLineage: 'non-exhaustive',
+      runStatus,
+      windows: windowEvents.length,
+      incompleteWindows,
+      failedSections: failedSectionEvents.length,
+      missingSections: missingSectionEvents.length,
+      partialSections: partialSectionEvents.length,
+      unparsedSections: unparsedSectionEvents.length,
+      skippedSections: skippedSectionEvents.length,
+      abortedCandidates,
+      candidateAccountingVerified: extractionExhaustive,
+      verified: extractionExhaustive,
+    };
+  }
+
   if (trace.completeness !== 'complete' || trace.droppedEvents > 0) {
     suspicious.push({
       code: 'trace_not_exhaustive',
@@ -2334,7 +3047,13 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
   return {
     traceId: trace.id,
     completeness: trace.completeness,
-    exhaustive: trace.completeness === 'complete' && trace.droppedEvents === 0 && contextExhaustive && writeExhaustive,
+    exhaustive:
+      trace.completeness === 'complete' &&
+      trace.droppedEvents === 0 &&
+      contextExhaustive &&
+      writeExhaustive &&
+      extractionExhaustive &&
+      extractionEvents.length === 0,
     droppedEvents: trace.droppedEvents,
     sampledRate: trace.sampledRate,
     finishedAt: trace.finishedAt,
@@ -2343,5 +3062,6 @@ export function auditTrace(db: TraceReadDb, traceId: string): TraceAuditResult |
     checks,
     limitations,
     noteAccounting,
+    extractionAccounting,
   };
 }

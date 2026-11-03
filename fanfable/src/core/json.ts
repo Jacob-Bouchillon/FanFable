@@ -37,43 +37,59 @@ function scanBalanced(text: string, start: number): string | null {
   return null;
 }
 
-/** Extract the first JSON object/array from arbitrary model output. */
-export function extractJson<T = unknown>(text: string): T | null {
-  if (!text) return null;
+export type JsonExtractionRoute = 'whole' | 'fenced' | 'embedded' | 'none';
+
+export interface JsonExtraction<T> {
+  value: T | null;
+  route: JsonExtractionRoute;
+}
+
+/** Extract the first JSON value and report the branch that actually yielded it. */
+export function extractJsonWithRoute<T = unknown>(text: string): JsonExtraction<T> {
+  if (!text) return { value: null, route: 'none' };
   const trimmed = text.trim();
 
-  // 1. whole string
+  // 1. whole string. A parsed falsy value is still a successful whole answer.
   try {
-    return JSON.parse(trimmed) as T;
+    return { value: JSON.parse(trimmed) as T, route: 'whole' };
   } catch {
     /* continue */
   }
 
-  // 2. fenced block
+  // 2. fenced block. This intentionally mirrors extractJson's truthy fallback:
+  // a falsy nested value is ignored and the later whole-text scan may still run.
   const fence = /```(?:json|JSON)?\s*([\s\S]*?)```/.exec(trimmed);
   if (fence) {
     const inner = fence[1].trim();
     try {
-      return JSON.parse(inner) as T;
+      return { value: JSON.parse(inner) as T, route: 'fenced' };
     } catch {
-      const inner2 = extractJson<T>(inner);
-      if (inner2) return inner2;
+      const inner2 = extractJsonWithRoute<T>(inner);
+      // Preserve where the nested value actually came from. A fenced truncated
+      // object can recurse to an embedded fragment; calling that 'fenced' would
+      // hide that the value is not the fenced document's top-level JSON.
+      if (inner2.value) return { value: inner2.value, route: inner2.route };
     }
   }
 
-  // 3. first balanced value anywhere
+  // 3. first balanced value anywhere.
   for (let i = 0; i < trimmed.length; i++) {
     const ch = trimmed[i];
     if (ch !== '{' && ch !== '[') continue;
     const candidate = scanBalanced(trimmed, i);
     if (!candidate) continue;
     try {
-      return JSON.parse(candidate) as T;
+      return { value: JSON.parse(candidate) as T, route: 'embedded' };
     } catch {
       /* try next start */
     }
   }
-  return null;
+  return { value: null, route: 'none' };
+}
+
+/** Extract the first JSON object/array from arbitrary model output. */
+export function extractJson<T = unknown>(text: string): T | null {
+  return extractJsonWithRoute<T>(text).value;
 }
 
 /** Extract every JSON value in the text (used for lists of objects). */

@@ -471,7 +471,7 @@ test('a truncated trace is inconclusive and is not audited as exhaustive', () =>
   const { db } = tempDb();
   const project = seedProject(db, 'trace-truncated');
   const started = trace.startTrace(db, { projectId: project.id });
-  for (let i = 0; i < 201; i++) {
+  for (let i = 0; i < trace.DIAGNOSTIC_MAX_EVENTS_PER_TRACE + 1; i++) {
     trace.recordTraceEvent(db, {
       traceId: started.id,
       projectId: project.id,

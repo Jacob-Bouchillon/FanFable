@@ -241,18 +241,22 @@ function manualTrace(
 }
 
 test('tracing on/off keeps the complete ContextBundle identical', async () => {
-  const { db } = tempDb();
-  const { project, chapter } = approvedProject(db, 'context-parity');
-  const llm = contextLlm();
-
-  const plain = await controller.assembleContext(db, llm, project.id, {
-    chapter,
+  // Lazy extraction mutates unmined windows, so the comparison uses isolated
+  // state. Otherwise a first run's incomplete/zero-write window would make the
+  // second run skip a repeat, which is the intended lazy-retry protection.
+  const plainFixture = tempDb();
+  const plainSetup = approvedProject(plainFixture.db, 'context-parity-plain');
+  const plain = await controller.assembleContext(plainFixture.db, contextLlm(), plainSetup.project.id, {
+    chapter: plainSetup.chapter,
     chapterNumber: 1,
     trace: false,
   });
+
+  const tracedFixture = tempDb();
+  const tracedSetup = approvedProject(tracedFixture.db, 'context-parity-traced');
   let traceId: string | undefined;
-  const traced = await controller.assembleContext(db, llm, project.id, {
-    chapter,
+  const traced = await controller.assembleContext(tracedFixture.db, contextLlm(), tracedSetup.project.id, {
+    chapter: tracedSetup.chapter,
     chapterNumber: 1,
     onTraceId: (id) => {
       traceId = id;
@@ -262,7 +266,8 @@ test('tracing on/off keeps the complete ContextBundle identical', async () => {
   assert.ok(traceId, 'an actual assembly produces a trace id');
   assert.deepEqual(traced, plain, 'trace metadata never changes the bundle');
   assert.equal(traced.requests.length, 0);
-  db.close();
+  plainFixture.db.close();
+  tracedFixture.db.close();
 });
 
 test('one root, distinct children and distinct ids for repeated assemblies', async () => {
@@ -685,14 +690,17 @@ test('sampled candidate detail keeps summaries and final items but cannot pass a
 });
 
 test('diagnostic write failure leaves assembly output unchanged', async () => {
-  const { db } = tempDb();
-  const { project, chapter } = approvedProject(db, 'context-write-failure');
-  const plain = await controller.assembleContext(db, contextLlm(), project.id, {
-    chapter,
+  const plainFixture = tempDb();
+  const plainSetup = approvedProject(plainFixture.db, 'context-write-failure-plain');
+  const plain = await controller.assembleContext(plainFixture.db, contextLlm(), plainSetup.project.id, {
+    chapter: plainSetup.chapter,
     chapterNumber: 1,
     trace: false,
   });
-  db.run(
+
+  const tracedFixture = tempDb();
+  const tracedSetup = approvedProject(tracedFixture.db, 'context-write-failure-traced');
+  tracedFixture.db.run(
     `CREATE TRIGGER fail_context_completed
        BEFORE INSERT ON trace_event
        WHEN NEW.event = 'context.completed'
@@ -701,8 +709,8 @@ test('diagnostic write failure leaves assembly output unchanged', async () => {
      END`,
   );
   let traceId: string | undefined;
-  const traced = await controller.assembleContext(db, contextLlm(), project.id, {
-    chapter,
+  const traced = await controller.assembleContext(tracedFixture.db, contextLlm(), tracedSetup.project.id, {
+    chapter: tracedSetup.chapter,
     chapterNumber: 1,
     onTraceId: (id) => {
       traceId = id;
@@ -710,17 +718,18 @@ test('diagnostic write failure leaves assembly output unchanged', async () => {
   });
   assert.deepEqual(traced, plain);
   assert.ok(traceId, 'the failing trace still exists');
-  const view = trace.showTrace(db, traceId!);
+  const view = trace.showTrace(tracedFixture.db, traceId!);
   assert.ok(view);
   assert.ok(
     view!.trace.completeness === 'truncated' || view!.trace.completeness === 'interrupted',
     `observable write loss is incomplete (${view!.trace.completeness})`,
   );
   assert.ok(view!.trace.droppedEvents > 0, 'dropped diagnostic writes are visible');
-  const audit = trace.auditTrace(db, traceId!);
+  const audit = trace.auditTrace(tracedFixture.db, traceId!);
   assert.equal(audit?.exhaustive, false);
   assert.ok(audit?.suspicious.some((item) => item.code === 'trace_not_exhaustive'));
-  db.close();
+  plainFixture.db.close();
+  tracedFixture.db.close();
 });
 
 test('uncited lore is explicit and brief slots carry chunk provenance', async () => {

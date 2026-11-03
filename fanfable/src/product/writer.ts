@@ -12,7 +12,7 @@
 import { extractJson } from '../core/json.ts';
 import type { ChatRequest, LlmClient } from '../core/llm.ts';
 import type { ChapterOutline, Outline, OutlinePreferences } from '../plan/planner.ts';
-import { dedupeParagraphs, wordCount } from '../core/text.ts';
+import { dedupeParagraphs, similarity, wordCount } from '../core/text.ts';
 import type { RequestTraceContext, WriteTrace } from '../trace/write-trace.ts';
 
 /* ------------------------------------------------------------ context protocol */
@@ -33,7 +33,10 @@ export interface ResolvedContext {
 }
 
 export interface ContextLimits {
-  /** Maximum request/answer round trips per scene. */
+  /**
+   * Maximum additional writer calls caused by context requests, across the
+   * whole chapter. Every part always gets one initial writer call first.
+   */
   maxRounds: number;
   /** Maximum distinct requests honoured per scene. */
   maxRequests: number;
@@ -356,6 +359,10 @@ export interface WriteResult {
   requests: ContextRequest[];
   /** Human-readable trace of what the writer asked for and what it got. */
   trace: { request: ContextRequest; answer: ResolvedContext }[];
+  /**
+   * Total writer calls: one initial call per requested part plus additional
+   * context-request calls. Continuation calls are counted separately.
+   */
   rounds: number;
   words: number;
   stats: {
@@ -365,6 +372,12 @@ export interface WriteResult {
     continuations: number;
     /** Paragraphs removed as near-duplicates. */
     droppedParagraphs: number;
+    /** Parts that received their guaranteed initial writer call. */
+    initialCalls: number;
+    /** Context-request writer calls beyond the initial part calls. */
+    additionalCalls: number;
+    /** Requests recorded unanswered because no additional call remained. */
+    unansweredRequests: number;
   };
 }
 
@@ -398,6 +411,129 @@ export function beatsSoFar(prose: string, limit = 12): string[] {
   return out;
 }
 
+/** Story text from one writer response, without context/meta protocol. */
+function storyText(text: string): string {
+  return stripTrailingMeta(stripProtocolBlocks(text)).trim();
+}
+
+function splitParagraphs(text: string): string[] {
+  return (text ?? '').split(/\n{2,}/).map((part) => part.trim()).filter(Boolean);
+}
+
+function splitSentences(text: string): string[] {
+  return (text ?? '').split(/(?<=[.!?])\s+/).map((part) => part.trim()).filter(Boolean);
+}
+
+function overlapNormal(text: string): string {
+  return (text ?? '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+/** Longest suffix of `existing` that equals the prefix of `next`. */
+function suffixPrefixOverlap(existing: string[], next: string[]): number {
+  const max = Math.min(existing.length, next.length);
+  for (let count = max; count >= 1; count--) {
+    let matches = true;
+    for (let i = 0; i < count; i++) {
+      if (overlapNormal(existing[existing.length - count + i]!) !== overlapNormal(next[i]!)) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) return count;
+  }
+  return 0;
+}
+
+interface SinglePartContribution {
+  text: string;
+  addedText: string;
+  addedChars: number;
+  addedWords: number;
+  overlapChars: number;
+  disposition: 'included' | 'superseded' | 'empty';
+  reason: string;
+}
+
+/**
+ * Add a single-part response to the prose already written. Distinct story text
+ * is retained; exact paragraph/sentence overlap is removed so a follow-up that
+ * restates the previous paragraph does not duplicate it in the chapter.
+ */
+function appendSinglePartStory(existing: string, text: string): SinglePartContribution {
+  const next = (text ?? '').trim();
+  if (!next) {
+    return {
+      text: existing,
+      addedText: '',
+      addedChars: 0,
+      addedWords: 0,
+      overlapChars: 0,
+      disposition: 'empty',
+      reason: 'empty-or-protocol-only',
+    };
+  }
+  if (!existing.trim()) {
+    return {
+      text: next,
+      addedText: next,
+      addedChars: next.length,
+      addedWords: wordCount(next),
+      overlapChars: 0,
+      disposition: 'included',
+      reason: 'single-part-contribution',
+    };
+  }
+  const existingNorm = overlapNormal(existing);
+  const nextNorm = overlapNormal(next);
+  if (nextNorm && existingNorm.includes(nextNorm)) {
+    return {
+      text: existing,
+      addedText: '',
+      addedChars: 0,
+      addedWords: 0,
+      overlapChars: next.length,
+      disposition: 'superseded',
+      reason: 'duplicate-output',
+    };
+  }
+
+  const existingParagraphs = splitParagraphs(existing);
+  const nextParagraphs = splitParagraphs(next);
+  const paragraphOverlap = suffixPrefixOverlap(existingParagraphs, nextParagraphs);
+  const remainingParagraphs = nextParagraphs.slice(paragraphOverlap);
+  const existingSentences = splitSentences(existing);
+  if (remainingParagraphs.length) {
+    const firstSentences = splitSentences(remainingParagraphs[0]!);
+    const sentenceOverlap = suffixPrefixOverlap(existingSentences, firstSentences);
+    if (sentenceOverlap) {
+      const keptSentences = firstSentences.slice(sentenceOverlap);
+      if (keptSentences.length) remainingParagraphs[0] = keptSentences.join(' ');
+      else remainingParagraphs.shift();
+    }
+  }
+  const remaining = remainingParagraphs.filter(Boolean).join('\n\n').trim();
+  if (!remaining) {
+    return {
+      text: existing,
+      addedText: '',
+      addedChars: 0,
+      addedWords: 0,
+      overlapChars: next.length,
+      disposition: 'superseded',
+      reason: 'duplicate-output',
+    };
+  }
+  return {
+    text: `${existing.trimEnd()}\n\n${remaining}`,
+    addedText: remaining,
+    addedChars: remaining.length,
+    addedWords: wordCount(remaining),
+    overlapChars: Math.max(0, next.length - remaining.length),
+    disposition: 'included',
+    reason: 'single-part-contribution',
+  };
+}
+
 export async function writeChapter(
   llm: LlmClient,
   opts: WriteOptions,
@@ -407,14 +543,24 @@ export async function writeChapter(
   const messages: { role: 'user' | 'assistant'; content: string }[] = [];
   const answered = new Map<string, ResolvedContext>();
   const trace: { request: ContextRequest; answer: ResolvedContext }[] = [];
-  let rounds = 0;
+  let writerCalls = 0;
+  let initialCalls = 0;
+  let additionalCalls = 0;
+  let unansweredRequests = 0;
   let requestSeq = 0;
   let meta: Record<string, unknown> | null = null;
   let prose = '';
   let requests: ContextRequest[] = [];
   const traceSink = opts.trace;
 
-  const mainOutputs: { callId: string; text: string; part: number; round: number }[] = [];
+  type MainOutput = {
+    callId: string;
+    disposition: 'included' | 'superseded' | 'empty';
+    reason: string;
+    contributedText: string;
+    overlapChars: number;
+  };
+  const mainOutputs: MainOutput[] = [];
   const continuationOutputs: { callId: string; text: string; attempt: number }[] = [];
 
   const target = opts.targetWords ?? opts.chapter?.targetWords ?? 2500;
@@ -424,173 +570,245 @@ export async function writeChapter(
   // chapter comes out the right length. Parts are available for chapters that
   // need them.
   const segments = Math.max(1, Math.min(opts.segments ?? 1, 6));
+  // Every part gets one initial call. These are follow-up calls caused by
+  // context requests, capped across the whole chapter.
+  const maxAdditionalCalls = Number.isFinite(limits.maxRounds)
+    ? Math.max(0, Math.floor(limits.maxRounds))
+    : 0;
+  const maxRequests = Number.isFinite(limits.maxRequests)
+    ? Math.max(0, Math.floor(limits.maxRequests))
+    : 0;
 
   for (let part = 0; part < segments; part++) {
-   const partTarget = Math.round(target / segments);
-   const partNumber = part + 1;
-   traceSink?.partStarted(partNumber, segments, target, partTarget);
-   let partCalls = 0;
-   // Within a part, the writer may ask for context and carry on. The loop is
-   // bounded by the round cap and the distinct-request cap.
-   while (rounds <= limits.maxRounds) {
-    rounds++;
-    const partPrevious = segments > 1 && prose ? stripProtocolBlocks(prose).slice(-2400) : '';
-    const partBeats = segments > 1 ? beatsSoFar(prose) : [];
-    const prompt = buildWriterPrompt({
-      chapter: opts.chapter,
-      chapterNumber: opts.chapterNumber,
-      outline: opts.outline,
-      memory: opts.memoryText,
-      canon: opts.canonText,
-      connected: opts.connectedText ?? '',
-      previousChapterTail: opts.previousChapterTail ?? '',
-      userInstructions: opts.userInstructions ?? '',
-      sceneSummary: opts.sceneSummary,
-      preferences: opts.preferences ?? {},
-      part:
-        segments > 1
+    const partTarget = Math.round(target / segments);
+    const partNumber = part + 1;
+    traceSink?.partStarted(partNumber, segments, target, partTarget);
+    let partCalls = 0;
+    initialCalls++;
+    let needPrompt = true;
+
+    // The first pass through this loop is the part's guaranteed initial call.
+    // Later passes are context-request follow-ups and consume the chapter-wide
+    // additional-call budget. Follow-ups continue the existing conversation:
+    // they must not append a second fresh task prompt.
+    while (true) {
+      const roundNumber = ++writerCalls;
+      const roundSpan = traceSink?.roundStarted(partNumber, roundNumber);
+      if (needPrompt) {
+        const partPrevious = segments > 1 && prose ? stripProtocolBlocks(prose).slice(-2400) : '';
+        const partBeats = segments > 1 ? beatsSoFar(prose) : [];
+        const prompt = buildWriterPrompt({
+          chapter: opts.chapter,
+          chapterNumber: opts.chapterNumber,
+          outline: opts.outline,
+          memory: opts.memoryText,
+          canon: opts.canonText,
+          connected: opts.connectedText ?? '',
+          previousChapterTail: opts.previousChapterTail ?? '',
+          userInstructions: opts.userInstructions ?? '',
+          sceneSummary: opts.sceneSummary,
+          preferences: opts.preferences ?? {},
+          part:
+            segments > 1
+              ? {
+                  index: partNumber,
+                  total: segments,
+                  target: partTarget,
+                  previous: partPrevious,
+                  beats: partBeats,
+                }
+              : undefined,
+        });
+
+        traceSink?.promptBuilt(roundSpan!, prompt, {
+          part: partNumber,
+          total: segments,
+          round: roundNumber,
+          messageCount: messages.length,
+          previousChars: partPrevious.length,
+          beatCount: partBeats.length,
+        });
+        messages.push({ role: 'user', content: prompt });
+        traceSink?.promptMessage(roundSpan!, messages.length - 1, 'user', 'built', prompt, {
+          part: partNumber,
+          round: roundNumber,
+        });
+        needPrompt = false;
+      }
+      const request: ChatRequest = {
+        system: WRITER_SYSTEM,
+        messages,
+        temperature: 0.85,
+        maxTokens: Math.max(1200, Math.ceil(partTarget * 1.8)),
+      };
+      const callId = traceSink?.modelStarted(request, {
+        role: 'writer',
+        part: partNumber,
+        round: roundNumber,
+        parentSpanId: roundSpan ?? 'sp-write',
+        llm,
+      });
+      let res;
+      try {
+        res = await llm.chat(request);
+        if (callId) traceSink?.modelCompleted(callId, res);
+      } catch (err) {
+        if (callId) traceSink?.modelFailed(callId, err);
+        throw err;
+      }
+      traceSink?.roundCompleted(partNumber, roundNumber);
+      partCalls++;
+      // Keep the actual assistant response in the conversation before any
+      // answer/notice user message or next part prompt.
+      messages.push({ role: 'assistant', content: res.text });
+
+      const story = storyText(res.text);
+      if (segments > 1) {
+        // Clean each part before assembling it. Stripping metadata from the
+        // concatenated raw responses can let an early bare metadata object
+        // cut off every later part.
+        if (story) prose = prose ? `${prose}\n\n${story}` : story;
+        if (callId) {
+          mainOutputs.push({
+            callId,
+            disposition: story ? 'included' : 'empty',
+            reason: story ? 'part-output' : 'empty-part-output',
+            contributedText: story,
+            overlapChars: 0,
+          });
+        }
+      } else {
+        // Single-part writes must keep every distinct response. Replacing the
+        // whole body here loses everything written before a context request.
+        const contribution = appendSinglePartStory(prose, story);
+        prose = contribution.text;
+        if (callId) {
+          mainOutputs.push({
+            callId,
+            disposition: contribution.disposition,
+            reason: contribution.reason,
+            contributedText: contribution.addedText,
+            overlapChars: contribution.overlapChars,
+          });
+        }
+      }
+
+      const parsedMeta = parseMeta(res.text);
+      if (parsedMeta) meta = parsedMeta;
+      requests = parseContextRequests(res.text);
+      if (!requests.length) break;
+
+      const parsed = requests.map((req) => {
+        const seq = ++requestSeq;
+        const ctx: RequestTraceContext | undefined = traceSink
           ? {
-              index: partNumber,
-              total: segments,
-              target: partTarget,
-              previous: partPrevious,
-              beats: partBeats,
+              requestId: traceSink.requestKey(req),
+              seq,
+              part: partNumber,
+              round: roundNumber,
+              spanId: traceSink.requestSpan(partNumber, roundNumber, seq),
             }
-          : undefined,
-    });
+          : undefined;
+        if (ctx) traceSink?.requestParsed(ctx, req);
+        return { req, ctx, key: requestKey(req) };
+      });
 
-    const roundSpan = traceSink?.roundStarted(partNumber, rounds);
-    traceSink?.promptBuilt(roundSpan!, prompt, {
-      part: partNumber,
-      total: segments,
-      round: rounds,
-      messageCount: messages.length,
-      previousChars: partPrevious.length,
-      beatCount: partBeats.length,
-    });
-    messages.push({ role: 'user', content: prompt });
-    traceSink?.promptMessage(roundSpan!, messages.length - 1, 'user', 'built', prompt, {
-      part: partNumber,
-      round: rounds,
-    });
-    const request: ChatRequest = {
-      system: WRITER_SYSTEM,
-      messages,
-      temperature: 0.85,
-      maxTokens: Math.max(1200, Math.ceil(partTarget * 1.8)),
-    };
-    const callId = traceSink?.modelStarted(request, {
-      role: 'writer',
-      part: partNumber,
-      round: rounds,
-      parentSpanId: roundSpan ?? 'sp-write',
-      llm,
-    });
-    let res;
-    try {
-      res = await llm.chat(request);
-      if (callId) traceSink?.modelCompleted(callId, res);
-    } catch (err) {
-      if (callId) traceSink?.modelFailed(callId, err);
-      throw err;
-    }
-    traceSink?.roundCompleted(partNumber, rounds);
-    partCalls++;
-    if (callId) mainOutputs.push({ callId, text: res.text, part: partNumber, round: rounds });
-    messages.push({ role: 'assistant', content: res.text });
-
-    const parsedMeta = parseMeta(res.text);
-    if (parsedMeta) meta = parsedMeta;
-    prose = segments > 1 ? (prose ? `${prose}\n\n${res.text}` : res.text) : res.text;
-    requests = parseContextRequests(res.text);
-
-    if (!requests.length) break;
-
-    const parsed = requests.map((req) => {
-      const seq = ++requestSeq;
-      const ctx = traceSink
-        ? {
-            requestId: traceSink.requestKey(req),
-            seq,
-            part: partNumber,
-            round: rounds,
-            spanId: traceSink.requestSpan(partNumber, rounds, seq),
-          }
-        : undefined;
-      if (ctx) traceSink?.requestParsed(ctx, req);
-      return { req, ctx };
-    });
-    const fresh = parsed.filter(({ req }) => !answered.has(requestKey(req)));
-    if (!fresh.length) {
-      // The model is repeating itself: tell it the answers and move on.
-      for (const { req, ctx } of parsed) {
-        if (ctx) traceSink?.requestDisposition(ctx, req, 'duplicate', 'already-answered');
+      // Give every parsed request exactly one terminal disposition before
+      // deciding whether another writer call is possible.
+      const candidates: typeof parsed = [];
+      let duplicateCount = 0;
+      let overLimitCount = 0;
+      for (const item of parsed) {
+        if (answered.has(item.key)) {
+          if (item.ctx) traceSink?.requestDisposition(item.ctx, item.req, 'duplicate', 'already-answered');
+          duplicateCount++;
+          continue;
+        }
+        if (answered.size >= maxRequests) {
+          if (item.ctx) traceSink?.requestDisposition(item.ctx, item.req, 'over-limit', 'request-limit');
+          overLimitCount++;
+          continue;
+        }
+        candidates.push(item);
       }
-      const message =
-        `Those requests were already answered. Here are the answers again:\n${[...answered.values()]
-          .map((a) => `--- ${a.label} ---\n${a.content}`)
-          .join('\n\n')}\n\nContinue the scene now using this information.`;
-      messages.push({ role: 'user', content: message });
-      traceSink?.promptMessage(roundSpan!, messages.length - 1, 'user', 'duplicate-answers', message, {
-        part: partNumber,
-        round: rounds,
-      });
-      continue;
-    }
-    if (answered.size >= limits.maxRequests) {
-      for (const { req, ctx } of fresh) {
-        if (ctx) traceSink?.requestDisposition(ctx, req, 'over-limit', 'request-limit');
+
+      if (!candidates.length) {
+        if (additionalCalls >= maxAdditionalCalls) break;
+        const message = overLimitCount
+          ? 'You have reached the context request limit for this scene. Continue with what you have ' +
+            'and do not make any more requests.'
+          : `Those requests were already answered. Here are the answers again:\n${[...answered.values()]
+              .map((answer) => `--- ${answer.label} ---\n${answer.content}`)
+              .join('\n\n')}\n\nContinue the scene now using this information.`;
+        messages.push({ role: 'user', content: message });
+        traceSink?.promptMessage(roundSpan!, messages.length - 1, 'user', overLimitCount ? 'request-limit' : 'duplicate-answers', message, {
+          part: partNumber,
+          round: roundNumber,
+        });
+        additionalCalls++;
+        continue;
       }
-      const message =
-        'You have reached the context request limit for this scene. Continue with what you have ' +
-        'and do not make any more requests.';
-      messages.push({ role: 'user', content: message });
-      traceSink?.promptMessage(roundSpan!, messages.length - 1, 'user', 'request-limit', message, {
-        part: partNumber,
-        round: rounds,
-      });
-      continue;
-    }
 
-    const processable = fresh.slice(0, Math.max(0, limits.maxRequests - answered.size));
-    const notProcessed = fresh.slice(processable.length);
-    for (const { req, ctx } of notProcessed) {
-      if (ctx) traceSink?.requestDisposition(ctx, req, 'not-processed', 'request-slot-limit');
-    }
+      // Apply the distinct-request slots first. A request that exceeds the
+      // slot limit is not-processed even when the follow-up budget is also
+      // exhausted; only requests that would otherwise fit are unanswered.
+      const processable = candidates.slice(0, Math.max(0, maxRequests - answered.size));
+      const notProcessed = candidates.slice(processable.length);
+      for (const item of notProcessed) {
+        if (item.ctx) traceSink?.requestDisposition(item.ctx, item.req, 'not-processed', 'request-slot-limit');
+      }
+      if (additionalCalls >= maxAdditionalCalls) {
+        // This is the final writer call the chapter budget allows. Requests
+        // that would otherwise have been resolved are recorded unanswered.
+        for (const item of processable) {
+          if (item.ctx) traceSink?.requestDisposition(item.ctx, item.req, 'unanswered', 'round-budget');
+        }
+        unansweredRequests += processable.length;
+        break;
+      }
 
-    const chunks: string[] = [];
-    for (const { req, ctx } of processable) {
-      const key = requestKey(req);
-      const answer = await resolve(req, ctx);
-      if (!answer) continue;
-      answered.set(key, answer);
-      trace.push({ request: req, answer });
-      chunks.push(`--- ${answer.label} ---\n${answer.content}`);
-      if (ctx) traceSink?.answerQueued(ctx, answer);
-    }
-    if (!chunks.length) {
-      const message = 'No matching information was found. Continue with the information you already have.';
+      const chunks: string[] = [];
+      for (const item of processable) {
+        const answer = await resolve(item.req, item.ctx);
+        if (!answer) continue;
+        answered.set(item.key, answer);
+        trace.push({ request: item.req, answer });
+        chunks.push(`--- ${answer.label} ---\n${answer.content}`);
+        if (item.ctx) traceSink?.answerQueued(item.ctx, answer);
+      }
+
+      let source = 'context-answer';
+      let message: string;
+      if (chunks.length) {
+        message =
+          `Here is the information you requested. Use it and continue the scene from where you stopped.\n\n` +
+          chunks.join('\n\n');
+      } else if (overLimitCount) {
+        source = 'request-limit';
+        message =
+          'You have reached the context request limit for this scene. Continue with what you have ' +
+          'and do not make any more requests.';
+      } else if (duplicateCount) {
+        source = 'duplicate-answers';
+        message =
+          `Those requests were already answered. Here are the answers again:\n${[...answered.values()]
+            .map((answer) => `--- ${answer.label} ---\n${answer.content}`)
+            .join('\n\n')}\n\nContinue the scene now using this information.`;
+      } else {
+        source = 'no-matching-information';
+        message = 'No matching information was found. Continue with the information you already have.';
+      }
       messages.push({ role: 'user', content: message });
-      traceSink?.promptMessage(roundSpan!, messages.length - 1, 'user', 'no-matching-information', message, {
+      traceSink?.promptMessage(roundSpan!, messages.length - 1, 'user', source, message, {
         part: partNumber,
-        round: rounds,
+        round: roundNumber,
       });
-      continue;
+      additionalCalls++;
     }
-    const message =
-      `Here is the information you requested. Use it and continue the scene from where you stopped.\n\n` +
-      chunks.join('\n\n');
-    messages.push({ role: 'user', content: message });
-    traceSink?.promptMessage(roundSpan!, messages.length - 1, 'user', 'context-answer', message, {
-      part: partNumber,
-      round: rounds,
-    });
-   }
-   if (partCalls === 0) traceSink?.partSkipped(partNumber, segments, 'round-cap');
-   else traceSink?.partCompleted(partNumber, wordCount(prose), partCalls);
+    traceSink?.partCompleted(partNumber, wordCount(prose), partCalls);
   }
 
-  let body = stripTrailingMeta(stripProtocolBlocks(prose));
+  let body = stripProtocolBlocks(prose).trim();
 
   // A chapter that stops at half its length is not a chapter, and a chapter
   // that says the same thing three times is worse than a short one. The writer
@@ -601,11 +819,9 @@ export async function writeChapter(
   const maxContinuations = opts.maxContinuations ?? 3;
   const threshold = opts.dedupeThreshold ?? 0.8;
   let continuations = 0;
-  let removed = 0;
 
   while (segments === 1 && continuations < maxContinuations) {
     const swept = dedupeParagraphs(body, threshold);
-    removed = swept.removed;
     const have = wordCount(swept.text);
     const raw = wordCount(body);
     const wasRepetitive = raw > 0 && (raw - have) / raw > 0.25;
@@ -621,24 +837,20 @@ export async function writeChapter(
     continuations++;
     const reason = wasRepetitive ? 'repetitive' : 'too-short';
     const continuationSpan = traceSink?.continuationStarted(continuations, reason, have, target);
+    const continuationInstruction =
+      (wasRepetitive
+        ? `The chapter so far says the same thing several times over; that repetition has been ` +
+          `removed, and what is left is ${have} words. `
+        : `The chapter so far is ${have} words; the target is about ${target}. It ends too early. `) +
+      `Continue the same chapter from exactly where it stops — same scene, same voice. ` +
+      `Do not repeat or restate anything already written: the next paragraphs must be new ` +
+      `action, new information, or the consequence of what has just happened. Do not make a ` +
+      `context request. Write until the chapter is complete.\n\n` +
+      `THE CHAPTER SO FAR (do not repeat any of it):\n${body.slice(-2400)}`;
+    messages.push({ role: 'user', content: continuationInstruction });
     const continuationRequest: ChatRequest = {
       system: WRITER_SYSTEM,
-      messages: [
-        ...messages,
-        {
-          role: 'user',
-          content:
-            (wasRepetitive
-              ? `The chapter so far says the same thing several times over; that repetition has been ` +
-                `removed, and what is left is ${have} words. `
-              : `The chapter so far is ${have} words; the target is about ${target}. It ends too early. `) +
-            `Continue the same chapter from exactly where it stops — same scene, same voice. ` +
-            `Do not repeat or restate anything already written: the next paragraphs must be new ` +
-            `action, new information, or the consequence of what has just happened. Do not make a ` +
-            `context request. Write until the chapter is complete.\n\n` +
-            `THE CHAPTER SO FAR (do not repeat any of it):\n${body.slice(-2400)}`,
-        },
-      ],
+      messages,
       temperature: 0.85,
       maxTokens: Math.max(1200, Math.ceil((target - have) * 1.8)),
     };
@@ -656,55 +868,187 @@ export async function writeChapter(
       if (callId) traceSink?.modelFailed(callId, err);
       throw err;
     }
-    if (callId) continuationOutputs.push({ callId, text: res.text, attempt: continuations });
     messages.push({ role: 'assistant', content: res.text });
     const more = stripTrailingMeta(stripProtocolBlocks(res.text));
     if (!more) {
-      if (callId) traceSink?.outputDisposition(callId, 'empty', 'continuation-empty');
+      if (callId) continuationOutputs.push({ callId, text: '', attempt: continuations });
       traceSink?.continuationEmpty(continuations);
       break;
     }
-    if (callId) traceSink?.outputDisposition(callId, 'included', 'continuation');
+    if (callId) continuationOutputs.push({ callId, text: more, attempt: continuations });
     traceSink?.continuationCompleted(continuations, more);
     body = `${body}\n\n${more}`;
     prose = body;
   }
 
   const rawWords = wordCount(body);
-  const swept = dedupeParagraphs(body, threshold);
-  removed = swept.removed;
-  if (removed) {
-    body = swept.text;
+  const finalSweep = dedupeParagraphs(body, threshold);
+  if (finalSweep.removed) {
+    body = finalSweep.text;
     prose = body;
   }
   traceSink?.pendingNotIncluded('round-limit');
-  traceSink?.outputDedupe(removed);
+
+  // Output provenance is emitted only after the final near-duplicate sweep.
+  // Simulate the same paragraph dedupe over each output's contributed text so
+  // the final attribution is tracked by provenance, not by substring presence.
+  type TrackedOutput = {
+    callId: string;
+    kind: 'main' | 'continuation';
+    text: string;
+    disposition?: 'included' | 'superseded' | 'empty';
+    reason?: string;
+    overlapChars: number;
+  };
+  const trackedOutputs: TrackedOutput[] = [
+    ...mainOutputs.map((output) => ({
+      callId: output.callId,
+      kind: 'main' as const,
+      text: output.contributedText,
+      disposition: output.disposition,
+      reason: output.reason,
+      overlapChars: output.overlapChars,
+    })),
+    ...continuationOutputs.map((output) => ({
+      callId: output.callId,
+      kind: 'continuation' as const,
+      text: output.text,
+      overlapChars: 0,
+    })),
+  ];
+  const tagged: { outputIndex: number; text: string }[] = [];
+  trackedOutputs.forEach((output, outputIndex) => {
+    for (const paragraph of splitParagraphs(output.text)) {
+      tagged.push({ outputIndex, text: paragraph });
+    }
+  });
+  const kept: { outputIndex: number; text: string }[] = [];
+  const removedTagged = new Set<number>();
+  tagged.forEach((paragraph, index) => {
+    const duplicate =
+      paragraph.text.length >= 40 &&
+      kept.some(
+        (earlier) =>
+          earlier.text.length >= 40 &&
+          similarity(paragraph.text, earlier.text) >= threshold,
+      );
+    if (duplicate) removedTagged.add(index);
+    else kept.push(paragraph);
+  });
+  const finalParagraphs = splitParagraphs(body);
+  const sequenceProven =
+    kept.length === finalParagraphs.length &&
+    kept.every(
+      (paragraph, index) => overlapNormal(paragraph.text) === overlapNormal(finalParagraphs[index]!),
+    );
+
+  const stats = trackedOutputs.map(() => ({
+    chars: 0,
+    words: 0,
+    dedupedChars: 0,
+    ambiguousChars: 0,
+  }));
+  if (sequenceProven) {
+    tagged.forEach((paragraph, index) => {
+      const output = stats[paragraph.outputIndex]!;
+      if (removedTagged.has(index)) output.dedupedChars += paragraph.text.length;
+      else {
+        output.chars += paragraph.text.length;
+        output.words += wordCount(paragraph.text);
+      }
+    });
+  } else {
+    // The assembled body cannot be reconciled with the tracked contributions.
+    // Do not assert survival or removal; record the uncertainty explicitly.
+    trackedOutputs.forEach((output, index) => {
+      if (output.text) stats[index]!.ambiguousChars = output.text.length;
+    });
+  }
+
+  const droppedParagraphs = removedTagged.size;
+  traceSink?.outputDedupe(droppedParagraphs);
   traceSink?.outputFinal(body);
 
-  // Emit output provenance after the final body is known. Single-part writes
-  // replace prose with each response; earlier responses remain in messages but
-  // are not persisted as the chapter body.
-  for (const output of mainOutputs) {
-    if (segments > 1) {
-      traceSink?.outputDisposition(output.callId, 'included', 'part-output');
-    } else if (output !== mainOutputs[mainOutputs.length - 1]) {
-      traceSink?.outputDisposition(output.callId, 'superseded', 'single-part-overwrite');
-    } else {
+  trackedOutputs.forEach((output, index) => {
+    const outputStats = stats[index]!;
+    if (output.kind === 'main' && (output.disposition !== 'included' || !output.text)) {
+      traceSink?.outputDisposition(output.callId, output.disposition ?? 'empty', output.reason ?? 'empty-output', {
+        contributed_chars: 0,
+        contributed_words: 0,
+        overlap_chars: output.overlapChars,
+        deduped_chars: 0,
+        ambiguous_chars: 0,
+      });
+      return;
+    }
+    if (!output.text) {
+      traceSink?.outputDisposition(output.callId, 'empty', 'continuation-empty', {
+        contributed_chars: 0,
+        contributed_words: 0,
+        overlap_chars: 0,
+        deduped_chars: 0,
+        ambiguous_chars: 0,
+      });
+      return;
+    }
+    if (outputStats.chars > 0) {
       traceSink?.outputDisposition(
         output.callId,
-        stripTrailingMeta(stripProtocolBlocks(output.text)) ? 'included' : 'empty',
-        'single-part-final',
+        'included',
+        output.kind === 'main' ? (output.reason ?? 'part-output') : 'continuation',
+        {
+          contributed_chars: outputStats.chars,
+          contributed_words: outputStats.words,
+          overlap_chars: output.overlapChars,
+          deduped_chars: outputStats.dedupedChars,
+          ambiguous_chars: 0,
+        },
       );
+      return;
     }
-  }
+    if (outputStats.ambiguousChars > 0) {
+      traceSink?.outputDisposition(output.callId, 'ambiguous', 'unproven-final-attribution', {
+        contributed_chars: 0,
+        contributed_words: 0,
+        overlap_chars: output.overlapChars,
+        deduped_chars: 0,
+        ambiguous_chars: outputStats.ambiguousChars,
+      });
+      return;
+    }
+    if (outputStats.dedupedChars > 0) {
+      traceSink?.outputDisposition(output.callId, 'superseded', 'dedupe-removed', {
+        contributed_chars: 0,
+        contributed_words: 0,
+        overlap_chars: output.overlapChars,
+        deduped_chars: outputStats.dedupedChars,
+        ambiguous_chars: 0,
+      });
+      return;
+    }
+    traceSink?.outputDisposition(output.callId, 'empty', 'empty-contribution', {
+      contributed_chars: 0,
+      contributed_words: 0,
+      overlap_chars: output.overlapChars,
+      deduped_chars: 0,
+      ambiguous_chars: 0,
+    });
+  });
 
   return {
     prose: body,
     meta,
     requests,
     trace,
-    rounds,
+    rounds: writerCalls,
     words: wordCount(body),
-    stats: { rawWords, continuations, droppedParagraphs: removed },
+    stats: {
+      rawWords,
+      continuations,
+      droppedParagraphs,
+      initialCalls,
+      additionalCalls,
+      unansweredRequests,
+    },
   };
 }

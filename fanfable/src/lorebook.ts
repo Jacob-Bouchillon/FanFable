@@ -15,12 +15,28 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { asRecordArray, extractJson, salvageJsonArray, toStringArray } from './core/json.ts';
-import type { LlmClient } from './core/llm.ts';
+import { asRecordArray, extractJson, extractJsonWithRoute, salvageJsonArray, toStringArray } from './core/json.ts';
+import type { FinishReason, LlmClient } from './core/llm.ts';
 import { embedMissing, type EmbedFn } from './support/embeddings.ts';
 import { CORROBORATION_CAP, tripleKey, rankRows } from './support/edge-rank.ts';
 import { noteFromExtraction, starvedWindowScores } from './web/note-ingest.ts';
 import type { RetrievalTraceSink } from './trace/trace.ts';
+import {
+  ExtractionTrace,
+  type CitationReason,
+  type ClaimReason,
+  type DispositionReason,
+  type EndpointResolutionMethod,
+  type ExtractionClaimRefs,
+  type ExtractionRunStatus as TraceRunStatus,
+  type ExtractionParseObservation,
+  type ExtractionSectionName as TraceSectionName,
+  type ExtractionSectionReason,
+  type ExtractionSectionState,
+  type RetryReason,
+  type ExtractionTraceOptions,
+  type TracedEndpointResolution,
+} from './trace/extraction-trace.ts';
 import { entitySubject, recordRuling } from './court/ruling.ts';
 import { newClaimUid } from './court/claim-proof.ts';
 import { findHeadings, lexicalScore, normalise, splitSentences, tokenize, truncate } from './core/text.ts';
@@ -433,6 +449,11 @@ export interface ExtractOptions {
   onProgress?: (message: string) => void;
   /** Structured window counts, for a progress monitor rather than the console. */
   onWindow?: (progress: ExtractWindowProgress) => void;
+  /**
+   * Opt-in relationship-extraction trace. Diagnostic only; the run and its
+   * canon writes never depend on a trace write. Off by default.
+   */
+  trace?: ExtractionTraceOptions;
 }
 
 /** What the span gate did with the claims of one extraction run. */
@@ -485,25 +506,50 @@ export interface EmptyWindowReport {
   detail?: string;
 }
 
-/** The three split-extractor calls. The first returns entities and facts. */
-export type ExtractionSectionName = 'entities-facts' | 'relations' | 'timeline';
+/** The three split-extractor calls, plus the one-call legacy path. */
+export type ExtractionSectionName = 'entities-facts' | 'relations' | 'timeline' | 'legacy';
+
+/** Why a section is not complete even though its call returned. */
+export type ExtractionIncompleteReason =
+  | 'section-missing'
+  | 'partial-array'
+  | 'mixed-entries'
+  | 'schema-mismatch'
+  | 'unparsed-answer'
+  | 'empty-response'
+  | 'finish-length'
+  | 'finish-content-filter'
+  | 'finish-tool-calls'
+  | 'finish-function-call';
+
+/** The parser section behind an incomplete split/legacy report. */
+export interface ExtractionIncompletePart {
+  section: 'entities' | 'facts' | 'relations' | 'timeline';
+  reason: ExtractionIncompleteReason;
+}
 
 export interface ExtractionSectionReport {
   section: ExtractionSectionName;
-  state: 'succeeded' | 'failed' | 'skipped';
+  state: 'succeeded' | 'incomplete' | 'failed' | 'skipped';
   /** Rows this section wrote, when it ran. */
   wrote: number;
   /** The call's error detail when `state` is failed. */
   error?: string;
+  /** Why the parsed section is incomplete when `state` is incomplete. */
+  reason?: ExtractionIncompleteReason;
+  /** Per-parser-section reasons, including split entities and facts. */
+  incompleteParts?: ExtractionIncompletePart[];
+  /** Provider stop reason for the call that produced this section. */
+  finishReason?: FinishReason;
 }
 
 /**
- * A window that is not complete because at least one section call failed.
+ * A window that is not complete because a section call failed or returned
+ * output the parser could not accept as complete.
  *
- * `partial` wrote at least one row before a later section failed; `failed`
- * wrote nothing. Both stay unmined so a later run can retry them. This is
- * separate from EmptyWindowReport, which explains a window that genuinely
- * produced no rows.
+ * `partial` wrote at least one row before the failure/incompleteness; `failed`
+ * wrote nothing. Both stay unmined so a later explicit run can retry them.
+ * This is separate from EmptyWindowReport, which explains a zero-row window.
  */
 export interface WindowIssueReport {
   index: number;
@@ -511,6 +557,8 @@ export interface WindowIssueReport {
   state: 'partial' | 'failed';
   sections: ExtractionSectionReport[];
   failedSections: ExtractionSectionName[];
+  /** Sections that returned but were not complete; absent in older reports. */
+  incompleteSections?: ExtractionSectionName[];
   succeededSections: ExtractionSectionName[];
   wrote: { entities: number; facts: number; relations: number; timeline: number };
   detail: string;
@@ -544,8 +592,9 @@ export interface MinedChunkProvenance {
 
 interface WindowOutcome {
   state: 'complete' | 'partial' | 'failed';
-  sections: Array<{ section: string; state: 'succeeded' | 'failed' | 'skipped'; wrote: number; error?: string }>;
-  failedSections: string[];
+  sections: ExtractionSectionReport[];
+  failedSections: ExtractionSectionName[];
+  incompleteSections: ExtractionSectionName[];
   wrote: { entities: number; facts: number; relations: number; timeline: number };
   error: string;
 }
@@ -565,6 +614,8 @@ export interface ExtractLoreResult {
   passages: number;
   /** Windows processed in this run. */
   windows: number;
+  /** Lazy retrieval skipped these because an earlier attempt was incomplete or zero-write. */
+  skippedRepeatedWindows?: number;
   verification: VerificationStats;
   /** Rows that passed the verbatim gate but failed the proven tier. */
   provisional: number;
@@ -581,6 +632,8 @@ export interface ExtractLoreResult {
   notesIngested?: number;
   /** One note-formation trace id per non-empty extraction window. */
   noteTraceIds?: string[];
+  /** Relationship-extraction trace id, when tracing was requested and available. */
+  traceId?: string;
   /** Windows reserved for starved threads, and the threads they covered. */
   starvedReserved?: number;
   starvedUsed?: number;
@@ -971,6 +1024,16 @@ export async function extractLore(
     maxTokens,
     singlePrompt: opts.singlePrompt === true,
   });
+  const extractionTrace = opts.trace?.enabled === true
+    ? ExtractionTrace.start(db, projectId, {
+        runId,
+        windowSize,
+        plannedWindows: runList.length,
+        singlePrompt: opts.singlePrompt === true,
+        maxEvents: opts.trace.maxEvents,
+      })
+    : null;
+  if (extractionTrace) stats.traceId = extractionTrace.traceId;
   let aborted = false;
   try {
     await runWindowBatch(db, llm, projectId, runList, ctx, entityIdByName, stats, {
@@ -984,12 +1047,50 @@ export async function extractLore(
       onWindow: opts.onWindow,
       roster,
       index: nameIndex,
+      trace: extractionTrace,
     });
   } catch (err) {
     aborted = true;
     throw err;
   } finally {
-    finalizeExtractionRun(db, runId, runList.length, aborted);
+    try {
+      finalizeExtractionRun(db, runId, runList.length, aborted);
+    } finally {
+      if (extractionTrace) {
+        let run: {
+          status: string;
+          windows_complete: number;
+          windows_partial: number;
+          windows_failed: number;
+          windows_total: number;
+        } | undefined;
+        try {
+          run = db.get(
+            `SELECT status, windows_complete, windows_partial, windows_failed, windows_total
+               FROM extraction_run WHERE id = ?`,
+            runId,
+          );
+        } catch {
+          // A diagnostic read must never change the extraction result.
+          extractionTrace.markIncomplete('run-finalization-read');
+        }
+        const rawStatus = String(run?.status ?? 'unknown');
+        const status: TraceRunStatus =
+          rawStatus === 'completed' || rawStatus === 'partial' || rawStatus === 'failed' || rawStatus === 'running'
+            ? rawStatus
+            : 'unknown';
+        const completed = Number(run?.windows_complete ?? 0);
+        const partial = Number(run?.windows_partial ?? 0);
+        const failed = Number(run?.windows_failed ?? 0);
+        extractionTrace.runFinalized(status, {
+          completed,
+          partial,
+          failed,
+          skipped: Math.max(0, Number(run?.windows_total ?? runList.length) - completed - partial - failed),
+        });
+        extractionTrace.finish(aborted);
+      }
+    }
   }
 
   // Fold any duplicates left by earlier runs into one row per pair.
@@ -1178,14 +1279,26 @@ export async function ensureWindowsForChunks(
   const chunks = loadOrderedChunks(db, projectId, opts.sourceId);
   if (!chunks.length) return stats;
   const mined = loadMinedSet(db, projectId);
+  const priorNonProductive = priorNonProductiveWindowKeys(db, projectId);
   const cap = Math.max(0, opts.maxLazyWindows ?? 2);
   const targets: { window: ChunkRow[]; index: number }[] = [];
+  let skippedRepeated = 0;
   sliceWindows(chunks, windowSize).forEach((window, index) => {
     if (targets.length >= cap) return;
     if (!window.some((c) => wanted.has(c.id))) return;
     if (window.every((c) => mined.has(c.id))) return;
+    if (priorNonProductive.has(windowChunkKey(window.map((c) => c.id)))) {
+      skippedRepeated++;
+      return;
+    }
     targets.push({ window, index });
   });
+  if (skippedRepeated) {
+    stats.skippedRepeatedWindows = skippedRepeated;
+    opts.onProgress?.(
+      `skipped ${skippedRepeated} window(s) with a previous incomplete or zero-write attempt; run extraction to retry`,
+    );
+  }
   if (!targets.length) return stats;
 
   const ctx = loadChunkContext(db, projectId);
@@ -1529,6 +1642,35 @@ function loadMinedSet(db: Db, projectId: number): Set<number> {
   );
 }
 
+/** Stable key for the exact chunk set a window attempt covered. */
+function windowChunkKey(chunkIds: number[]): string {
+  return [...new Set(chunkIds.filter((id) => Number.isFinite(id)))]
+    .sort((a, b) => a - b)
+    .join(',');
+}
+
+/**
+ * Windows with a durable non-complete or zero-write attempt.
+ *
+ * Lazy retrieval must not call the model for the same unproductive window on
+ * every query: either the last window was incomplete, or it completed with no
+ * rows and would only be retried by the zero-write policy. An explicit
+ * extraction still retries it because it does not consult this set.
+ */
+function priorNonProductiveWindowKeys(db: Db, projectId: number): Set<string> {
+  const rows = db.all<{ chunk_ids: string }>(
+    `SELECT chunk_ids FROM extraction_window_run
+      WHERE project_id = ?
+        AND (
+          state IN ('partial', 'failed')
+          OR (state = 'complete'
+              AND wrote_entities + wrote_facts + wrote_relations + wrote_timeline = 0)
+        )`,
+    projectId,
+  );
+  return new Set(rows.map((row) => windowChunkKey(fromJson<number[]>(row.chunk_ids, []))));
+}
+
 function sliceWindows(chunks: ChunkRow[], windowSize: number): ChunkRow[][] {
   const windows: ChunkRow[][] = [];
   for (let start = 0; start < chunks.length; start += windowSize) {
@@ -1587,6 +1729,8 @@ interface RunBatchOpts {
   roster?: NameRoster;
   /** Derived-variant index, built once per extraction command. */
   index?: RosterIndex;
+  /** Opt-in diagnostic trace for this extraction run. */
+  trace?: ExtractionTrace | null;
 }
 
 /** Run windows through the split (or legacy) path and mark them mined. */
@@ -1608,10 +1752,23 @@ async function runWindowBatch(
         const emptyBefore = stats.emptyWindows.length;
         const issuesBefore = stats.windowIssues.length;
         const windowStartedAt = nowIso();
+        if (batch.trace?.canRecord()) batch.trace.windowStarted(index, window.map((chunk) => chunk.id));
         let outcome: WindowOutcome;
         try {
           outcome = batch.singlePrompt
-            ? await extractWindowLegacy(db, llm, projectId, window, entityIdByName, stats, ctx.neighboursOf, batch.maxTokens, batch.index)
+            ? await extractWindowLegacy(
+                db,
+                llm,
+                projectId,
+                window,
+                entityIdByName,
+                stats,
+                ctx.neighboursOf,
+                batch.maxTokens,
+                batch.index,
+                batch.trace,
+                index,
+              )
             : await extractWindowSplit(
                 db,
                 llm,
@@ -1624,6 +1781,7 @@ async function runWindowBatch(
                 index,
                 batch.roster,
                 batch.index,
+                batch.trace,
               );
         } catch (err) {
           // One bad window must not abort the run, but it must not be silent.
@@ -1640,13 +1798,18 @@ async function runWindowBatch(
               ? [{ section: 'legacy', state: 'failed', wrote: 0, error: detail }]
               : [],
             failedSections: batch.singlePrompt ? ['legacy'] : [],
+            incompleteSections: [],
             wrote: { entities: 0, facts: 0, relations: 0, timeline: 0 },
             error: detail,
           };
         }
+        // A thrown window leaves parsed candidates without a decision. Mark
+        // those as aborted rather than silently omitting their lineage.
+        if (batch.trace?.canRecord()) batch.trace.abortWindow(index);
         // Durable provenance is written per window, not in a run-wide
         // transaction: a later crash must leave this row behind.
         recordExtractionWindow(db, batch.runId, projectId, window, index, outcome, windowStartedAt, nowIso());
+        if (batch.trace?.canRecord()) batch.trace.windowFinished(index, outcome.state, outcome.wrote.relations);
         // Any empty-window or partial/failed-window record for this index
         // means the window is not complete. It must stay unmined so a later
         // pass can retry it instead of trusting a silent or half-written gap.
@@ -2072,12 +2235,23 @@ function salvageSection(text: string, key: string): Record<string, unknown>[] {
  * A complete answer is used as it is. A truncated one is salvaged section by
  * section, so the parts the model finished are kept.
  */
-function parseExtraction(text: string): {
+function parseExtraction(
+  text: string,
+  observe?: (key: string, observation: ExtractionParseObservation) => void,
+): {
   entities: Record<string, unknown>[];
   relations: Record<string, unknown>[];
   facts: Record<string, unknown>[];
   timeline: Record<string, unknown>[];
 } {
+  const notify = (key: string, parsed: unknown, rows: Record<string, unknown>[], source: 'section' | 'salvage'): void => {
+    if (!observe) return;
+    try {
+      observe(key, parseObservation(text, key, parsed, rows, source, false));
+    } catch {
+      /* diagnostics never affect parsing */
+    }
+  };
   const parsed = extractJson<Record<string, unknown>>(text);
   if (parsed && typeof parsed === 'object') {
     const whole = {
@@ -2087,15 +2261,317 @@ function parseExtraction(text: string): {
       timeline: asRecordArray(parsed.timeline),
     };
     if (whole.entities.length || whole.relations.length || whole.facts.length || whole.timeline.length) {
+      for (const key of ['entities', 'relations', 'facts', 'timeline'] as const) {
+        notify(key, parsed, whole[key], Array.isArray(parsed[key]) && whole[key].length ? 'section' : 'salvage');
+      }
       return whole;
     }
   }
-  return {
+  const salvaged = {
     entities: salvageSection(text, 'entities'),
     relations: salvageSection(text, 'relations'),
     facts: salvageSection(text, 'facts'),
     timeline: salvageSection(text, 'timeline'),
   };
+  for (const key of ['entities', 'relations', 'facts', 'timeline'] as const) {
+    notify(key, parsed, salvaged[key], 'salvage');
+  }
+  return salvaged;
+}
+
+/**
+ * Conservative diagnostic state for one parsed section.
+ *
+ * `empty` means the answer confidently carried an empty array for the section.
+ * `missing` means a parsed object omitted the key. `partial` means candidates
+ * were salvaged from an answer whose whole structure was not parsed. None of
+ * these classifications changes extraction; they only stop the trace from
+ * calling an absent or truncated section "empty".
+ */
+function jsonEnvelope(text: string): 'whole' | 'fenced' | 'embedded' | 'none' {
+  // Use the same extractor branch as the parser; never infer fencing separately.
+  return extractJsonWithRoute<unknown>(text).route;
+}
+
+function parseObservation(
+  text: string,
+  key: string,
+  parsed: unknown,
+  rows: Record<string, unknown>[],
+  source: 'section' | 'bare' | 'salvage',
+  allowBare: boolean,
+): ExtractionParseObservation {
+  const clean = (text ?? '').trim();
+  const envelope = jsonEnvelope(text);
+  const empty = (route: ExtractionParseObservation['route']): ExtractionParseObservation => ({
+    route,
+    rawEntries: 0,
+    acceptedEntries: 0,
+    filteredEntries: 0,
+    salvagedEntries: 0,
+  });
+  const unknown = (
+    route: ExtractionParseObservation['route'],
+    acceptedEntries = 0,
+    salvagedEntries = 0,
+  ): ExtractionParseObservation => ({
+    route,
+    rawEntries: null,
+    acceptedEntries,
+    filteredEntries: null,
+    salvagedEntries,
+    incomplete: true,
+  });
+  if (!clean) return empty('empty-response');
+
+  if (source === 'bare' && Array.isArray(parsed)) {
+    const rawEntries = parsed.length;
+    const acceptedEntries = rows.length;
+    // A bare array is section-identified only when the whole answer (or its
+    // fence) is that array. An array recovered from inside a truncated or
+    // prose-wrapped answer is a salvage, not a proven section.
+    if (envelope !== 'whole' && envelope !== 'fenced') {
+      return unknown(rows.length > 0 ? 'salvaged-array' : 'unparsed', rows.length, rows.length);
+    }
+    const route: ExtractionParseObservation['route'] = rawEntries === 0
+      ? 'empty-array'
+      : acceptedEntries === 0
+        ? 'filtered-array'
+        : `${envelope}-bare-array`;
+    return {
+      route,
+      rawEntries,
+      acceptedEntries,
+      filteredEntries: Math.max(0, rawEntries - acceptedEntries),
+      salvagedEntries: 0,
+    };
+  }
+
+  if (source === 'section' && parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    const value = (parsed as Record<string, unknown>)[key];
+    if (!Array.isArray(value)) return unknown('wrong-shape', rows.length, rows.length);
+    const rawEntries = value.length;
+    const acceptedEntries = rows.length;
+    const route: ExtractionParseObservation['route'] = rawEntries === 0
+      ? 'empty-array'
+      : acceptedEntries === 0
+        ? 'filtered-array'
+        : `${envelope === 'whole' || envelope === 'fenced' || envelope === 'embedded' ? envelope : 'embedded'}-section-array` as ExtractionParseObservation['route'];
+    return {
+      route,
+      rawEntries,
+      acceptedEntries,
+      filteredEntries: Math.max(0, rawEntries - acceptedEntries),
+      salvagedEntries: 0,
+    };
+  }
+
+  if (!allowBare && Array.isArray(parsed)) {
+    if (envelope === 'whole' || envelope === 'fenced') {
+      return unknown('wrong-shape', rows.length, rows.length);
+    }
+    // An embedded array in a legacy answer is not section-identified.
+    return unknown(rows.length > 0 ? 'salvaged-array' : 'unparsed', rows.length, rows.length);
+  }
+
+  if (Array.isArray(parsed)) {
+    if (envelope === 'embedded') {
+      // A split parser may find an empty/arbitrary embedded array in a truncated
+      // enclosing object. It is not a proven standalone bare [] for this section.
+      return unknown(rows.length > 0 ? 'salvaged-array' : 'unparsed', rows.length, rows.length);
+    }
+    const rawEntries = parsed.length;
+    const acceptedEntries = rows.length;
+    const route: ExtractionParseObservation['route'] = rawEntries === 0 && acceptedEntries === 0
+      ? 'empty-array'
+      : acceptedEntries > 0
+        ? 'salvaged-array'
+        : 'filtered-array';
+    return {
+      route,
+      rawEntries,
+      acceptedEntries,
+      filteredEntries: Math.max(0, rawEntries - acceptedEntries),
+      salvagedEntries: acceptedEntries,
+    };
+  }
+
+  if (parsed && typeof parsed === 'object') {
+    const hasKey = Object.prototype.hasOwnProperty.call(parsed, key);
+    if (!hasKey) {
+      return unknown(rows.length > 0 ? 'salvaged-array' : 'missing-section', rows.length, rows.length);
+    }
+    const value = (parsed as Record<string, unknown>)[key];
+    if (!Array.isArray(value)) return unknown('wrong-shape', rows.length, rows.length);
+    const rawEntries = value.length;
+    const acceptedEntries = rows.length;
+    if (rawEntries === 0 && acceptedEntries === 0) return empty('empty-array');
+    if (acceptedEntries > 0) return unknown('salvaged-array', acceptedEntries, acceptedEntries);
+    return {
+      route: 'filtered-array',
+      rawEntries,
+      acceptedEntries,
+      filteredEntries: Math.max(0, rawEntries - acceptedEntries),
+      salvagedEntries: 0,
+    };
+  }
+
+  return rows.length > 0
+    ? unknown('salvaged-array', rows.length, rows.length)
+    : unknown('unparsed');
+}
+
+function sectionStateFromObservation(
+  observation: ExtractionParseObservation,
+): { state: ExtractionSectionState; reason: ExtractionSectionReason } {
+  if (observation.route === 'empty-response') return { state: 'unparsed', reason: 'empty-response' };
+  if (observation.route === 'unparsed') return { state: 'unparsed', reason: 'unparsed-answer' };
+  if (observation.route === 'missing-section') return { state: 'missing', reason: 'section-missing' };
+  if (observation.route === 'wrong-shape') return { state: 'unparsed', reason: 'schema-mismatch' };
+  if (observation.route === 'filtered-array') {
+    return observation.acceptedEntries > 0
+      ? { state: 'partial', reason: 'mixed-entries' }
+      : { state: 'unparsed', reason: 'unparsed-answer' };
+  }
+  if (observation.route === 'salvaged-array') {
+    return observation.acceptedEntries > 0
+      ? { state: 'partial', reason: 'partial-array' }
+      : { state: 'unparsed', reason: 'unparsed-answer' };
+  }
+  if (observation.route === 'empty-array' || observation.rawEntries === 0) {
+    return { state: 'empty', reason: 'empty-array' };
+  }
+  if (observation.acceptedEntries === 0) return { state: 'unparsed', reason: 'unparsed-answer' };
+  if (observation.filteredEntries !== null && observation.filteredEntries > 0) {
+    return { state: 'partial', reason: 'mixed-entries' };
+  }
+  return { state: 'parsed', reason: 'parsed-array' };
+}
+
+/** A known non-stop provider finish reason; `stop` and unknown are not incomplete. */
+function finishIncompleteReason(
+  finishReason: FinishReason | undefined,
+): ExtractionIncompleteReason | undefined {
+  switch (finishReason) {
+    case 'length':
+      return 'finish-length';
+    case 'content_filter':
+      return 'finish-content-filter';
+    case 'tool_calls':
+      return 'finish-tool-calls';
+    case 'function_call':
+      return 'finish-function-call';
+    default:
+      return undefined;
+  }
+}
+
+interface SectionCompletion {
+  state: 'succeeded' | 'incomplete';
+  reason?: ExtractionIncompleteReason;
+}
+
+/**
+ * Decide whether a parsed section is complete enough to stop retrying.
+ *
+ * A known non-stop provider reason always wins: even syntactically valid JSON
+ * is incomplete when the provider says it stopped early. An absent or unknown
+ * provider reason is not evidence either way; the parser decides. Explicit
+ * empty arrays are complete. Salvage, missing, partial, filtered, malformed
+ * and unparsed sections are not.
+ */
+function sectionCompletionFromObservation(
+  observation: ExtractionParseObservation | undefined,
+  finishReason: FinishReason | undefined,
+): SectionCompletion {
+  const providerReason = finishIncompleteReason(finishReason);
+  if (providerReason) return { state: 'incomplete', reason: providerReason };
+  if (!observation) return { state: 'incomplete', reason: 'unparsed-answer' };
+  if (observation.incomplete) {
+    switch (observation.route) {
+      case 'missing-section':
+        return { state: 'incomplete', reason: 'section-missing' };
+      case 'wrong-shape':
+        return { state: 'incomplete', reason: 'schema-mismatch' };
+      case 'filtered-array':
+        return { state: 'incomplete', reason: 'mixed-entries' };
+      case 'empty-response':
+        return { state: 'incomplete', reason: 'empty-response' };
+      case 'unparsed':
+        return { state: 'incomplete', reason: 'unparsed-answer' };
+      case 'salvaged-array':
+        return { state: 'incomplete', reason: 'partial-array' };
+      default:
+        return { state: 'incomplete', reason: 'partial-array' };
+    }
+  }
+  switch (observation.route) {
+    case 'empty-array':
+      return { state: 'succeeded' };
+    case 'missing-section':
+      return { state: 'incomplete', reason: 'section-missing' };
+    case 'wrong-shape':
+      return { state: 'incomplete', reason: 'schema-mismatch' };
+    case 'filtered-array':
+      return { state: 'incomplete', reason: 'mixed-entries' };
+    case 'empty-response':
+      return { state: 'incomplete', reason: 'empty-response' };
+    case 'unparsed':
+      return { state: 'incomplete', reason: 'unparsed-answer' };
+    case 'salvaged-array':
+      return { state: 'incomplete', reason: 'partial-array' };
+    default:
+      break;
+  }
+  if (observation.filteredEntries !== null && observation.filteredEntries > 0) {
+    return { state: 'incomplete', reason: 'mixed-entries' };
+  }
+  if (observation.acceptedEntries === 0) {
+    return { state: 'incomplete', reason: 'unparsed-answer' };
+  }
+  return { state: 'succeeded' };
+}
+
+function combineSectionCompletions(
+  parts: Array<{ section: ExtractionIncompletePart['section']; completion: SectionCompletion }>,
+): { state: 'succeeded' | 'incomplete'; reason?: ExtractionIncompleteReason; incompleteParts?: ExtractionIncompletePart[] } {
+  const incompleteParts = parts
+    .filter((part) => part.completion.state === 'incomplete')
+    .map((part) => ({ section: part.section, reason: part.completion.reason ?? 'unparsed-answer' }));
+  if (!incompleteParts.length) return { state: 'succeeded' };
+  return {
+    state: 'incomplete',
+    reason: incompleteParts[0]!.reason,
+    incompleteParts,
+  };
+}
+
+function makeSectionReport(
+  section: ExtractionSectionName,
+  wrote: number,
+  finishReason: FinishReason | undefined,
+  parts: Array<{ section: ExtractionIncompletePart['section']; completion: SectionCompletion }>,
+): ExtractionSectionReport {
+  const combined = combineSectionCompletions(parts);
+  return {
+    section,
+    state: combined.state,
+    wrote,
+    ...(combined.state === 'incomplete'
+      ? { reason: combined.reason, incompleteParts: combined.incompleteParts }
+      : {}),
+    ...(finishReason !== undefined ? { finishReason } : {}),
+  };
+}
+
+/** One durable phrase per incomplete section, including parser sub-sections. */
+function incompleteSectionDetail(report: ExtractionSectionReport): string {
+  if (report.incompleteParts?.length) {
+    return `${report.section}: ${report.incompleteParts
+      .map((part) => `${part.section} (${part.reason})`)
+      .join(', ')}`;
+  }
+  return `${report.section}: ${report.reason ?? 'incomplete'}`;
 }
 
 /** A claim's quote, after checking it against the source. */
@@ -2383,19 +2859,40 @@ export function pageEvidenceText(db: Db, chunkId: number): string | null {
   return rows.length ? rows.map((row) => row.text).join('\n') : null;
 }
 
-/** Parse one section of an answer, salvaging it when the answer was cut off. */function parseSection(text: string, key: string): Record<string, unknown>[] {
+/** Parse one section of an answer, salvaging it when the answer was cut off. */
+function parseSection(
+  text: string,
+  key: string,
+  observe?: (observation: ExtractionParseObservation) => void,
+): Record<string, unknown>[] {
+  const notify = (parsed: unknown, rows: Record<string, unknown>[], source: 'section' | 'bare' | 'salvage'): void => {
+    if (!observe) return;
+    try {
+      observe(parseObservation(text, key, parsed, rows, source, true));
+    } catch {
+      /* diagnostics never affect parsing */
+    }
+  };
   const parsed = extractJson<unknown>(text);
   // Models sometimes return the section as a bare list instead of the asked-for
   // labelled box (e.g. `[{...}]` for relations). That is the same content and
   // must not be silently dropped.
   if (Array.isArray(parsed)) {
     const values = asRecordArray(parsed);
-    if (values.length) return values;
+    if (values.length) {
+      notify(parsed, values, 'bare');
+      return values;
+    }
   } else if (parsed && typeof parsed === 'object') {
     const values = asRecordArray((parsed as Record<string, unknown>)[key]);
-    if (values.length) return values;
+    if (values.length) {
+      notify(parsed, values, 'section');
+      return values;
+    }
   }
-  return salvageSection(text, key);
+  const salvaged = salvageSection(text, key);
+  notify(parsed, salvaged, 'salvage');
+  return salvaged;
 }
 
 /** The passages as the model sees them. */
@@ -4273,7 +4770,7 @@ function bankMomentEvent(
   description: string,
   span: { quote: string; chunkId: number | null; source: string; locator: string },
   chunk: ChunkRow | undefined,
-): void {
+): number | null {
   const names = new Map<number, string>();
   for (const row of db.all<{ id: number; name: string }>(
     'SELECT id, name FROM canon_entity WHERE project_id = ? AND id IN (?, ?)',
@@ -4285,7 +4782,7 @@ function bankMomentEvent(
   }
   const fromName = names.get(fromId) ?? '';
   const toName = names.get(toId) ?? '';
-  if (!fromName || !toName) return;
+  if (!fromName || !toName) return null;
   let sourceId: number | null = null;
   let chunkId: number | null = null;
   let locator = span.locator;
@@ -4321,8 +4818,8 @@ function bankMomentEvent(
     chunkId,
     chunkId ?? -1,
   );
-  if (dup) return;
-  db.run(
+  if (dup) return null;
+  return Number(db.run(
     `INSERT INTO canon_event (project_id, source_id, chunk_id, locator, title, summary, participants, location, time_label, kind, quote, seq, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, '', '', 'event', ?, ?, ?)`,
     projectId,
@@ -4335,7 +4832,7 @@ function bankMomentEvent(
     span.quote,
     seq,
     nowIso(),
-  );
+  ).lastInsertRowid);
 }
 
 /** Strict-mode kind mapping: a closed kind wins, otherwise the first one stays. */
@@ -4426,16 +4923,17 @@ async function retryRelationQuotes(
   projectId: number,
   window: ChunkRow[],
   raws: Record<string, unknown>[],
-  entityIdByName: Map<string, number>,
   stats: ExtractLoreResult,
+  trace?: ExtractionTrace | null,
+  windowIndex = 0,
+  candidateIds: string[] = [],
 ): Promise<void> {
   let used = 0;
-  for (const raw of raws) {
-    if (used >= MAX_RELATION_RETRIES_PER_WINDOW) break;
+  for (const [ordinal, raw] of raws.entries()) {
     const fromName = String(raw.from ?? '').trim();
     const toName = String(raw.to ?? '').trim();
-    const fromId = resolveEntity(db, projectId, entityIdByName, fromName);
-    const toId = resolveEntity(db, projectId, entityIdByName, toName);
+    const fromId = resolveEntity(db, projectId, fromName);
+    const toId = resolveEntity(db, projectId, toName);
     if (!fromId || !toId || fromId === toId) continue;
     const chunk = chunkAt(window, raw.chunk_index);
     const passage = chunk?.text ?? window.map((c) => c.text).join('\n\n');
@@ -4456,8 +4954,13 @@ async function retryRelationQuotes(
       to: { id: toId, name: to.name, aliases: to.aliases },
     };
     if (quoteNamesBothEntities(endpoints.from, endpoints.to, String(raw.evidence ?? ''))) continue;
+    if (used >= MAX_RELATION_RETRIES_PER_WINDOW) {
+      trace?.retryCapped(windowIndex, 1);
+      break;
+    }
     used++;
     stats.verification.retried++;
+    const candidateId = candidateIds[ordinal];
     const sentence = await askRelationSentence(llm, passage, from.name, to.name, String(raw.kind ?? ''));
     if (
       sentence &&
@@ -4466,9 +4969,66 @@ async function retryRelationQuotes(
     ) {
       raw.evidence = sentence;
       stats.verification.retriedFixed++;
+      if (candidateId) trace?.retry(candidateId, 'fixed', 'verbatim-both-names', used);
     } else {
       stats.verification.retriedFailed++;
+      if (candidateId) {
+        const reason: RetryReason = !sentence
+          ? 'no-usable-sentence'
+          : !sentenceFromPassage(passage, sentence)
+            ? 'not-verbatim'
+            : 'missing-endpoint';
+        trace?.retry(candidateId, 'failed', reason, used);
+      }
     }
+  }
+}
+
+/** Safe downstream id for a tie note, used only by diagnostics. */
+function traceNoteId(
+  trace: ExtractionTrace | null | undefined,
+  db: Db,
+  projectId: number,
+  fromId: number,
+  toId: number,
+  kind: string,
+): number | undefined {
+  if (!trace) return undefined;
+  try {
+    return db.get<{ id: number }>(
+      `SELECT id FROM canon_tie_note
+        WHERE project_id = ? AND from_entity = ? AND to_entity = ? AND attempted_kind = ?
+        ORDER BY id LIMIT 1`,
+      projectId,
+      fromId,
+      toId,
+      kind,
+    )?.id;
+  } catch {
+    // The lookup is diagnostic only; never let it alter extraction.
+    trace.markIncomplete('note-id-lookup');
+    return undefined;
+  }
+}
+
+/** Register parsed relation candidates; diagnostic preparation never escapes. */
+function traceRelationCandidates(
+  trace: ExtractionTrace | null | undefined,
+  windowIndex: number,
+  raws: Record<string, unknown>[],
+): string[] {
+  if (!trace || !trace.canRecord()) return [];
+  try {
+    return trace.registerRelationCandidates(
+      windowIndex,
+      raws.map((raw) => ({
+        kind: String(raw.kind ?? ''),
+        kindCount: normaliseKinds(String(raw.kind ?? '')).length,
+      })),
+    );
+  } catch {
+    trace.markIncomplete('preparation');
+    return [];
   }
 }
 
@@ -4478,26 +5038,66 @@ function applyRelations(
   projectId: number,
   raws: Record<string, unknown>[],
   window: ChunkRow[],
-  entityIdByName: Map<string, number>,
   stats: ExtractLoreResult,
   neighboursOf: (id: number | undefined) => ChunkRow[],
   gate: boolean,
   index?: RosterIndex,
+  trace?: ExtractionTrace | null,
+  windowIndex = 0,
+  candidateIds: string[] = [],
 ): number {
   let accepted = 0;
   const minConfidence = projectMinConfidence(db, projectId);
-  for (const raw of raws) {
+  for (const [ordinal, raw] of raws.entries()) {
     let fromName = String(raw.from ?? '').trim();
     let toName = String(raw.to ?? '').trim();
-    let fromId = resolveEntity(db, projectId, entityIdByName, fromName);
-    let toId = resolveEntity(db, projectId, entityIdByName, toName);
-    if (!fromId || !toId || fromId === toId) {
-      // A relation naming someone the bank has never seen is a recall hole,
-      // not noise: keep the names, kind and quote as a hint. No entity is
-      // created and nothing is promoted to a relation. Same-person claims are
-      // refused by the mechanical identity check.
-      if (gate) stats.verification.unresolved++;
-      if (!fromId || !toId) {
+    const kinds = normaliseKinds(String(raw.kind ?? ''));
+    const candidateId = candidateIds[ordinal];
+    const counts = { inserted: 0, merged: 0, hinted: 0, noted: 0, dropped: 0 };
+    let finished = false;
+    const recordClaim = (
+      kind: string,
+      decision: 'inserted' | 'merged' | 'hinted' | 'noted' | 'dropped',
+      reason: ClaimReason,
+      refs: ExtractionClaimRefs = {},
+    ): void => {
+      counts[decision]++;
+      if (candidateId) {
+        trace?.claim(candidateId, kind, decision, reason, refs);
+      }
+    };
+    const finish = (decision: 'inserted' | 'merged' | 'mixed' | 'hinted' | 'noted' | 'dropped' | 'error', reason: DispositionReason): void => {
+      if (finished) return;
+      finished = true;
+      if (candidateId) trace?.disposition(candidateId, decision, reason, counts);
+    };
+    try {
+      const fromResolution = resolveEntityDetailed(db, projectId, fromName);
+      const toResolution = resolveEntityDetailed(db, projectId, toName);
+      if (candidateId) {
+        trace?.endpoint(candidateId, 'from', fromResolution);
+        trace?.endpoint(candidateId, 'to', toResolution);
+      }
+      let fromId = fromResolution.id;
+      let toId = toResolution.id;
+      if (!fromId || !toId || fromId === toId) {
+        // A relation naming someone the bank has never seen is a recall hole,
+        // not noise: keep the names, kind and quote as a hint. No entity is
+        // created and nothing is promoted to a relation. Same-person claims are
+        // refused by the mechanical identity check.
+        if (gate) stats.verification.unresolved++;
+        if (fromId && toId && fromId === toId) {
+          recordClaim(kinds[0] ?? 'related to', 'dropped', 'same-entity');
+          finish('dropped', 'same-entity');
+          continue;
+        }
+        const endpointMethod = (method: string): boolean =>
+          method === 'direct-collision' || method === 'short-collision';
+        const endpointMissing = (method: string): boolean =>
+          method === 'none' || method === 'empty';
+        const ambiguousOnly =
+          (endpointMethod(fromResolution.method) || endpointMethod(toResolution.method)) &&
+          !(endpointMissing(fromResolution.method) || endpointMissing(toResolution.method));
         const chunk = chunkAt(window, raw.chunk_index);
         let quote = '';
         let refs: { source: string; locator: string; chunk?: number }[] = [];
@@ -4513,367 +5113,473 @@ function applyRelations(
               ? [{ source: hintSpan.source, locator: hintSpan.locator, chunk: hintSpan.chunkId }]
               : refsFor(chunk);
           }
+          if (candidateId) {
+            trace?.citation(
+              candidateId,
+              hintSpan.status === 'repointed' ? 'repointed' : hintSpan.status === 'verified' ? 'verified' : 'dropped',
+              hintSpan.status === 'repointed'
+                ? 'hint-quote-repointed'
+                : hintSpan.status === 'verified'
+                  ? 'hint-quote-verified'
+                  : 'hint-quote-not-found',
+              { chunkId: hintSpan.chunkId, evidence: String(raw.evidence ?? '') },
+            );
+          }
         }
         const rawKind = String(raw.kind ?? '').trim();
         let captured = false;
+        let hinted = false;
         if (quote && rawKind && /[a-z]/i.test(rawKind)) {
-          for (const kind of normaliseKinds(rawKind)) {
-            if (captureTieHint(db, projectId, { fromName, toName, kind, quote, refs })) captured = true;
+          const traceHints = !!candidateId && trace?.canRecord() === true;
+          for (const kind of kinds) {
+            if (!traceHints) {
+              if (captureTieHint(db, projectId, { fromName, toName, kind, quote, refs })) captured = true;
+              continue;
+            }
+            const capture = captureTieHintWithOutcome(db, projectId, { fromName, toName, kind, quote, refs });
+            if (capture.incomplete) trace?.markIncomplete('hint-id-lookup');
+            if (capture.changed) captured = true;
+            if (capture.id !== null) {
+              hinted = true;
+              recordClaim(kind, 'hinted', capture.reason, { hint_id: capture.id });
+            } else if (capture.changed) {
+              hinted = true;
+              recordClaim(kind, 'hinted', capture.reason);
+            } else {
+              recordClaim(kind, 'dropped', capture.reason);
+            }
           }
+        } else {
+          recordClaim(kinds[0] ?? 'related to', 'dropped', quote ? 'no-kind' : 'no-verified-hint');
         }
         if (captured) stats.verification.hinted++;
-      }
-      continue;
-    }
-    const kinds = normaliseKinds(String(raw.kind ?? ''));
-    const chunk = chunkAt(window, raw.chunk_index);
-    const span = spanFor(raw.evidence, chunk, neighboursOf(chunk?.id), gate, stats.verification);
-    const refs = span.status !== 'dropped' && span.chunkId !== null
-      ? [{ source: span.source, locator: span.locator, chunk: span.chunkId }]
-      : refsFor(chunk);
-    const passageText = span.status !== 'dropped' && span.chunkId !== null
-      ? pageEvidenceText(db, span.chunkId) ??
-        db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', span.chunkId)?.text ??
-        chunk?.text ??
-        ''
-      : chunk?.text ?? '';
-
-    // Check 1: the quote must exist in the cited passage. A fabrication is a
-    // case file, never a row.
-    const quoteVerbatim =
-      span.status !== 'dropped' &&
-      span.quote.trim().length > 0 &&
-      passageText.length > 0 &&
-      normalise(passageText).includes(normalise(span.quote));
-    if (!quoteVerbatim) {
-      stats.verification.unsupported++;
-      persistTieNote(
-        db,
-        projectId,
-        fromId,
-        toId,
-        kinds[0] ?? 'related to',
-        'unsupported-citation',
-        String(raw.evidence ?? '').trim(),
-        toJson(refs),
-      );
-      continue;
-    }
-
-    // Check 1 also covers the anchor: it is part of the citation.
-    const anchorRaw = String(raw.anchor ?? '').trim();
-    const anchorVerbatim =
-      anchorRaw.length > 0 && passageText.length > 0 && normalise(passageText).includes(normalise(anchorRaw));
-    if (anchorRaw && !anchorVerbatim) {
-      stats.verification.unsupported++;
-      persistTieNote(db, projectId, fromId, toId, kinds[0] ?? 'related to', 'unsupported-citation', anchorRaw, toJson(refs));
-      continue;
-    }
-    const anchorEvidence = anchorVerbatim ? anchorRaw : '';
-
-    // The model's own judgement, recorded as provenance. The confidence alone
-    // decides the tier; none of the assessment fields are a grammar gate.
-    const assessment = readClaimAssessment(raw);
-    const confidence = assessment.strength;
-    const supporting = assessmentSupporting(assessment);
-    // Intake banks nothing. A verbatim quote and a confident model only put
-    // the row in the queue; accepted is earned at the gate, never here.
-    const rowReview = 'needs_review';
-    if (claimTier(confidence, minConfidence) === 'provisional') stats.provisional++;
-
-    const kindSourceRaw = String(raw.kind_source ?? '').trim();
-    const kindSource =
-      kindSourceRaw &&
-      (normalise(span.quote).includes(normalise(kindSourceRaw)) ||
-        (anchorEvidence.length > 0 && normalise(anchorEvidence).includes(normalise(kindSourceRaw))))
-        ? kindSourceRaw
-        : '';
-
-    // The arrow comes from the winning sentence, never from the order the
-    // candidate listed. A directional kind whose passage reads the other way
-    // is stored the other way; a passage that names neither side in a
-    // relationship leaves the stated order alone.
-    const leadingKind = kinds.find((kind) => familyOfKind(kind) !== 'other');
-    if (leadingKind && directionOfSentence(span.quote, fromName, toName, leadingKind) === 'reverse') {
-      [fromId, toId] = [toId, fromId];
-      [fromName, toName] = [toName, fromName];
-      stats.verification.flipped++;
-    }
-
-    for (const kind of kinds) {
-      // Moments are not ties: the happening banks as an event with both people
-      // attached, and the tie question stays in the queue. Routed before the
-      // citation check so a denied moment still reaches the event index.
-      if (isMomentKind(kind)) {
-        stats.verification.moment++;
-        bankMomentEvent(db, projectId, fromId, toId, kind, String(raw.description ?? '').trim(), span, chunk);
-        persistTieNote(db, projectId, fromId, toId, kind, 'moment', span.quote, toJson(refs), '', kindSource);
-        continue;
-      }
-      // Citation honesty runs first: a quote that hides a hedge or a denial is
-      // a refused citation whatever the label is. "Perhaps X is his sister"
-      // must report unsupported-citation, never kind-unsupported — the quote
-      // is the worse defect and the one a human needs to see.
-      const citationReason = attestedQuoteReason(
-        { fromId, toId, fromName, toName, kind, evidence: span.quote, kindSource, anchorEvidence },
-        passageText,
-        index,
-      );
-      if (citationReason) {
-        stats.verification.unsupported++;
-        persistTieNote(db, projectId, fromId, toId, kind, 'unsupported-citation', span.quote, toJson(refs), '', kindSource);
-        continue;
-      }
-      // Only the twelve families are proof kinds. Anything else ("was",
-      // "suspected of", "influence over", a bare verb) parks as a review note
-      // and never banks, whatever confidence the model claimed. The family
-      // table is the whole allow-list; there is no second one.
-      if (proofIntake(kind).action === 'park') {
-        stats.verification.unsupported++;
-        persistTieNote(db, projectId, fromId, toId, kind, 'kind-unsupported', span.quote, toJson(refs), '', kindSource);
-        continue;
-      }
-      // A generic kinship word repeats a specific one: "parent of" beside
-      // "father of" says nothing new. Pure dedupe, not a meaning judgment.
-      const lk = kind.toLowerCase();
-      const specifics = GENERIC_KINSHIP.get(lk);
-      const kinPair = pairClause(kind);
-      if (specifics) {
-        const dup = db.get<{ id: number }>(
-          `SELECT id FROM canon_relation WHERE project_id = ? AND lower(kind) IN (${[...specifics].map(() => '?').join(',')})
-             AND ${kinPair.sql} LIMIT 1`,
-          projectId,
-          ...[...specifics].map((s) => s.toLowerCase()),
-          ...kinPair.args(fromId, toId),
+        finish(
+          hinted ? 'hinted' : 'dropped',
+          hinted
+            ? ambiguousOnly ? 'ambiguous-endpoint' : 'unresolved-endpoint'
+            : quote ? 'hint-refused' : 'no-verified-hint',
         );
-        if (dup) {
-          stats.verification.redundant++;
+        continue;
+      }
+      const chunk = chunkAt(window, raw.chunk_index);
+      const span = spanFor(raw.evidence, chunk, neighboursOf(chunk?.id), gate, stats.verification);
+      const refs = span.status !== 'dropped' && span.chunkId !== null
+        ? [{ source: span.source, locator: span.locator, chunk: span.chunkId }]
+        : refsFor(chunk);
+      const passageText = span.status !== 'dropped' && span.chunkId !== null
+        ? pageEvidenceText(db, span.chunkId) ??
+          db.get<{ text: string }>('SELECT text FROM canon_chunk WHERE id = ?', span.chunkId)?.text ??
+          chunk?.text ??
+          ''
+        : chunk?.text ?? '';
+
+      // Check 1: the quote must exist in the cited passage. A fabrication is a
+      // case file, never a row.
+      const quoteVerbatim =
+        span.status !== 'dropped' &&
+        span.quote.trim().length > 0 &&
+        passageText.length > 0 &&
+        normalise(passageText).includes(normalise(span.quote));
+      if (!quoteVerbatim) {
+        stats.verification.unsupported++;
+        if (candidateId) {
+          trace?.citation(
+            candidateId,
+            span.status === 'dropped' ? 'dropped' : 'rejected',
+            span.status === 'dropped' ? 'quote-not-found' : 'quote-not-verbatim',
+            { chunkId: span.chunkId, evidence: String(raw.evidence ?? '') },
+          );
+        }
+        const noteKind = kinds[0] ?? 'related to';
+        persistTieNote(
+          db,
+          projectId,
+          fromId,
+          toId,
+          noteKind,
+          'unsupported-citation',
+          String(raw.evidence ?? '').trim(),
+          toJson(refs),
+        );
+        recordClaim(noteKind, 'noted', 'unsupported-citation', candidateId && trace?.canRecord() ? { note_id: traceNoteId(trace, db, projectId, fromId, toId, noteKind) } : {});
+        finish('noted', 'invalid-citation');
+        continue;
+      }
+
+      // Check 1 also covers the anchor: it is part of the citation.
+      const anchorRaw = String(raw.anchor ?? '').trim();
+      const anchorVerbatim =
+        anchorRaw.length > 0 && passageText.length > 0 && normalise(passageText).includes(normalise(anchorRaw));
+      if (anchorRaw && !anchorVerbatim) {
+        stats.verification.unsupported++;
+        const noteKind = kinds[0] ?? 'related to';
+        if (candidateId) {
+          trace?.citation(candidateId, 'rejected', 'anchor-not-verbatim', {
+            chunkId: span.chunkId,
+            evidence: span.quote,
+            anchor: anchorRaw,
+          });
+        }
+        persistTieNote(db, projectId, fromId, toId, noteKind, 'unsupported-citation', anchorRaw, toJson(refs));
+        recordClaim(noteKind, 'noted', 'anchor-not-verbatim', candidateId && trace?.canRecord() ? { note_id: traceNoteId(trace, db, projectId, fromId, toId, noteKind) } : {});
+        finish('noted', 'invalid-anchor');
+        continue;
+      }
+      if (candidateId) {
+        trace?.citation(
+          candidateId,
+          span.status === 'repointed' ? 'repointed' : 'verified',
+          span.status === 'repointed' ? 'quote-repointed' : 'quote-verified',
+          { chunkId: span.chunkId, evidence: span.quote, ...(anchorRaw ? { anchor: anchorRaw } : {}) },
+        );
+      }
+      const anchorEvidence = anchorVerbatim ? anchorRaw : '';
+
+      // The model's own judgement, recorded as provenance. The confidence alone
+      // decides the tier; none of the assessment fields are a grammar gate.
+      const assessment = readClaimAssessment(raw);
+      const confidence = assessment.strength;
+      const supporting = assessmentSupporting(assessment);
+      // Intake banks nothing. A verbatim quote and a confident model only put
+      // the row in the queue; accepted is earned at the gate, never here.
+      const rowReview = 'needs_review';
+      if (claimTier(confidence, minConfidence) === 'provisional') stats.provisional++;
+
+      const kindSourceRaw = String(raw.kind_source ?? '').trim();
+      const kindSource =
+        kindSourceRaw &&
+        (normalise(span.quote).includes(normalise(kindSourceRaw)) ||
+          (anchorEvidence.length > 0 && normalise(anchorEvidence).includes(normalise(kindSourceRaw))))
+          ? kindSourceRaw
+          : '';
+
+      // The arrow comes from the winning sentence, never from the order the
+      // candidate listed. A directional kind whose passage reads the other way
+      // is stored the other way; a passage that names neither side in a
+      // relationship leaves the stated order alone.
+      const leadingKind = kinds.find((kind) => familyOfKind(kind) !== 'other');
+      if (leadingKind && directionOfSentence(span.quote, fromName, toName, leadingKind) === 'reverse') {
+        [fromId, toId] = [toId, fromId];
+        [fromName, toName] = [toName, fromName];
+        stats.verification.flipped++;
+        if (candidateId) trace?.direction(candidateId, fromId, toId);
+      }
+
+      for (const kind of kinds) {
+        // Moments are not ties: the happening banks as an event with both people
+        // attached, and the tie question stays in the queue. Routed before the
+        // citation check so a denied moment still reaches the event index.
+        if (isMomentKind(kind)) {
+          stats.verification.moment++;
+          const eventId = bankMomentEvent(db, projectId, fromId, toId, kind, String(raw.description ?? '').trim(), span, chunk);
+          persistTieNote(db, projectId, fromId, toId, kind, 'moment', span.quote, toJson(refs), '', kindSource);
+          recordClaim(kind, 'noted', 'moment', {
+            ...(eventId !== null ? { event_id: eventId } : {}),
+            ...(candidateId && trace?.canRecord() ? { note_id: traceNoteId(trace, db, projectId, fromId, toId, kind) } : {}),
+          });
           continue;
         }
-      } else {
-        for (const [generic, genericKinds] of GENERIC_KINSHIP) {
-          if (!genericKinds.has(lk)) continue;
-          const stale = db.all<{ id: number; evidence: string; review_status: string }>(
-            `SELECT id, evidence, review_status FROM canon_relation
-              WHERE project_id = ? AND lower(kind) = ? AND review_status != ? AND ${kinPair.sql}`,
+        // Citation honesty runs first: a quote that hides a hedge or a denial is
+        // a refused citation whatever the label is. "Perhaps X is his sister"
+        // must report unsupported-citation, never kind-unsupported — the quote
+        // is the worse defect and the one a human needs to see.
+        const citationReason = attestedQuoteReason(
+          { fromId, toId, fromName, toName, kind, evidence: span.quote, kindSource, anchorEvidence },
+          passageText,
+          index,
+        );
+        if (citationReason) {
+          stats.verification.unsupported++;
+          persistTieNote(db, projectId, fromId, toId, kind, 'unsupported-citation', span.quote, toJson(refs), '', kindSource);
+          recordClaim(kind, 'noted', `citation-${citationReason}`, candidateId && trace?.canRecord()
+            ? { note_id: traceNoteId(trace, db, projectId, fromId, toId, kind) }
+            : {});
+          continue;
+        }
+        // Only the twelve families are proof kinds. Anything else ("was",
+        // "suspected of", "influence over", a bare verb) parks as a review note
+        // and never banks, whatever confidence the model claimed. The family
+        // table is the whole allow-list; there is no second one.
+        if (proofIntake(kind).action === 'park') {
+          stats.verification.unsupported++;
+          persistTieNote(db, projectId, fromId, toId, kind, 'kind-unsupported', span.quote, toJson(refs), '', kindSource);
+          recordClaim(kind, 'noted', 'kind-unsupported', candidateId && trace?.canRecord()
+            ? { note_id: traceNoteId(trace, db, projectId, fromId, toId, kind) }
+            : {});
+          continue;
+        }
+        // A generic kinship word repeats a specific one: "parent of" beside
+        // "father of" says nothing new. Pure dedupe, not a meaning judgment.
+        const lk = kind.toLowerCase();
+        const specifics = GENERIC_KINSHIP.get(lk);
+        const kinPair = pairClause(kind);
+        if (specifics) {
+          const dup = db.get<{ id: number }>(
+            `SELECT id FROM canon_relation WHERE project_id = ? AND lower(kind) IN (${[...specifics].map(() => '?').join(',')})
+               AND ${kinPair.sql} LIMIT 1`,
             projectId,
-            generic,
-            'user_confirmed',
+            ...[...specifics].map((s) => s.toLowerCase()),
             ...kinPair.args(fromId, toId),
           );
-          if (stale.length) {
-            for (const row of stale) {
-              db.transaction(() => {
-                recordRuling(db, projectId, {
-                  relationId: row.id,
-                  role: 'appeal',
-                  actor: 'guard',
-                  standard: 'generic-kinship',
-                  fromStatus: row.review_status,
-                  toStatus: 'merged',
-                  basis: `replaced by specific relation ${kind}`,
-                  quote: row.evidence,
+          if (dup) {
+            stats.verification.redundant++;
+            recordClaim(kind, 'dropped', 'redundant-kind');
+            continue;
+          }
+        } else {
+          for (const [generic, genericKinds] of GENERIC_KINSHIP) {
+            if (!genericKinds.has(lk)) continue;
+            const stale = db.all<{ id: number; evidence: string; review_status: string }>(
+              `SELECT id, evidence, review_status FROM canon_relation
+                WHERE project_id = ? AND lower(kind) = ? AND review_status != ? AND ${kinPair.sql}`,
+              projectId,
+              generic,
+              'user_confirmed',
+              ...kinPair.args(fromId, toId),
+            );
+            if (stale.length) {
+              for (const row of stale) {
+                db.transaction(() => {
+                  recordRuling(db, projectId, {
+                    relationId: row.id,
+                    role: 'appeal',
+                    actor: 'guard',
+                    standard: 'generic-kinship',
+                    fromStatus: row.review_status,
+                    toStatus: 'merged',
+                    basis: `replaced by specific relation ${kind}`,
+                    quote: row.evidence,
+                  });
+                  db.run('DELETE FROM canon_relation WHERE id = ? AND project_id = ?', row.id, projectId);
                 });
-                db.run('DELETE FROM canon_relation WHERE id = ? AND project_id = ?', row.id, projectId);
+              }
+              stats.verification.redundant += stale.length;
+            }
+            break;
+          }
+        }
+        // The same claim in two words: one pair, one quote, one head verb.
+        const headWord = (k: string): string => {
+          const stop = new Set(['a', 'an', 'the', 'to', 'of', 'with', 'by', 'for', 'in', 'on', 'at']);
+          return k.toLowerCase().split(/[^a-z]+/).filter((w) => w && !stop.has(w))[0] ?? '';
+        };
+        const pair = pairClause(kind);
+        const incoming: EvidenceBundle = {
+          id: null,
+          description: String(raw.description ?? '').trim(),
+          evidence: span.quote,
+          source_refs: toJson(refs),
+          kind_source: kindSource,
+          anchor_evidence: anchorEvidence,
+          modality: normaliseModality(raw.modality),
+          relation_status: relationStatusOf(span.quote),
+          confidence,
+          review_status: rowReview,
+          supporting_evidence: supporting,
+        };
+        const rivals = db.all<{
+          id: number;
+          kind: string;
+          description: string;
+          evidence: string;
+          source_refs: string;
+          kind_source: string;
+          anchor_evidence: string;
+          modality: string;
+          relation_status: string;
+          review_status: string;
+          confidence: number;
+          supporting_evidence: string;
+        }>(
+          `SELECT id, kind, description, evidence, source_refs, kind_source, anchor_evidence,
+                  modality, relation_status, review_status, confidence, supporting_evidence
+             FROM canon_relation
+            WHERE project_id = ? AND evidence = ? AND ${pair.sql}
+            ORDER BY id`,
+          projectId,
+          span.quote,
+          ...pair.args(fromId, toId),
+        );
+        const twin = rivals.find((r) => headWord(r.kind) === headWord(kind) && headWord(kind).length > 0);
+        if (twin) {
+          const stored: EvidenceBundle = {
+            id: twin.id,
+            description: twin.description,
+            evidence: twin.evidence,
+            source_refs: twin.source_refs,
+            kind_source: twin.kind_source,
+            anchor_evidence: twin.anchor_evidence,
+            modality: twin.modality,
+            relation_status: twin.relation_status,
+            confidence: Number(twin.confidence) || 0,
+            review_status: twin.review_status,
+            supporting_evidence: twin.supporting_evidence,
+          };
+          // One bundle supplies every primary field; the other is preserved.
+          const primary = bundleOutranks(db, stored, incoming) ? incoming : stored;
+          const other = primary === incoming ? stored : incoming;
+          const mergedSupporting = mergeBundleSupporting(primary, other);
+          db.transaction(() => {
+            db.run(
+              `UPDATE canon_relation
+                  SET kind = ?, description = ?, evidence = ?, source_refs = ?, review_status = ?,
+                      kind_source = ?, anchor_evidence = ?, modality = ?, relation_status = ?,
+                      confidence = ?, supporting_evidence = ?
+                WHERE id = ?`,
+              twin.kind,
+              primary.description,
+              primary.evidence,
+              primary.source_refs,
+              primary.review_status,
+              primary.kind_source,
+              primary.anchor_evidence,
+              primary.modality,
+              primary.relation_status,
+              primary.confidence,
+              mergedSupporting,
+              twin.id,
+            );
+            if (primary.review_status !== stored.review_status) {
+              recordRuling(db, projectId, {
+                relationId: twin.id,
+                role: 'appeal',
+                actor: 'guard',
+                standard: 'merge',
+                fromStatus: stored.review_status,
+                toStatus: primary.review_status,
+                basis: 'same quote merged into the rival claim',
+                quote: primary.evidence,
               });
             }
-            stats.verification.redundant += stale.length;
-          }
-          break;
+          });
+          recordClaim(kind, 'merged', primary === incoming ? 'primary-adopted' : 'supporting-preserved', {
+            relation_id: twin.id,
+            status: primary === incoming ? 'primary' : 'supporting',
+          });
+          accepted++;
+          continue;
         }
-      }
-      // The same claim in two words: one pair, one quote, one head verb.
-      const headWord = (k: string): string => {
-        const stop = new Set(['a', 'an', 'the', 'to', 'of', 'with', 'by', 'for', 'in', 'on', 'at']);
-        return k.toLowerCase().split(/[^a-z]+/).filter((w) => w && !stop.has(w))[0] ?? '';
-      };
-      const pair = pairClause(kind);
-      const incoming: EvidenceBundle = {
-        id: null,
-        description: String(raw.description ?? '').trim(),
-        evidence: span.quote,
-        source_refs: toJson(refs),
-        kind_source: kindSource,
-        anchor_evidence: anchorEvidence,
-        modality: normaliseModality(raw.modality),
-        relation_status: relationStatusOf(span.quote),
-        confidence,
-        review_status: rowReview,
-        supporting_evidence: supporting,
-      };
-      const rivals = db.all<{
-        id: number;
-        kind: string;
-        description: string;
-        evidence: string;
-        source_refs: string;
-        kind_source: string;
-        anchor_evidence: string;
-        modality: string;
-        relation_status: string;
-        review_status: string;
-        confidence: number;
-        supporting_evidence: string;
-      }>(
-        `SELECT id, kind, description, evidence, source_refs, kind_source, anchor_evidence,
-                modality, relation_status, review_status, confidence, supporting_evidence
-           FROM canon_relation
-          WHERE project_id = ? AND evidence = ? AND ${pair.sql}
-          ORDER BY id`,
-        projectId,
-        span.quote,
-        ...pair.args(fromId, toId),
-      );
-      const twin = rivals.find((r) => headWord(r.kind) === headWord(kind) && headWord(kind).length > 0);
-      if (twin) {
-        const stored: EvidenceBundle = {
-          id: twin.id,
-          description: twin.description,
-          evidence: twin.evidence,
-          source_refs: twin.source_refs,
-          kind_source: twin.kind_source,
-          anchor_evidence: twin.anchor_evidence,
-          modality: twin.modality,
-          relation_status: twin.relation_status,
-          confidence: Number(twin.confidence) || 0,
-          review_status: twin.review_status,
-          supporting_evidence: twin.supporting_evidence,
-        };
-        // One bundle supplies every primary field; the other is preserved.
-        const primary = bundleOutranks(db, stored, incoming) ? incoming : stored;
-        const other = primary === incoming ? stored : incoming;
-        const mergedSupporting = mergeBundleSupporting(primary, other);
-        db.transaction(() => {
-          db.run(
-            `UPDATE canon_relation
-                SET kind = ?, description = ?, evidence = ?, source_refs = ?, review_status = ?,
-                    kind_source = ?, anchor_evidence = ?, modality = ?, relation_status = ?,
-                    confidence = ?, supporting_evidence = ?
-              WHERE id = ?`,
-            twin.kind,
-            primary.description,
-            primary.evidence,
-            primary.source_refs,
-            primary.review_status,
-            primary.kind_source,
-            primary.anchor_evidence,
-            primary.modality,
-            primary.relation_status,
-            primary.confidence,
-            mergedSupporting,
-            twin.id,
-          );
-          if (primary.review_status !== stored.review_status) {
-            recordRuling(db, projectId, {
-              relationId: twin.id,
-              role: 'appeal',
-              actor: 'guard',
-              standard: 'merge',
-              fromStatus: stored.review_status,
-              toStatus: primary.review_status,
-              basis: 'same quote merged into the rival claim',
-              quote: primary.evidence,
-            });
-          }
+        const existing = db.get<{
+          id: number;
+          kind: string;
+          description: string;
+          evidence: string;
+          source_refs: string;
+          kind_source: string;
+          anchor_evidence: string;
+          modality: string;
+          relation_status: string;
+          review_status: string;
+          confidence: number;
+          supporting_evidence: string;
+        }>(
+          `SELECT id, kind, description, evidence, source_refs, kind_source, anchor_evidence,
+                  modality, relation_status, review_status, confidence, supporting_evidence
+             FROM canon_relation
+            WHERE project_id = ? AND lower(kind) = ? AND ${pair.sql}
+            ORDER BY id LIMIT 1`,
+          projectId,
+          kind.toLowerCase(),
+          ...pair.args(fromId, toId),
+        );
+        if (existing) {
+          // One relation per pair and label: merge rather than bank the same
+          // tie twice. Symmetric kinds merge from either side; a directional
+          // kind keeps its arrow.
+          const stored: EvidenceBundle = {
+            id: existing.id,
+            description: existing.description,
+            evidence: existing.evidence,
+            source_refs: existing.source_refs,
+            kind_source: existing.kind_source,
+            anchor_evidence: existing.anchor_evidence,
+            modality: existing.modality,
+            relation_status: existing.relation_status,
+            confidence: Number(existing.confidence) || 0,
+            review_status: existing.review_status,
+            supporting_evidence: existing.supporting_evidence,
+          };
+          const primary = bundleOutranks(db, stored, incoming) ? incoming : stored;
+          const other = primary === incoming ? stored : incoming;
+          const mergedSupporting = mergeBundleSupporting(primary, other);
+          db.transaction(() => {
+            db.run(
+              `UPDATE canon_relation
+                  SET description = ?, evidence = ?, source_refs = ?, review_status = ?,
+                      kind_source = ?, anchor_evidence = ?, modality = ?, relation_status = ?,
+                      confidence = ?, supporting_evidence = ?
+                WHERE id = ?`,
+              primary.description,
+              primary.evidence,
+              primary.source_refs,
+              primary.review_status,
+              primary.kind_source,
+              primary.anchor_evidence,
+              primary.modality,
+              primary.relation_status,
+              primary.confidence,
+              mergedSupporting,
+              existing.id,
+            );
+            if (primary.review_status !== stored.review_status) {
+              recordRuling(db, projectId, {
+                relationId: existing.id,
+                role: 'appeal',
+                actor: 'guard',
+                standard: 'merge',
+                fromStatus: stored.review_status,
+                toStatus: primary.review_status,
+                basis: 'duplicate claim merged',
+                quote: primary.evidence,
+              });
+            }
+          });
+          recordClaim(kind, 'merged', primary === incoming ? 'primary-adopted' : 'supporting-preserved', {
+            relation_id: existing.id,
+            status: primary === incoming ? 'primary' : 'supporting',
+          });
+          accepted++;
+          continue;
+        }
+        const relationId = insertRelation(db, projectId, {
+          fromEntity: fromId,
+          toEntity: toId,
+          kind,
+          description: String(raw.description ?? '').trim(),
+          evidence: span.quote,
+          sourceRefs: toJson(refs),
+          kindSource,
+          anchorEvidence,
+          modality: normaliseModality(raw.modality),
+          reviewStatus: rowReview,
+          confidence,
+          supportingEvidence: supporting,
+          relationStatus: relationStatusOf(span.quote),
         });
+        recordClaim(kind, 'inserted', 'banked', { relation_id: relationId });
+        stats.relations++;
         accepted++;
-        continue;
       }
-      const existing = db.get<{
-        id: number;
-        kind: string;
-        description: string;
-        evidence: string;
-        source_refs: string;
-        kind_source: string;
-        anchor_evidence: string;
-        modality: string;
-        relation_status: string;
-        review_status: string;
-        confidence: number;
-        supporting_evidence: string;
-      }>(
-        `SELECT id, kind, description, evidence, source_refs, kind_source, anchor_evidence,
-                modality, relation_status, review_status, confidence, supporting_evidence
-           FROM canon_relation
-          WHERE project_id = ? AND lower(kind) = ? AND ${pair.sql}
-          ORDER BY id LIMIT 1`,
-        projectId,
-        kind.toLowerCase(),
-        ...pair.args(fromId, toId),
-      );
-      if (existing) {
-        // One relation per pair and label: merge rather than bank the same
-        // tie twice. Symmetric kinds merge from either side; a directional
-        // kind keeps its arrow.
-        const stored: EvidenceBundle = {
-          id: existing.id,
-          description: existing.description,
-          evidence: existing.evidence,
-          source_refs: existing.source_refs,
-          kind_source: existing.kind_source,
-          anchor_evidence: existing.anchor_evidence,
-          modality: existing.modality,
-          relation_status: existing.relation_status,
-          confidence: Number(existing.confidence) || 0,
-          review_status: existing.review_status,
-          supporting_evidence: existing.supporting_evidence,
-        };
-        const primary = bundleOutranks(db, stored, incoming) ? incoming : stored;
-        const other = primary === incoming ? stored : incoming;
-        const mergedSupporting = mergeBundleSupporting(primary, other);
-        db.transaction(() => {
-          db.run(
-            `UPDATE canon_relation
-                SET description = ?, evidence = ?, source_refs = ?, review_status = ?,
-                    kind_source = ?, anchor_evidence = ?, modality = ?, relation_status = ?,
-                    confidence = ?, supporting_evidence = ?
-              WHERE id = ?`,
-            primary.description,
-            primary.evidence,
-            primary.source_refs,
-            primary.review_status,
-            primary.kind_source,
-            primary.anchor_evidence,
-            primary.modality,
-            primary.relation_status,
-            primary.confidence,
-            mergedSupporting,
-            existing.id,
-          );
-          if (primary.review_status !== stored.review_status) {
-            recordRuling(db, projectId, {
-              relationId: existing.id,
-              role: 'appeal',
-              actor: 'guard',
-              standard: 'merge',
-              fromStatus: stored.review_status,
-              toStatus: primary.review_status,
-              basis: 'duplicate claim merged',
-              quote: primary.evidence,
-            });
-          }
-        });
-        accepted++;
-        continue;
+      const sum = counts.inserted + counts.merged + counts.hinted + counts.noted + counts.dropped;
+      if (sum === 0) {
+        finish('dropped', 'no-claim-outcome');
+      } else if (counts.inserted && !counts.merged && !counts.hinted && !counts.noted && !counts.dropped) {
+        finish('inserted', 'candidate-inserted');
+      } else if (counts.merged && !counts.inserted && !counts.hinted && !counts.noted && !counts.dropped) {
+        finish('merged', 'candidate-merged');
+      } else if (counts.hinted && !counts.inserted && !counts.merged && !counts.noted && !counts.dropped) {
+        finish('hinted', 'candidate-hinted');
+      } else if (counts.noted && !counts.inserted && !counts.merged && !counts.hinted && !counts.dropped) {
+        finish('noted', 'candidate-noted');
+      } else if (counts.dropped && !counts.inserted && !counts.merged && !counts.hinted && !counts.noted) {
+        finish('dropped', 'candidate-dropped');
+      } else {
+        finish('mixed', 'mixed-outcomes');
       }
-      insertRelation(db, projectId, {
-        fromEntity: fromId,
-        toEntity: toId,
-        kind,
-        description: String(raw.description ?? '').trim(),
-        evidence: span.quote,
-        sourceRefs: toJson(refs),
-        kindSource,
-        anchorEvidence,
-        modality: normaliseModality(raw.modality),
-        reviewStatus: rowReview,
-        confidence,
-        supportingEvidence: supporting,
-        relationStatus: relationStatusOf(span.quote),
-      });
-      stats.relations++;
-      accepted++;
+    } catch (error) {
+      recordClaim(kinds[0] ?? 'related to', 'dropped', 'candidate-error');
+      finish('error', 'candidate-exception');
+      throw error;
     }
   }
   return accepted;
@@ -4939,6 +5645,8 @@ async function extractWindowLegacy(
   neighboursOf: (id: number | undefined) => ChunkRow[] = () => [],
   maxTokens = 3000,
   nameIndex?: RosterIndex,
+  trace?: ExtractionTrace | null,
+  windowIndex = 0,
 ): Promise<WindowOutcome> {
   let parsed: {
     entities: Record<string, unknown>[];
@@ -4946,6 +5654,9 @@ async function extractWindowLegacy(
     facts: Record<string, unknown>[];
     timeline: Record<string, unknown>[];
   } = { entities: [], relations: [], facts: [], timeline: [] };
+  let responseText = '';
+  let finishReason: FinishReason | undefined;
+  const observations = new Map<string, ExtractionParseObservation>();
   try {
     const res = await llm.chat({
       system: EXTRACT_SYSTEM,
@@ -4953,28 +5664,90 @@ async function extractWindowLegacy(
       temperature: 0.1,
       maxTokens,
     });
-    parsed = parseExtraction(res.text);
+    responseText = res.text;
+    finishReason = res.finishReason;
+    parsed = parseExtraction(responseText, (key, observation) => { observations.set(key, observation); });
   } catch (err) {
+    for (const section of ['entities', 'facts', 'relations', 'timeline'] as const) {
+      trace?.section(windowIndex, section, 'failed', 0, { reason: 'call-error' });
+    }
     // Let runWindowBatch record the failed window and leave it retryable.
     // A bad window still must not abort the whole extraction.
     throw err;
   }
 
+  const relationCandidateIds = traceRelationCandidates(trace, windowIndex, parsed.relations);
+  const traceSection = (section: TraceSectionName, count: number): void => {
+    if (!trace || !trace.canRecord()) return;
+    const observation = observations.get(section);
+    if (!observation) {
+      trace.markIncomplete('preparation');
+      return;
+    }
+    const state = sectionStateFromObservation(observation);
+    trace.section(windowIndex, section, state.state, count, {
+      responseText,
+      reason: state.reason,
+      parse: observation,
+    });
+  };
+  traceSection('entities', parsed.entities.length);
+  traceSection('facts', parsed.facts.length);
+  traceSection('relations', parsed.relations.length);
+  traceSection('timeline', parsed.timeline.length);
+
   const wroteEntities = applyEntities(db, projectId, parsed.entities, window, entityIdByName, stats, neighboursOf, true);
-  const wroteRelations = applyRelations(db, projectId, parsed.relations, window, entityIdByName, stats, neighboursOf, true, nameIndex);
+  const wroteRelations = applyRelations(
+    db,
+    projectId,
+    parsed.relations,
+    window,
+    stats,
+    neighboursOf,
+    true,
+    nameIndex,
+    trace,
+    windowIndex,
+    relationCandidateIds,
+  );
   const wroteFacts = applyFacts(db, projectId, parsed.facts, window, stats, neighboursOf, true);
   const wroteTimeline = applyTimeline(db, projectId, parsed.timeline, window, stats, neighboursOf, true);
   stats.passages += window.length;
-  return {
-    state: 'complete',
-    sections: [
-      {
-        section: 'legacy',
-        state: 'succeeded',
-        wrote: wroteEntities + wroteFacts + wroteRelations + wroteTimeline,
+  const totalWrote = wroteEntities + wroteFacts + wroteRelations + wroteTimeline;
+  const report = makeSectionReport(
+    'legacy',
+    totalWrote,
+    finishReason,
+    (['entities', 'facts', 'relations', 'timeline'] as const).map((section) => ({
+      section,
+      completion: sectionCompletionFromObservation(observations.get(section), finishReason),
+    })),
+  );
+  const windowState: 'complete' | 'partial' | 'failed' =
+    report.state === 'succeeded' ? 'complete' : totalWrote > 0 ? 'partial' : 'failed';
+  if (windowState !== 'complete') {
+    stats.windowIssues.push({
+      index: windowIndex,
+      locator: window[0]?.locator ?? '',
+      state: windowState,
+      sections: [report],
+      failedSections: [],
+      incompleteSections: ['legacy'],
+      succeededSections: [],
+      wrote: {
+        entities: wroteEntities,
+        facts: wroteFacts,
+        relations: wroteRelations,
+        timeline: wroteTimeline,
       },
-    ],
+      detail: incompleteSectionDetail(report),
+    });
+  }
+  return {
+    state: windowState,
+    sections: [report],
     failedSections: [],
+    incompleteSections: windowState === 'complete' ? [] : ['legacy'],
     wrote: {
       entities: wroteEntities,
       facts: wroteFacts,
@@ -5002,17 +5775,38 @@ async function extractWindowSplit(
   index: number,
   roster?: NameRoster,
   nameIndex?: RosterIndex,
+  trace?: ExtractionTrace | null,
 ): Promise<WindowOutcome> {
   const passages = passageBlock(window);
   const answers: string[] = [];
   const sections: ExtractionSectionReport[] = [];
   const failures: { section: ExtractionSectionName; error: string }[] = [];
+  const finishReasons = new Map<ExtractionSectionName, FinishReason | undefined>();
   let accepted = 0;
   let parsedClaims = 0;
   let wroteEntities = 0;
   let wroteFacts = 0;
   let wroteRelations = 0;
   let wroteTimeline = 0;
+
+  const traceSection = (
+    section: TraceSectionName,
+    count: number,
+    text: string,
+    observation: ExtractionParseObservation | undefined,
+  ): void => {
+    if (!trace || !trace.canRecord()) return;
+    if (!observation) {
+      trace.markIncomplete('preparation');
+      return;
+    }
+    const state = sectionStateFromObservation(observation);
+    trace.section(index, section, state.state, count, {
+      responseText: text,
+      reason: state.reason,
+      parse: observation,
+    });
+  };
 
   const ask = async (
     section: ExtractionSectionName,
@@ -5028,11 +5822,13 @@ async function extractWindowSplit(
         maxTokens: maxTok,
       });
       answers.push(res.text);
+      finishReasons.set(section, res.finishReason);
       return res.text;
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);
       failures.push({ section, error });
       sections.push({ section, state: 'failed', wrote: 0, error });
+      trace?.section(index, section, 'failed', 0, { reason: 'call-error' });
       return null;
     }
   };
@@ -5040,13 +5836,27 @@ async function extractWindowSplit(
   // (a) The things the passages establish, and the facts they state.
   const first = await ask('entities-facts', EXTRACT_ENTITIES_SYSTEM, Math.min(1600, maxTokens));
   if (first !== null) {
-    const entities = parseSection(first, 'entities');
-    const facts = parseSection(first, 'facts');
+    let entitiesObservation: ExtractionParseObservation | undefined;
+    let factsObservation: ExtractionParseObservation | undefined;
+    const entities = parseSection(first, 'entities', (observation) => { entitiesObservation = observation; });
+    const facts = parseSection(first, 'facts', (observation) => { factsObservation = observation; });
     parsedClaims += entities.length + facts.length;
+    traceSection('entities', entities.length, first, entitiesObservation);
+    traceSection('facts', facts.length, first, factsObservation);
     wroteEntities = applyEntities(db, projectId, entities, window, entityIdByName, stats, neighboursOf, true);
     wroteFacts = applyFacts(db, projectId, facts, window, stats, neighboursOf, true);
     accepted += wroteEntities + wroteFacts;
-    sections.push({ section: 'entities-facts', state: 'succeeded', wrote: wroteEntities + wroteFacts });
+    const finishReason = finishReasons.get('entities-facts');
+    sections.push(makeSectionReport('entities-facts', wroteEntities + wroteFacts, finishReason, [
+      {
+        section: 'entities',
+        completion: sectionCompletionFromObservation(entitiesObservation, finishReason),
+      },
+      {
+        section: 'facts',
+        completion: sectionCompletionFromObservation(factsObservation, finishReason),
+      },
+    ]));
   }
 
   // (b) Relationships between names that already exist. Names go in the
@@ -5058,42 +5868,84 @@ async function extractWindowSplit(
     const system = `${relationsSystemPrompt()}\n\n${formatKnownEntities(names)}`;
     const second = await ask('relations', system, Math.min(3000, maxTokens), 0);
     if (second !== null) {
-      let relations = parseSection(second, 'relations');
+      let relationsObservation: ExtractionParseObservation | undefined;
+      let relations = parseSection(
+        second,
+        'relations',
+        (observation) => { relationsObservation = observation; },
+      );
+      const relationCandidateIds = traceRelationCandidates(trace, index, relations);
+      traceSection('relations', relations.length, second, relationsObservation);
       if (strictRelationsEnabled()) {
         relations = relations.map((raw) => ({
           ...raw,
           kind: strictRelationKind(String(raw.kind ?? '')),
         }));
-        await retryRelationQuotes(db, llm, projectId, window, relations, entityIdByName, stats);
+        await retryRelationQuotes(db, llm, projectId, window, relations, stats, trace, index, relationCandidateIds);
       }
       parsedClaims += relations.length;
-      wroteRelations = applyRelations(db, projectId, relations, window, entityIdByName, stats, neighboursOf, true, nameIndex);
+      wroteRelations = applyRelations(
+        db,
+        projectId,
+        relations,
+        window,
+        stats,
+        neighboursOf,
+        true,
+        nameIndex,
+        trace,
+        index,
+        relationCandidateIds,
+      );
       accepted += wroteRelations;
-      sections.push({ section: 'relations', state: 'succeeded', wrote: wroteRelations });
+      const finishReason = finishReasons.get('relations');
+      sections.push(makeSectionReport('relations', wroteRelations, finishReason, [
+        {
+          section: 'relations',
+          completion: sectionCompletionFromObservation(relationsObservation, finishReason),
+        },
+      ]));
     }
   } else {
     sections.push({ section: 'relations', state: 'skipped', wrote: 0 });
+    trace?.section(index, 'relations', 'skipped', 0, { reason: 'no-roster-names' });
   }
 
   // (c) What happens, in order.
   const third = await ask('timeline', EXTRACT_EVENTS_SYSTEM, Math.min(1200, maxTokens));
   if (third !== null) {
-    const timeline = parseSection(third, 'timeline');
+    let timelineObservation: ExtractionParseObservation | undefined;
+    const timeline = parseSection(
+      third,
+      'timeline',
+      (observation) => { timelineObservation = observation; },
+    );
     parsedClaims += timeline.length;
+    traceSection('timeline', timeline.length, third, timelineObservation);
     wroteTimeline = applyTimeline(db, projectId, timeline, window, stats, neighboursOf, true);
     accepted += wroteTimeline;
-    sections.push({ section: 'timeline', state: 'succeeded', wrote: wroteTimeline });
+    const finishReason = finishReasons.get('timeline');
+    sections.push(makeSectionReport('timeline', wroteTimeline, finishReason, [
+      {
+        section: 'timeline',
+        completion: sectionCompletionFromObservation(timelineObservation, finishReason),
+      },
+    ]));
   }
 
   stats.passages += window.length;
-  // A complete window is the absence of an issue record; partial and failed
-  // windows are explicit so the batch can leave their chunks retryable.
+  // A complete window has no failed and no parser-incomplete section. Partial
+  // and failed windows are explicit so the batch leaves their chunks retryable.
+  const incomplete = sections.filter((section) => section.state === 'incomplete');
   const windowState: 'complete' | 'partial' | 'failed' =
-    failures.length === 0 ? 'complete' : accepted > 0 ? 'partial' : 'failed';
+    failures.length === 0 && incomplete.length === 0 ? 'complete' : accepted > 0 ? 'partial' : 'failed';
+  const failureDetail = failures.map((f) => `${f.section}: ${f.error}`);
+  const detail = [...failureDetail, ...incomplete.map(incompleteSectionDetail)].join('; ');
   const outcome: WindowOutcome = {
     state: windowState,
     sections,
     failedSections: failures.map((f) => f.section),
+    incompleteSections: incomplete.map((section) => section.section),
     wrote: {
       entities: wroteEntities,
       facts: wroteFacts,
@@ -5109,27 +5961,34 @@ async function extractWindowSplit(
       state: windowState,
       sections,
       failedSections: failures.map((f) => f.section),
+      incompleteSections: incomplete.map((section) => section.section),
       succeededSections: sections.filter((s) => s.state === 'succeeded').map((s) => s.section),
       wrote: outcome.wrote,
-      detail: outcome.error,
+      detail,
     });
   }
   if (accepted > 0) return outcome;
 
   // A window that wrote nothing must say why. A well-formed answer with empty
   // arrays is an empty window, not a truncation: only an answer that carries
-  // claims but parses to nothing (cut off mid-array) is truncated. A failed
-  // section is always recorded as such, even when another section wrote rows.
+  // claims but parses to nothing (cut off mid-array) is truncated. A known
+  // non-stop provider reason is truncation even when the JSON is valid. A
+  // failed section is always recorded as such, even when another section wrote.
   const hasContent = answers.some((t) => !answerIsEmpty(t));
+  const providerStoppedEarly = [...finishReasons.values()].some(
+    (finishReason) => finishIncompleteReason(finishReason) !== undefined,
+  );
   const reason: EmptyWindowReport['reason'] = failures.length
     ? 'error'
     : answers.length === 0
       ? 'error'
-      : parsedClaims > 0
-        ? 'gate-dropped'
-        : hasContent
-          ? 'truncated-answer'
-          : 'empty-answer';
+      : providerStoppedEarly
+        ? 'truncated-answer'
+        : parsedClaims > 0
+          ? 'gate-dropped'
+          : hasContent
+            ? 'truncated-answer'
+            : 'empty-answer';
   stats.emptyWindows.push({
     index,
     locator: window[0]?.locator ?? '',
@@ -7768,6 +8627,100 @@ function isHintKind(kind: string): boolean {
  * and its refs. A duplicate key keeps the longer quote; it never creates an
  * entity and never promotes anything.
  */
+type TieHintCaptureOutcome = {
+  id: number | null;
+  changed: boolean;
+  reason:
+    | 'hint-created'
+    | 'hint-updated'
+    | 'hint-existing'
+    | 'hint-invalid-name'
+    | 'hint-same-name'
+    | 'hint-invalid-kind'
+    | 'hint-no-quote'
+    | 'hint-write-unavailable';
+  incomplete?: boolean;
+};
+
+/**
+ * Tracing-only hint capture. The extra SELECT exists only to recover the row
+ * id for the trace; it is isolated and a failed lookup does not skip the
+ * original INSERT/UPDATE behaviour.
+ */
+function captureTieHintWithOutcome(
+  db: Db,
+  projectId: number,
+  hint: {
+    fromName: string;
+    toName: string;
+    kind: string;
+    quote: string;
+    refs: { source: string; locator: string; chunk?: number }[];
+  },
+): TieHintCaptureOutcome {
+  const fromName = hint.fromName.trim();
+  const toName = hint.toName.trim();
+  const kind = hint.kind.trim();
+  const quote = hint.quote.trim();
+  if (!isHintName(fromName) || !isHintName(toName)) {
+    return { id: null, changed: false, reason: 'hint-invalid-name' };
+  }
+  if (fromName.toLowerCase() === toName.toLowerCase()) {
+    return { id: null, changed: false, reason: 'hint-same-name' };
+  }
+  if (!isHintKind(kind)) return { id: null, changed: false, reason: 'hint-invalid-kind' };
+  if (!quote) return { id: null, changed: false, reason: 'hint-no-quote' };
+  const refs = Array.isArray(hint.refs) ? hint.refs : [];
+  const inserted = db.run(
+    `INSERT OR IGNORE INTO canon_tie_hint
+       (project_id, from_name, to_name, kind, evidence, source_refs, status, note, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'pending', '', ?)`,
+    projectId,
+    fromName,
+    toName,
+    kind,
+    quote,
+    toJson(refs),
+    nowIso(),
+  );
+  if (inserted.changes > 0) {
+    return { id: Number(inserted.lastInsertRowid), changed: true, reason: 'hint-created' };
+  }
+  let existingId: number | null = null;
+  let incomplete = false;
+  try {
+    existingId = db.get<{ id: number }>(
+      `SELECT id FROM canon_tie_hint
+        WHERE project_id = ? AND from_name = ? AND to_name = ? AND kind = ?`,
+      projectId,
+      fromName,
+      toName,
+      kind,
+    )?.id ?? null;
+  } catch {
+    incomplete = true;
+  }
+  const updated = db.run(
+    `UPDATE canon_tie_hint SET evidence = ?, source_refs = ?
+      WHERE project_id = ? AND from_name = ? AND to_name = ? AND kind = ? AND length(?) > length(evidence)`,
+    quote,
+    toJson(refs),
+    projectId,
+    fromName,
+    toName,
+    kind,
+    quote,
+  );
+  return {
+    id: existingId,
+    changed: updated.changes > 0,
+    reason: existingId !== null
+      ? updated.changes > 0 ? 'hint-updated' : 'hint-existing'
+      : updated.changes > 0 ? 'hint-updated' : 'hint-write-unavailable',
+    ...(incomplete ? { incomplete: true } : {}),
+  };
+}
+
 export function captureTieHint(
   db: Db,
   projectId: number,
@@ -9558,21 +10511,73 @@ function findEntityId(db: Db, projectId: number, kind: EntityKind, name: string)
   return alias?.id;
 }
 
+/**
+ * Resolve a relationship endpoint against the current project roster.
+ *
+ * Canonical exact name, then canonical exact stored alias, then the existing
+ * unique single-token short-name rule. More than one candidate is ambiguous
+ * and returns undefined, so the caller keeps its existing unresolved hint.
+ * This deliberately does not import an alias from another row, merge records
+ * or fall through to a different kind. No result is cached: extraction adds
+ * entities between windows, and a unique short form can become ambiguous.
+ */
+function resolveEntityDetailed(
+  db: Db,
+  projectId: number,
+  name: string,
+): TracedEndpointResolution {
+  const query = canonicalName(name);
+  if (!query) return { method: 'empty', candidateIds: [] };
+  const rows = db.all<{ id: number; name: string; aliases: string }>(
+    'SELECT id, name, aliases FROM canon_entity WHERE project_id = ? ORDER BY id',
+    projectId,
+  );
+
+  const nameHits = rows
+    .filter((row) => canonicalName(row.name) === query)
+    .map((row) => row.id);
+  const aliasHits = rows
+    .filter((row) => strList(row.aliases).some((alias) => canonicalName(alias) === query))
+    .map((row) => row.id);
+  // An exact name and another entity's alias are both direct matches. They
+  // must be compared as one candidate set; returning the name hit first would
+  // silently assign the alias collision to one entity.
+  const directHits = [...new Set([...nameHits, ...aliasHits])];
+  if (directHits.length === 1) {
+    const method: EndpointResolutionMethod =
+      nameHits.length && aliasHits.length
+        ? 'direct-mixed'
+        : nameHits.length
+          ? 'direct-name'
+          : 'direct-alias';
+    return { id: directHits[0], method, candidateIds: directHits };
+  }
+  if (directHits.length > 1) {
+    return { method: 'direct-collision', candidateIds: directHits };
+  }
+
+  const tokens = query.split(' ').filter(Boolean);
+  if (tokens.length !== 1) return { method: 'none', candidateIds: [] };
+  const needle = tokens[0]!;
+  if (needle.length < 3) return { method: 'none', candidateIds: [] };
+  const shortHits = rows
+    .filter((row) =>
+      [row.name, ...strList(row.aliases)].some((value) =>
+        canonicalName(value).split(' ').includes(needle),
+      ),
+    )
+    .map((row) => row.id);
+  if (shortHits.length === 1) return { id: shortHits[0], method: 'short-name', candidateIds: shortHits };
+  if (shortHits.length > 1) return { method: 'short-collision', candidateIds: shortHits };
+  return { method: 'none', candidateIds: [] };
+}
+
 function resolveEntity(
   db: Db,
   projectId: number,
-  cache: Map<string, number>,
   name: string,
 ): number | undefined {
-  const clean = name.trim();
-  if (!clean) return undefined;
-  const cached = cache.get(key(clean));
-  if (cached) return cached;
-  const found = findEntityId(db, projectId, 'character', clean)
-    ?? db.get<{ id: number }>('SELECT id FROM canon_entity WHERE project_id = ? AND lower(name) = lower(?)', projectId, clean)?.id
-    ?? resolveShortName(db, projectId, clean);
-  if (found) cache.set(key(clean), found);
-  return found;
+  return resolveEntityDetailed(db, projectId, name).id;
 }
 
 /**
@@ -11203,7 +12208,10 @@ export function buildLoreBrief(
       )
     : all;
   const chosen = matched.slice(0, opts.maxEntities ?? 20);
-  const relations = listRelations(db, projectId).filter(
+  // The writer-facing brief is factual canon only. Needs-review/provisional/
+  // attested/rejected candidates stay in the bank and in the planning web
+  // brief, but must not be presented to the writer as source relationships.
+  const relations = listRelations(db, projectId, ['accepted', 'user_confirmed']).filter(
     (r) => !names.length || chosen.some((e) => e.id === r.fromId || e.id === r.toId),
   );
   const facts = opts.includeFacts === false ? [] : listFacts(db, projectId);

@@ -8,7 +8,7 @@
  * a mutable check.
  */
 import type { Db } from '../core/db.ts';
-import { canonicalName, deriveNameVariants, type RosterIndex } from '../identity/names.ts';
+import { canonicalName, deriveNameVariants, nameRelation, type RosterIndex } from '../identity/names.ts';
 import { normalise, splitSentences } from '../core/text.ts';
 import { KIND_FILLER, headForms, kindHeadWord } from '../core/vocab.ts';
 import {
@@ -584,6 +584,9 @@ export function relationEntailmentReason(row: PromoteRow, index?: RosterIndex): 
     const toFamilies = heldFamilies(row, 'to', citation, index);
     if (fromFamilies.has(family) && toFamilies.has(inverse)) return null;
     if (fromFamilies.has(inverse) && toFamilies.has(family)) return 'direction-mismatch';
+    const dialogue = dialogueDirection(row, family, index);
+    if (dialogue === 'forward') return null;
+    if (dialogue === 'reverse') return 'direction-mismatch';
     const possessive = possessiveDirection(row, family, index);
     if (possessive === 'forward') return null;
     if (possessive === 'reverse') return 'direction-mismatch';
@@ -603,6 +606,7 @@ export function relationEntailmentReason(row: PromoteRow, index?: RosterIndex): 
   if (sameClauseWithBothEndpoints(row, family, index)) return null;
   if (definiteDescriptionAnchor(row, family, index)) return null;
   if (contiguousDefiniteDescription(row, family, index)) return null;
+  if (dialogueAttributionEntails(row, family, index)) return null;
   return 'relationship-not-entailed';
 }
 
@@ -719,11 +723,31 @@ function contextSentences(text: string): string[] {
 function namesOtherEntity(text: string, row: PromoteRow, index?: RosterIndex): boolean {
   if (!index) return false;
   const source = canonicalName(text);
+  const sameEndpoint = (name: string): boolean =>
+    [row.fromName, row.toName].some((endpoint) => {
+      const relation = nameRelation(name, endpoint);
+      return relation === 'same' || relation === 'containment';
+    });
+  const endpointForms = [
+    ...variantsFor(row, 'from', index),
+    ...variantsFor(row, 'to', index),
+  ].map((variant) => canonicalName(variant)).filter(Boolean);
+  // A shorter unrelated name is not a third party when a longer endpoint
+  // alias covers the same words: "Magister Damask" is the endpoint's alias,
+  // while a bare "Damask" row is not a competing referent in that phrase.
+  const shadowed = (form: string): boolean =>
+    endpointForms.some(
+      (longer) =>
+        longer !== form &&
+        longer.includes(form) &&
+        new RegExp(`\\b${rx(longer)}\\b`, 'i').test(source),
+    );
   for (const other of index.rows) {
-    if (other.name === row.fromName || other.name === row.toName) continue;
+    if (sameEndpoint(other.name)) continue;
     for (const variant of explicitVariants(other.name, other.aliases, index)) {
       const form = canonicalName(variant);
-      if (form && new RegExp(`\\b${rx(form)}\\b`, 'i').test(source)) return true;
+      if (!form || !new RegExp(`\\b${rx(form)}\\b`, 'i').test(source)) continue;
+      if (!shadowed(form)) return true;
     }
   }
   return false;
@@ -772,14 +796,226 @@ function introducedReferentAnchor(
   return null;
 }
 
+/** Dialogue tags that explicitly name who is speaking. */
+const ATTRIBUTION_VERB =
+  'said|says|say|replied|replies|answered|answers|asked|asks|whispered|whispers|' +
+  'muttered|mutters|growled|growls|responded|responds|added|adds|continued|continues|' +
+  'explained|explains|declared|declares|told|tells|strained|strains|suggested|suggests|' +
+  'countered|counters|called|calls|shouted|shouts|hissed|hisses|murmured|murmurs|was\\s+saying';
+
+/** Narration that can carry a speech beat when the quote itself names the
+ * addressee. It never supplies the addressee on its own. */
+const ACTION_BEAT =
+  'walked|walk|turned|turn|looked|look|smiled|smile|nodded|nod|ran|run|lifted|lift|' +
+  'glanced|glance|stood|stand|sat|sit|rose|rise|stepped|step|moved|move|reached|reach|' +
+  'shook|shake|breathed|inhaled|exhaled|paused|pause|watched|watch|gestured|gesture|' +
+  'frowned|frown|grinned|grin|laughed|laugh|sighed|sigh|relaxed|relax|narrowed|narrow|' +
+  'responded|responds|reenabled|re-enabled';
+
+/** True when a sentence names one side, using the same canonical matching as
+ * `mentionSpans` (hyphenated names such as 11-4D included). */
+function mentionsSide(text: string, row: PromoteRow, side: 'from' | 'to', index?: RosterIndex): boolean {
+  const source = canonicalName(text);
+  return variantsFor(row, side, index).some((variant) => {
+    const form = canonicalName(variant);
+    return form !== '' && new RegExp(`\\b${rx(form)}\\b`, 'i').test(source);
+  });
+}
+
+/** Which endpoint a sentence names, only when it names exactly one. */
+function endpointSide(text: string, row: PromoteRow, index?: RosterIndex): 'from' | 'to' | null {
+  const from = mentionsSide(text, row, 'from', index);
+  const to = mentionsSide(text, row, 'to', index);
+  if (from === to) return null;
+  return from ? 'from' : 'to';
+}
+
+/** Character position of the first endpoint mention in canonical text. */
+function firstMentionCanonical(text: string, row: PromoteRow, side: 'from' | 'to', index?: RosterIndex): number {
+  const source = canonicalName(text);
+  let best = Infinity;
+  for (const variant of variantsFor(row, side, index)) {
+    const form = canonicalName(variant);
+    if (!form) continue;
+    const at = source.search(new RegExp(`\\b${rx(form)}\\b`, 'i'));
+    if (at >= 0 && at < best) best = at;
+  }
+  return best;
+}
+
+/** The endpoint an explicit dialogue tag attributes the sentence to. Both
+ * endpoints tagged, or neither, is ambiguous and returns null. */
+function attributionSpeaker(sentence: string, row: PromoteRow, index?: RosterIndex): 'from' | 'to' | null {
+  const from = aliasAlt(row, 'from', index);
+  const to = aliasAlt(row, 'to', index);
+  if (!from || !to) return null;
+  const source = canonicalName(sentence);
+  const tag = (alt: string): RegExp =>
+    new RegExp(
+      `\\b(?:${alt})\\b\\s+(?:${ATTRIBUTION_VERB})\\b|\\b(?:${ATTRIBUTION_VERB})\\b\\s+(?:${alt})\\b`,
+      'i',
+    );
+  const fromSaid = tag(from).test(source);
+  const toSaid = tag(to).test(source);
+  if (fromSaid === toSaid) return null;
+  return fromSaid ? 'from' : 'to';
+}
+
+/** An explicit addressee: a vocative set off by punctuation, or "to NAME" in
+ * an attribution clause. Proximity alone is never enough. */
+function addressedIn(text: string, alt: string): boolean {
+  return new RegExp(
+    `(?:,\\s*(?:${alt})\\s*[,.;!?"”]|\\b(?:to|told|addressed|asked)\\s+(?:${alt})\\b|^\\s*["“]?\\s*(?:${alt})\\s*[,;])`,
+    'i',
+  ).test(text);
+}
+
+/**
+ * A dialogue anchor from an explicit tag or an action beat. A tag must name
+ * both endpoints and put the non-speaker in an explicit addressee position.
+ * An action beat must name exactly one endpoint and the quote itself must name
+ * the addressee with a vocative. A second quote or attribution between the
+ * beat and the quote breaks the link.
+ */
+function dialogueAnchor(
+  row: PromoteRow,
+  holding: string,
+  sentences: string[],
+  at: number,
+  index?: RosterIndex,
+): string | null {
+  // The quote must itself be dialogue: quotation marks and a first/second
+  // person address. A third-person pronoun may refer outside the pair.
+  if (!/["“”]/.test(holding)) return null;
+  if (!/\b(?:I|me|my|we|us|our|you|your)\b/i.test(holding)) return null;
+  if (/\b(?:he|him|his|she|her|hers|they|them|their)\b/i.test(holding)) return null;
+  if (namesOtherEntity(holding, row, index)) return null;
+  // An explicit tag inside the holding is the holding's own business; do not
+  // replace it with a nearby beat.
+  if (attributionSpeaker(holding, row, index)) return null;
+
+  for (const offset of [-1, -2, 1, 2]) {
+    const j = at + offset;
+    if (j < 0 || j >= sentences.length) continue;
+    const candidate = sentences[j]!;
+
+    const speaker = attributionSpeaker(candidate, row, index);
+    if (speaker) {
+      if (!citationNamesBothEndpoints({ ...row, evidence: candidate, anchorEvidence: undefined }, index)) continue;
+      if (namesOtherEntity(candidate, row, index)) continue;
+      const addressee = speaker === 'from' ? 'to' : 'from';
+      const alt = aliasAlt(row, addressee, index);
+      if (!alt || !addressedIn(candidate, alt)) continue;
+      // The quoted relationship must address the tagged addressee, not a
+      // third party: the quote says "you", or names the addressee as a vocative.
+      if (!/\b(?:you|your)\b/i.test(holding) && !addressedIn(holding, alt)) continue;
+      if (offset === -2) {
+        const between = sentences[at - 1]!;
+        if (/["“”]/.test(between)) continue;
+        if (attributionSpeaker(between, row, index)) continue;
+      }
+      if (offset === 2) {
+        const between = sentences[at + 1]!;
+        if (/["“”]/.test(between)) continue;
+        if (attributionSpeaker(between, row, index)) continue;
+      }
+      return candidate;
+    }
+
+    // Action beat: the quote's own vocative supplies the addressee. The
+    // endpoint must precede the action verb; a third-party name elsewhere in
+    // the narration (for example a faction called "the Sith") does not make
+    // the named endpoint any less the actor.
+    if (/["“”]/.test(candidate)) continue;
+    const speakerSide = endpointSide(candidate, row, index);
+    if (!speakerSide) continue;
+    const speakerAt = firstMentionCanonical(candidate, row, speakerSide, index);
+    const verbAt = new RegExp(`\\b(?:${ACTION_BEAT})\\b`, 'i').exec(canonicalName(candidate))?.index ?? -1;
+    if (!Number.isFinite(speakerAt) || verbAt < 0 || speakerAt > verbAt) continue;
+    const addressee = speakerSide === 'from' ? 'to' : 'from';
+    const alt = aliasAlt(row, addressee, index);
+    if (!alt || !addressedIn(holding, alt)) continue;
+    if (offset === -2) {
+      const between = sentences[at - 1]!;
+      if (/["“”]/.test(between)) continue;
+      if (attributionSpeaker(between, row, index)) continue;
+      if (endpointSide(between, row, index)) continue;
+    }
+    return candidate;
+  }
+  return null;
+}
+
+/** True when a symmetric dialogue tie is proved by an explicit attribution:
+ * the quote carries the family term, names no third party, and addresses the
+ * tagged addressee. Asymmetric dialogue keeps the direction grammar below. */
+function dialogueAttributionEntails(row: PromoteRow, family: RelationFamily, index?: RosterIndex): boolean {
+  if (isAsymmetricFamily(family)) return false;
+  const anchor = (row.anchorEvidence ?? '').trim();
+  if (!anchor) return false;
+  if (!citationNamesBothEndpoints(row, index)) return false;
+  const evidence = row.evidence;
+  if (/\b(?:he|him|his|she|her|hers|they|them|their)\b/i.test(evidence)) return false;
+  if (namesOtherEntity(evidence, row, index)) return false;
+  if (namesOtherEntity(anchor, row, index)) return false;
+  const speaker = attributionSpeaker(anchor, row, index) ?? endpointSide(anchor, row, index);
+  if (!speaker) return false;
+  const addressee = speaker === 'from' ? 'to' : 'from';
+  const alt = aliasAlt(row, addressee, index);
+  if (!alt) return false;
+  if (!addressedIn(anchor, alt) && !addressedIn(evidence, alt)) return false;
+  if (!/\b(?:you|your)\b/i.test(evidence) && !addressedIn(evidence, alt)) return false;
+  const maskedEvidence = maskText(evidence, row, index);
+  return familyTermPresent(maskedEvidence, family);
+}
+
+/** The arrow of an asymmetric dialogue claim from "I am your HEAD" / "you are
+ * my HEAD" and the explicit speaker/addressee. Null means the quote does not
+ * place the family in the first or second person; existing grammar decides. */
+function dialogueDirection(row: PromoteRow, family: RelationFamily, index?: RosterIndex): 'forward' | 'reverse' | 'none' {
+  const anchor = (row.anchorEvidence ?? '').trim();
+  if (!anchor) return 'none';
+  const speaker = attributionSpeaker(anchor, row, index) ?? endpointSide(anchor, row, index);
+  if (!speaker) return 'none';
+  const addressee = speaker === 'from' ? 'to' : 'from';
+  const evidence = row.evidence;
+  if (/\b(?:he|him|his|she|her|hers|they|them|their)\b/i.test(evidence)) return 'none';
+  const inverse = inverseFamilyOf(family);
+  const heads = [...familyHeadForms(family)].sort((a, b) => b.length - a.length).map(rx).join('|');
+  const invHeads = [...familyHeadForms(inverse)].sort((a, b) => b.length - a.length).map(rx).join('|');
+  if (!heads || !invHeads) return 'none';
+
+  const firstPerson = new RegExp(
+    `\\bI\\s+(?:am|was|become|became|will\\s+be|shall\\s+be)\\s+(?:your|thy)\\s+(?:the\\s+)?(${heads}|${invHeads})\\b`,
+    'i',
+  ).exec(evidence);
+  if (firstPerson) {
+    const head = firstPerson[1]!.toLowerCase();
+    if (familyHeadForms(family).has(head)) return speaker === 'from' ? 'forward' : 'reverse';
+    if (familyHeadForms(inverse).has(head)) return speaker === 'from' ? 'reverse' : 'forward';
+  }
+
+  const secondPerson = new RegExp(
+    `\\b(?:you|thou)\\s+(?:are|were|become|became|will\\s+be|shall\\s+be)\\s+(?:my|our)\\s+(?:the\\s+)?(${heads}|${invHeads})\\b`,
+    'i',
+  ).exec(evidence);
+  if (secondPerson) {
+    const head = secondPerson[1]!.toLowerCase();
+    if (familyHeadForms(family).has(head)) return addressee === 'from' ? 'forward' : 'reverse';
+    if (familyHeadForms(inverse).has(head)) return addressee === 'from' ? 'reverse' : 'forward';
+  }
+  return 'none';
+}
+
 /**
  * Endpoint context from the quoted sentence itself. A stored relation often
  * quotes a sub-span of the sentence that introduces both people ("Married to
  * Ruwee by arrangement" from "…she was…", with "You remember Jobal?" just
- * before). Identity grounding may use that introduction and a pure description
- * between it and the quote. It never treats a nearby named character as the
- * antecedent, and it never decides the relationship; entailment remains a
- * separate check.
+ * before), or a pronoun-only line of dialogue whose speaker and addressee are
+ * named by an explicit tag. Identity grounding may use the introduction and a
+ * pure description, or an explicit local attribution. It never treats a
+ * nearby named character as the antecedent, and it never decides the
+ * relationship; entailment remains a separate check.
  */
 function contextualEvidence(
   row: PromoteRow,
@@ -793,7 +1029,9 @@ function contextualEvidence(
   for (let i = 0; i < sentences.length; i += 1) {
     const holding = sentences[i]!;
     if (!normalise(holding).includes(source)) continue;
-    const anchor = introducedReferentAnchor(row, holding, sentences, i, index);
+    const anchor =
+      introducedReferentAnchor(row, holding, sentences, i, index) ??
+      dialogueAnchor(row, holding, sentences, i, index);
     if (!anchor) continue;
     const withAnchor = { ...row, evidence: holding, anchorEvidence: anchor };
     if (citationNamesBothEndpoints(withAnchor, index)) return withAnchor;

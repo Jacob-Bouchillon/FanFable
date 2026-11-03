@@ -2,7 +2,7 @@
 description: Code
 mode: primary
 color: "#3e63dd"
-steps: 75
+steps: 120
 request:
   body:
     temperature: 0.2

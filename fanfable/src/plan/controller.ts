@@ -27,7 +27,7 @@ import * as planner from './planner.ts';
 import { buildWebBrief, renderWebBrief } from './brief.ts';
 import { ContextAssemblyTrace } from './context-trace.ts';
 import * as traceLog from '../trace/trace.ts';
-import { WriteTrace } from '../trace/write-trace.ts';
+import { WRITE_TRACE_MAX_EVENTS, WriteTrace } from '../trace/write-trace.ts';
 import * as writer from '../product/writer.ts';
 import * as continuity from '../product/continuity.ts';
 import { continuitySettings, filterBySeverity } from '../product/continuity-settings.ts';
@@ -873,7 +873,9 @@ export async function resolveContextRequest(
       const canonLore = exactEntity
         ? {
             entities: [exactEntity],
-            relations: lorebook.listRelations(db, projectId).filter(
+            // Character context is factual source context. Keep the story
+            // record separate below; only keeper canon ties may enter here.
+            relations: lorebook.listRelations(db, projectId, ['accepted', 'user_confirmed']).filter(
               (r) => r.fromId === exactEntity.id || r.toId === exactEntity.id,
             ),
             facts: lorebook.listFacts(db, projectId).filter((f) =>
@@ -1043,6 +1045,7 @@ export async function writeChapter(
     try {
       const started = traceLog.startTrace(db, {
         projectId,
+        maxEvents: WRITE_TRACE_MAX_EVENTS,
         metadata: {
           command: 'write chapter',
           chapter_number: chapterNumber,

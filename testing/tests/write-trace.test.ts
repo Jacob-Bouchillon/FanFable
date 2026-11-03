@@ -15,6 +15,8 @@ import { MockProvider } from '../../fanfable/src/core/llm.ts';
 import * as controller from '../../fanfable/src/plan/controller.ts';
 import * as planner from '../../fanfable/src/plan/planner.ts';
 import * as trace from '../../fanfable/src/trace/trace.ts';
+import { WriteTrace } from '../../fanfable/src/trace/write-trace.ts';
+import { writeChapter } from '../../fanfable/src/product/writer.ts';
 import { seedProject, tempDb } from './helpers.ts';
 
 const AT = '2024-01-01T00:00:00.000Z';
@@ -146,26 +148,34 @@ test('single-part writes expose lifecycle, prompt and storage without extra call
   db.close();
 });
 
-test('multipart writes track part prompts, previous/beats, and round-cap skips', async () => {
+test('multipart writes give every part an initial call and track previous/beats', async () => {
   const { db } = tempDb();
   const project = approvedProject(db, 'write-parts');
-  const { llm } = scripted([
+  const { llm, calls } = scripted([
     'The first part ends here with enough words to stand.',
     'The second part continues from the first part.',
-    'The third part would never be called.',
+    'The third part closes after the second.',
   ]);
   let writeTraceId: string | undefined;
-  await controller.writeChapter(db, llm, project.id, {
+  const result = await controller.writeChapter(db, llm, project.id, {
     chapterNumber: 1,
     bundle: emptyBundle(),
-    targetWords: 12,
-    segments: 2,
+    targetWords: 1,
+    segments: 3,
+    contextLimits: { maxRounds: 0, maxRequests: 10 },
     skipContinuity: true,
     onWriteTraceId: (id) => {
       writeTraceId = id;
     },
   });
+  assert.equal(calls.length, 3, 'one initial call per part even with no follow-up budget');
+  assert.match(result.chapter.body, /first part/);
+  assert.match(result.chapter.body, /second part/);
+  assert.match(result.chapter.body, /third part/);
   const list = events(db, writeTraceId!);
+  assert.equal(list.filter((event) => event.event === 'write.part.started').length, 3);
+  assert.equal(list.filter((event) => event.event === 'write.part.completed').length, 3);
+  assert.ok(!list.some((event) => event.event === 'write.part.skipped'));
   assert.ok(list.some((event) => event.event === 'write.part.started' && event.refs.part === 2));
   assert.ok(
     list.some(
@@ -175,29 +185,200 @@ test('multipart writes track part prompts, previous/beats, and round-cap skips',
         Number(event.refs.previous_chars) > 0,
     ),
   );
-  const skipped = await (async () => {
-    const { db: skipDb } = tempDb();
-    const skipProject = approvedProject(skipDb, 'write-skip');
-    const script = scripted(['The only part that gets a model call.']);
-    let skipTraceId: string | undefined;
-    const result = await controller.writeChapter(skipDb, script.llm, skipProject.id, {
-      chapterNumber: 1,
-      bundle: emptyBundle(),
-      targetWords: 1,
-      segments: 3,
-      contextLimits: { maxRounds: 0, maxRequests: 10 },
-      skipContinuity: true,
-      onWriteTraceId: (id) => {
-        skipTraceId = id;
-      },
-    });
-    const skipEvents = events(skipDb, skipTraceId!);
-    assert.ok(skipEvents.some((event) => event.event === 'write.part.skipped'));
-    assert.equal(result.chapter.body, 'The only part that gets a model call.');
-    skipDb.close();
-    return skipEvents;
-  })();
-  assert.ok(skipped.some((event) => event.event === 'write.part.skipped'));
+  db.close();
+});
+
+test('a protocol-only later response is traced empty and does not erase stored prose', async () => {
+  const { db } = tempDb();
+  const project = approvedProject(db, 'write-protocol-only-later');
+  const { llm, calls } = scripted([
+    'KEEP THIS STORY PROSE.\n\n[[CONTEXT]]\n{"kind":"au","query":"what changed"}\n[[END]]',
+    '[[META]]\n{"summary":"only metadata"}\n[[END]]',
+  ]);
+  let writeTraceId: string | undefined;
+  const result = await controller.writeChapter(db, llm, project.id, {
+    chapterNumber: 1,
+    bundle: emptyBundle(),
+    targetWords: 1,
+    skipContinuity: true,
+    onWriteTraceId: (id) => {
+      writeTraceId = id;
+    },
+  });
+  assert.equal(calls.length, 2);
+  assert.equal(result.chapter.body, 'KEEP THIS STORY PROSE.');
+  const list = events(db, writeTraceId!);
+  const dispositions = list.filter((event) => event.event === 'write.output.disposition');
+  assert.equal(dispositions.length, 2);
+  assert.equal(dispositions[0]?.decision, 'included');
+  assert.equal(dispositions[1]?.decision, 'empty');
+  assert.equal(dispositions[1]?.refs.contributed_chars, 0);
+  const audit = trace.auditTrace(db, writeTraceId!);
+  assert.deepEqual(audit?.violations, []);
+  assert.equal(audit?.exhaustive, true);
+  db.close();
+});
+
+test('repeated and partially overlapping single-part output is stored once and traced accurately', async () => {
+  const { db } = tempDb();
+  const project = approvedProject(db, 'write-overlap');
+  const paragraphA = 'Paragraph A is long enough to be treated as a real story paragraph.';
+  const { llm, calls } = scripted([
+    `${paragraphA}\n\n[[CONTEXT]]\n{"kind":"au","query":"first"}\n[[END]]`,
+    `${paragraphA}\n\nParagraph B adds new action.\n\n[[CONTEXT]]\n{"kind":"au","query":"second"}\n[[END]]`,
+    paragraphA,
+  ]);
+  let writeTraceId: string | undefined;
+  const result = await controller.writeChapter(db, llm, project.id, {
+    chapterNumber: 1,
+    bundle: emptyBundle(),
+    targetWords: 1,
+    skipContinuity: true,
+    onWriteTraceId: (id) => {
+      writeTraceId = id;
+    },
+  });
+  assert.equal(calls.length, 3);
+  assert.equal(result.chapter.body.match(/Paragraph A is long enough/g)?.length, 1);
+  assert.match(result.chapter.body, /Paragraph B adds new action/);
+  const list = events(db, writeTraceId!);
+  const dispositions = list.filter((event) => event.event === 'write.output.disposition');
+  assert.equal(dispositions.length, 3);
+  assert.deepEqual(
+    dispositions.map((event) => event.decision),
+    ['included', 'included', 'superseded'],
+  );
+  assert.ok(Number(dispositions[1]?.refs.contributed_chars) > 0);
+  assert.ok(Number(dispositions[2]?.refs.overlap_chars) > 0);
+  const audit = trace.auditTrace(db, writeTraceId!);
+  assert.deepEqual(audit?.violations, []);
+  assert.equal(audit?.exhaustive, true);
+  db.close();
+});
+
+test('six parts with defaults and requests keep every initial call', async () => {
+  const { db } = tempDb();
+  const project = approvedProject(db, 'write-six-parts');
+  let n = 0;
+  const { llm, calls } = scripted([
+    () => {
+      n++;
+      return `PART ${n} DISTINCT PROSE.\n\n[[CONTEXT]]\n{"kind":"au","query":"question ${n}"}\n[[END]]`;
+    },
+  ]);
+  let writeTraceId: string | undefined;
+  const result = await controller.writeChapter(db, llm, project.id, {
+    chapterNumber: 1,
+    bundle: emptyBundle(),
+    targetWords: 1200,
+    segments: 6,
+    skipContinuity: true,
+    onWriteTraceId: (id) => {
+      writeTraceId = id;
+    },
+  });
+  assert.equal(calls.length, 10, 'six initial calls plus four additional calls');
+  assert.equal(result.stats.initialCalls, 6);
+  assert.equal(result.stats.additionalCalls, 4);
+  assert.equal(result.stats.unansweredRequests, 6);
+  assert.match(result.chapter.body, /PART 1 DISTINCT PROSE/);
+  assert.match(result.chapter.body, /PART 6 DISTINCT PROSE/);
+  assert.match(result.chapter.body, /PART 10 DISTINCT PROSE/);
+  const list = events(db, writeTraceId!);
+  assert.equal(list.filter((event) => event.event === 'write.prompt.built').length, 6);
+  assert.equal(list.filter((event) => event.event === 'write.part.started').length, 6);
+  assert.equal(list.filter((event) => event.event === 'write.part.completed').length, 6);
+  assert.ok(!list.some((event) => event.event === 'write.part.skipped'));
+  assert.equal(
+    list.filter((event) => event.event === 'write.request.unanswered').length,
+    6,
+  );
+  const completed = list.find((event) => event.event === 'write.completed');
+  assert.equal(completed?.refs.unanswered_requests, 6);
+  const audit = trace.auditTrace(db, writeTraceId!);
+  assert.deepEqual(audit?.violations, []);
+  assert.equal(audit?.exhaustive, true);
+  assert.ok(audit?.limitations.some((item) => /unanswered/.test(item)));
+  db.close();
+});
+
+test('two continuation calls retain both instructions and assistant responses', async () => {
+  const { db } = tempDb();
+  const project = approvedProject(db, 'write-two-continuations');
+  const first = 'The first short beat opens the chapter.';
+  const second = 'A second short beat carries the action forward.';
+  const third = 'A third short beat closes the scene.';
+  const { llm, calls } = scripted([first, second, third]);
+  let writeTraceId: string | undefined;
+  const result = await controller.writeChapter(db, llm, project.id, {
+    chapterNumber: 1,
+    bundle: emptyBundle(),
+    targetWords: 100,
+    maxContinuations: 2,
+    skipContinuity: true,
+    onWriteTraceId: (id) => {
+      writeTraceId = id;
+    },
+  });
+  assert.equal(calls.length, 3);
+  assert.equal(result.stats.continuations, 2);
+  assert.ok(result.chapter.body.includes(first));
+  assert.ok(result.chapter.body.includes(second));
+  assert.ok(result.chapter.body.includes(third));
+  assert.deepEqual(
+    calls.map((request) => request.messages.map((message) => message.role)),
+    [
+      ['user'],
+      ['user', 'assistant', 'user'],
+      ['user', 'assistant', 'user', 'assistant', 'user'],
+    ],
+  );
+  assert.match(calls[2]!.messages[1]!.content, /first short beat/);
+  assert.match(calls[2]!.messages[2]!.content, /THE CHAPTER SO FAR/);
+  assert.match(calls[2]!.messages[3]!.content, /second short beat/);
+  assert.match(calls[2]!.messages[4]!.content, /THE CHAPTER SO FAR/);
+  const list = events(db, writeTraceId!);
+  assert.equal(list.filter((event) => event.event === 'write.continuation.started').length, 2);
+  assert.equal(list.filter((event) => event.event === 'write.continuation.completed').length, 2);
+  const audit = trace.auditTrace(db, writeTraceId!);
+  assert.deepEqual(audit?.violations, []);
+  assert.equal(audit?.exhaustive, true);
+  db.close();
+});
+
+test('an early part ending in unmarked metadata does not cut later part prose', async () => {
+  const { db } = tempDb();
+  const project = approvedProject(db, 'write-early-bare-metadata');
+  const first = 'This is the first surviving paragraph of the chapter.';
+  const second = 'This is the second surviving paragraph of the chapter.';
+  const { llm, calls } = scripted([
+    `${first}\n{"summary":"bare metadata without markers"}`,
+    second,
+  ]);
+  let writeTraceId: string | undefined;
+  const result = await controller.writeChapter(db, llm, project.id, {
+    chapterNumber: 1,
+    bundle: emptyBundle(),
+    targetWords: 20,
+    segments: 2,
+    skipContinuity: true,
+    onWriteTraceId: (id) => {
+      writeTraceId = id;
+    },
+  });
+  assert.equal(calls.length, 2);
+  assert.ok(result.chapter.body.includes(first));
+  assert.ok(result.chapter.body.includes(second));
+  assert.ok(!result.chapter.body.includes('bare metadata'));
+  const list = events(db, writeTraceId!);
+  const dispositions = list.filter((event) => event.event === 'write.output.disposition');
+  assert.equal(dispositions.length, 2);
+  assert.deepEqual(dispositions.map((event) => event.decision), ['included', 'included']);
+  assert.equal(dispositions[1]?.refs.contributed_chars, second.length);
+  assert.equal(dispositions[1]?.refs.deduped_chars, 0);
+  const audit = trace.auditTrace(db, writeTraceId!);
+  assert.deepEqual(audit?.violations, []);
+  assert.equal(audit?.exhaustive, true);
   db.close();
 });
 
@@ -219,8 +400,11 @@ test('resolved context answers are consumed only by the later writer call', asyn
     },
   });
   assert.equal(calls.length, 2);
-  assert.equal(result.chapter.body, 'Second half final response.');
+  assert.equal(result.chapter.body, 'First half only.\n\nSecond half final response.');
+  assert.match(result.chapter.body, /First half only/);
+  assert.match(result.chapter.body, /Second half final response/);
   const list = events(db, writeTraceId!);
+  assert.equal(list.filter((event) => event.event === 'write.prompt.built').length, 1);
   assert.ok(list.some((event) => event.event === 'write.request.resolved'));
   assert.ok(list.some((event) => event.event === 'write.answer.consumed'));
   assert.ok(
@@ -230,26 +414,25 @@ test('resolved context answers are consumed only by the later writer call', asyn
         event.spanId.startsWith('sp-write-call-'),
     ),
   );
-  assert.ok(
-    list.some(
-      (event) =>
-        event.event === 'write.output.disposition' &&
-        event.decision === 'superseded',
-    ),
-  );
+  const dispositions = list.filter((event) => event.event === 'write.output.disposition');
+  assert.equal(dispositions.length, 2);
+  assert.ok(dispositions.every((event) => event.decision === 'included'));
+  assert.ok(dispositions.every((event) => Number(event.refs.contributed_chars) > 0));
+  assert.ok(!dispositions.some((event) => event.decision === 'superseded'));
   const audit = trace.auditTrace(db, writeTraceId!);
   assert.deepEqual(audit?.violations, []);
+  assert.equal(audit?.exhaustive, true);
   db.close();
 });
 
-test('resolved answers at the final round are explicitly not included', async () => {
+test('requests arriving with no additional writer budget are unanswered', async () => {
   const { db } = tempDb();
   const project = approvedProject(db, 'write-request-unconsumed');
   const { llm, calls } = scripted([
     'First answer request.\n\n[[CONTEXT]]\n{"kind":"au","query":"what changed"}\n[[END]]',
   ]);
   let writeTraceId: string | undefined;
-  await controller.writeChapter(db, llm, project.id, {
+  const result = await controller.writeChapter(db, llm, project.id, {
     chapterNumber: 1,
     bundle: emptyBundle(),
     targetWords: 1,
@@ -259,11 +442,260 @@ test('resolved answers at the final round are explicitly not included', async ()
       writeTraceId = id;
     },
   });
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 1, 'no follow-up call is made when maxRounds is 0');
+  assert.equal(result.chapter.body, 'First answer request.');
   const list = events(db, writeTraceId!);
-  assert.ok(list.some((event) => event.event === 'write.request.resolved'));
-  assert.ok(list.some((event) => event.event === 'write.answer.not-included'));
+  assert.ok(list.some((event) => event.event === 'write.request.unanswered'));
+  assert.ok(!list.some((event) => event.event === 'write.request.resolved'));
+  assert.ok(!list.some((event) => event.event === 'write.answer.not-included'));
   assert.ok(!list.some((event) => event.event === 'write.answer.consumed'));
+  const completed = list.find((event) => event.event === 'write.completed');
+  assert.equal(completed?.refs.unanswered_requests, 1);
+  const audit = trace.auditTrace(db, writeTraceId!);
+  assert.deepEqual(audit?.violations, []);
+  assert.equal(audit?.exhaustive, true);
+  assert.ok(audit?.limitations.some((item) => /unanswered/.test(item)));
+  db.close();
+});
+
+test('an answered request left without a writer call is traced not-included', async () => {
+  const { db } = tempDb();
+  const project = seedProject(db, 'write-unconsumed');
+  const started = trace.startTrace(db, {
+    projectId: project.id,
+    metadata: { command: 'write chapter' },
+  });
+  const writeTrace = new WriteTrace(db, project.id, started.id, {
+    chapterNumber: 1,
+    mode: 'write',
+    existing: false,
+    targetWords: 1,
+  });
+  const llm = scripted([
+    'Prose before the resolver fails.\n\n' +
+      '[[CONTEXT]]\n{"kind":"au","query":"one"}\n[[END]]\n' +
+      '[[CONTEXT]]\n{"kind":"au","query":"two"}\n[[END]]',
+  ]).llm;
+  let resolved = 0;
+  await assert.rejects(
+    writeChapter(
+      llm,
+      { chapterNumber: 1, memoryText: '', canonText: '', segments: 1, targetWords: 1, trace: writeTrace },
+      async (req, ctx) => {
+        resolved++;
+        if (resolved === 1) {
+          const answer = { label: 'answer one', kind: 'au' as const, content: 'ANSWER ONE' };
+          if (ctx) {
+            writeTrace.requestOutcome(ctx, req, 'resolved', answer, {
+              status: 'resolved',
+              resultCount: 1,
+            });
+          }
+          return answer;
+        }
+        throw new Error('resolver failed');
+      },
+      { maxRounds: 2, maxRequests: 10 },
+    ),
+    /resolver failed/,
+  );
+  writeTrace.failed('write-error');
+  writeTrace.finish(true);
+  const list = events(db, started.id);
+  assert.equal(list.filter((event) => event.event === 'write.answer.not-included').length, 1);
+  assert.equal(list.filter((event) => event.event === 'write.answer.consumed').length, 0);
+  const audit = trace.auditTrace(db, started.id);
+  assert.equal(audit?.exhaustive, false);
+  db.close();
+});
+
+test('simultaneous request-slot and round-budget limits remain distinct', async () => {
+  const { db } = tempDb();
+  const project = approvedProject(db, 'write-simultaneous-limits');
+  const { llm, calls } = scripted([
+    'First prose.\n\n' +
+      '[[CONTEXT]]\n{"kind":"au","query":"first"}\n[[END]]\n' +
+      '[[CONTEXT]]\n{"kind":"au","query":"second"}\n[[END]]',
+  ]);
+  let writeTraceId: string | undefined;
+  const result = await controller.writeChapter(db, llm, project.id, {
+    chapterNumber: 1,
+    bundle: emptyBundle(),
+    targetWords: 1,
+    contextLimits: { maxRounds: 0, maxRequests: 1 },
+    skipContinuity: true,
+    onWriteTraceId: (id) => {
+      writeTraceId = id;
+    },
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(result.chapter.body, 'First prose.');
+  const list = events(db, writeTraceId!);
+  assert.equal(list.filter((event) => event.event === 'write.request.unanswered').length, 1);
+  assert.equal(list.filter((event) => event.event === 'write.request.not-processed').length, 1);
+  assert.equal(list.filter((event) => event.event === 'write.request.resolved').length, 0);
+  assert.equal(list.filter((event) => event.event === 'write.request.over-limit').length, 0);
+  const completed = list.find((event) => event.event === 'write.completed');
+  assert.equal(completed?.refs.unanswered_requests, 1);
+  const audit = trace.auditTrace(db, writeTraceId!);
+  assert.deepEqual(audit?.violations, []);
+  assert.equal(audit?.exhaustive, true);
+  assert.ok(audit?.limitations.some((item) => /additional-call budget/.test(item)));
+  assert.ok(audit?.limitations.some((item) => /slot limit/.test(item)));
+  db.close();
+});
+
+test('near-duplicate removal updates main-output contribution counts', async () => {
+  const { db } = tempDb();
+  const project = approvedProject(db, 'write-near-duplicate-main');
+  const paragraphA = 'The rain fell steadily over the empty bridge while Serena watched the dark water below.';
+  const paragraphA2 = 'The rain fell steadily over the empty bridge as Serena watched the dark water below.';
+  const paragraphB = 'A lantern moved along the far bank and vanished behind the reeds.';
+  const { llm } = scripted([
+    `${paragraphA}\n\n[[CONTEXT]]\n{"kind":"au","query":"first"}\n[[END]]`,
+    `${paragraphA2}\n\n${paragraphB}`,
+  ]);
+  let writeTraceId: string | undefined;
+  const result = await controller.writeChapter(db, llm, project.id, {
+    chapterNumber: 1,
+    bundle: emptyBundle(),
+    targetWords: 1,
+    maxContinuations: 0,
+    skipContinuity: true,
+    onWriteTraceId: (id) => {
+      writeTraceId = id;
+    },
+  });
+  assert.ok(result.chapter.body.includes(paragraphA));
+  assert.ok(result.chapter.body.includes(paragraphB));
+  assert.ok(!result.chapter.body.includes(paragraphA2));
+  const list = events(db, writeTraceId!);
+  const dispositions = list.filter((event) => event.event === 'write.output.disposition');
+  assert.equal(dispositions.length, 2);
+  assert.deepEqual(dispositions.map((event) => event.decision), ['included', 'included']);
+  assert.ok(Number(dispositions[1]?.refs.contributed_chars) > 0);
+  assert.equal(dispositions[1]?.refs.contributed_chars, paragraphB.length);
+  assert.equal(dispositions[1]?.refs.deduped_chars, paragraphA2.length);
+  const audit = trace.auditTrace(db, writeTraceId!);
+  assert.deepEqual(audit?.violations, []);
+  assert.equal(audit?.exhaustive, true);
+  db.close();
+});
+
+test('a later paragraph contained in an earlier survivor is not credited', async () => {
+  const { db } = tempDb();
+  const project = approvedProject(db, 'write-substring-provenance');
+  const paragraphA = 'The rain fell steadily over the empty bridge while Serena watched the dark water below.';
+  const paragraphA2 = 'fell steadily over the empty bridge while Serena watched the dark water below.';
+  const { llm } = scripted([paragraphA, paragraphA2]);
+  let writeTraceId: string | undefined;
+  const result = await controller.writeChapter(db, llm, project.id, {
+    chapterNumber: 1,
+    bundle: emptyBundle(),
+    targetWords: 20,
+    segments: 2,
+    skipContinuity: true,
+    onWriteTraceId: (id) => {
+      writeTraceId = id;
+    },
+  });
+  assert.equal(result.chapter.body, paragraphA);
+  const list = events(db, writeTraceId!);
+  const dispositions = list.filter((event) => event.event === 'write.output.disposition');
+  assert.equal(dispositions.length, 2);
+  assert.deepEqual(dispositions.map((event) => event.decision), ['included', 'superseded']);
+  assert.equal(dispositions[1]?.refs.contributed_chars, 0);
+  assert.equal(dispositions[1]?.refs.deduped_chars, paragraphA2.length);
+  assert.equal(
+    list.find((event) => event.event === 'write.output.dedupe')?.refs.dropped_paragraphs,
+    1,
+  );
+  const audit = trace.auditTrace(db, writeTraceId!);
+  assert.deepEqual(audit?.violations, []);
+  assert.equal(audit?.exhaustive, true);
+  db.close();
+});
+
+test('intermediate dedupe removals are counted once in stats and trace', async () => {
+  const { db } = tempDb();
+  const project = approvedProject(db, 'write-dedupe-counter');
+  const paragraphs = [
+    'The first paragraph is long enough to be kept by the dedupe sweep.',
+    'The second paragraph is different and also long enough to survive.',
+    'The third paragraph carries a separate beat through the scene.',
+    'The fourth paragraph adds another distinct piece of action.',
+    'The fifth paragraph closes the sequence with a new detail.',
+  ];
+  const duplicate = paragraphs[0]!;
+  const { llm } = scripted([[...paragraphs, duplicate].join('\n\n')]);
+  let writeTraceId: string | undefined;
+  const result = await controller.writeChapter(db, llm, project.id, {
+    chapterNumber: 1,
+    bundle: emptyBundle(),
+    targetWords: 1,
+    maxContinuations: 1,
+    skipContinuity: true,
+    onWriteTraceId: (id) => {
+      writeTraceId = id;
+    },
+  });
+  const bodyParagraphs = result.chapter.body.split(/\n{2,}/).filter(Boolean);
+  assert.equal(bodyParagraphs.length, 5);
+  assert.equal((result.chapter.body.match(/The first paragraph/g) ?? []).length, 1);
+  assert.equal(result.stats.droppedParagraphs, 1);
+  const list = events(db, writeTraceId!);
+  assert.equal(
+    list.find((event) => event.event === 'write.output.dedupe')?.refs.dropped_paragraphs,
+    1,
+  );
+  assert.equal(
+    list.find((event) => event.event === 'write.completed')?.refs.dropped_paragraphs,
+    1,
+  );
+  const dispositions = list.filter((event) => event.event === 'write.output.disposition');
+  assert.equal(dispositions.length, 1);
+  assert.equal(dispositions[0]?.refs.deduped_chars, duplicate.length);
+  const audit = trace.auditTrace(db, writeTraceId!);
+  assert.deepEqual(audit?.violations, []);
+  assert.equal(audit?.exhaustive, true);
+  db.close();
+});
+
+test('continuation removed by the final dedupe is traced superseded', async () => {
+  const { db } = tempDb();
+  const project = approvedProject(db, 'write-near-duplicate-continuation');
+  const paragraphA = 'The rain fell steadily over the empty bridge while Serena watched the dark water below.';
+  const paragraphA2 = 'The rain fell steadily over the empty bridge as Serena watched the dark water below.';
+  const { llm } = scripted([paragraphA, paragraphA2]);
+  let writeTraceId: string | undefined;
+  const result = await controller.writeChapter(db, llm, project.id, {
+    chapterNumber: 1,
+    bundle: emptyBundle(),
+    targetWords: 100,
+    maxContinuations: 1,
+    skipContinuity: true,
+    onWriteTraceId: (id) => {
+      writeTraceId = id;
+    },
+  });
+  assert.equal(result.stats.continuations, 1);
+  assert.equal(result.chapter.body, paragraphA);
+  const list = events(db, writeTraceId!);
+  const dispositions = list.filter((event) => event.event === 'write.output.disposition');
+  assert.equal(dispositions.length, 2);
+  assert.deepEqual(dispositions.map((event) => event.decision), ['included', 'superseded']);
+  assert.equal(dispositions[1]?.refs.contributed_chars, 0);
+  assert.equal(dispositions[1]?.refs.deduped_chars, paragraphA2.length);
+  assert.ok(
+    list.some(
+      (event) =>
+        event.event === 'write.continuation.completed' &&
+        event.reasonCode === 'continuation-output',
+    ),
+  );
+  const audit = trace.auditTrace(db, writeTraceId!);
+  assert.deepEqual(audit?.violations, []);
+  assert.equal(audit?.exhaustive, true);
   db.close();
 });
 

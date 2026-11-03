@@ -141,11 +141,12 @@ ${C.bold('SOURCE MATERIAL')}
   sources                          List imported sources
   lore search <query>              Search canon, show passages with references
   lore ask <question>              Answer a lore question with citations
-  lore extract [--model m] [--max-windows n] [--starved-first n] [--starved-reserve n] [--priority-first n] [--random-floor f] [--seed n] [--full]
+  lore extract [--model m] [--max-windows n] [--starved-first n] [--starved-reserve n] [--priority-first n] [--random-floor f] [--seed n] [--full] [--trace]
                            Extract the book's lore: people, places, rules, facts.
                            No budget flags mines everything; --max-windows caps it (top priority
                            first, seeded sample of the rest); --full ignores the budget.
                            --starved-reserve n orders starved windows first on full runs (default 0).
+                           --trace writes a privacy-safe relationship-extraction trace.
   lore embed [--model m]           Embed passages, entities and triples for dense retrieval
   lore trails --query "..." [--out f]  Draw how each top passage connects to the query
                            [--web] show the association layer too (default off)
@@ -1142,6 +1143,7 @@ async function cmdLore(args: Args): Promise<void> {
       randomFloor: budgetFlag(args, 'random-floor'),
       seed: budgetFlag(args, 'seed'),
       full: args.flags.full === true,
+      trace: args.flags.trace === true ? { enabled: true } : undefined,
       onProgress: (m) => process.stdout.write(`  ${C.dim(m)}\n`),
     });
     console.log(
@@ -1149,6 +1151,7 @@ async function cmdLore(args: Args): Promise<void> {
         `${stats.facts} facts, ${stats.timeline} timeline entries` +
         (stats.provisional ? ` (${stats.provisional} provisional)` : ''),
     );
+    if (stats.traceId) console.log(C.dim(`trace ${stats.traceId}`));
     if (stats.selection) {
       console.log(
         C.dim(
@@ -1185,7 +1188,8 @@ async function cmdLore(args: Args): Promise<void> {
     if (stats.windowIssues.length) {
       console.log(C.dim(`  ${stats.windowIssues.length} window(s) incomplete and left unmined:`));
       for (const w of stats.windowIssues) {
-        console.log(C.dim(`    #${w.index} ${w.locator}: ${w.state} (${w.failedSections.join(', ')}) — ${w.detail}`));
+        const sections = [...w.failedSections, ...(w.incompleteSections ?? [])].join(', ');
+        console.log(C.dim(`    #${w.index} ${w.locator}: ${w.state} (${sections}) — ${w.detail}`));
       }
     }
     if (stats.contested && (stats.contested.facts || stats.contested.relations)) {
@@ -3121,6 +3125,26 @@ async function cmdTrace(args: Args, dbPath: string): Promise<void> {
           `admitted ${accounting.admitted} + deduplicated ${accounting.deduplicated} + ` +
           `rejected ${accounting.rejected} + parked ${accounting.parked} ` +
           `(${accounting.verified ? 'verified' : 'not verified'})`,
+      );
+    }
+    if (audit.extractionAccounting) {
+      const accounting = audit.extractionAccounting;
+      const outcomes = accounting.candidateOutcomes;
+      const claims = accounting.claimEvents
+        ? `claim events inserted ${accounting.claimEvents.inserted}, merged ${accounting.claimEvents.merged}, ` +
+          `hinted ${accounting.claimEvents.hinted}, noted ${accounting.claimEvents.noted}, ` +
+          `dropped ${accounting.claimEvents.dropped}`
+        : 'claim events unavailable';
+      console.log(
+        `extraction accounting: parsed ${accounting.parsedCandidates}, terminal ${accounting.terminalDispositions} ` +
+          `candidate outcomes (inserted ${outcomes.inserted}, merged ${outcomes.merged}, hinted ${outcomes.hinted}, ` +
+          `noted ${outcomes.noted}, dropped ${outcomes.dropped}, mixed ${outcomes.mixed}, ` +
+          `errors ${outcomes.errors}); ${claims}; sections failed ${accounting.failedSections}, ` +
+          `missing ${accounting.missingSections}, partial ${accounting.partialSections}, ` +
+          `unparsed ${accounting.unparsedSections}, skipped ${accounting.skippedSections}; ` +
+          `aborted candidates ${accounting.abortedCandidates}; unique hints ${accounting.uniqueHints ?? 'unavailable'}; ` +
+          `pipeline ${accounting.pipelineScope}/${accounting.pipelineLineage}; run ${accounting.runStatus} ` +
+          `(${accounting.candidateAccountingVerified ? 'candidate accounting verified' : 'candidate accounting not verified'})`,
       );
     }
     console.log(`\n${C.bold('Provable violations')}: ${audit.violations.length}`);

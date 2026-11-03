@@ -324,7 +324,7 @@ test('sampled and truncated traces are inconclusive', () => {
   assert.equal(trace.auditTrace(fixture.db, started.id)?.exhaustive, false);
 
   const truncated = trace.startTrace(fixture.db, { projectId: fixture.project.id });
-  for (let i = 0; i < 201; i++) {
+  for (let i = 0; i < trace.DIAGNOSTIC_MAX_EVENTS_PER_TRACE + 1; i++) {
     trace.recordTraceEvent(fixture.db, {
       traceId: truncated.id,
       projectId: fixture.project.id,

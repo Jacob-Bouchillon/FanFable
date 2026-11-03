@@ -29,6 +29,7 @@ import {
   type TransitionResult,
 } from '../../fanfable/src/court/claim-transition.ts';
 import {
+  DIAGNOSTIC_MAX_EVENTS_CEILING,
   DIAGNOSTIC_MAX_EVENTS_PER_TRACE,
   TRACE_EVENT_APPLIED,
   TRACE_STAGE_COURT_TRANSITION,
@@ -357,6 +358,50 @@ test('the diagnostic cap drops excess events and marks the trace truncated', () 
   assert.ok(audit);
   assert.equal(audit.completeness, 'truncated');
   assert.equal(audit.exhaustive, false);
+  db.close();
+});
+
+test('per-trace diagnostic caps are explicit, bounded and private', () => {
+  const { db, project } = setup();
+  const record = (traceId: string, index: number) =>
+    recordTraceEvent(db, {
+      traceId,
+      projectId: project.id,
+      spanId: `sp-cap-${index}`,
+      stage: 'test',
+      event: 'test.diagnostic',
+      eventClass: 'diagnostic',
+    });
+
+  // Ordinary metadata cannot raise the cap.
+  const metadataBypass = startTrace(db, {
+    projectId: project.id,
+    metadata: { diagnostic_max_events: 1 },
+  });
+  assert.equal(record(metadataBypass.id, 1).recorded, true);
+  assert.equal(record(metadataBypass.id, 2).recorded, true);
+  const bypassView = showTrace(db, metadataBypass.id);
+  assert.equal(bypassView?.trace.metadata.diagnostic_max_events, undefined);
+
+  // An explicit per-trace cap is honored.
+  const capped = startTrace(db, { projectId: project.id, maxEvents: 3 });
+  assert.equal(record(capped.id, 1).recorded, true);
+  assert.equal(record(capped.id, 2).recorded, true);
+  assert.equal(record(capped.id, 3).recorded, true);
+  const dropped = record(capped.id, 4);
+  assert.equal(dropped.recorded, false);
+  assert.equal(dropped.reason, 'cap');
+  assert.equal(showTrace(db, capped.id)?.trace.metadata.diagnostic_max_events, 3);
+
+  // An oversized explicit request is clamped to the hard ceiling.
+  const huge = startTrace(db, {
+    projectId: project.id,
+    maxEvents: DIAGNOSTIC_MAX_EVENTS_CEILING + 100,
+  });
+  assert.equal(
+    showTrace(db, huge.id)?.trace.metadata.diagnostic_max_events,
+    DIAGNOSTIC_MAX_EVENTS_CEILING,
+  );
   db.close();
 });
 

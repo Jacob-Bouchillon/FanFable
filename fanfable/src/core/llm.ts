@@ -77,12 +77,45 @@ export interface ChatRequest {
   format?: 'json';
 }
 
+/**
+ * Normalized provider stop reason.
+ *
+ * `stop` is the provider's normal completion. `length` and the other known
+ * non-stop reasons mean the provider stopped before a normal end. `unknown`
+ * is an unrecognised non-empty reason and is treated exactly like an absent
+ * reason: it neither proves truncation nor proves completion.
+ */
+export type FinishReason =
+  | 'stop'
+  | 'length'
+  | 'content_filter'
+  | 'tool_calls'
+  | 'function_call'
+  | 'unknown';
+
 export interface ChatResponse {
   text: string;
   model: string;
   provider: ProviderName;
   durationMs: number;
   usage?: { promptTokens?: number; completionTokens?: number };
+  /** Normalized provider stop reason; absent when the provider reports none. */
+  finishReason?: FinishReason;
+}
+
+function normalizeFinishReason(value: unknown): FinishReason | undefined {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  const reason = value.trim().toLowerCase();
+  if (
+    reason === 'stop' ||
+    reason === 'length' ||
+    reason === 'content_filter' ||
+    reason === 'tool_calls' ||
+    reason === 'function_call'
+  ) {
+    return reason;
+  }
+  return 'unknown';
 }
 
 export interface LlmClient {
@@ -272,6 +305,7 @@ class OllamaProvider implements LlmClient {
     let finalModel = this.settings.model;
     let promptTokens: number | undefined;
     let completionTokens: number | undefined;
+    let finishReason: string | undefined;
     try {
       const res = await fetch(`${this.settings.baseUrl.replace(/\/$/, '')}/api/chat`, {
         method: 'POST',
@@ -324,6 +358,7 @@ class OllamaProvider implements LlmClient {
             finalModel = data.model ?? finalModel;
             promptTokens = data.prompt_eval_count ?? promptTokens;
             completionTokens = data.eval_count ?? completionTokens;
+            finishReason = data.done_reason ?? finishReason;
             done = true;
           }
         }
@@ -356,6 +391,7 @@ class OllamaProvider implements LlmClient {
         promptTokens,
         completionTokens,
       },
+      finishReason: normalizeFinishReason(finishReason),
     };
   }
 
@@ -408,6 +444,7 @@ class OpenAiCompatProvider implements LlmClient {
         promptTokens: data?.usage?.prompt_tokens,
         completionTokens: data?.usage?.completion_tokens,
       },
+      finishReason: normalizeFinishReason(data?.choices?.[0]?.finish_reason),
     };
   }
 

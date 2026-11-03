@@ -131,8 +131,10 @@ export function diagnose(db: Db, projectId: number, opts: { limit?: number } = {
     }
     const windowIssues = lastRun.windowIssues ?? [];
     if (windowIssues.length) {
-      const failed = [...new Set(windowIssues.flatMap((w) => w.failedSections))].join(', ');
-      problems.push(`${windowIssues.length} window(s) incomplete (${failed}) and left for retry`);
+      const incomplete = [
+        ...new Set(windowIssues.flatMap((w) => [...w.failedSections, ...(w.incompleteSections ?? [])])),
+      ].join(', ');
+      problems.push(`${windowIssues.length} window(s) incomplete (${incomplete}) and left for retry`);
     }
     if (lastRun.quarantinedAliases) problems.push(`${lastRun.quarantinedAliases} near-duplicate name(s) await review`);
     if (problems.length) {

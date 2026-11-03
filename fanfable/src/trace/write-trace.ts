@@ -11,6 +11,9 @@ import type { ChatRequest, ChatResponse, LlmClient } from '../core/llm.ts';
 import * as traceLog from '../trace/trace.ts';
 import type { TraceRefs } from '../trace/trace.ts';
 
+/** A six-part write with four context follow-ups needs about 260 events. */
+export const WRITE_TRACE_MAX_EVENTS = 512;
+
 export interface TraceContextRequest {
   kind: string;
   query: string;
@@ -109,6 +112,7 @@ export class WriteTrace {
     answerChars: number;
   }>();
   private callSeq = 0;
+  private unansweredCount = 0;
   private finished = false;
   private failedFlag = false;
 
@@ -328,6 +332,7 @@ export class WriteTrace {
   }
 
   requestDisposition(ctx: RequestTraceContext, req: TraceContextRequest, status: string, reason: string): void {
+    if (status === 'unanswered') this.unansweredCount++;
     this.event(ctx.spanId, `write.request.${status}`, `request:${ctx.requestId}`, status, reason, 'best-effort', {
       stage: 'best-effort',
       part: ctx.part,
@@ -424,7 +429,7 @@ export class WriteTrace {
 
   outputDisposition(
     callId: string,
-    decision: 'included' | 'superseded' | 'empty' | 'truncated',
+    decision: 'included' | 'superseded' | 'empty' | 'truncated' | 'ambiguous',
     reason: string,
     extra: TraceRefs = {},
   ): void {
@@ -451,7 +456,7 @@ export class WriteTrace {
   }
 
   continuationCompleted(attempt: number, text: string): void {
-    this.event(`sp-write-continuation-${attempt}`, 'write.continuation.completed', `continuation:${attempt}`, 'completed', 'included', 'best-effort', {
+    this.event(`sp-write-continuation-${attempt}`, 'write.continuation.completed', `continuation:${attempt}`, 'completed', 'continuation-output', 'best-effort', {
       stage: 'best-effort',
       attempt,
       response_chars: text.length,
@@ -531,6 +536,7 @@ export class WriteTrace {
       body_words: info.words,
       continuation_count: info.continuations,
       dropped_paragraphs: info.droppedParagraphs,
+      unanswered_requests: this.unansweredCount,
     });
   }
 

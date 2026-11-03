@@ -142,6 +142,22 @@ Both apostrophes are one character now. `canonicalName` (and the sweep's tokenis
 
 A note's strength now comes from its evidence, never from a default of one: an assessment's stored `strength` when there is one (`assessed`), otherwise the quote's own shape — a tie stated about both people 0.9, a one-sided mention 0.35 — and mere co-presence becomes a context note at 0.2 (`context`). Context notes stay in the web as clues but are excluded from pair evidence and birth scoring. An open end is created only for a non-context note below the project threshold, so context never manufactures a question. Identity notes take their claim from the entity's stored evidence (then its summary) and are skipped as `no-identity-evidence` when there is neither, which retires the old "is recorded as &lt;kind&gt;" template that only restated our own column.
 
+### Relationship-extraction trace *(shipped)*
+
+`lore extract --trace` writes a diagnostic trace of relationship extraction. It is an accounting record, not a truth audit: `verified` means the recorded candidate/claim/disposition accounting is internally complete, never that the relationship is correct.
+
+Coverage starts at the JSON candidates the parser actually received. An empty/whitespace answer is `unparsed`, an omitted section key is `missing`, and mixed or wrongly shaped arrays are `partial` or `unparsed`; only a valid empty array is `empty`. Claims the model omitted are not observable and are never invented.
+
+Candidate and claim totals are named separately. `candidateOutcomes` counts terminal candidate dispositions; a mixed candidate can contain several claims. `claimEvents` counts recorded claim events and is `null` when the trace is not complete. `uniqueHints` counts distinct hint ids separately from hinted candidate dispositions.
+
+Section events carry a safe `parse_route` plus raw/accepted/filtered/salvaged counters from the parser branch that actually ran, so whole, fenced, embedded, salvaged, empty, missing and wrong-shaped sections can be distinguished without storing the answer. Only a genuine standalone split empty array or an explicit empty target key is `empty`; an embedded array that is not section-identified is unparsed/salvaged, omits unknown raw/filtered counts and marks the trace incomplete. A terminal hint reason distinguishes `ambiguous-endpoint` from `unresolved-endpoint` where the resolver data supports it.
+
+`pipelineScope` is `window-candidates-only` and `pipelineLineage` is `non-exhaustive`: inline close-the-loop enrichment runs after the extraction trace finalizes, so its model calls, candidates and final ties are not individually traced. Because of that scope, top-level `audit.exhaustive` is false for extraction traces. Use `candidateAccountingVerified` for window candidate accounting; it does not cover full pipeline or final entity/dedup lineage.
+
+Relation, hint, note and event IDs are recorded at decision time. Later kinship dedupe, entity merge or quarantine may replace or delete them. The audit checks presence and type in the trace, not project ownership, claim provenance or final database existence. Hashes are unsalted SHA-256 fingerprints, not anonymisation; a short guessed label or quote can be confirmed by hashing it.
+
+`dropped_events` is a lower bound when the trace ledger itself cannot persist an event; completeness is then `truncated` or `interrupted` and audit never verifies the trace. The privacy contract covers trace events only: `extraction_run` and `extraction_window_run` may contain raw error text or settings.
+
 ## 8. Rules future work must obey
 
 - No automatic `accepted` from a pronoun binding — even the best binders err one time in five, silently. Confirmed bindings become `user_confirmed`.

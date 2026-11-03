@@ -72,7 +72,54 @@ test('Ollama streaming chat accumulates content, model and token counts', async 
     assert.equal(response.provider, 'ollama');
     assert.equal(response.usage?.promptTokens, 10);
     assert.equal(response.usage?.completionTokens, 2);
+    assert.equal(response.finishReason, undefined, 'an absent provider reason stays unknown');
     assert.ok(response.durationMs >= 0);
+  } finally {
+    close();
+  }
+});
+
+test('Ollama normalizes a non-stop done_reason', async () => {
+  const { baseUrl, close } = await withServer(async (req, res) => {
+    await drainBody(req);
+    res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+    res.end(
+      JSON.stringify({
+        model: 'test-model',
+        message: { role: 'assistant', content: '{}' },
+        done: true,
+        done_reason: 'length',
+        prompt_eval_count: 3,
+        eval_count: 4,
+      }) + '\n',
+    );
+  });
+  try {
+    const client = createClient({ provider: 'ollama', baseUrl, model: 'test-model', timeoutMs: 5000 });
+    const response = await client.chat({ messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(response.finishReason, 'length');
+  } finally {
+    close();
+  }
+});
+
+test('Ollama keeps an unrecognised done_reason as unknown', async () => {
+  const { baseUrl, close } = await withServer(async (req, res) => {
+    await drainBody(req);
+    res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+    res.end(
+      JSON.stringify({
+        model: 'test-model',
+        message: { role: 'assistant', content: '{}' },
+        done: true,
+        done_reason: 'eos',
+      }) + '\n',
+    );
+  });
+  try {
+    const client = createClient({ provider: 'ollama', baseUrl, model: 'test-model', timeoutMs: 5000 });
+    const response = await client.chat({ messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(response.finishReason, 'unknown');
   } finally {
     close();
   }
@@ -221,6 +268,33 @@ test('OpenAI-compatible chat withholds the API key from a loopback server', asyn
     assert.equal(response.provider, 'openai');
     assert.equal(response.usage?.promptTokens, 5);
     assert.equal(response.usage?.completionTokens, 1);
+    assert.equal(response.finishReason, undefined, 'an absent provider reason stays unknown');
+  } finally {
+    close();
+  }
+});
+
+test('OpenAI-compatible normalizes finish_reason', async () => {
+  const { baseUrl, close } = await withServer(async (req, res) => {
+    await drainBody(req);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        model: 'vendor/model-7b',
+        choices: [{ message: { role: 'assistant', content: '{}' }, finish_reason: 'length' }],
+        usage: { prompt_tokens: 5, completion_tokens: 1 },
+      }),
+    );
+  });
+  try {
+    const client = createClient({
+      provider: 'openai',
+      baseUrl,
+      model: 'vendor/model-7b',
+      timeoutMs: 5000,
+    });
+    const response = await client.chat({ messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(response.finishReason, 'length');
   } finally {
     close();
   }
