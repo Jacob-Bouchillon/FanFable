@@ -40,6 +40,12 @@ function budgetMock(entities?: Record<string, unknown>[]) {
     if (system.includes('search keywords')) return JSON.stringify({ terms: ['bridge'] });
     if (system.includes('KNOWN ENTITIES')) return JSON.stringify({ relations: [] });
     if (system.includes('"timeline"')) return JSON.stringify({ timeline: [] });
+    const prompt = req.messages[0]?.content ?? '';
+    const passage = prompt.split('\n').slice(2).join('\n').trim();
+    const lines = passage.split('\n').map((line) => line.trim()).filter(Boolean);
+    const rawEvidence = lines[1] ?? lines[0] ?? 'the';
+    const cut = rawEvidence.slice(0, 120).lastIndexOf(' ');
+    const evidence = cut > 20 ? rawEvidence.slice(0, cut) : rawEvidence.slice(0, 120);
     return JSON.stringify({
       entities: entities ?? [
         {
@@ -51,7 +57,7 @@ function budgetMock(entities?: Record<string, unknown>[]) {
           role: '',
           status: '',
           chunk_index: 0,
-          evidence: 'the',
+          evidence,
         },
       ],
       facts: [],

@@ -847,6 +847,259 @@ export const MIGRATIONS: Migration[] = [
     `,
   },
   {
+    version: 31,
+    name: 'durable extraction recovery ledger',
+    // Additive only. Existing canon rows, lore_mined flags and the old
+    // extraction_run/extraction_window_run provenance remain untouched. These
+    // tables hold ownership, attempts, staged complete batches, stage
+    // coverage and contribution/effect identities for the recovery controller.
+    sql: `
+      CREATE TABLE IF NOT EXISTS extraction_recovery_parent (
+        id                  INTEGER PRIMARY KEY,
+        project_id          INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        source_id           INTEGER REFERENCES canon_source(id) ON DELETE SET NULL,
+        scope_key           TEXT NOT NULL,
+        dependency_version  TEXT NOT NULL,
+        fingerprint         TEXT NOT NULL,
+        status              TEXT NOT NULL DEFAULT 'pending',
+        readiness           TEXT NOT NULL DEFAULT 'pending',
+        optional_status     TEXT NOT NULL DEFAULT '{}',
+        created_at          TEXT NOT NULL,
+        completed_at        TEXT
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS extraction_recovery_parent_scope
+        ON extraction_recovery_parent(project_id, scope_key, fingerprint);
+      CREATE INDEX IF NOT EXISTS extraction_recovery_parent_status
+        ON extraction_recovery_parent(project_id, status);
+
+      CREATE TABLE IF NOT EXISTS extraction_recovery_child (
+        id                  INTEGER PRIMARY KEY,
+        parent_id           INTEGER NOT NULL REFERENCES extraction_recovery_parent(id) ON DELETE CASCADE,
+        project_id          INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        work_key            TEXT NOT NULL,
+        window_index        INTEGER NOT NULL,
+        source_order        INTEGER NOT NULL DEFAULT 0,
+        chunk_ids           TEXT NOT NULL DEFAULT '[]',
+        required_stages     TEXT NOT NULL DEFAULT '[]',
+        stage_fingerprints  TEXT NOT NULL DEFAULT '{}',
+        fingerprint         TEXT NOT NULL,
+        status              TEXT NOT NULL DEFAULT 'pending',
+        fencing             INTEGER NOT NULL DEFAULT 0,
+        retry_epoch         INTEGER NOT NULL DEFAULT 0,
+        created_at          TEXT NOT NULL,
+        completed_at        TEXT
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS extraction_recovery_child_window
+        ON extraction_recovery_child(parent_id, window_index);
+      CREATE UNIQUE INDEX IF NOT EXISTS extraction_recovery_child_work
+        ON extraction_recovery_child(project_id, work_key)
+        WHERE work_key <> '';
+      CREATE INDEX IF NOT EXISTS extraction_recovery_child_status
+        ON extraction_recovery_child(project_id, status);
+
+      CREATE TABLE IF NOT EXISTS extraction_recovery_run_child (
+        parent_id           INTEGER NOT NULL REFERENCES extraction_recovery_parent(id) ON DELETE CASCADE,
+        child_id            INTEGER NOT NULL REFERENCES extraction_recovery_child(id) ON DELETE CASCADE,
+        window_index        INTEGER NOT NULL,
+        source_order        INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (parent_id, window_index)
+      );
+      CREATE INDEX IF NOT EXISTS extraction_recovery_run_child_child
+        ON extraction_recovery_run_child(child_id);
+      CREATE INDEX IF NOT EXISTS extraction_recovery_run_child_order
+        ON extraction_recovery_run_child(parent_id, source_order);
+
+      CREATE TABLE IF NOT EXISTS extraction_recovery_chunk_work (
+        chunk_id            INTEGER NOT NULL REFERENCES canon_chunk(id) ON DELETE CASCADE,
+        project_id          INTEGER NOT NULL,
+        child_id            INTEGER NOT NULL REFERENCES extraction_recovery_child(id) ON DELETE CASCADE,
+        work_key            TEXT NOT NULL,
+        created_at          TEXT NOT NULL,
+        PRIMARY KEY (chunk_id, child_id)
+      );
+      CREATE INDEX IF NOT EXISTS extraction_recovery_chunk_work_project
+        ON extraction_recovery_chunk_work(project_id, chunk_id);
+      CREATE INDEX IF NOT EXISTS extraction_recovery_chunk_work_child
+        ON extraction_recovery_chunk_work(child_id);
+
+      CREATE TABLE IF NOT EXISTS extraction_attempt (
+        id                  INTEGER PRIMARY KEY,
+        child_id            INTEGER NOT NULL REFERENCES extraction_recovery_child(id) ON DELETE CASCADE,
+        project_id          INTEGER NOT NULL,
+        stage               TEXT NOT NULL,
+        fingerprint         TEXT NOT NULL,
+        retry_epoch         INTEGER NOT NULL DEFAULT 0,
+        attempt_number      INTEGER NOT NULL,
+        status              TEXT NOT NULL,
+        owner               TEXT NOT NULL,
+        fencing             INTEGER NOT NULL,
+        lease_until         TEXT NOT NULL,
+        finish_reason       TEXT NOT NULL DEFAULT '',
+        parser_route        TEXT NOT NULL DEFAULT '',
+        error_code          TEXT NOT NULL DEFAULT '',
+        started_at          TEXT NOT NULL,
+        finished_at         TEXT
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS extraction_attempt_number
+        ON extraction_attempt(child_id, stage, fingerprint, retry_epoch, attempt_number);
+      CREATE INDEX IF NOT EXISTS extraction_attempt_running
+        ON extraction_attempt(status, lease_until);
+      CREATE INDEX IF NOT EXISTS extraction_attempt_child
+        ON extraction_attempt(child_id, stage, fingerprint, retry_epoch);
+
+      CREATE TABLE IF NOT EXISTS extraction_staged_batch (
+        id                  INTEGER PRIMARY KEY,
+        attempt_id          INTEGER NOT NULL REFERENCES extraction_attempt(id) ON DELETE CASCADE,
+        child_id            INTEGER NOT NULL,
+        project_id          INTEGER NOT NULL,
+        stage               TEXT NOT NULL,
+        fingerprint         TEXT NOT NULL,
+        payload_json        TEXT NOT NULL,
+        payload_sha256      TEXT NOT NULL,
+        byte_size           INTEGER NOT NULL,
+        complete            INTEGER NOT NULL DEFAULT 0,
+        finish_reason       TEXT NOT NULL DEFAULT '',
+        created_at          TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS extraction_staged_batch_payload
+        ON extraction_staged_batch(child_id, stage, fingerprint, payload_sha256);
+      CREATE INDEX IF NOT EXISTS extraction_staged_batch_child
+        ON extraction_staged_batch(child_id, stage);
+
+      CREATE TABLE IF NOT EXISTS extraction_stage_coverage (
+        id                  INTEGER PRIMARY KEY,
+        child_id            INTEGER NOT NULL REFERENCES extraction_recovery_child(id) ON DELETE CASCADE,
+        project_id          INTEGER NOT NULL,
+        stage               TEXT NOT NULL,
+        fingerprint         TEXT NOT NULL,
+        status              TEXT NOT NULL,
+        attempt_id          INTEGER REFERENCES extraction_attempt(id) ON DELETE SET NULL,
+        result_json         TEXT NOT NULL DEFAULT '{}',
+        finalized_at        TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS extraction_stage_coverage_key
+        ON extraction_stage_coverage(child_id, stage, fingerprint);
+      CREATE INDEX IF NOT EXISTS extraction_stage_coverage_status
+        ON extraction_stage_coverage(project_id, status);
+
+      CREATE TABLE IF NOT EXISTS extraction_contribution (
+        id                  INTEGER PRIMARY KEY,
+        project_id          INTEGER NOT NULL,
+        child_id            INTEGER NOT NULL,
+        stage               TEXT NOT NULL,
+        contribution_uid    TEXT NOT NULL,
+        claim_type          TEXT NOT NULL,
+        payload_sha256      TEXT NOT NULL,
+        dependency_fingerprint TEXT NOT NULL DEFAULT '',
+        evaluation_count    INTEGER NOT NULL DEFAULT 0,
+        disposition         TEXT NOT NULL DEFAULT 'applied',
+        canon_table         TEXT NOT NULL DEFAULT '',
+        canon_id            INTEGER,
+        applied_at          TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS extraction_contribution_uid
+        ON extraction_contribution(project_id, contribution_uid);
+      CREATE INDEX IF NOT EXISTS extraction_contribution_child
+        ON extraction_contribution(child_id, stage);
+      CREATE INDEX IF NOT EXISTS extraction_contribution_canon
+        ON extraction_contribution(project_id, canon_table, canon_id);
+
+      CREATE TABLE IF NOT EXISTS extraction_effect (
+        id                  INTEGER PRIMARY KEY,
+        contribution_id     INTEGER NOT NULL REFERENCES extraction_contribution(id) ON DELETE CASCADE,
+        effect_type         TEXT NOT NULL,
+        effect_key          TEXT NOT NULL,
+        canon_table         TEXT NOT NULL DEFAULT '',
+        canon_id            INTEGER,
+        created_at          TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS extraction_effect_key
+        ON extraction_effect(contribution_id, effect_type, effect_key);
+      CREATE INDEX IF NOT EXISTS extraction_effect_canon
+        ON extraction_effect(canon_table, canon_id);
+
+      CREATE TABLE IF NOT EXISTS extraction_chunk_lease (
+        chunk_id            INTEGER PRIMARY KEY REFERENCES canon_chunk(id) ON DELETE CASCADE,
+        project_id          INTEGER NOT NULL,
+        child_id            INTEGER NOT NULL,
+        owner               TEXT NOT NULL,
+        fencing             INTEGER NOT NULL,
+        lease_until         TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS extraction_chunk_lease_child
+        ON extraction_chunk_lease(child_id);
+      CREATE INDEX IF NOT EXISTS extraction_chunk_lease_expiry
+        ON extraction_chunk_lease(lease_until);
+
+      CREATE TABLE IF NOT EXISTS extraction_roster_snapshot (
+        id                  INTEGER PRIMARY KEY,
+        project_id          INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        fingerprint         TEXT NOT NULL,
+        roster_json         TEXT NOT NULL,
+        created_at          TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS extraction_roster_snapshot_fingerprint
+        ON extraction_roster_snapshot(project_id, fingerprint);
+    `,
+  },
+  {
+    version: 32,
+    name: 'recovery ledger v31 upgrade',
+    // Migration 31 was edited in place during the experiment. A database that
+    // already recorded user_version 31 therefore skipped the revised shape.
+    // This later migration adds the missing columns/tables/indexes. Old
+    // experimental rows with an empty work_key are deliberately not reusable:
+    // they remain visible but fail closed as legacy-v31 work.
+    columns: [
+      ['extraction_recovery_parent', 'readiness', "TEXT NOT NULL DEFAULT 'pending'"],
+      ['extraction_recovery_parent', 'optional_status', "TEXT NOT NULL DEFAULT '{}'"],
+      ['extraction_recovery_child', 'work_key', "TEXT NOT NULL DEFAULT ''"],
+      ['extraction_recovery_child', 'retry_epoch', 'INTEGER NOT NULL DEFAULT 0'],
+      ['extraction_attempt', 'fingerprint', "TEXT NOT NULL DEFAULT ''"],
+      ['extraction_attempt', 'retry_epoch', 'INTEGER NOT NULL DEFAULT 0'],
+      ['extraction_contribution', 'dependency_fingerprint', "TEXT NOT NULL DEFAULT ''"],
+      ['extraction_contribution', 'evaluation_count', 'INTEGER NOT NULL DEFAULT 0'],
+    ],
+    sql: `
+      DROP INDEX IF EXISTS extraction_attempt_number;
+      DROP INDEX IF EXISTS extraction_attempt_child;
+      DROP INDEX IF EXISTS extraction_recovery_child_work;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS extraction_attempt_number
+        ON extraction_attempt(child_id, stage, fingerprint, retry_epoch, attempt_number);
+      CREATE INDEX IF NOT EXISTS extraction_attempt_child
+        ON extraction_attempt(child_id, stage, fingerprint, retry_epoch);
+      CREATE UNIQUE INDEX IF NOT EXISTS extraction_recovery_child_work
+        ON extraction_recovery_child(project_id, work_key)
+        WHERE work_key <> '';
+
+      CREATE TABLE IF NOT EXISTS extraction_recovery_run_child (
+        parent_id           INTEGER NOT NULL REFERENCES extraction_recovery_parent(id) ON DELETE CASCADE,
+        child_id            INTEGER NOT NULL REFERENCES extraction_recovery_child(id) ON DELETE CASCADE,
+        window_index        INTEGER NOT NULL,
+        source_order        INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (parent_id, window_index)
+      );
+      CREATE INDEX IF NOT EXISTS extraction_recovery_run_child_child
+        ON extraction_recovery_run_child(child_id);
+      CREATE INDEX IF NOT EXISTS extraction_recovery_run_child_order
+        ON extraction_recovery_run_child(parent_id, source_order);
+
+      CREATE TABLE IF NOT EXISTS extraction_recovery_chunk_work (
+        chunk_id            INTEGER NOT NULL REFERENCES canon_chunk(id) ON DELETE CASCADE,
+        project_id          INTEGER NOT NULL,
+        child_id            INTEGER NOT NULL REFERENCES extraction_recovery_child(id) ON DELETE CASCADE,
+        work_key            TEXT NOT NULL,
+        created_at          TEXT NOT NULL,
+        PRIMARY KEY (chunk_id, child_id)
+      );
+      CREATE INDEX IF NOT EXISTS extraction_recovery_chunk_work_project
+        ON extraction_recovery_chunk_work(project_id, chunk_id);
+      CREATE INDEX IF NOT EXISTS extraction_recovery_chunk_work_child
+        ON extraction_recovery_chunk_work(child_id);
+    `,
+  },
+  {
     version: 30,
     name: 'trace ledger',
     // Observability only: a trace records what a pipeline stage decided, not

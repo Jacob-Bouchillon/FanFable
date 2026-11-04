@@ -141,12 +141,16 @@ ${C.bold('SOURCE MATERIAL')}
   sources                          List imported sources
   lore search <query>              Search canon, show passages with references
   lore ask <question>              Answer a lore question with citations
-  lore extract [--model m] [--max-windows n] [--starved-first n] [--starved-reserve n] [--priority-first n] [--random-floor f] [--seed n] [--full] [--trace]
+  lore extract [--model m] [--max-windows n] [--starved-first n] [--starved-reserve n] [--priority-first n] [--random-floor f] [--seed n] [--full] [--retry] [--legacy] [--trace]
                            Extract the book's lore: people, places, rules, facts.
                            No budget flags mines everything; --max-windows caps it (top priority
                            first, seeded sample of the rest); --full ignores the budget.
+                           In staged fragment mode the budget counts bounded fragments.
                            --starved-reserve n orders starved windows first on full runs (default 0).
-                           --trace writes a privacy-safe relationship-extraction trace.
+                           --retry resets an exhausted/deferred recovery backoff; it never steals an active lease.
+                           --legacy explicitly uses the old canon-publishing extraction path.
+                           --trace requires --legacy; stage-only extraction does not write traces.
+                           --legacy publishes to canon, so use it only on a disposable database.
   lore embed [--model m]           Embed passages, entities and triples for dense retrieval
   lore trails --query "..." [--out f]  Draw how each top passage connects to the query
                            [--web] show the association layer too (default off)
@@ -450,6 +454,12 @@ async function cmdSources(args: Args): Promise<void> {
 }
 
 async function cmdLore(args: Args): Promise<void> {
+  if (args._[1] === 'extract' && args.flags.trace === true && args.flags.legacy !== true) {
+    throw new Error(
+      '--trace requires --legacy: stage-only extraction does not write traces. ' +
+        '--legacy publishes through the canon path, so use it only on a disposable database.',
+    );
+  }
   const project = requireProject(args);
   const sub = args._[1] ?? '';
   const a = app(args);
@@ -1143,19 +1153,157 @@ async function cmdLore(args: Args): Promise<void> {
       randomFloor: budgetFlag(args, 'random-floor'),
       seed: budgetFlag(args, 'seed'),
       full: args.flags.full === true,
+      recovery: args.flags.legacy === true
+        ? { enabled: false }
+        : { explicitRetry: args.flags.retry === true, stageOnly: true },
       trace: args.flags.trace === true ? { enabled: true } : undefined,
       onProgress: (m) => process.stdout.write(`  ${C.dim(m)}\n`),
     });
-    console.log(
-      `${C.green('extracted')} ${stats.entities} entities, ${stats.relations} relationships, ` +
-        `${stats.facts} facts, ${stats.timeline} timeline entries` +
-        (stats.provisional ? ` (${stats.provisional} provisional)` : ''),
-    );
+    const staged = stats.stageOnly === true || stats.recovery?.readiness === 'staged_only';
+    const fragmentCoverage = stats.fragmentCoverage;
+    const partialSource =
+      fragmentCoverage?.status === 'partial' || stats.recovery?.status === 'partial';
+    const incompleteSource =
+      fragmentCoverage?.status === 'none' ||
+      stats.recovery?.status === 'failed' ||
+      stats.recovery?.status === 'deferred';
+    if (stats.legacyStagedContributions?.count) {
+      console.log(
+        C.yellow(
+          `  warning: ${stats.legacyStagedContributions.count} pre-namespace staged contribution(s) ` +
+            'are incompatible; they are not reused as staging and need manual review before publication. ' +
+            'No automatic repair was performed.',
+        ),
+      );
+    }
+    if (stats.emptySource) {
+      console.log(
+        C.yellow(
+          staged
+            ? 'nothing to stage: no imported passages are available'
+            : 'nothing to extract: no imported passages are available',
+        ),
+      );
+      return;
+    }
+    if (stats.recoveryNoEligibleWork) {
+      console.log(
+        `${C.yellow('nothing staged')} every candidate is already complete or deferred; ` +
+          'completed work is reused and deferred work needs --retry after review.',
+      );
+    } else {
+      console.log(
+        staged
+          ? `${C.yellow(
+              incompleteSource
+                ? 'staging incomplete (not canon)'
+                : partialSource
+                  ? 'staged partially (not canon)'
+                  : 'staged only (not canon)',
+            )} ${stats.entities} entities, ${stats.relations} relationships, ` +
+              `${stats.facts} facts, ${stats.timeline} timeline entries. ` +
+              'Nothing was published to canon, lore_mined or embeddings; publication is not implemented.'
+          : `${C.green('extracted')} ${stats.entities} entities, ${stats.relations} relationships, ` +
+              `${stats.facts} facts, ${stats.timeline} timeline entries` +
+              (stats.provisional ? ` (${stats.provisional} provisional)` : ''),
+      );
+    }
+    if (fragmentCoverage) {
+      console.log(
+        C.dim(
+          `  source coverage: ${fragmentCoverage.status}; ` +
+            `${fragmentCoverage.completeFragments}/${fragmentCoverage.plannedFragments} fragments complete; ` +
+            `${fragmentCoverage.completeSourceChunks}/${fragmentCoverage.totalSourceChunks} source chunk(s) complete, ` +
+            `${fragmentCoverage.partialSourceChunks} partial, ${fragmentCoverage.uncoveredSourceChunks} uncovered`,
+        ),
+      );
+      if (fragmentCoverage.status === 'none' || incompleteSource) {
+        console.log(
+          C.yellow(
+            '  warning: source coverage is incomplete; this run is not a complete source-coverage claim',
+          ),
+        );
+      } else if (fragmentCoverage.status === 'partial') {
+        console.log(
+          C.yellow(
+            '  warning: source coverage is partial; this run is not a complete source-coverage claim',
+          ),
+        );
+      }
+      if (fragmentCoverage.staleRelationFragments) {
+        console.log(
+          C.dim(
+            `  ${fragmentCoverage.staleRelationFragments} fragment(s) need relationship revalidation against the final staged roster`,
+          ),
+        );
+      }
+    } else if (stats.recoveryRelationStale) {
+      console.log(
+        C.dim(
+          `  ${stats.recoveryRelationStale} window(s) need relationship revalidation against the final staged roster`,
+        ),
+      );
+    }
+    if (!fragmentCoverage && incompleteSource) {
+      console.log(
+        C.yellow(
+          '  warning: source coverage is incomplete; this run is not a complete source-coverage claim',
+        ),
+      );
+    }
+    if (stats.truncatedPassages) {
+      console.log(
+        C.yellow(
+          `  warning: ${stats.truncatedPassages} passage(s) exceeded ` +
+            `${stats.promptPassageChars ?? 1400} characters; only the prefix was read, ` +
+            'so this run is not exhaustive source coverage',
+        ),
+      );
+    }
     if (stats.traceId) console.log(C.dim(`trace ${stats.traceId}`));
+    if (stats.recovery) {
+      console.log(
+        C.dim(
+          `  recovery parent ${stats.recovery.parentId}: ${stats.recovery.status}; ` +
+            `${stats.recovery.completeChildren}/${stats.recovery.children} ` +
+            `${stats.fragmentMode ? 'fragment' : 'window'}(s) complete` +
+            (stats.recovery.deferredChildren
+              ? `, ${stats.recovery.deferredChildren} deferred (retry with --retry after reviewing)`
+              : ''),
+        ),
+      );
+      console.log(
+        C.dim(
+          `  recovery readiness: ${stats.recovery.readiness}; ` +
+            `optional: notes ${String((stats.recovery.optional as Record<string, unknown>).noteIngestion ?? 'unknown')}, ` +
+            `close-loop ${String((stats.recovery.optional as Record<string, unknown>).closeTheLoop ?? 'unknown')}, ` +
+            `embeddings ${String((stats.recovery.optional as Record<string, unknown>).embeddings ?? 'unknown')}`,
+        ),
+      );
+    }
+    if (stats.legacyBlockedFragments || stats.legacyBlockedWindows) {
+      const blocked = stats.fragmentMode
+        ? stats.legacyBlockedFragments ?? 0
+        : stats.legacyBlockedWindows ?? 0;
+      console.log(
+        C.yellow(
+          `  ${blocked} ${stats.fragmentMode ? 'fragment' : 'window'}(s) left untouched: legacy mined rows block recovery; old canon was not changed`,
+        ),
+      );
+    }
+    if (stats.recoverySkippedComplete || stats.recoverySkippedDeferred) {
+      console.log(
+        C.dim(
+          `  budget skipped ${stats.recoverySkippedComplete ?? 0} complete and ` +
+            `${stats.recoverySkippedDeferred ?? 0} deferred ${stats.fragmentMode ? 'fragment' : 'window'}(s)`,
+        ),
+      );
+    }
     if (stats.selection) {
       console.log(
         C.dim(
-          `  budget: mined ${stats.selection.selected} of ${stats.selection.total} windows, ` +
+          `  budget: mined ${stats.selection.selected} of ${stats.selection.total} ` +
+            `${stats.fragmentMode ? 'fragments' : 'windows'}, ` +
             `${stats.selection.skipped} left unmined (re-run with --full for the rest)`,
         ),
       );
@@ -1181,12 +1329,21 @@ async function cmdLore(args: Args): Promise<void> {
         ),
       );
     }
+    if (stats.executionFailures) {
+      console.log(
+        C.yellow(
+          `  ${stats.executionFailures} ${stats.fragmentMode ? 'fragment' : 'window'}(s) failed before producing an outcome; see diagnostics`,
+        ),
+      );
+    }
     if (stats.emptyWindows.length) {
-      console.log(C.dim(`  ${stats.emptyWindows.length} window(s) produced nothing:`));
+      const unit = stats.fragmentMode ? 'fragment' : 'window';
+      console.log(C.dim(`  ${stats.emptyWindows.length} ${unit}(s) produced nothing:`));
       for (const w of stats.emptyWindows) console.log(C.dim(`    #${w.index} ${w.locator}: ${w.reason}`));
     }
     if (stats.windowIssues.length) {
-      console.log(C.dim(`  ${stats.windowIssues.length} window(s) incomplete and left unmined:`));
+      const unit = stats.fragmentMode ? 'fragment' : 'window';
+      console.log(C.dim(`  ${stats.windowIssues.length} ${unit}(s) incomplete and left unmined:`));
       for (const w of stats.windowIssues) {
         const sections = [...w.failedSections, ...(w.incompleteSections ?? [])].join(', ');
         console.log(C.dim(`    #${w.index} ${w.locator}: ${w.state} (${sections}) — ${w.detail}`));
@@ -1204,7 +1361,7 @@ async function cmdLore(args: Args): Promise<void> {
         C.dim(`  ${stats.quarantinedAliases.length} near-duplicate name(s) left for review; see "fanfable lore merge"`),
       );
     }
-    console.log(C.dim('  review them with "fanfable lore show"'));
+    console.log(C.dim(staged ? '  staged work is not visible to retrieval, writer or canon; a separate publication path is required' : '  review them with "fanfable lore show"'));
     return;
   }
 

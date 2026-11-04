@@ -81,10 +81,11 @@ test('sub-word digits are rejected while standalone digits are accepted', () => 
   assert.equal(accepted('23', 'At 23 doors.').quote, '23');
 });
 
-test('normalized-only boundary variants stay ambiguous; repeated exact text uses the first', () => {
+test('normalized-only boundary variants and repeated exact text stay ambiguous', () => {
   assert.equal(lorebook.verifySpan('hello', chunk('Hello. HELLO.')).status, 'dropped');
   assert.equal(lorebook.verifySpan('hello', chunk('Hello. HELLO.')).quote, '');
-  assert.equal(accepted('hello', 'hello. hello.').quote, 'hello.');
+  assert.equal(lorebook.verifySpan('hello', chunk('hello. hello.')).status, 'dropped');
+  assert.equal(lorebook.verifySpan('hello', chunk('hello. hello.')).quote, '');
 });
 
 test('accepted spans are raw-exact in the source chunk', () => {

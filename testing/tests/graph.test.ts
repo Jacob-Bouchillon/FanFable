@@ -436,14 +436,15 @@ test('a compound relation kind is split into separate relations', () => {
 test('a kind that is really the prompt example list is not stored', () => {
   const { db } = tempDb();
   const project = seedProject(db, 'graph-kinds-list');
+  const evidence = 'Serena Marsh watched it from the ridge';
   const llm = mockProvider(() =>
     JSON.stringify({
       entities: [
-        { kind: 'character', name: 'A', aliases: [], summary: '', attributes: {}, role: '', status: '', chunk_index: 0, evidence: 'bridge' },
-        { kind: 'character', name: 'B', aliases: [], summary: '', attributes: {}, role: '', status: '', chunk_index: 0, evidence: 'bridge' },
+        { kind: 'character', name: 'A', aliases: [], summary: '', attributes: {}, role: '', status: '', chunk_index: 0, evidence },
+        { kind: 'character', name: 'B', aliases: [], summary: '', attributes: {}, role: '', status: '', chunk_index: 0, evidence },
       ],
       relations: [
-        { from: 'A', to: 'B', kind: 'sibling of | serves | suspects | owes | married to | leads', description: 'x', chunk_index: 0, evidence: 'bridge' },
+        { from: 'A', to: 'B', kind: 'sibling of | serves | suspects | owes | married to | leads', description: 'x', chunk_index: 0, evidence },
       ],
       facts: [],
       timeline: [],

@@ -98,6 +98,53 @@ function startJob(
   return { id };
 }
 
+/** Diagnostic entries exposed to the browser never carry raw exception text. */
+function publicDiagnosticList(value: unknown): unknown {
+  if (!Array.isArray(value)) return value;
+  return value.map((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return entry;
+    const copy = { ...(entry as Record<string, unknown>) };
+    delete copy.detail;
+    if (Array.isArray(copy.sections)) {
+      copy.sections = copy.sections.map((section) => {
+        if (!section || typeof section !== 'object' || Array.isArray(section)) return section;
+        const safeSection = { ...(section as Record<string, unknown>) };
+        delete safeSection.error;
+        return safeSection;
+      });
+    }
+    return copy;
+  });
+}
+
+function publicJobResult(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(publicJobResult);
+  if (!value || typeof value !== 'object') return value;
+  const out: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (key === 'emptyWindows' || key === 'windowIssues') {
+      out[key] = publicDiagnosticList(entry);
+    } else {
+      out[key] = publicJobResult(entry);
+    }
+  }
+  return out;
+}
+
+function publicJobView(job: Job): Record<string, unknown> {
+  const result = job.result === undefined ? undefined : publicJobResult(job.result);
+  return {
+    id: job.id,
+    name: job.name,
+    status: job.status,
+    message: job.status === 'error' ? 'job failed' : job.message,
+    ...(job.status === 'error' ? { error: 'job failed' } : {}),
+    ...(result === undefined ? {} : { result }),
+    startedAt: job.startedAt,
+    ...(job.finishedAt === undefined ? {} : { finishedAt: job.finishedAt }),
+  };
+}
+
 /* ------------------------------------------------------------------ utils */
 
 function json(res: ServerResponse, code: number, body: unknown): void {
@@ -478,6 +525,9 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
             randomFloor: num(body.randomFloor),
             seed: num(body.seed),
             full: body.full === true,
+            recovery: body.legacy === true
+              ? { enabled: false }
+              : { explicitRetry: body.retry === true, stageOnly: true },
             onProgress: (m) => progress(m),
           });
         });
@@ -1029,7 +1079,7 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
           json(res, 404, { error: 'job not found' });
           return;
         }
-        json(res, 200, job);
+        json(res, 200, publicJobView(job));
         return;
       }
 

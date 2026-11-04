@@ -11,7 +11,22 @@
  * than in a wall of retrieved text.
  */
 import { Db, fromJson, nowIso, strList, toJson } from './core/db.ts';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  RecoveryController,
+  legacyStagedContributionStatus,
+  newRecoveryOwner,
+  recoveryContributionUid,
+  recoveryPublishedChunkIds,
+  recoveryStageFingerprint,
+  stagedRecoveryContributionUid,
+  RECOVERY_DEPENDENCY_VERSION,
+  RECOVERY_PARSER_VERSION,
+  startRecoveryHeartbeat,
+  type RecoveryPolicy,
+  type RecoveryStage,
+  type RecoveryStageStatus,
+} from './extract/recovery.ts';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -375,6 +390,22 @@ export interface ExtractWindowProgress {
   passagesTotal: number;
 }
 
+export interface ExtractionRecoveryOptions {
+  /**
+   * Opt-in durable recovery. User-facing CLI/server/lazy paths enable it; the
+   * direct library path stays on the legacy completion flow unless asked.
+   */
+  enabled?: boolean;
+  /** Explicit retry creates a new parent and bypasses exhausted backoff. */
+  explicitRetry?: boolean;
+  /** Stage only; never write canon, mined flags, provenance or embeddings. */
+  stageOnly?: boolean;
+  /** Lease/attempt policy. Defaults are the approved 3-attempt/5-minute policy. */
+  policy?: Partial<RecoveryPolicy>;
+  /** Test seam; production uses setTimeout. */
+  sleep?: (ms: number) => Promise<void>;
+}
+
 export interface ExtractOptions {
   sourceId?: number;
   /** How many passages to send in one request. */
@@ -454,6 +485,8 @@ export interface ExtractOptions {
    * canon writes never depend on a trace write. Off by default.
    */
   trace?: ExtractionTraceOptions;
+  /** Durable attempt/stage recovery. Off only for the legacy library path. */
+  recovery?: ExtractionRecoveryOptions;
 }
 
 /** What the span gate did with the claims of one extraction run. */
@@ -520,7 +553,9 @@ export type ExtractionIncompleteReason =
   | 'finish-length'
   | 'finish-content-filter'
   | 'finish-tool-calls'
-  | 'finish-function-call';
+  | 'finish-function-call'
+  | 'finish-unknown'
+  | 'finish-missing';
 
 /** The parser section behind an incomplete split/legacy report. */
 export interface ExtractionIncompletePart {
@@ -597,6 +632,8 @@ interface WindowOutcome {
   incompleteSections: ExtractionSectionName[];
   wrote: { entities: number; facts: number; relations: number; timeline: number };
   error: string;
+  /** Legacy provenance was attempted/written in the recovery finalization transaction. */
+  provenanceWritten?: boolean;
 }
 
 /** A pair that looks like one thing under two names but was not merged. */
@@ -616,6 +653,55 @@ export interface ExtractLoreResult {
   windows: number;
   /** Lazy retrieval skipped these because an earlier attempt was incomplete or zero-write. */
   skippedRepeatedWindows?: number;
+  /** Recovery windows left unprocessed because they contain legacy mined rows. */
+  legacyBlockedWindows?: number;
+  /** True when this run was deliberately staging-only and wrote no canon. */
+  stageOnly?: boolean;
+  /** Bounded recovery skipped this many already-complete work units. */
+  recoverySkippedComplete?: number;
+  /** Bounded recovery skipped this many exhausted-deferred work units. */
+  recoverySkippedDeferred?: number;
+  /** Complete windows made eligible again because the shared roster changed. */
+  recoveryRosterStale?: number;
+  /** Completed work whose relation coverage is stale against the final roster. */
+  recoveryRelationStale?: number;
+  /** Windows/fragments that threw before producing a structured outcome. */
+  executionFailures?: number;
+  /** Pre-namespace staged rows that cannot be safely reused or published. */
+  legacyStagedContributions?: {
+    count: number;
+    stages: string[];
+    claimTypes: string[];
+    status: 'incompatible-prefix';
+    action: 'manual-review-required';
+  };
+  /** Every budget candidate was already complete/deferred, so nothing ran. */
+  recoveryNoEligibleWork?: boolean;
+  /** No imported passages were available, so nothing was extracted or staged. */
+  emptySource?: boolean;
+  /** Chunks whose prompt text exceeded the per-passage prompt budget. */
+  truncatedPassages?: number;
+  /** True when at least one selected passage was not fully shown to the model. */
+  coverageNonExhaustive?: boolean;
+  /** Per-passage prompt character budget used when building prompts. */
+  promptPassageChars?: number;
+  /** True when stage-only extraction is using bounded fragment children. */
+  fragmentMode?: boolean;
+  /** Fragment/source-chunk coverage for fragment-mode extraction. */
+  fragmentCoverage?: {
+    plannedFragments: number;
+    selectedFragments: number;
+    completeFragments: number;
+    totalSourceChunks: number;
+    completeSourceChunks: number;
+    partialSourceChunks: number;
+    uncoveredSourceChunks: number;
+    /** Completed fragments whose relationship fingerprint no longer matches the final roster. */
+    staleRelationFragments: number;
+    status: 'complete' | 'partial' | 'none';
+  };
+  /** Fragments skipped because their source chunk is legacy-blocked. */
+  legacyBlockedFragments?: number;
   verification: VerificationStats;
   /** Rows that passed the verbatim gate but failed the proven tier. */
   provisional: number;
@@ -634,6 +720,16 @@ export interface ExtractLoreResult {
   noteTraceIds?: string[];
   /** Relationship-extraction trace id, when tracing was requested and available. */
   traceId?: string;
+  /** Durable recovery parent status, when recovery was enabled. */
+  recovery?: {
+    parentId: number;
+    status: string;
+    readiness: string;
+    optional: Record<string, unknown>;
+    children: number;
+    completeChildren: number;
+    deferredChildren: number;
+  };
   /** Windows reserved for starved threads, and the threads they covered. */
   starvedReserved?: number;
   starvedUsed?: number;
@@ -649,6 +745,10 @@ export interface ChunkRow {
   source_title: string;
   path: string;
   source_id: number;
+  /** UTF-16 offset into the canonical chunk text for this fragment (inclusive). */
+  chunk_start?: number;
+  /** UTF-16 offset into the canonical chunk text for this fragment (exclusive). */
+  chunk_end?: number;
 }
 
 /* ------------------------------------------------------- window scoring */
@@ -852,6 +952,366 @@ export function starvedCandidateIndices(
   return reserved;
 }
 
+interface RecoveryRuntime {
+  controller: RecoveryController;
+  parentId: number;
+  /** Unique parent/run scope id; string for staging, number for legacy DB runs. */
+  runId: number | string;
+  owner: string;
+  parentFingerprint: string;
+  explicitRetry: boolean;
+  stageOnly: boolean;
+  fragmentMode: boolean;
+  childByWindowIndex: Map<number, number>;
+  /** Compatible children whose verified staged entities belong to this generation. */
+  rosterChildIds: number[];
+  stageFingerprint: (window: ChunkRow[], stage: RecoveryStage, rosterOverride?: string) => string;
+}
+
+function hashJson(value: unknown): string {
+  return createHash('sha256').update(JSON.stringify(value)).digest('hex');
+}
+
+function recoverySettingsHash(llm: LlmClient): string {
+  const s = llm.settings;
+  return hashJson({
+    provider: s.provider,
+    model: s.model,
+    temperature: s.temperature,
+    maxTokens: s.maxTokens,
+    contextTokens: s.contextTokens,
+    seed: s.seed ?? null,
+    think: s.think ?? null,
+  });
+}
+
+function recoveryStagePrompt(stage: RecoveryStage): string {
+  if (stage === 'entities-facts') return EXTRACT_ENTITIES_SYSTEM;
+  if (stage === 'relations') return relationsSystemPrompt();
+  if (stage === 'timeline') return EXTRACT_EVENTS_SYSTEM;
+  return EXTRACT_SYSTEM;
+}
+
+function requiredRecoveryStages(singlePrompt: boolean): RecoveryStage[] {
+  return singlePrompt
+    ? ['legacy']
+    : ['entities-facts', 'relations', 'timeline'];
+}
+
+/**
+ * Recovery is the default for every real provider. An explicit stageOnly
+ * request always forces the staging boundary, even for the offline mock
+ * provider. Otherwise callers can opt out with recovery.enabled = false.
+ */
+function recoveryEnabledFor(
+  opts: { recovery?: ExtractionRecoveryOptions },
+  llm: LlmClient,
+): boolean {
+  if (opts.recovery?.stageOnly === true) return true;
+  if (opts.recovery?.enabled !== undefined) return opts.recovery.enabled;
+  return llm.settings.provider !== 'mock';
+}
+
+/** Real providers are staging-only by default; mock tests retain the old path. */
+function recoveryStageOnlyFor(
+  opts: { recovery?: ExtractionRecoveryOptions },
+  llm: LlmClient,
+): boolean {
+  if (opts.recovery?.stageOnly !== undefined) return opts.recovery.stageOnly;
+  return llm.settings.provider !== 'mock';
+}
+
+
+function recoveryStageConfigHash(
+  llm: LlmClient,
+  opts: ExtractOptions,
+  singlePrompt: boolean,
+  windowSize: number,
+  maxTokens: number,
+  stageOnly: boolean,
+  freshNonce = '',
+): string {
+  return hashJson({
+    kind: 'fanfable-recovery-stage-config',
+    provider: llm.settings.provider,
+    model: llm.settings.model,
+    settingsHash: recoverySettingsHash(llm),
+    windowSize,
+    maxTokens,
+    singlePrompt,
+    stageOnly,
+    requiredStages: requiredRecoveryStages(singlePrompt),
+    parserVersion: RECOVERY_PARSER_VERSION,
+    dependencyVersion: RECOVERY_DEPENDENCY_VERSION,
+    freshNonce,
+    prompts: requiredRecoveryStages(singlePrompt).map((stage) => ({
+      stage,
+      prompt: recoveryStagePrompt(stage),
+    })),
+    strictRelations: strictRelationsEnabled(),
+    relationRoster: process.env.FANFABLE_REL_ROSTER === '1',
+  });
+}
+
+function recoveryGenerationRevision(
+  db: Db,
+  projectId: number,
+  chunks: ChunkRow[],
+): string {
+  const sourceIds = [...new Set(chunks.map((chunk) => chunk.source_id))].sort((a, b) => a - b);
+  return hashJson({
+    kind: 'fanfable-recovery-generation-revision',
+    projectId,
+    chunks: chunks.map((chunk) => ({
+      id: chunk.id,
+      seq: chunk.seq,
+      source_id: chunk.source_id,
+      locator: chunk.locator,
+      text: createHash('sha256').update(chunk.text, 'utf8').digest('hex'),
+    })),
+    sources: sourceIds.map((sourceId) => ({
+      id: sourceId,
+      sha256: db.get<{ sha256: string }>(
+        'SELECT sha256 FROM canon_source WHERE id = ?',
+        sourceId,
+      )?.sha256 ?? '',
+    })),
+  });
+}
+
+function recoveryWindowWorkKey(
+  db: Db,
+  projectId: number,
+  window: ChunkRow[],
+  stageConfigHash: string,
+  requiredStages: RecoveryStage[],
+  generationRevision: string,
+  fragmentStart?: number,
+  fragmentEnd?: number,
+): string {
+  const sourceIds = [...new Set(window.map((chunk) => chunk.source_id))].sort((a, b) => a - b);
+  const sourceRevision = hashJson({
+    kind: 'fanfable-recovery-source-revision',
+    chunks: window.map((chunk) => ({
+      id: chunk.id,
+      seq: chunk.seq,
+      source_id: chunk.source_id,
+      locator: chunk.locator,
+      text: createHash('sha256').update(chunk.text, 'utf8').digest('hex'),
+    })),
+    sources: sourceIds.map((sourceId) => ({
+      id: sourceId,
+      sha256: db.get<{ sha256: string }>(
+        'SELECT sha256 FROM canon_source WHERE id = ?',
+        sourceId,
+      )?.sha256 ?? '',
+    })),
+  });
+  return hashJson({
+    kind: 'fanfable-recovery-work',
+    projectId,
+    sourceIds,
+    sourceRevision,
+    generationRevision,
+    stageConfigHash,
+    chunkIds: window.map((chunk) => chunk.id),
+    ...(fragmentStart === undefined ? {} : { fragmentStart, fragmentEnd }),
+    requiredStages,
+  });
+}
+
+function recoveryChildTruncatedPassages(
+  db: Db,
+  child: { id: number; stage_fingerprints: string },
+  fallbackWindow: ChunkRow[],
+): number {
+  const fingerprint = fromJson<Partial<Record<RecoveryStage, string>>>(
+    child.stage_fingerprints,
+    {},
+  )['entities-facts'];
+  if (fingerprint) {
+    const coverage = db.get<{ result_json: string }>(
+      `SELECT result_json FROM extraction_stage_coverage
+        WHERE child_id = ? AND stage = 'entities-facts' AND fingerprint = ?
+          AND status IN ('complete', 'empty')
+        ORDER BY id DESC LIMIT 1`,
+      child.id,
+      fingerprint,
+    );
+    if (coverage) {
+      try {
+        const result = JSON.parse(coverage.result_json) as { truncatedPassages?: unknown };
+        if (typeof result.truncatedPassages === 'number') return result.truncatedPassages;
+      } catch {
+        /* fall through to the current window text */
+      }
+    }
+  }
+  return fallbackWindow.filter((chunk) => chunk.text.length > PROMPT_PASSAGE_CHARS).length;
+}
+
+function recoveryStageFingerprintFor(
+  llm: LlmClient,
+  window: ChunkRow[],
+  stage: RecoveryStage,
+  windowSize: number,
+  maxTokens: number,
+  singlePrompt: boolean,
+  rosterFingerprint = '',
+): string {
+  const chunkHashes = window.map((chunk) =>
+    createHash('sha256').update(chunk.text, 'utf8').digest('hex'),
+  );
+  return recoveryStageFingerprint({
+    stage,
+    chunkIds: window.map((chunk) => chunk.id),
+    chunkHashes,
+    promptHash: hashJson({
+      stage,
+      prompt: recoveryStagePrompt(stage),
+      windowSize,
+      maxTokens,
+      singlePrompt,
+      strictRelations: strictRelationsEnabled(),
+      relationRoster: process.env.FANFABLE_REL_ROSTER === '1',
+    }),
+    provider: llm.settings.provider,
+    model: llm.settings.model,
+    settingsHash: recoverySettingsHash(llm),
+    rosterFingerprint: stage === 'relations' ? rosterFingerprint : '',
+  });
+}
+
+function createRecoveryRuntime(
+  db: Db,
+  llm: LlmClient,
+  projectId: number,
+  runId: number | string,
+  runList: {
+    window: ChunkRow[];
+    index: number;
+    fragmentStart?: number;
+    fragmentEnd?: number;
+  }[],
+  opts: ExtractOptions,
+  rosterChildIds: number[] = [],
+  generationRevision = '',
+  fragmentMode = false,
+): RecoveryRuntime {
+  const windowSize = opts.windowSize ?? 8;
+  const maxTokens = opts.maxTokens ?? 3000;
+  const singlePrompt = opts.singlePrompt === true;
+  const controller = new RecoveryController(db, opts.recovery?.policy, {
+    sleep: opts.recovery?.sleep,
+  });
+  const owner = newRecoveryOwner();
+  const stageOnly = opts.recovery?.stageOnly === true;
+  const settingsHash = recoverySettingsHash(llm);
+  const requiredStages = requiredRecoveryStages(singlePrompt);
+  const stageConfigHash = recoveryStageConfigHash(
+    llm,
+    opts,
+    singlePrompt,
+    windowSize,
+    maxTokens,
+    stageOnly,
+    opts.fresh === true ? `fresh:${runId}` : '',
+  );
+  // A parent is run provenance/orchestration, not work identity. Each run gets
+  // its own parent; reusable work is located by its own exact scope below.
+  const scopeKey = `${projectId}:${opts.sourceId ?? 'all'}:run:${runId}`;
+  const parentFingerprint = hashJson({
+    kind: 'fanfable-recovery-run',
+    scopeKey,
+    settingsHash,
+    windowSize,
+    maxTokens,
+    singlePrompt,
+    requiredStages,
+  });
+  const parentId = controller.beginParent({
+    projectId,
+    sourceId: opts.sourceId ?? null,
+    scopeKey,
+    fingerprint: parentFingerprint,
+  });
+  if (stageOnly) {
+    // Mark the generation before any child work starts. A crash must not leave
+    // staged work looking like authoritative published coverage.
+    controller.setParentReadiness(parentId, 'staged_only', {});
+  }
+  const childByWindowIndex = new Map<number, number>();
+  const managedBefore = controller.managedChunkIds(projectId);
+  for (const entry of runList) {
+    const chunkIds = entry.window.map((chunk) => chunk.id);
+    const workKey = recoveryWindowWorkKey(
+      db,
+      projectId,
+      entry.window,
+      stageConfigHash,
+      requiredStages,
+      generationRevision,
+      entry.fragmentStart,
+      entry.fragmentEnd,
+    );
+    const existingWork = controller.childByWorkKey(projectId, workKey);
+    const childFingerprint = workKey;
+    const childId = controller.beginChild({
+      parentId,
+      projectId,
+      workKey,
+      windowIndex: entry.index,
+      sourceOrder: entry.index,
+      chunkIds,
+      requiredStages,
+      fingerprint: childFingerprint,
+    });
+    if (!stageOnly && !existingWork) {
+      // A new generation over previously recovery-managed chunks reopens only
+      // those recovery flags. Legacy mined rows are never in managedBefore.
+      const reset = chunkIds.filter((id) => managedBefore.has(id));
+      if (reset.length) {
+        db.run(
+          `UPDATE canon_chunk SET lore_mined = 0 WHERE id IN (${reset.map(() => '?').join(',')})`,
+          ...reset,
+        );
+      }
+    }
+    childByWindowIndex.set(entry.index, childId);
+  }
+  const stageFingerprint = (
+    window: ChunkRow[],
+    stage: RecoveryStage,
+    rosterOverride?: string,
+  ): string => {
+    const rosterFingerprint = stage === 'relations'
+      ? rosterOverride ?? controller.snapshotRoster(projectId).fingerprint
+      : '';
+    return recoveryStageFingerprintFor(
+      llm,
+      window,
+      stage,
+      windowSize,
+      maxTokens,
+      singlePrompt,
+      rosterFingerprint,
+    );
+  };
+  return {
+    controller,
+    parentId,
+    runId,
+    owner,
+    parentFingerprint,
+    explicitRetry: opts.recovery?.explicitRetry === true,
+    stageOnly,
+    fragmentMode,
+    childByWindowIndex,
+    rosterChildIds: [...new Set([...rosterChildIds, ...childByWindowIndex.values()])],
+    stageFingerprint,
+  };
+}
+
 /**
  * Read the imported material and record its lore.
  *
@@ -879,17 +1339,49 @@ export async function extractLore(
   const maxTokens = opts.maxTokens ?? 3000;
   const chunks = loadOrderedChunks(db, projectId, opts.sourceId);
   const stats = blankResult();
-  if (!chunks.length) return stats;
+  const recoveryEnabled = recoveryEnabledFor(opts, llm);
+  const stageOnly = recoveryEnabled && recoveryStageOnlyFor(opts, llm);
+  stats.stageOnly = stageOnly;
+  stats.promptPassageChars = PROMPT_PASSAGE_CHARS;
+  const legacyStaged = legacyStagedContributionStatus(db, projectId);
+  if (legacyStaged.count) stats.legacyStagedContributions = legacyStaged;
+  if (!chunks.length) {
+    stats.emptySource = true;
+    opts.onProgress?.(
+      stageOnly
+        ? 'nothing to stage: no imported passages are available'
+        : 'nothing to extract: no imported passages are available',
+    );
+    return stats;
+  }
+  if (stageOnly && chunks.some((chunk) => chunk.text.length > PROMPT_PASSAGE_CHARS)) {
+    return extractLoreFragments(db, llm, projectId, opts, chunks, stats);
+  }
   const runStartedAt = nowIso();
+  const managedChunkIds = recoveryEnabled
+    ? recoveryPublishedChunkIds(db, projectId)
+    : new Set<number>();
 
   // Passages that have already been mined are skipped, so re-running the
   // extraction over a long book is cheap. A --fresh run is the exception: it
-  // resets the flags inside the run, so no external or stale flag can decide
-  // what a full pass reads.
-  if (opts.fresh === true) {
-    db.run('UPDATE canon_chunk SET lore_mined = 0 WHERE project_id = ?', projectId);
+  // resets recovery-managed flags only; legacy mined rows are never reset.
+  if (opts.fresh === true && !stageOnly) {
+    if (recoveryEnabled) {
+      if (managedChunkIds.size) {
+        db.run(
+          `UPDATE canon_chunk SET lore_mined = 0
+            WHERE project_id = ? AND id IN (${[...managedChunkIds].map(() => '?').join(',')})`,
+          projectId,
+          ...managedChunkIds,
+        );
+      }
+    } else {
+      db.run('UPDATE canon_chunk SET lore_mined = 0 WHERE project_id = ?', projectId);
+    }
   }
-  const mined = opts.fresh === true ? new Set<number>() : loadMinedSet(db, projectId);
+  const mined = opts.fresh === true
+    ? (recoveryEnabled ? loadMinedSet(db, projectId) : new Set<number>())
+    : loadMinedSet(db, projectId);
   const ctx = loadChunkContext(db, projectId);
   const entityIdByName = new Map<string, number>();
   // Names harvested from the whole book once, before any window runs.
@@ -898,13 +1390,60 @@ export async function extractLore(
   const nameIndex = commandRosterIndex(db, projectId);
 
   const allWindows = sliceWindows(chunks, windowSize);
+  const singlePrompt = opts.singlePrompt === true;
+  const requiredStages = requiredRecoveryStages(singlePrompt);
+  // A generation is the exact source/config scope, not the selected subset of
+  // a bounded run. Its children stay eligible for shared staged roster context
+  // even when a later budget selects only other windows.
+  const generationStageConfigHash = recoveryEnabled && opts.fresh !== true
+    ? recoveryStageConfigHash(
+        llm,
+        opts,
+        singlePrompt,
+        windowSize,
+        maxTokens,
+        stageOnly,
+      )
+    : undefined;
+  const generationRevision = recoveryGenerationRevision(db, projectId, chunks);
+  const scopeController = stageOnly && generationStageConfigHash
+    ? new RecoveryController(db, opts.recovery?.policy, { sleep: opts.recovery?.sleep })
+    : undefined;
+  const generationChildIds: number[] = [];
+  if (scopeController && generationStageConfigHash) {
+    for (const window of allWindows) {
+      if (window.some((chunk) => mined.has(chunk.id) && !managedChunkIds.has(chunk.id))) {
+        // A legacy-blocked window is not part of the eligible staging
+        // generation, even if a stage-only child exists for it.
+        continue;
+      }
+      const workKey = recoveryWindowWorkKey(
+        db,
+        projectId,
+        window,
+        generationStageConfigHash,
+        requiredStages,
+        generationRevision,
+      );
+      const child = scopeController.childByWorkKey(projectId, workKey);
+      if (child) generationChildIds.push(child.id);
+    }
+  }
   // Bridges are recurrence across the book, so the frequencies are built over
   // every window — including already-mined ones — while only candidates run.
   const docFreq = buildNameDocFreq(allWindows);
-  const candidates: { window: ChunkRow[]; index: number }[] = [];
+  let candidates: { window: ChunkRow[]; index: number }[] = [];
   let skippedMined = 0;
+  let skippedLegacy = 0;
   allWindows.forEach((window, index) => {
-    if (opts.incremental !== false && window.every((c) => mined.has(c.id))) {
+    if (recoveryEnabled) {
+      // Never reprocess a legacy row. A mixed window is failed closed and made
+      // visible instead of silently widening or resetting legacy flags.
+      if (window.some((chunk) => mined.has(chunk.id) && !managedChunkIds.has(chunk.id))) {
+        skippedLegacy++;
+        return;
+      }
+    } else if (opts.incremental !== false && window.every((c) => mined.has(c.id))) {
       skippedMined++;
       return;
     }
@@ -914,9 +1453,118 @@ export async function extractLore(
     // A skipped window is a decision, so it is counted and said out loud.
     opts.onProgress?.(`skipped ${skippedMined} window(s) already marked read`);
   }
+  if (skippedLegacy > 0) {
+    stats.legacyBlockedWindows = skippedLegacy;
+    opts.onProgress?.(
+      `skipped ${skippedLegacy} window(s) containing legacy mined rows; recovery never auto-resets legacy state`,
+    );
+  }
   if (!candidates.length) {
     opts.onProgress?.('everything has already been read');
     return stats;
+  }
+
+  // A bounded run must spend its budget on work that can still make progress.
+  // Completed work is reused (not re-mined), and exhausted-deferred work needs
+  // an explicit retry; selecting either would starve pending windows forever.
+  let reusedTruncatedPassages = 0;
+  const budgetRequested = opts.full !== true && opts.maxWindows !== undefined;
+  if (budgetRequested && recoveryEnabled && opts.fresh !== true) {
+    const controller = scopeController ?? new RecoveryController(db, opts.recovery?.policy, {
+      sleep: opts.recovery?.sleep,
+    });
+    let scopeRoster: ReturnType<typeof recoveryRosterRows> | undefined;
+    const scopeRosterRows = (): ReturnType<typeof recoveryRosterRows> => {
+      if (!scopeRoster) {
+        scopeRoster = recoveryRosterRows(db, projectId, 0, true, generationChildIds);
+      }
+      return scopeRoster;
+    };
+    const currentRelationFingerprint = (window: ChunkRow[]): string => {
+      const rows = scopeRosterRows();
+      const promptNames = windowEntityNames(db, projectId, window, roster, rows.promptEntities);
+      const snapshot = controller.snapshotRelationStage(
+        projectId,
+        promptNames,
+        rows.resolverRows,
+        false,
+      );
+      return recoveryStageFingerprintFor(
+        llm,
+        window,
+        'relations',
+        windowSize,
+        maxTokens,
+        singlePrompt,
+        snapshot.fingerprint,
+      );
+    };
+    let skippedComplete = 0;
+    let skippedDeferred = 0;
+    let staleRoster = 0;
+    const eligible: { window: ChunkRow[]; index: number }[] = [];
+    for (const entry of candidates) {
+      const workKey = recoveryWindowWorkKey(
+        db,
+        projectId,
+        entry.window,
+        generationStageConfigHash!,
+        requiredStages,
+        generationRevision,
+      );
+      const child = controller.childByWorkKey(projectId, workKey);
+      if (child?.status === 'complete') {
+        const storedRelation = fromJson<Partial<Record<RecoveryStage, string>>>(
+          child.stage_fingerprints,
+          {},
+        )['relations'];
+        const stale =
+          stageOnly &&
+          requiredStages.includes('relations') &&
+          storedRelation !== currentRelationFingerprint(entry.window);
+        if (!stale) {
+          skippedComplete++;
+          reusedTruncatedPassages += recoveryChildTruncatedPassages(db, child, entry.window);
+          continue;
+        }
+        staleRoster++;
+      }
+      if (child?.status === 'deferred' && opts.recovery?.explicitRetry !== true) {
+        skippedDeferred++;
+        reusedTruncatedPassages += recoveryChildTruncatedPassages(db, child, entry.window);
+        continue;
+      }
+      eligible.push(entry);
+    }
+    candidates = eligible;
+    stats.recoverySkippedComplete = skippedComplete;
+    stats.recoverySkippedDeferred = skippedDeferred;
+    stats.recoveryRosterStale = staleRoster;
+    if (skippedComplete || skippedDeferred) {
+      opts.onProgress?.(
+        `budget skips ${skippedComplete} complete and ${skippedDeferred} deferred window(s); ` +
+          'deferred work needs an explicit retry',
+      );
+    }
+    if (staleRoster) {
+      opts.onProgress?.(
+        `${staleRoster} complete window(s) need relationship revalidation against the current staged roster`,
+      );
+    }
+    if (!candidates.length) {
+      stats.recoveryNoEligibleWork = true;
+      stats.truncatedPassages = reusedTruncatedPassages;
+      stats.coverageNonExhaustive = reusedTruncatedPassages > 0;
+      if (reusedTruncatedPassages > 0) {
+        opts.onProgress?.(
+          `${reusedTruncatedPassages} reused passage(s) longer than ${PROMPT_PASSAGE_CHARS} characters were only partially read; prompt coverage is non-exhaustive`,
+        );
+      }
+      opts.onProgress?.(
+        'no eligible windows under this budget; completed work is reused and deferred work is not retried automatically',
+      );
+      return stats;
+    }
   }
 
   // Starved first: a few windows are reserved for threads that have nothing
@@ -992,6 +1640,18 @@ export async function extractLore(
   const runList = (runOrder ?? candidates.map((_, i) => i))
     .filter((i) => chosen.has(i))
     .map((i) => candidates[i]!);
+  const truncatedPassages = reusedTruncatedPassages + runList.reduce(
+    (total, { window }) =>
+      total + window.filter((chunk) => chunk.text.length > PROMPT_PASSAGE_CHARS).length,
+    0,
+  );
+  stats.truncatedPassages = truncatedPassages;
+  stats.coverageNonExhaustive = truncatedPassages > 0;
+  if (truncatedPassages > 0) {
+    opts.onProgress?.(
+      `${truncatedPassages} passage(s) longer than ${PROMPT_PASSAGE_CHARS} characters were only partially read; prompt coverage is non-exhaustive`,
+    );
+  }
   if (runList.length < candidates.length) {
     const kinds = new Map<string, number>();
     for (const i of selection.selected) {
@@ -1016,17 +1676,19 @@ export async function extractLore(
     };
   }
 
-  const runId = startExtractionRun(db, projectId, runList.length, {
-    provider: llm.settings.provider,
-    model: llm.settings.model,
-    seed: opts.seed ?? null,
-    windowSize,
-    maxTokens,
-    singlePrompt: opts.singlePrompt === true,
-  });
-  const extractionTrace = opts.trace?.enabled === true
+  const runId = stageOnly
+    ? randomUUID()
+    : startExtractionRun(db, projectId, runList.length, {
+        provider: llm.settings.provider,
+        model: llm.settings.model,
+        seed: opts.seed ?? null,
+        windowSize,
+        maxTokens,
+        singlePrompt: opts.singlePrompt === true,
+      });
+  const extractionTrace = !stageOnly && opts.trace?.enabled === true
     ? ExtractionTrace.start(db, projectId, {
-        runId,
+        runId: runId as number,
         windowSize,
         plannedWindows: runList.length,
         singlePrompt: opts.singlePrompt === true,
@@ -1034,6 +1696,14 @@ export async function extractLore(
       })
     : null;
   if (extractionTrace) stats.traceId = extractionTrace.traceId;
+  const recovery = recoveryEnabled
+    ? createRecoveryRuntime(db, llm, projectId, runId, runList, {
+        ...opts,
+        windowSize,
+        maxTokens,
+        recovery: { ...opts.recovery, stageOnly },
+      }, generationChildIds, generationRevision)
+    : undefined;
   let aborted = false;
   try {
     await runWindowBatch(db, llm, projectId, runList, ctx, entityIdByName, stats, {
@@ -1048,13 +1718,14 @@ export async function extractLore(
       roster,
       index: nameIndex,
       trace: extractionTrace,
+      recovery,
     });
   } catch (err) {
     aborted = true;
     throw err;
   } finally {
     try {
-      finalizeExtractionRun(db, runId, runList.length, aborted);
+      if (!stageOnly) finalizeExtractionRun(db, runId as number, runList.length, aborted);
     } finally {
       if (extractionTrace) {
         let run: {
@@ -1090,66 +1761,179 @@ export async function extractLore(
         });
         extractionTrace.finish(aborted);
       }
+      if (recovery) {
+        let staleRelationWindows = 0;
+        if (stageOnly) {
+          const chunksById = new Map(chunks.map((chunk) => [chunk.id, chunk]));
+          const finalChildIds = new Set<number>();
+          if (scopeController && generationStageConfigHash) {
+            for (const window of allWindows) {
+              if (window.some((chunk) => mined.has(chunk.id) && !managedChunkIds.has(chunk.id))) {
+                continue;
+              }
+              const workKey = recoveryWindowWorkKey(
+                db,
+                projectId,
+                window,
+                generationStageConfigHash,
+                requiredStages,
+                generationRevision,
+              );
+              const child = scopeController.childByWorkKey(projectId, workKey);
+              if (child) finalChildIds.add(child.id);
+            }
+          }
+          for (const childId of recovery.childByWindowIndex.values()) finalChildIds.add(childId);
+          const entries = [...finalChildIds]
+            .map((childId) => {
+              const child = recovery.controller.getChild(childId);
+              if (!child) return undefined;
+              const window = fromJson<number[]>(child.chunk_ids, [])
+                .map((id) => chunksById.get(id))
+                .filter((chunk): chunk is ChunkRow => chunk !== undefined);
+              return window.length ? { childId, window } : undefined;
+            })
+            .filter((entry): entry is { childId: number; window: ChunkRow[] } => entry !== undefined);
+          staleRelationWindows = countStaleRelationChildren(
+            recovery.controller,
+            db,
+            projectId,
+            llm,
+            roster,
+            requiredStages,
+            windowSize,
+            maxTokens,
+            singlePrompt,
+            entries,
+          );
+          stats.recoveryRelationStale = staleRelationWindows;
+        }
+        const parentStatus = recovery.controller.finalizeParent(recovery.parentId, {
+          forcePartial: staleRelationWindows > 0,
+        });
+        const reportedParentStatus = parentStatus;
+        const readiness = stageOnly
+          ? 'staged_only'
+          : parentStatus === 'complete' ? 'correctness_pending' : 'incomplete';
+        const coverageStatus = staleRelationWindows > 0
+          ? 'partial'
+          : stats.coverageNonExhaustive
+            ? 'non_exhaustive'
+            : 'complete';
+        const optional = stageOnly
+          ? {
+              noteIngestion: 'unavailable-staging-only',
+              closeTheLoop: 'unavailable-staging-only',
+              embeddings: 'unavailable-staging-only',
+              projectWideDisposition: 'not_implemented',
+              publication: 'not_implemented',
+              coverage: {
+                status: coverageStatus,
+                passages: truncatedPassages,
+                promptChars: PROMPT_PASSAGE_CHARS,
+                staleRelationWindows,
+              },
+            }
+          : {
+              noteIngestion: 'deferred',
+              closeTheLoop: 'deferred',
+              embeddings: opts.embed ? 'pending' : 'not_requested',
+              projectWideDisposition: 'pending',
+              operations: ['dedupeRelations', 'markContestedClaims', 'mergeCanonEntities', 'linkTimelineToEvents', 'identity/capacity/quarantine sweeps'],
+              coverage: {
+                status: coverageStatus,
+                passages: truncatedPassages,
+                promptChars: PROMPT_PASSAGE_CHARS,
+                staleRelationWindows,
+              },
+            };
+        recovery.controller.setParentReadiness(recovery.parentId, readiness, optional);
+        const children = recovery.controller.children(recovery.parentId);
+        stats.recovery = {
+          parentId: recovery.parentId,
+          status: reportedParentStatus,
+          readiness,
+          optional,
+          children: children.length,
+          completeChildren: children.filter((child) => child.status === 'complete').length,
+          deferredChildren: children.filter((child) => child.status === 'deferred').length,
+        };
+      }
     }
   }
 
-  // Fold any duplicates left by earlier runs into one row per pair.
-  dedupeRelations(db, projectId);
-  const contested = markContestedClaims(db, projectId);
-  if (contested.facts || contested.relations) stats.contested = contested;
-  const merged = mergeCanonEntities(db, projectId);
-  stats.mergedAliases = merged.merged;
-  stats.quarantinedAliases = merged.quarantined;
-  persistQuarantine(db, projectId, merged.quarantined);
-  // Identity-claim sweep over entity summaries: flags only, merges stay
-  // human-gated. Dynamic import avoids the lorebook<->rule-checker cycle
-  // (same precedent as the deferred diagnostics import).
-  const identityHits = (await import('./answer/rule-checker.ts')).checkEntities(db, projectId);
-  if (identityHits.length) {
-    opts.onProgress?.(
-      `identity sweep: ${identityHits.length} summar${identityHits.length === 1 ? 'y' : 'ies'} flagged for review`,
-    );
-  }
-  // Now that the entities and the events exist, marry the two.
-  linkTimelineToEvents(db, projectId);
-  if (opts.embed) {
-    try {
-      await embedMissing(db, projectId, opts.embed);
-    } catch {
-      /* embedding never fails an extraction */
+  // Project-wide canon disposition and optional enrichment stay on the legacy
+  // path for now. Under durable recovery, stage application is the only canon
+  // write; a separate pass must handle dedupe/merge/enrichment without
+  // touching unrelated legacy rows.
+  if (!recovery) {
+    // Fold any duplicates left by earlier runs into one row per pair.
+    dedupeRelations(db, projectId);
+    const contested = markContestedClaims(db, projectId);
+    if (contested.facts || contested.relations) stats.contested = contested;
+    const merged = mergeCanonEntities(db, projectId);
+    stats.mergedAliases = merged.merged;
+    stats.quarantinedAliases = merged.quarantined;
+    persistQuarantine(db, projectId, merged.quarantined);
+    // Identity-claim sweep over entity summaries: flags only, merges stay
+    // human-gated. Dynamic import avoids the lorebook<->rule-checker cycle
+    // (same precedent as the deferred diagnostics import).
+    const identityHits = (await import('./answer/rule-checker.ts')).checkEntities(db, projectId);
+    if (identityHits.length) {
+      opts.onProgress?.(
+        `identity sweep: ${identityHits.length} summar${identityHits.length === 1 ? 'y' : 'ies'} flagged for review`,
+      );
+    }
+    // Now that the entities and the events exist, marry the two.
+    linkTimelineToEvents(db, projectId);
+    if (opts.embed) {
+      try {
+        await embedMissing(db, projectId, opts.embed);
+      } catch {
+        /* embedding never fails an extraction */
+      }
     }
   }
   stats.windows = runList.length;
   // Close the loop inline: re-read thin spots in the same run, never a
   // second pass afterward. Same unchanged extractor paths, tight-gated and
-  // capped; never throws the extraction.
-  const loopLines = await closeTheLoop(db, llm, projectId, stats, {
-    maxEntities: 5,
-    maxPassages: 4,
-    onProgress: opts.onProgress,
-  });
-  // Capacity sweep over only the entities this run created or touched.
-  const touched = new Set(entityIdByName.values());
-  for (const row of db.all<{ id: number }>(
-    'SELECT id FROM canon_entity WHERE project_id = ? AND (created_at >= ? OR updated_at >= ?)',
-    projectId,
-    runStartedAt,
-    runStartedAt,
-  )) {
-    touched.add(row.id);
+  // capped; never throws the extraction. It is optional enrichment, so a
+  // partial/deferred recovery parent does not run it.
+  const loopLines = recovery
+    ? ['loop: skipped; optional enrichment is outside durable stage coverage']
+    : await closeTheLoop(db, llm, projectId, stats, {
+        maxEntities: 5,
+        maxPassages: 4,
+        onProgress: opts.onProgress,
+      });
+  // Capacity/quarantine sweeps are optional canon hygiene. They wait for a
+  // complete parent so they cannot mutate a partial stage boundary.
+  let quarantinedEntities = { quarantined: 0, released: 0 };
+  if (!recovery) {
+    const touched = new Set(entityIdByName.values());
+    for (const row of db.all<{ id: number }>(
+      'SELECT id FROM canon_entity WHERE project_id = ? AND (created_at >= ? OR updated_at >= ?)',
+      projectId,
+      runStartedAt,
+      runStartedAt,
+    )) {
+      touched.add(row.id);
+    }
+    checkEntityCapacity(db, projectId, touched, { write: true });
+    quarantinedEntities = quarantineSuspectCharacters(db, projectId);
   }
-  checkEntityCapacity(db, projectId, touched, { write: true });
-  const quarantinedEntities = quarantineSuspectCharacters(db, projectId);
-  rememberExtractionReport(db, projectId, stats);
-  writeAuditNote(projectId, 'extract', [
-    `windows visited: ${stats.windows}`,
-    `ties banked: ${stats.relations}`,
-    `entities quarantined: ${quarantinedEntities.quarantined}, released: ${quarantinedEntities.released}`,
-    `quotes verified: ${stats.verification.verified}, repointed: ${stats.verification.repointed}, dropped: ${stats.verification.dropped}`,
-    `empty windows: ${stats.emptyWindows.length}`,
-    `partial/failed windows: ${stats.windowIssues.length}`,
-    ...loopLines,
-  ], db);
+  if (!stageOnly) {
+    rememberExtractionReport(db, projectId, stats);
+    writeAuditNote(projectId, 'extract', [
+      `windows visited: ${stats.windows}`,
+      `ties banked: ${stats.relations}`,
+      `entities quarantined: ${quarantinedEntities.quarantined}, released: ${quarantinedEntities.released}`,
+      `quotes verified: ${stats.verification.verified}, repointed: ${stats.verification.repointed}, dropped: ${stats.verification.dropped}`,
+      `empty windows: ${stats.emptyWindows.length}`,
+      `partial/failed windows: ${stats.windowIssues.length}`,
+      ...loopLines,
+    ], db);
+  }
 
   return stats;
 }
@@ -1249,6 +2033,8 @@ export interface LazyMineOptions {
   singlePrompt?: boolean;
   /** Never mine more than this many windows in one call. Default 2. */
   maxLazyWindows?: number;
+  /** Durable recovery; lazy user-facing paths enable it. */
+  recovery?: ExtractionRecoveryOptions;
   onProgress?: (message: string) => void;
   /** Structured window counts, for a progress monitor rather than the console. */
   onWindow?: (progress: ExtractWindowProgress) => void;
@@ -1263,6 +2049,408 @@ export interface LazyMineOptions {
  * later full run picks up where this left off. On any error the caller falls
  * back to the unmined passages as today.
  */
+async function extractLoreFragments(
+  db: Db,
+  llm: LlmClient,
+  projectId: number,
+  opts: ExtractOptions,
+  chunks: ChunkRow[],
+  stats: ExtractLoreResult,
+): Promise<ExtractLoreResult> {
+  const windowSize = opts.windowSize ?? 8;
+  const maxTokens = opts.maxTokens ?? 3000;
+  const singlePrompt = opts.singlePrompt === true;
+  const requiredStages = requiredRecoveryStages(singlePrompt);
+  const managedChunkIds = recoveryPublishedChunkIds(db, projectId);
+  const mined = loadMinedSet(db, projectId);
+  const allFragments = planRecoveryFragments(chunks);
+  const legacyBlockedChunks = new Set(
+    chunks
+      .filter((chunk) => mined.has(chunk.id) && !managedChunkIds.has(chunk.id))
+      .map((chunk) => chunk.id),
+  );
+  const legacyBlockedFragments = allFragments.filter((fragment) =>
+    legacyBlockedChunks.has(fragment.sourceChunkId),
+  ).length;
+  stats.fragmentMode = true;
+  stats.truncatedPassages = 0;
+  stats.coverageNonExhaustive = false;
+  stats.legacyBlockedFragments = legacyBlockedFragments;
+  stats.legacyBlockedWindows = legacyBlockedChunks.size;
+  stats.promptPassageChars = PROMPT_PASSAGE_CHARS;
+  stats.fragmentCoverage = {
+    plannedFragments: allFragments.length,
+    selectedFragments: 0,
+    completeFragments: 0,
+    totalSourceChunks: new Set(allFragments.map((fragment) => fragment.sourceChunkId)).size,
+    completeSourceChunks: 0,
+    partialSourceChunks: 0,
+    uncoveredSourceChunks: new Set(allFragments.map((fragment) => fragment.sourceChunkId)).size,
+    staleRelationFragments: 0,
+    status: 'none',
+  };
+  if (!allFragments.length) {
+    stats.emptySource = true;
+    return stats;
+  }
+  if (legacyBlockedFragments > 0) {
+    opts.onProgress?.(
+      `skipped ${legacyBlockedFragments} fragment(s) containing legacy mined rows; old canon was not changed`,
+    );
+  }
+
+  const runId = randomUUID();
+  const stageConfigHash = recoveryStageConfigHash(
+    llm,
+    opts,
+    singlePrompt,
+    windowSize,
+    maxTokens,
+    true,
+    opts.fresh === true ? `fresh:${runId}` : '',
+  );
+  const generationRevision = recoveryGenerationRevision(db, projectId, chunks);
+  const controller = new RecoveryController(db, opts.recovery?.policy, {
+    sleep: opts.recovery?.sleep,
+  });
+  const workKeyFor = (fragment: RecoveryFragmentUnit): string =>
+    recoveryWindowWorkKey(
+      db,
+      projectId,
+      fragment.window,
+      stageConfigHash,
+      requiredStages,
+      generationRevision,
+      fragment.sourceStart,
+      fragment.sourceEnd,
+    );
+  const eligibleFragments = allFragments.filter(
+    (fragment) => !legacyBlockedChunks.has(fragment.sourceChunkId),
+  );
+  const generationChildIds: number[] = [];
+  for (const fragment of eligibleFragments) {
+    const child = controller.childByWorkKey(projectId, workKeyFor(fragment));
+    if (child) generationChildIds.push(child.id);
+  }
+
+  const roster = buildNameRoster(db, projectId, chunks);
+  const nameIndex = commandRosterIndex(db, projectId);
+  const scopeRoster = recoveryRosterRows(db, projectId, 0, true, generationChildIds);
+  const currentRelationFingerprint = (fragment: RecoveryFragmentUnit): string => {
+    const promptNames = windowEntityNames(
+      db,
+      projectId,
+      fragment.window,
+      roster,
+      scopeRoster.promptEntities,
+    );
+    const snapshot = controller.snapshotRelationStage(
+      projectId,
+      promptNames,
+      scopeRoster.resolverRows,
+      false,
+    );
+    return recoveryStageFingerprintFor(
+      llm,
+      fragment.window,
+      'relations',
+      windowSize,
+      maxTokens,
+      singlePrompt,
+      snapshot.fingerprint,
+    );
+  };
+
+  let skippedComplete = 0;
+  let skippedDeferred = 0;
+  let staleRoster = 0;
+  const candidates: RecoveryFragmentUnit[] = [];
+  for (const fragment of eligibleFragments) {
+    const child = controller.childByWorkKey(projectId, workKeyFor(fragment));
+    if (child?.status === 'complete') {
+      const storedRelation = fromJson<Partial<Record<RecoveryStage, string>>>(
+        child.stage_fingerprints,
+        {},
+      )['relations'];
+      const stale =
+        requiredStages.includes('relations') &&
+        storedRelation !== currentRelationFingerprint(fragment);
+      if (!stale) {
+        skippedComplete++;
+        continue;
+      }
+      staleRoster++;
+    }
+    if (child?.status === 'deferred' && opts.recovery?.explicitRetry !== true) {
+      skippedDeferred++;
+      continue;
+    }
+    candidates.push(fragment);
+  }
+  stats.recoverySkippedComplete = skippedComplete;
+  stats.recoverySkippedDeferred = skippedDeferred;
+  stats.recoveryRosterStale = staleRoster;
+  if (skippedComplete || skippedDeferred) {
+    opts.onProgress?.(
+      `budget skips ${skippedComplete} complete and ${skippedDeferred} deferred fragment(s); ` +
+        'deferred work needs an explicit retry',
+    );
+  }
+  if (staleRoster) {
+    opts.onProgress?.(
+      `${staleRoster} complete fragment(s) need relationship revalidation against the current staged roster`,
+    );
+  }
+  if (!candidates.length) {
+    stats.recoveryNoEligibleWork = true;
+    stats.fragmentCoverage = computeFragmentCoverage(
+      controller,
+      projectId,
+      allFragments,
+      legacyBlockedChunks,
+      workKeyFor,
+      0,
+    );
+    opts.onProgress?.(
+      'no eligible fragments; completed fragments are reused and deferred work is not retried automatically',
+    );
+    return stats;
+  }
+
+  const docFreq = buildNameDocFreq(candidates.map((fragment) => fragment.window));
+  const selection = selectWindows(
+    candidates.map((fragment) => scoreWindow(fragment.window, docFreq)),
+    opts,
+  );
+  const runList = selection.selected.map((index) => candidates[index]!);
+  if (runList.length < candidates.length) {
+    stats.selection = {
+      selected: runList.length,
+      total: candidates.length,
+      skipped: candidates.length - runList.length,
+    };
+    opts.onProgress?.(
+      `selected ${runList.length} of ${candidates.length} fragments; ` +
+        `${candidates.length - runList.length} left for a later run`,
+    );
+  }
+
+  const recovery = createRecoveryRuntime(
+    db,
+    llm,
+    projectId,
+    runId,
+    runList,
+    {
+      ...opts,
+      windowSize,
+      maxTokens,
+      recovery: { ...opts.recovery, stageOnly: true },
+    },
+    generationChildIds,
+    generationRevision,
+    true,
+  );
+  const ctx = loadChunkContext(db, projectId);
+  let aborted = false;
+  try {
+    await runWindowBatch(db, llm, projectId, runList, ctx, new Map<string, number>(), stats, {
+      concurrency: 1,
+      maxTokens,
+      singlePrompt,
+      windowSize,
+      totalChunks: allFragments.length,
+      runId,
+      onProgress: opts.onProgress,
+      onWindow: opts.onWindow,
+      roster,
+      index: nameIndex,
+      trace: null,
+      recovery,
+    });
+  } catch (err) {
+    aborted = true;
+    throw err;
+  } finally {
+    try {
+      const finalEntries = eligibleFragments
+        .map((fragment) => {
+          const child = controller.childByWorkKey(projectId, workKeyFor(fragment));
+          return child ? { childId: child.id, window: fragment.window } : undefined;
+        })
+        .filter((entry): entry is { childId: number; window: ChunkRow[] } => entry !== undefined);
+      const staleRelationFragments = countStaleRelationChildren(
+        controller,
+        db,
+        projectId,
+        llm,
+        roster,
+        requiredStages,
+        windowSize,
+        maxTokens,
+        singlePrompt,
+        finalEntries,
+      );
+      const coverage = computeFragmentCoverage(
+        controller,
+        projectId,
+        allFragments,
+        legacyBlockedChunks,
+        workKeyFor,
+        runList.length,
+        staleRelationFragments,
+      );
+      stats.fragmentCoverage = coverage;
+      stats.recoveryRelationStale = staleRelationFragments;
+      const parentStatus = controller.finalizeParent(recovery.parentId, {
+        forcePartial: staleRelationFragments > 0,
+      });
+      const reportedParentStatus = parentStatus;
+      const readiness = 'staged_only';
+      const optional = {
+        noteIngestion: 'unavailable-staging-only',
+        closeTheLoop: 'unavailable-staging-only',
+        embeddings: 'unavailable-staging-only',
+        projectWideDisposition: 'not_implemented',
+        publication: 'not_implemented',
+        coverage: {
+          status: coverage.status,
+          plannedFragments: coverage.plannedFragments,
+          selectedFragments: coverage.selectedFragments,
+          completeFragments: coverage.completeFragments,
+          partialSourceChunks: coverage.partialSourceChunks,
+          staleRelationFragments: coverage.staleRelationFragments,
+        },
+      };
+      controller.setParentReadiness(recovery.parentId, readiness, optional);
+      const children = controller.children(recovery.parentId);
+      stats.recovery = {
+        parentId: recovery.parentId,
+        status: reportedParentStatus,
+        readiness,
+        optional,
+        children: children.length,
+        completeChildren: children.filter((child) => child.status === 'complete').length,
+        deferredChildren: children.filter((child) => child.status === 'deferred').length,
+      };
+    } finally {
+      if (aborted) {
+        /* preserve the original failure */
+      }
+    }
+  }
+  stats.windows = runList.length;
+  return stats;
+}
+
+function countStaleRelationChildren(
+  controller: RecoveryController,
+  db: Db,
+  projectId: number,
+  llm: LlmClient,
+  roster: NameRoster | undefined,
+  requiredStages: RecoveryStage[],
+  windowSize: number,
+  maxTokens: number,
+  singlePrompt: boolean,
+  entries: { childId: number; window: ChunkRow[] }[],
+): number {
+  if (!requiredStages.includes('relations') || !entries.length) return 0;
+  const finalRoster = recoveryRosterRows(
+    db,
+    projectId,
+    0,
+    true,
+    [...new Set(entries.map((entry) => entry.childId))],
+  );
+  let stale = 0;
+  for (const entry of entries) {
+    const child = controller.getChild(entry.childId);
+    if (child?.status !== 'complete') continue;
+    const stored = fromJson<Partial<Record<RecoveryStage, string>>>(
+      child.stage_fingerprints,
+      {},
+    )['relations'];
+    const promptNames = windowEntityNames(
+      db,
+      projectId,
+      entry.window,
+      roster,
+      finalRoster.promptEntities,
+    );
+    const snapshot = controller.snapshotRelationStage(
+      projectId,
+      promptNames,
+      finalRoster.resolverRows,
+      false,
+    );
+    const current = recoveryStageFingerprintFor(
+      llm,
+      entry.window,
+      'relations',
+      windowSize,
+      maxTokens,
+      singlePrompt,
+      snapshot.fingerprint,
+    );
+    if (stored !== current) stale++;
+  }
+  return stale;
+}
+
+function computeFragmentCoverage(
+  controller: RecoveryController,
+  projectId: number,
+  allFragments: RecoveryFragmentUnit[],
+  legacyBlockedChunks: Set<number>,
+  workKeyFor: (fragment: RecoveryFragmentUnit) => string,
+  selectedFragments: number,
+  staleRelationFragments = 0,
+): NonNullable<ExtractLoreResult['fragmentCoverage']> {
+  const byChunk = new Map<number, { total: number; complete: number }>();
+  let completeFragments = 0;
+  for (const fragment of allFragments) {
+    const entry = byChunk.get(fragment.sourceChunkId) ?? { total: 0, complete: 0 };
+    entry.total++;
+    if (!legacyBlockedChunks.has(fragment.sourceChunkId)) {
+      const child = controller.childByWorkKey(projectId, workKeyFor(fragment));
+      if (child?.status === 'complete') {
+        entry.complete++;
+        completeFragments++;
+      }
+    }
+    byChunk.set(fragment.sourceChunkId, entry);
+  }
+  let completeSourceChunks = 0;
+  let partialSourceChunks = 0;
+  let uncoveredSourceChunks = 0;
+  for (const entry of byChunk.values()) {
+    if (entry.complete === entry.total) completeSourceChunks++;
+    else if (entry.complete > 0) partialSourceChunks++;
+    else uncoveredSourceChunks++;
+  }
+  const plannedFragments = allFragments.length;
+  const status: 'complete' | 'partial' | 'none' =
+    staleRelationFragments > 0
+      ? 'partial'
+      : completeFragments === plannedFragments
+        ? 'complete'
+        : completeFragments > 0
+          ? 'partial'
+          : 'none';
+  return {
+    plannedFragments,
+    selectedFragments,
+    completeFragments,
+    totalSourceChunks: byChunk.size,
+    completeSourceChunks,
+    partialSourceChunks,
+    uncoveredSourceChunks,
+    staleRelationFragments,
+    status,
+  };
+}
+
 export async function ensureWindowsForChunks(
   db: Db,
   llm: LlmClient,
@@ -1271,47 +2459,189 @@ export async function ensureWindowsForChunks(
   opts: LazyMineOptions = {},
 ): Promise<ExtractLoreResult> {
   const stats = blankResult();
+  const recoveryEnabled = recoveryEnabledFor(opts, llm);
+  const stageOnly = recoveryEnabled && recoveryStageOnlyFor(opts, llm);
+  stats.stageOnly = stageOnly;
+  stats.promptPassageChars = PROMPT_PASSAGE_CHARS;
+  const legacyStaged = legacyStagedContributionStatus(db, projectId);
+  if (legacyStaged.count) stats.legacyStagedContributions = legacyStaged;
   const wanted = new Set((chunkIds ?? []).filter((n) => Number.isFinite(n)));
   if (!wanted.size) return stats;
 
   const windowSize = opts.windowSize ?? 8;
   const maxTokens = opts.maxTokens ?? 3000;
   const chunks = loadOrderedChunks(db, projectId, opts.sourceId);
-  if (!chunks.length) return stats;
+  if (!chunks.length) {
+    stats.emptySource = true;
+    opts.onProgress?.(
+      stageOnly
+        ? 'nothing to stage: no imported passages are available'
+        : 'nothing to extract: no imported passages are available',
+    );
+    return stats;
+  }
   const mined = loadMinedSet(db, projectId);
-  const priorNonProductive = priorNonProductiveWindowKeys(db, projectId);
+  const generationRevision = recoveryGenerationRevision(db, projectId, chunks);
+  const managedChunkIds = recoveryEnabled
+    ? recoveryPublishedChunkIds(db, projectId)
+    : new Set<number>();
+  const priorNonProductive = recoveryEnabled
+    ? new Set<string>()
+    : priorNonProductiveWindowKeys(db, projectId);
+  const allWindows = sliceWindows(chunks, windowSize);
+  const singlePrompt = opts.singlePrompt === true;
+  const requiredStages = requiredRecoveryStages(singlePrompt);
+  const generationStageConfigHash = recoveryEnabled
+    ? recoveryStageConfigHash(llm, opts, singlePrompt, windowSize, maxTokens, stageOnly)
+    : undefined;
+  const recoveryController = recoveryEnabled
+    ? new RecoveryController(db, opts.recovery?.policy, { sleep: opts.recovery?.sleep })
+    : undefined;
+  const scopeController = stageOnly ? recoveryController : undefined;
+  const childByWindowIndex = new Map<number, ReturnType<RecoveryController['childByWorkKey']>>();
+  const generationChildIds: number[] = [];
+  if (recoveryController && generationStageConfigHash) {
+    allWindows.forEach((window, index) => {
+      if (window.some((chunk) => mined.has(chunk.id) && !managedChunkIds.has(chunk.id))) {
+        return;
+      }
+      const workKey = recoveryWindowWorkKey(
+        db,
+        projectId,
+        window,
+        generationStageConfigHash,
+        requiredStages,
+        generationRevision,
+      );
+      const child = recoveryController.childByWorkKey(projectId, workKey);
+      childByWindowIndex.set(index, child);
+      if (scopeController && child) generationChildIds.push(child.id);
+    });
+  }
+  const roster = buildNameRoster(db, projectId, chunks);
+  const scopeRoster = stageOnly && scopeController && generationStageConfigHash
+    ? recoveryRosterRows(db, projectId, 0, true, generationChildIds)
+    : undefined;
+  const currentRelationFingerprint = (window: ChunkRow[]): string => {
+    if (!scopeRoster || !scopeController) return '';
+    const promptNames = windowEntityNames(db, projectId, window, roster, scopeRoster.promptEntities);
+    const snapshot = scopeController.snapshotRelationStage(
+      projectId,
+      promptNames,
+      scopeRoster.resolverRows,
+      false,
+    );
+    return recoveryStageFingerprintFor(
+      llm,
+      window,
+      'relations',
+      windowSize,
+      maxTokens,
+      singlePrompt,
+      snapshot.fingerprint,
+    );
+  };
   const cap = Math.max(0, opts.maxLazyWindows ?? 2);
-  const targets: { window: ChunkRow[]; index: number }[] = [];
+  const eligibleTargets: { window: ChunkRow[]; index: number }[] = [];
+  const reuseTargets: { window: ChunkRow[]; index: number }[] = [];
   let skippedRepeated = 0;
-  sliceWindows(chunks, windowSize).forEach((window, index) => {
-    if (targets.length >= cap) return;
+  let skippedLegacy = 0;
+  let skippedComplete = 0;
+  let skippedDeferred = 0;
+  let staleRoster = 0;
+  allWindows.forEach((window, index) => {
     if (!window.some((c) => wanted.has(c.id))) return;
-    if (window.every((c) => mined.has(c.id))) return;
+    if (recoveryEnabled) {
+      if (window.some((chunk) => mined.has(chunk.id) && !managedChunkIds.has(chunk.id))) {
+        skippedLegacy++;
+        return;
+      }
+    } else if (window.every((c) => mined.has(c.id))) {
+      return;
+    }
     if (priorNonProductive.has(windowChunkKey(window.map((c) => c.id)))) {
       skippedRepeated++;
       return;
     }
-    targets.push({ window, index });
+    if (recoveryEnabled && recoveryController) {
+      const child = childByWindowIndex.get(index);
+      if (child?.status === 'complete') {
+        const stored = fromJson<Partial<Record<RecoveryStage, string>>>(
+          child.stage_fingerprints,
+          {},
+        )['relations'];
+        const stale =
+          stageOnly &&
+          requiredStages.includes('relations') &&
+          stored !== currentRelationFingerprint(window);
+        if (!stale) {
+          skippedComplete++;
+          reuseTargets.push({ window, index });
+          return;
+        }
+        staleRoster++;
+      }
+      if (child?.status === 'deferred' && opts.recovery?.explicitRetry !== true) {
+        skippedDeferred++;
+        reuseTargets.push({ window, index });
+        return;
+      }
+    }
+    eligibleTargets.push({ window, index });
   });
+  if (staleRoster) stats.recoveryRosterStale = staleRoster;
+  if (skippedComplete) stats.recoverySkippedComplete = skippedComplete;
+  if (skippedDeferred) stats.recoverySkippedDeferred = skippedDeferred;
+  const targets = [
+    ...eligibleTargets.slice(0, cap),
+    ...reuseTargets.slice(0, Math.max(0, cap - Math.min(cap, eligibleTargets.length))),
+  ].sort((a, b) => a.index - b.index);
   if (skippedRepeated) {
     stats.skippedRepeatedWindows = skippedRepeated;
     opts.onProgress?.(
       `skipped ${skippedRepeated} window(s) with a previous incomplete or zero-write attempt; run extraction to retry`,
     );
   }
+  if (skippedLegacy) {
+    stats.legacyBlockedWindows = skippedLegacy;
+    opts.onProgress?.(
+      `skipped ${skippedLegacy} lazy window(s) containing legacy mined rows; recovery never auto-resets legacy state`,
+    );
+  }
   if (!targets.length) return stats;
 
   const ctx = loadChunkContext(db, projectId);
-  const roster = buildNameRoster(db, projectId, chunks);
   const nameIndex = commandRosterIndex(db, projectId);
-  const runId = startExtractionRun(db, projectId, targets.length, {
-    provider: llm.settings.provider,
-    model: llm.settings.model,
-    seed: null,
-    windowSize,
-    maxTokens,
-    singlePrompt: opts.singlePrompt === true,
-  });
+  const truncatedPassages = targets.reduce(
+    (total, { window }) =>
+      total + window.filter((chunk) => chunk.text.length > PROMPT_PASSAGE_CHARS).length,
+    0,
+  );
+  stats.truncatedPassages = truncatedPassages;
+  stats.coverageNonExhaustive = truncatedPassages > 0;
+  if (truncatedPassages > 0) {
+    opts.onProgress?.(
+      `${truncatedPassages} passage(s) longer than ${PROMPT_PASSAGE_CHARS} characters were only partially read; prompt coverage is non-exhaustive`,
+    );
+  }
+  const runId = stageOnly
+    ? randomUUID()
+    : startExtractionRun(db, projectId, targets.length, {
+        provider: llm.settings.provider,
+        model: llm.settings.model,
+        seed: null,
+        windowSize,
+        maxTokens,
+        singlePrompt: opts.singlePrompt === true,
+      });
+  const recovery = recoveryEnabled
+    ? createRecoveryRuntime(db, llm, projectId, runId, targets, {
+        ...opts,
+        windowSize,
+        maxTokens,
+        recovery: { ...opts.recovery, stageOnly },
+      }, generationChildIds, generationRevision)
+    : undefined;
   let aborted = false;
   try {
     await runWindowBatch(db, llm, projectId, targets, ctx, new Map<string, number>(), stats, {
@@ -1325,39 +2655,143 @@ export async function ensureWindowsForChunks(
       onWindow: opts.onWindow,
       roster,
       index: nameIndex,
+      recovery,
     });
   } catch (err) {
     aborted = true;
     throw err;
   } finally {
-    finalizeExtractionRun(db, runId, targets.length, aborted);
+    try {
+      if (!stageOnly) finalizeExtractionRun(db, runId as number, targets.length, aborted);
+    } finally {
+      if (recovery) {
+        let staleRelationWindows = 0;
+        if (stageOnly) {
+          const chunksById = new Map(chunks.map((chunk) => [chunk.id, chunk]));
+          const finalChildIds = new Set<number>();
+          if (scopeController && generationStageConfigHash) {
+            for (const window of allWindows) {
+              if (window.some((chunk) => mined.has(chunk.id) && !managedChunkIds.has(chunk.id))) {
+                continue;
+              }
+              const workKey = recoveryWindowWorkKey(
+                db,
+                projectId,
+                window,
+                generationStageConfigHash,
+                requiredStages,
+                generationRevision,
+              );
+              const child = scopeController.childByWorkKey(projectId, workKey);
+              if (child) finalChildIds.add(child.id);
+            }
+          }
+          for (const childId of recovery.childByWindowIndex.values()) finalChildIds.add(childId);
+          const entries = [...finalChildIds]
+            .map((childId) => {
+              const child = recovery.controller.getChild(childId);
+              if (!child) return undefined;
+              const window = fromJson<number[]>(child.chunk_ids, [])
+                .map((id) => chunksById.get(id))
+                .filter((chunk): chunk is ChunkRow => chunk !== undefined);
+              return window.length ? { childId, window } : undefined;
+            })
+            .filter((entry): entry is { childId: number; window: ChunkRow[] } => entry !== undefined);
+          staleRelationWindows = countStaleRelationChildren(
+            recovery.controller,
+            db,
+            projectId,
+            llm,
+            roster,
+            requiredStages,
+            windowSize,
+            maxTokens,
+            singlePrompt,
+            entries,
+          );
+          stats.recoveryRelationStale = staleRelationWindows;
+        }
+        const parentStatus = recovery.controller.finalizeParent(recovery.parentId, {
+          forcePartial: staleRelationWindows > 0,
+        });
+        const readiness = stageOnly
+          ? 'staged_only'
+          : parentStatus === 'complete' ? 'correctness_pending' : 'incomplete';
+        const coverageStatus = staleRelationWindows > 0
+          ? 'partial'
+          : stats.coverageNonExhaustive
+            ? 'non_exhaustive'
+            : 'complete';
+        const optional = stageOnly
+          ? {
+              noteIngestion: 'unavailable-staging-only',
+              closeTheLoop: 'unavailable-staging-only',
+              embeddings: 'unavailable-staging-only',
+              projectWideDisposition: 'not_implemented',
+              publication: 'not_implemented',
+              coverage: {
+                status: coverageStatus,
+                passages: truncatedPassages,
+                promptChars: PROMPT_PASSAGE_CHARS,
+                staleRelationWindows,
+              },
+            }
+          : {
+              noteIngestion: 'deferred',
+              closeTheLoop: 'deferred',
+              embeddings: 'not_requested',
+              projectWideDisposition: 'pending',
+              operations: ['dedupeRelations', 'markContestedClaims', 'mergeCanonEntities', 'linkTimelineToEvents', 'identity/capacity/quarantine sweeps'],
+              coverage: {
+                status: coverageStatus,
+                passages: truncatedPassages,
+                promptChars: PROMPT_PASSAGE_CHARS,
+                staleRelationWindows,
+              },
+            };
+        recovery.controller.setParentReadiness(recovery.parentId, readiness, optional);
+        const children = recovery.controller.children(recovery.parentId);
+        stats.recovery = {
+          parentId: recovery.parentId,
+          status: parentStatus,
+          readiness,
+          optional,
+          children: children.length,
+          completeChildren: children.filter((child) => child.status === 'complete').length,
+          deferredChildren: children.filter((child) => child.status === 'deferred').length,
+        };
+      }
+    }
   }
-
-  dedupeRelations(db, projectId);
-  const contested = markContestedClaims(db, projectId);
-  if (contested.facts || contested.relations) stats.contested = contested;
-  const merged = mergeCanonEntities(db, projectId);
-  stats.mergedAliases = merged.merged;
-  stats.quarantinedAliases = merged.quarantined;
-  persistQuarantine(db, projectId, merged.quarantined);
-  // Identity-claim sweep over entity summaries: flags only, merges stay
-  // human-gated. Dynamic import avoids the lorebook<->rule-checker cycle
-  // (same precedent as the deferred diagnostics import).
-  const identityHits = (await import('./answer/rule-checker.ts')).checkEntities(db, projectId);
-  if (identityHits.length) {
-    opts.onProgress?.(
-      `identity sweep: ${identityHits.length} summar${identityHits.length === 1 ? 'y' : 'ies'} flagged for review`,
-    );
+  if (!recovery) {
+    dedupeRelations(db, projectId);
+    const contested = markContestedClaims(db, projectId);
+    if (contested.facts || contested.relations) stats.contested = contested;
+    const merged = mergeCanonEntities(db, projectId);
+    stats.mergedAliases = merged.merged;
+    stats.quarantinedAliases = merged.quarantined;
+    persistQuarantine(db, projectId, merged.quarantined);
+    // Identity-claim sweep over entity summaries: flags only, merges stay
+    // human-gated. Dynamic import avoids the lorebook<->rule-checker cycle
+    // (same precedent as the deferred diagnostics import).
+    const identityHits = (await import('./answer/rule-checker.ts')).checkEntities(db, projectId);
+    if (identityHits.length) {
+      opts.onProgress?.(
+        `identity sweep: ${identityHits.length} summar${identityHits.length === 1 ? 'y' : 'ies'} flagged for review`,
+      );
+    }
+    linkTimelineToEvents(db, projectId);
   }
-  linkTimelineToEvents(db, projectId);
   stats.windows = targets.length;
-  writeAuditNote(projectId, 'mine', [
-    `windows visited: ${stats.windows}`,
-    `ties banked: ${stats.relations}`,
-    `quotes verified: ${stats.verification.verified}, repointed: ${stats.verification.repointed}, dropped: ${stats.verification.dropped}`,
-    `empty windows: ${stats.emptyWindows.length}`,
-    `partial/failed windows: ${stats.windowIssues.length}`,
-  ], db);
+  if (!stageOnly) {
+    writeAuditNote(projectId, 'mine', [
+      `windows visited: ${stats.windows}`,
+      `ties banked: ${stats.relations}`,
+      `quotes verified: ${stats.verification.verified}, repointed: ${stats.verification.repointed}, dropped: ${stats.verification.dropped}`,
+      `empty windows: ${stats.emptyWindows.length}`,
+      `partial/failed windows: ${stats.windowIssues.length}`,
+    ], db);
+  }
   return stats;
 }
 
@@ -1375,6 +2809,9 @@ export async function mineUnminedHits(
   chunkIds: number[],
 ): Promise<ExtractLoreResult | undefined> {
   if (!chunkIds.length) return undefined;
+  // Staging-only work is not visible to retrieval. Automatic lazy mining
+  // would spend model time producing results no reader may use.
+  if (recoveryEnabledFor({}, llm)) return undefined;
   const unmined = db
     .all<{ id: number }>(
       `SELECT id FROM canon_chunk WHERE project_id = ? AND lore_mined = 0 AND id IN (${chunkIds.map(() => '?').join(',')})`,
@@ -1386,7 +2823,11 @@ export async function mineUnminedHits(
   try {
     // Window size 8 is the extraction default; a mismatch only regroups,
     // because mined state is per passage and a later run regroups anyway.
-    const mini = await ensureWindowsForChunks(db, llm, projectId, unmined, { windowSize: 8 });
+    // Let the shared default decide: real providers recover; the test-only
+    // mock provider keeps the legacy lazy flow.
+    const mini = await ensureWindowsForChunks(db, llm, projectId, unmined, {
+      windowSize: 8,
+    });
     return mini.windows > 0 ? mini : undefined;
   } catch {
     return undefined;
@@ -1721,8 +3162,8 @@ interface RunBatchOpts {
   singlePrompt: boolean;
   windowSize: number;
   totalChunks: number;
-  /** Durable extraction-run row for this batch. */
-  runId: number;
+  /** Durable extraction-run row for this batch, or a unique staging scope. */
+  runId: number | string;
   onProgress?: (message: string) => void;
   onWindow?: (progress: ExtractWindowProgress) => void;
   /** Book-wide capitalization roster, built once per extraction. */
@@ -1731,6 +3172,8 @@ interface RunBatchOpts {
   index?: RosterIndex;
   /** Opt-in diagnostic trace for this extraction run. */
   trace?: ExtractionTrace | null;
+  /** Durable recovery ledger for this run, when enabled. */
+  recovery?: RecoveryRuntime;
 }
 
 /** Run windows through the split (or legacy) path and mark them mined. */
@@ -1755,37 +3198,56 @@ async function runWindowBatch(
         if (batch.trace?.canRecord()) batch.trace.windowStarted(index, window.map((chunk) => chunk.id));
         let outcome: WindowOutcome;
         try {
-          outcome = batch.singlePrompt
-            ? await extractWindowLegacy(
+          outcome = batch.recovery
+            ? await extractWindowWithRecovery(
                 db,
                 llm,
                 projectId,
                 window,
                 entityIdByName,
                 stats,
-                ctx.neighboursOf,
-                batch.maxTokens,
-                batch.index,
-                batch.trace,
-                index,
-              )
-            : await extractWindowSplit(
-                db,
-                llm,
-                projectId,
-                window,
-                entityIdByName,
-                stats,
-                ctx.neighboursOf,
+                batch.recovery?.fragmentMode ? () => [] : ctx.neighboursOf,
                 batch.maxTokens,
                 index,
                 batch.roster,
                 batch.index,
                 batch.trace,
-              );
+                batch.recovery,
+                batch.singlePrompt,
+                windowStartedAt,
+              )
+            : batch.singlePrompt
+              ? await extractWindowLegacy(
+                  db,
+                  llm,
+                  projectId,
+                  window,
+                  entityIdByName,
+                  stats,
+                  ctx.neighboursOf,
+                  batch.maxTokens,
+                  batch.index,
+                  batch.trace,
+                  index,
+                )
+              : await extractWindowSplit(
+                  db,
+                  llm,
+                  projectId,
+                  window,
+                  entityIdByName,
+                  stats,
+                  ctx.neighboursOf,
+                  batch.maxTokens,
+                  index,
+                  batch.roster,
+                  batch.index,
+                  batch.trace,
+                );
         } catch (err) {
           // One bad window must not abort the run, but it must not be silent.
           const detail = err instanceof Error ? err.message : String(err);
+          stats.executionFailures = (stats.executionFailures ?? 0) + 1;
           stats.emptyWindows.push({
             index,
             locator: window[0]?.locator ?? '',
@@ -1807,8 +3269,11 @@ async function runWindowBatch(
         // those as aborted rather than silently omitting their lineage.
         if (batch.trace?.canRecord()) batch.trace.abortWindow(index);
         // Durable provenance is written per window, not in a run-wide
-        // transaction: a later crash must leave this row behind.
-        recordExtractionWindow(db, batch.runId, projectId, window, index, outcome, windowStartedAt, nowIso());
+        // transaction: a later crash must leave this row behind. Recovery
+        // writes it inside child finalization instead of after it.
+        if (!batch.recovery) {
+          recordExtractionWindow(db, batch.runId as number, projectId, window, index, outcome, windowStartedAt, nowIso());
+        }
         if (batch.trace?.canRecord()) batch.trace.windowFinished(index, outcome.state, outcome.wrote.relations);
         // Any empty-window or partial/failed-window record for this index
         // means the window is not complete. It must stay unmined so a later
@@ -1816,27 +3281,32 @@ async function runWindowBatch(
         const incomplete =
           stats.emptyWindows.slice(emptyBefore).some((e) => e.index === index) ||
           stats.windowIssues.slice(issuesBefore).some((w) => w.index === index);
-        if (outcome.state === 'complete' && !incomplete) {
+        if (!batch.recovery && outcome.state === 'complete' && !incomplete) {
           for (const c of window) db.run('UPDATE canon_chunk SET lore_mined = 1 WHERE id = ?', c.id);
         }
-        // Feed the evidence web from this window. Additive and fenced off: a
-        // failure here is logged and never fails the extraction.
-        try {
-          const ingested = noteFromExtraction(db, projectId, window, stats, {
-            runId: batch.runId,
-            windowIndex: index,
-          });
-          if (ingested.traceId || ingested.notes) {
-            const deduplicated = ingested.deduplicated ? `, deduplicated ${ingested.deduplicated}` : '';
-            const trace = ingested.traceId ? ` (trace ${ingested.traceId})` : '';
+        // Feed the evidence web from this window on the legacy path. Recovery
+        // keeps note ingestion outside the durable stage transaction; the
+        // optional enrichment pass must be separately recoverable.
+        if (!batch.recovery) {
+          try {
+            const ingested = noteFromExtraction(db, projectId, window, stats, {
+              runId: batch.runId as number,
+              windowIndex: index,
+            });
+            if (ingested.traceId || ingested.notes) {
+              const deduplicated = ingested.deduplicated ? `, deduplicated ${ingested.deduplicated}` : '';
+              const trace = ingested.traceId ? ` (trace ${ingested.traceId})` : '';
+              batch.onProgress?.(
+                `  notes: +${ingested.notes}${deduplicated} from window ${index}${trace}`,
+              );
+            }
+          } catch {
+            // Progress is browser-facing for server jobs. Keep the raw error in
+            // server-side diagnostics, never in a transient progress message.
             batch.onProgress?.(
-              `  notes: +${ingested.notes}${deduplicated} from window ${index}${trace}`,
+              `  note ingestion skipped for window ${index}; see diagnostics`,
             );
           }
-        } catch (err) {
-          batch.onProgress?.(
-            `  note ingestion skipped for window ${index}: ${err instanceof Error ? err.message : String(err)}`,
-          );
         }
         done++;
         batch.onProgress?.(
@@ -2581,6 +4051,9 @@ interface SpanCheck {
   source: string;
   locator: string;
   status: 'verified' | 'repointed' | 'dropped';
+  /** UTF-16 offsets into the canonical chunk text, only for fragment windows. */
+  chunk_start?: number;
+  chunk_end?: number;
 }
 
 /**
@@ -2738,13 +4211,18 @@ function canonicalSpans(raw: string, needle: string, exactText = ''): CanonicalS
   // canonical source span. Normalized variants that are not raw-exact still
   // fall through to the ambiguity check in the caller.
   if (exactText) {
+    const exactSpans = new Map<string, CanonicalSpan>();
     let exactAt = raw.indexOf(exactText);
     while (exactAt >= 0) {
       const exactEnd = exactAt + exactText.length;
       const exact = candidates.find((span) => span.start <= exactAt && exactEnd <= span.end);
-      if (exact) return [exact];
+      if (exact) exactSpans.set(`${exact.start}:${exact.end}`, exact);
       exactAt = raw.indexOf(exactText, exactAt + 1);
     }
+    // Repeated exact text is an ambiguous source location. Never silently bind
+    // the claim to the first occurrence; let the caller fail closed.
+    if (exactSpans.size === 1) return [...exactSpans.values()];
+    if (exactSpans.size > 1) return [...exactSpans.values()];
   }
   return candidates;
 }
@@ -2779,7 +4257,15 @@ export function verifySpan(
   const citedSpans = canonicalSpans(chunk.text, needle, text);
   if (citedSpans.length > 1) return { ...cited, quote: '', status: 'dropped' };
   if (citedSpans.length === 1) {
-    return { ...cited, quote: citedSpans[0]!.quote, status: 'verified' };
+    const span = citedSpans[0]!;
+    return {
+      ...cited,
+      quote: span.quote,
+      status: 'verified',
+      ...(chunk.chunk_start === undefined
+        ? {}
+        : { chunk_start: chunk.chunk_start + span.start, chunk_end: chunk.chunk_start + span.end }),
+    };
   }
 
   const neighbourMatches: { candidate: ChunkRow; span: CanonicalSpan }[] = [];
@@ -2797,6 +4283,12 @@ export function verifySpan(
     source: match.candidate.source_title,
     locator: match.candidate.locator,
     status: 'repointed',
+    ...(match.candidate.chunk_start === undefined
+      ? {}
+      : {
+          chunk_start: match.candidate.chunk_start + match.span.start,
+          chunk_end: match.candidate.chunk_start + match.span.end,
+        }),
   };
 }
 
@@ -2864,11 +4356,12 @@ function parseSection(
   text: string,
   key: string,
   observe?: (observation: ExtractionParseObservation) => void,
+  allowBare = true,
 ): Record<string, unknown>[] {
   const notify = (parsed: unknown, rows: Record<string, unknown>[], source: 'section' | 'bare' | 'salvage'): void => {
     if (!observe) return;
     try {
-      observe(parseObservation(text, key, parsed, rows, source, true));
+      observe(parseObservation(text, key, parsed, rows, source, allowBare));
     } catch {
       /* diagnostics never affect parsing */
     }
@@ -2876,12 +4369,19 @@ function parseSection(
   const parsed = extractJson<unknown>(text);
   // Models sometimes return the section as a bare list instead of the asked-for
   // labelled box (e.g. `[{...}]` for relations). That is the same content and
-  // must not be silently dropped.
+  // must not be silently dropped. A combined entities/facts call is different:
+  // a bare list cannot say which section it belongs to, so recovery requires
+  // the labelled object.
   if (Array.isArray(parsed)) {
-    const values = asRecordArray(parsed);
-    if (values.length) {
-      notify(parsed, values, 'bare');
-      return values;
+    if (allowBare) {
+      const values = asRecordArray(parsed);
+      if (values.length) {
+        notify(parsed, values, 'bare');
+        return values;
+      }
+    } else {
+      notify(parsed, [], 'bare');
+      return [];
     }
   } else if (parsed && typeof parsed === 'object') {
     const values = asRecordArray((parsed as Record<string, unknown>)[key]);
@@ -2896,11 +4396,76 @@ function parseSection(
 }
 
 /** The passages as the model sees them. */
+/** Per-passage prompt budget. Longer chunks are only partially shown. */
+export const PROMPT_PASSAGE_CHARS = 1400;
+/** Approved overlap between adjacent fragments of one long source chunk. */
+export const FRAGMENT_OVERLAP_CHARS = 256;
+
+export interface RecoveryFragmentUnit {
+  window: ChunkRow[];
+  index: number;
+  sourceChunkId: number;
+  sourceStart: number;
+  sourceEnd: number;
+  fragmentStart: number;
+  fragmentEnd: number;
+}
+
+/**
+ * Plan one recovery child per bounded source fragment. Short chunks stay one
+ * unit; only chunks over the prompt budget are split. Overlap preserves
+ * evidence that fits wholly inside the overlap at a split boundary.
+ */
+export function planRecoveryFragments(chunks: ChunkRow[]): RecoveryFragmentUnit[] {
+  const out: RecoveryFragmentUnit[] = [];
+  let index = 0;
+  for (const chunk of chunks) {
+    const length = chunk.text.length;
+    if (length <= PROMPT_PASSAGE_CHARS) {
+      out.push({
+        window: [{
+          ...chunk,
+          text: chunk.text,
+          chunk_start: 0,
+          chunk_end: length,
+        }],
+        index: index++,
+        sourceChunkId: chunk.id,
+        sourceStart: 0,
+        sourceEnd: length,
+        fragmentStart: 0,
+        fragmentEnd: length,
+      });
+      continue;
+    }
+    const step = PROMPT_PASSAGE_CHARS - FRAGMENT_OVERLAP_CHARS;
+    for (let start = 0; start < length; start += step) {
+      const end = Math.min(length, start + PROMPT_PASSAGE_CHARS);
+      out.push({
+        window: [{
+          ...chunk,
+          text: chunk.text.slice(start, end),
+          chunk_start: start,
+          chunk_end: end,
+        }],
+        index: index++,
+        sourceChunkId: chunk.id,
+        sourceStart: start,
+        sourceEnd: end,
+        fragmentStart: start,
+        fragmentEnd: end,
+      });
+      if (end >= length) break;
+    }
+  }
+  return out;
+}
+
 function passageBlock(window: ChunkRow[]): string {
   return (
     'PASSAGES:\n' +
     window
-      .map((c, i) => `[#${i}] ${c.source_title} | ${c.locator}\n${truncate(c.text, 1400)}`)
+      .map((c, i) => `[#${i}] ${c.source_title} | ${c.locator}\n${truncate(c.text, PROMPT_PASSAGE_CHARS)}`)
       .join('\n\n')
   );
 }
@@ -2910,8 +4475,17 @@ function chunkAt(window: ChunkRow[], idx: unknown): ChunkRow | undefined {
   return Number.isFinite(i) ? window[i] : undefined;
 }
 
-function refsFor(chunk: ChunkRow | undefined): { source: string; locator: string; chunk?: number }[] {
-  return chunk ? [{ source: chunk.source_title, locator: chunk.locator, chunk: chunk.id }] : [];
+function refsFor(
+  chunk: ChunkRow | undefined,
+): { source: string; locator: string; chunk?: number; chunk_start?: number; chunk_end?: number }[] {
+  if (!chunk) return [];
+  return [{
+    source: chunk.source_title,
+    locator: chunk.locator,
+    chunk: chunk.id,
+    ...(chunk.chunk_start === undefined ? {} : { chunk_start: chunk.chunk_start }),
+    ...(chunk.chunk_end === undefined ? {} : { chunk_end: chunk.chunk_end }),
+  }];
 }
 
 
@@ -3351,7 +4925,8 @@ function rosterEntryInWindow(
     return !!canonical && ` ${hayCanonical} `.includes(` ${canonical} `);
   });
   if (present) return [present];
-  return entry.tokens.some((token) => hayTokens.has(token)) ? [entry.surface] : [];
+  const hit = entry.tokens.some((token) => hayTokens.has(token));
+  return hit ? [entry.surface] : [];
 }
 
 /**
@@ -3365,11 +4940,12 @@ export function windowEntityNames(
   projectId: number,
   window: ChunkRow[],
   roster?: NameRoster,
+  entities?: Array<{ name: string; aliases: string[] }>,
 ): string[] {
   const hayCanonical = canonicalName(window.map((c) => c.text).join(' '));
   const hayTokens = new Set(hayCanonical.split(' ').filter(Boolean));
   const names: string[] = [];
-  for (const entity of listEntities(db, projectId)) {
+  for (const entity of entities ?? listEntities(db, projectId)) {
     const variants = [entity.name, ...entity.aliases];
     if (
       variants.some((variant) =>
@@ -3396,8 +4972,9 @@ export function windowEntityNames(
   const merged = [...bankNames];
   if (roster) {
     for (const entry of roster.entries) {
-      if (!rosterEntryInWindow(entry, hayCanonical, hayTokens)) continue;
-      merged.push(entry.surface);
+      const matched = rosterEntryInWindow(entry, hayCanonical, hayTokens);
+      if (!matched.length) continue;
+      merged.push(...matched);
     }
   }
   return uniqueNames(merged).slice(0, WINDOW_NAME_CAP);
@@ -3516,17 +5093,83 @@ function applyEntities(
     const existing = entityIdByName.get(key(name)) ?? findEntityId(db, projectId, kind, name);
     const attributes = (raw.attributes ?? {}) as Record<string, unknown>;
     if (existing) {
+      // Fill-only metadata: a repeat or a narrower follow-up must not replace a
+      // richer summary/role/status/evidence, and a human-confirmed row stays
+      // human-confirmed. New aliases and evidence links append once per
+      // contribution; the caller's exact-repeat filter prevents double counts.
+      const current = db.get<{
+        aliases: string;
+        source_refs: string;
+        summary: string;
+        role: string;
+        status: string;
+        attributes: string;
+        evidence: string;
+        review_status: string;
+      }>(
+        `SELECT aliases, source_refs, summary, role, status, attributes, evidence, review_status
+           FROM canon_entity WHERE id = ? AND project_id = ?`,
+        existing,
+        projectId,
+      );
+      if (!current) {
+        entityIdByName.set(key(name), existing);
+        accepted++;
+        continue;
+      }
+      const nextSummary = String(raw.summary ?? '').trim();
+      const nextRole = String(raw.role ?? '').trim();
+      const nextStatus = String(raw.status ?? '').trim();
+      const nextAttributes = toJson(
+        Object.fromEntries(Object.entries(attributes).map(([k, v]) => [k, String(v)])),
+      );
+      const nextEvidence = evidence;
+      const nonEmpty = (value: string): boolean => value.trim().length > 0;
+      const attrsNonEmpty = (value: string): boolean => value.trim() !== '' && value.trim() !== '{}';
+      const conflict =
+        (nonEmpty(nextSummary) && nonEmpty(current.summary) && nextSummary !== current.summary) ||
+        (nonEmpty(nextRole) && nonEmpty(current.role) && nextRole !== current.role) ||
+        (nonEmpty(nextStatus) && nonEmpty(current.status) && nextStatus !== current.status) ||
+        (attrsNonEmpty(nextAttributes) && attrsNonEmpty(current.attributes) && nextAttributes !== current.attributes) ||
+        (nonEmpty(nextEvidence) && nonEmpty(current.evidence) && nextEvidence !== current.evidence);
+      const aliases = [
+        ...new Set([...strList(current.aliases), ...toStringArray(raw.aliases)]),
+      ];
+      const refsMerged = [
+        ...new Map(
+          [...fromJson<unknown[]>(current.source_refs, []), ...refs].map((item) => [
+            JSON.stringify(item),
+            item,
+          ]),
+        ).values(),
+      ];
       db.run(
-        `UPDATE canon_entity SET summary = ?, role = ?, status = ?, attributes = ?, evidence = ?,
-                source_refs = ?, mentions = mentions + 1, updated_at = ? WHERE id = ?`,
-        String(raw.summary ?? '').trim(),
-        String(raw.role ?? '').trim(),
-        String(raw.status ?? '').trim(),
-        toJson(Object.fromEntries(Object.entries(attributes).map(([k, v]) => [k, String(v)]))),
-        evidence,
-        toJson(refs),
+        `UPDATE canon_entity SET
+           summary = CASE WHEN summary = '' THEN ? ELSE summary END,
+           role = CASE WHEN role = '' THEN ? ELSE role END,
+           status = CASE WHEN status = '' THEN ? ELSE status END,
+           attributes = CASE WHEN attributes = '' OR attributes = '{}' THEN ? ELSE attributes END,
+           evidence = CASE WHEN evidence = '' THEN ? ELSE evidence END,
+           aliases = ?, source_refs = ?,
+           review_status = CASE
+             WHEN review_status = 'user_confirmed' THEN review_status
+             WHEN ? THEN 'needs_review'
+             ELSE review_status
+           END,
+           mentions = mentions + 1,
+           updated_at = ?
+         WHERE id = ? AND project_id = ?`,
+        nextSummary,
+        nextRole,
+        nextStatus,
+        nextAttributes,
+        nextEvidence,
+        toJson(aliases),
+        toJson(refsMerged),
+        conflict ? 1 : 0,
         nowIso(),
         existing,
+        projectId,
       );
       entityIdByName.set(key(name), existing);
       accepted++;
@@ -5045,9 +6688,14 @@ function applyRelations(
   trace?: ExtractionTrace | null,
   windowIndex = 0,
   candidateIds: string[] = [],
+  rosterRows?: Array<{ id: number; name: string; aliases: string }>,
 ): number {
   let accepted = 0;
   const minConfidence = projectMinConfidence(db, projectId);
+  const resolveEndpoint = (name: string): TracedEndpointResolution =>
+    rosterRows
+      ? resolveEntityDetailedFromRows(rosterRows, name)
+      : resolveEntityDetailed(db, projectId, name);
   for (const [ordinal, raw] of raws.entries()) {
     let fromName = String(raw.from ?? '').trim();
     let toName = String(raw.to ?? '').trim();
@@ -5072,8 +6720,8 @@ function applyRelations(
       if (candidateId) trace?.disposition(candidateId, decision, reason, counts);
     };
     try {
-      const fromResolution = resolveEntityDetailed(db, projectId, fromName);
-      const toResolution = resolveEntityDetailed(db, projectId, toName);
+      const fromResolution = resolveEndpoint(fromName);
+      const toResolution = resolveEndpoint(toName);
       if (candidateId) {
         trace?.endpoint(candidateId, 'from', fromResolution);
         trace?.endpoint(candidateId, 'to', toResolution);
@@ -5602,7 +7250,19 @@ function applyTimeline(
     const chunk = chunkAt(window, raw.chunk_index);
     const span = spanFor(raw.evidence, chunk, neighboursOf(chunk?.id), gate, stats.verification);
     if (span.status === 'dropped') continue;
-    const dup = db.get<{ id: number }>('SELECT id FROM canon_timeline WHERE project_id = ? AND title = ?', projectId, title);
+    const summary = String(raw.summary ?? '').trim();
+    // Identity is the full claim, not the title alone: two different events may
+    // share a title, while an exact repeat has the same title, summary and
+    // verified quote and is skipped here as a second guard beside contribution
+    // identity.
+    const dup = db.get<{ id: number }>(
+      `SELECT id FROM canon_timeline
+        WHERE project_id = ? AND title = ? AND summary = ? AND evidence = ?`,
+      projectId,
+      title,
+      summary,
+      span.quote,
+    );
     if (dup) {
       accepted++;
       continue;
@@ -5617,7 +7277,7 @@ function applyTimeline(
       projectId,
       (seq?.n ?? 0) + 1,
       title,
-      String(raw.summary ?? '').trim(),
+      summary,
       String(raw.when ?? '').trim(),
       toJson(toStringArray(raw.participants)),
       String(raw.location ?? '').trim(),
@@ -5998,6 +7658,1676 @@ async function extractWindowSplit(
       : `parsed ${parsedClaims} claims, wrote 0 rows`,
   });
   return outcome;
+}
+
+interface RecoveryCompletion {
+  complete: boolean;
+  empty: boolean;
+  reason?: ExtractionIncompleteReason;
+}
+
+interface RecoveryStageResult {
+  stage: RecoveryStage;
+  status: RecoveryStageStatus;
+  wrote: number;
+  wroteStats: { entities: number; facts: number; relations: number; timeline: number };
+  section: ExtractionSectionReport;
+  failed: boolean;
+  error?: string;
+}
+
+interface RecoveryStageSpec {
+  stage: RecoveryStage;
+  system: () => string;
+  maxTokens: number;
+  temperature: number;
+  fingerprint?: string;
+  validateSnapshot?: () => boolean;
+  rosterRows?: Array<{ id: number; kind: string; name: string; aliases: string; review_status: string }>;
+  prepare: (
+    text: string,
+    finishReason: FinishReason | undefined,
+  ) => Promise<{
+    payload: Record<string, unknown>;
+    completion: RecoveryCompletion;
+    parsedClaims: number;
+    apply: (fingerprint: string) => number;
+  }>;
+}
+
+function recoveryReasonForObservation(
+  observation: ExtractionParseObservation | undefined,
+): ExtractionIncompleteReason {
+  if (!observation) return 'unparsed-answer';
+  switch (observation.route) {
+    case 'missing-section':
+      return 'section-missing';
+    case 'wrong-shape':
+      return 'schema-mismatch';
+    case 'filtered-array':
+      return 'mixed-entries';
+    case 'empty-response':
+      return 'empty-response';
+    case 'salvaged-array':
+      return 'partial-array';
+    case 'unparsed':
+      return 'unparsed-answer';
+    default:
+      return 'unparsed-answer';
+  }
+}
+
+function recoveryCompletionOf(
+  observation: ExtractionParseObservation | undefined,
+  finishReason: FinishReason | undefined,
+): RecoveryCompletion {
+  if (finishReason === undefined) return { complete: false, empty: false, reason: 'finish-missing' };
+  if (finishReason !== 'stop') {
+    return {
+      complete: false,
+      empty: false,
+      reason: finishIncompleteReason(finishReason) ?? 'finish-unknown',
+    };
+  }
+  if (!observation) return { complete: false, empty: false, reason: 'unparsed-answer' };
+  if (observation.incomplete) {
+    return { complete: false, empty: false, reason: recoveryReasonForObservation(observation) };
+  }
+  switch (observation.route) {
+    case 'empty-array':
+      return { complete: true, empty: true };
+    case 'whole-section-array':
+    case 'fenced-section-array':
+    case 'embedded-section-array':
+    case 'whole-bare-array':
+    case 'fenced-bare-array':
+    case 'embedded-bare-array':
+      return { complete: true, empty: false };
+    default:
+      return { complete: false, empty: false, reason: recoveryReasonForObservation(observation) };
+  }
+}
+
+function recoveryPayloadEmpty(stage: RecoveryStage, payload: Record<string, unknown>): boolean {
+  if (stage === 'entities-facts') {
+    return asRecordArray(payload.entities).length === 0 && asRecordArray(payload.facts).length === 0;
+  }
+  if (stage === 'relations') return asRecordArray(payload.relations).length === 0;
+  if (stage === 'timeline') return asRecordArray(payload.timeline).length === 0;
+  return (
+    asRecordArray(payload.entities).length === 0 &&
+    asRecordArray(payload.facts).length === 0 &&
+    asRecordArray(payload.relations).length === 0 &&
+    asRecordArray(payload.timeline).length === 0
+  );
+}
+
+function recoveryClaimSource(window: ChunkRow[], raw: Record<string, unknown>): ChunkRow | undefined {
+  const index = raw.chunk_index;
+  // The extraction contract is a JSON number. Null, booleans, strings and
+  // fractions are invalid citations, not positions: fail closed rather than
+  // coercing them onto a different source chunk.
+  if (
+    typeof index !== 'number' ||
+    !Number.isInteger(index) ||
+    index < 0 ||
+    index >= window.length
+  ) {
+    return undefined;
+  }
+  return window[index];
+}
+
+interface RecoveryClaim {
+  raw: Record<string, unknown>;
+  uid: string;
+  sourceChunkId: number | null;
+  contributionId?: number;
+}
+
+function recoveryClaims(
+  window: ChunkRow[],
+  claimType: string,
+  raws: Record<string, unknown>[],
+  neighboursOf?: (id: number | undefined) => ChunkRow[],
+  verifySource = false,
+): RecoveryClaim[] {
+  const byUid = new Map<string, RecoveryClaim>();
+  for (const raw of raws) {
+    const cited = recoveryClaimSource(window, raw);
+    let sourceChunkId = cited?.id ?? null;
+    let canonical: Record<string, unknown>;
+    if (verifySource) {
+      const span = verifySpan(raw.evidence, cited, neighboursOf?.(cited?.id) ?? []);
+      if (span.chunkId === null || span.status === 'dropped' || !span.quote) continue;
+      sourceChunkId = span.chunkId;
+      const { chunk_index: _windowIndex, ...rest } = raw;
+      canonical = {
+        ...rest,
+        evidence: span.quote,
+        ...(span.chunk_start === undefined
+          ? {}
+          : { chunk_start: span.chunk_start, chunk_end: span.chunk_end }),
+      };
+    } else {
+      const { chunk_index: _windowIndex, ...rest } = raw;
+      canonical = rest;
+    }
+    const uid = recoveryContributionUid({ claimType, sourceChunkId, payload: canonical });
+    if (!byUid.has(uid)) byUid.set(uid, { raw, sourceChunkId, uid });
+  }
+  return [...byUid.values()];
+}
+
+/**
+ * Additive canonical-chunk-relative UTF-16 offsets for staged fragment evidence. Existing
+ * source/quote fields are preserved; claims whose offsets cannot be validated
+ * are left untouched and will fail the staged-claim verification downstream.
+ */
+function annotateFragmentPayload(
+  stage: RecoveryStage,
+  payload: Record<string, unknown>,
+  window: ChunkRow[],
+  neighboursOf: (id: number | undefined) => ChunkRow[],
+): Record<string, unknown> {
+  const annotate = (raws: Record<string, unknown>[]): Record<string, unknown>[] =>
+    raws.map((raw) => {
+      const cited = recoveryClaimSource(window, raw);
+      const span = verifySpan(raw.evidence, cited, neighboursOf(cited?.id));
+      if (span.chunk_start === undefined) return raw;
+      return { ...raw, chunk_start: span.chunk_start, chunk_end: span.chunk_end };
+    });
+  const next = { ...payload };
+  if (stage === 'entities-facts' || stage === 'legacy') {
+    if (Array.isArray(payload.entities)) next.entities = annotate(asRecordArray(payload.entities));
+    if (Array.isArray(payload.facts)) next.facts = annotate(asRecordArray(payload.facts));
+  }
+  if (stage === 'relations' || stage === 'legacy') {
+    if (Array.isArray(payload.relations)) next.relations = annotate(asRecordArray(payload.relations));
+  }
+  if (stage === 'timeline' || stage === 'legacy') {
+    if (Array.isArray(payload.timeline)) next.timeline = annotate(asRecordArray(payload.timeline));
+  }
+  return next;
+}
+
+
+function stagedEntityRows(
+  db: Db,
+  projectId: number,
+  parentId: number | null,
+  childIds?: number[],
+): Array<{ id: number; kind: string; name: string; aliases: string; review_status: string }> {
+  if (childIds && !childIds.length) return [];
+  type ChildRow = {
+    id: number;
+    chunk_ids: string;
+    stage_fingerprints: string;
+    source_order: number;
+    window_index: number;
+  };
+  let children: ChildRow[];
+  if (childIds) {
+    children = [];
+    for (let start = 0; start < childIds.length; start += 400) {
+      const batch = childIds.slice(start, start + 400);
+      children.push(
+        ...db.all<ChildRow>(
+          `SELECT c.id, c.chunk_ids, c.stage_fingerprints, c.source_order, c.window_index
+             FROM extraction_recovery_child c
+            WHERE c.id IN (${batch.map(() => '?').join(',')})`,
+          ...batch,
+        ),
+      );
+    }
+    children.sort(
+      (a, b) =>
+        a.source_order - b.source_order ||
+        a.window_index - b.window_index ||
+        a.id - b.id,
+    );
+  } else {
+    children = db.all<ChildRow>(
+      `SELECT c.id, c.chunk_ids, c.stage_fingerprints, c.source_order, c.window_index
+         FROM extraction_recovery_child c
+         JOIN extraction_recovery_run_child r ON r.child_id = c.id
+        WHERE r.parent_id = ?
+        ORDER BY r.source_order, r.window_index`,
+      parentId,
+    );
+  }
+  if (!children.length) return [];
+  const chunks = loadOrderedChunks(db, projectId);
+  const chunkById = new Map(chunks.map((chunk) => [chunk.id, chunk]));
+  const { neighboursOf } = loadChunkContext(db, projectId);
+  const out: Array<{ id: number; kind: string; name: string; aliases: string; review_status: string }> = [];
+  let nextId = -1;
+  for (const child of children) {
+    const fingerprint = fromJson<Partial<Record<RecoveryStage, string>>>(
+      child.stage_fingerprints,
+      {},
+    )['entities-facts'];
+    if (!fingerprint) continue;
+    const coverage = db.get<{ attempt_id: number | null; result_json: string }>(
+      `SELECT attempt_id, result_json FROM extraction_stage_coverage
+        WHERE child_id = ? AND stage = 'entities-facts' AND fingerprint = ?
+          AND status IN ('complete', 'empty')
+        ORDER BY id DESC LIMIT 1`,
+      child.id,
+      fingerprint,
+    );
+    if (!coverage) continue;
+    // Only the batch the coverage actually sealed is authoritative. An older
+    // complete batch under another fingerprint (or a superseded payload) is
+    // not part of this generation's roster.
+    const batch = coverage.attempt_id === null
+      ? undefined
+      : db.get<{ payload_json: string }>(
+          `SELECT payload_json FROM extraction_staged_batch
+            WHERE attempt_id = ? AND child_id = ? AND stage = 'entities-facts'
+              AND fingerprint = ? AND complete = 1
+            ORDER BY id DESC LIMIT 1`,
+          coverage.attempt_id,
+          child.id,
+          fingerprint,
+        );
+    if (!batch) continue;
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(batch.payload_json) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const window = fromJson<number[]>(child.chunk_ids, [])
+      .map((id) => chunkById.get(id))
+      .filter((chunk): chunk is ChunkRow => chunk !== undefined);
+    if (!window.length) continue;
+    const stagedUids = new Set(
+      db
+        .all<{ contribution_uid: string }>(
+          `SELECT contribution_uid FROM extraction_contribution
+            WHERE project_id = ? AND stage = 'entities-facts' AND claim_type = 'entity'
+              AND disposition = 'staged' AND contribution_uid LIKE 'staged:%'`,
+          projectId,
+        )
+        .map((row) => row.contribution_uid),
+    );
+    let membership: Set<string> | undefined;
+    try {
+      const stored = JSON.parse(coverage.result_json) as { stagedEntityUids?: unknown };
+      if (Array.isArray(stored.stagedEntityUids)) {
+        membership = new Set(stored.stagedEntityUids.map(String));
+      }
+    } catch {
+      /* older coverage without explicit membership falls back to the global staged reference */
+    }
+    // The same verification that staged the contribution decides whether the
+    // entity may join the generation-local roster. Invalid citations and
+    // rejected claims never reach this list. The staged row may have been
+    // created by an earlier child/window grouping; the current sealed batch
+    // plus this exact UID is the safe generation-local reference.
+    for (const raw of asRecordArray(payload.entities)) {
+      const cited = recoveryClaimSource(window, raw);
+      if (!cited) continue;
+      const hasStart = raw.chunk_start !== undefined;
+      const hasEnd = raw.chunk_end !== undefined;
+      let claim: RecoveryClaim | undefined;
+      if (hasStart || hasEnd) {
+        // Only a persisted integer pair is a usable canonical offset. Coercion
+        // would turn null/empty into 0 and silently bind the first occurrence.
+        const start = raw.chunk_start;
+        const end = raw.chunk_end;
+        if (
+          typeof start !== 'number' ||
+          typeof end !== 'number' ||
+          !Number.isInteger(start) ||
+          !Number.isInteger(end) ||
+          start < 0 ||
+          end <= start ||
+          end > cited.text.length
+        ) {
+          continue;
+        }
+        const evidence = String(raw.evidence ?? '');
+        const needle = normalise(evidence);
+        if (!needle) continue;
+        const matched = canonicalSpans(cited.text, needle, evidence)
+          .find((span) => span.start === start && span.end === end);
+        if (!matched) continue;
+        const { chunk_index: _chunkIndex, ...rest } = raw;
+        const canonical = {
+          ...rest,
+          evidence: matched.quote,
+          chunk_start: start,
+          chunk_end: end,
+        };
+        claim = {
+          raw,
+          sourceChunkId: cited.id,
+          uid: recoveryContributionUid({
+            claimType: 'entity',
+            sourceChunkId: cited.id,
+            payload: canonical,
+          }),
+        };
+      } else {
+        claim = recoveryClaims(window, 'entity', [raw], neighboursOf, true)[0];
+      }
+      if (!claim) continue;
+      const uid = stagedRecoveryContributionUid(claim.uid);
+      if (!stagedUids.has(uid)) continue;
+      if (membership && !membership.has(uid)) continue;
+      const name = String(claim.raw.name ?? '').trim();
+      if (!name) continue;
+      out.push({
+        id: nextId--,
+        kind: normaliseKind(String(claim.raw.kind ?? 'character')),
+        name,
+        aliases: JSON.stringify(toStringArray(claim.raw.aliases)),
+        review_status: 'staged',
+      });
+    }
+  }
+  return out;
+}
+
+function recoveryRosterRows(
+  db: Db,
+  projectId: number,
+  parentId: number,
+  stageOnly: boolean,
+  childIds?: number[],
+): {
+  promptEntities: Array<{ name: string; aliases: string[] }>;
+  resolverRows: Array<{ id: number; kind: string; name: string; aliases: string; review_status: string }>;
+} {
+  const canon = listEntities(db, projectId);
+  const promptEntities = canon.map((entity) => ({ name: entity.name, aliases: entity.aliases }));
+  const resolverRows: Array<{
+    id: number;
+    kind: string;
+    name: string;
+    aliases: string;
+    review_status: string;
+  }> = canon.map((entity) => ({
+    id: entity.id,
+    kind: entity.kind,
+    name: entity.name,
+    aliases: JSON.stringify(entity.aliases),
+    review_status: entity.reviewStatus,
+  }));
+  if (!stageOnly) return { promptEntities, resolverRows };
+  const seen = new Set(canon.map((entity) => canonicalName(entity.name)));
+  for (const staged of stagedEntityRows(db, projectId, parentId, childIds)) {
+    const key = canonicalName(staged.name);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    promptEntities.push({ name: staged.name, aliases: strList(staged.aliases) });
+    resolverRows.push(staged);
+  }
+  return { promptEntities, resolverRows };
+}
+
+function claimRecoveryClaims(
+  runtime: RecoveryRuntime,
+  projectId: number,
+  childId: number,
+  stage: RecoveryStage,
+  claims: RecoveryClaim[],
+  claimType: string,
+  dependencyFingerprint: string,
+): RecoveryClaim[] {
+  const claimed: RecoveryClaim[] = [];
+  for (const claim of claims) {
+    const recorded = runtime.controller.recordContribution({
+      projectId,
+      childId,
+      stage,
+      claimType,
+      uid: claim.uid,
+      payload: claim.raw,
+      dependencyFingerprint,
+      disposition: 'applying',
+    });
+    if (recorded.inserted && recorded.id) {
+      claimed.push({ ...claim, contributionId: recorded.id });
+    }
+  }
+  return claimed;
+}
+
+function finalizeRecoveryClaims(
+  runtime: RecoveryRuntime,
+  claims: RecoveryClaim[],
+  canonTable: string,
+  findCanonId: (raw: Record<string, unknown>) => number | null,
+): void {
+  for (const claim of claims) {
+    if (claim.contributionId === undefined) continue;
+    const canonId = findCanonId(claim.raw);
+    runtime.controller.finalizeContribution(claim.contributionId, {
+      disposition: canonId === null ? 'dropped' : 'applied',
+      canonTable,
+      canonId,
+    });
+    runtime.controller.recordEffect({
+      contributionId: claim.contributionId,
+      effectType: 'claim',
+      effectKey: claim.uid,
+      canonTable,
+      canonId,
+    });
+  }
+}
+
+async function extractWindowWithRecovery(
+  db: Db,
+  llm: LlmClient,
+  projectId: number,
+  window: ChunkRow[],
+  entityIdByName: Map<string, number>,
+  stats: ExtractLoreResult,
+  neighboursOf: (id: number | undefined) => ChunkRow[],
+  maxTokens: number,
+  index: number,
+  roster: NameRoster | undefined,
+  nameIndex: RosterIndex | undefined,
+  trace: ExtractionTrace | null | undefined,
+  runtime: RecoveryRuntime,
+  singlePrompt: boolean,
+  windowStartedAt: string,
+): Promise<WindowOutcome> {
+  const childId = runtime.childByWindowIndex.get(index);
+  if (childId === undefined) throw new Error(`missing recovery child for window ${index}`);
+  const expectedStageFingerprints: Partial<Record<RecoveryStage, string>> = {};
+  for (const stage of requiredRecoveryStages(singlePrompt)) {
+    if (stage === 'relations') {
+      const rosterInfo = recoveryRosterRows(db, projectId, runtime.parentId, runtime.stageOnly, runtime.rosterChildIds);
+      const promptNames = runtime.stageOnly
+        ? windowEntityNames(db, projectId, window, roster, rosterInfo.promptEntities)
+        : process.env.FANFABLE_REL_ROSTER === '1' && roster
+          ? windowRosterNames(window, roster)
+          : windowEntityNames(db, projectId, window, roster, rosterInfo.promptEntities);
+      const snapshot = runtime.controller.snapshotRelationStage(
+        projectId,
+        promptNames,
+        rosterInfo.resolverRows,
+      );
+      expectedStageFingerprints[stage] = runtime.stageFingerprint(window, stage, snapshot.fingerprint);
+    } else {
+      expectedStageFingerprints[stage] = runtime.stageFingerprint(window, stage);
+    }
+  }
+  const claim = runtime.controller.claimChild(childId, runtime.owner, {
+    expectedStageFingerprints,
+    explicitRetry: runtime.explicitRetry,
+  });
+  if (!claim.ok || claim.fencing === undefined) {
+    const reason = claim.reason ?? 'claim-failed';
+    const outcome: WindowOutcome = {
+      state: 'failed',
+      sections: [],
+      failedSections: [],
+      incompleteSections: [],
+      wrote: { entities: 0, facts: 0, relations: 0, timeline: 0 },
+      error: `recovery-${reason}`,
+    };
+    stats.windowIssues.push({
+      index,
+      locator: window[0]?.locator ?? '',
+      state: 'failed',
+      sections: [],
+      failedSections: [],
+      incompleteSections: [],
+      succeededSections: [],
+      wrote: outcome.wrote,
+      detail: `recovery-${reason}`,
+    });
+    return outcome;
+  }
+  if (claim.alreadyComplete) {
+    return {
+      state: 'complete',
+      sections: [],
+      failedSections: [],
+      incompleteSections: [],
+      wrote: { entities: 0, facts: 0, relations: 0, timeline: 0 },
+      error: '',
+    };
+  }
+
+  const fencing = claim.fencing;
+  const heartbeat = startRecoveryHeartbeat(runtime.controller, childId, runtime.owner, fencing);
+  const sections: ExtractionSectionReport[] = [];
+  const stageResults: RecoveryStageResult[] = [];
+  let parsedClaims = 0;
+  let anyEmpty = true;
+  const passages = passageBlock(window);
+  const windowTruncatedPassages = window.filter(
+    (chunk) => chunk.text.length > PROMPT_PASSAGE_CHARS,
+  ).length;
+
+  const finishReasons = new Map<RecoveryStage, FinishReason | undefined>();
+  const ask = async (system: string, maxTok: number, temperature: number): Promise<{
+    text: string;
+    finishReason: FinishReason | undefined;
+  }> => {
+    if (heartbeat.lost()) throw new Error('stale-lease');
+    const response = await llm.chat({
+      system,
+      messages: [{ role: 'user', content: passages }],
+      temperature,
+      maxTokens: maxTok,
+    });
+    if (heartbeat.lost()) throw new Error('stale-lease');
+    return { text: response.text, finishReason: response.finishReason };
+  };
+
+  const runStage = async (spec: RecoveryStageSpec): Promise<RecoveryStageResult> => {
+    const stagedMembership = (payload: Record<string, unknown>): string[] | undefined =>
+      runtime.stageOnly && spec.stage === 'entities-facts'
+        ? recoveryClaims(
+            window,
+            'entity',
+            asRecordArray(payload.entities),
+            neighboursOf,
+            true,
+          ).map((claim) => stagedRecoveryContributionUid(claim.uid))
+        : undefined;
+    if (runtime.controller.getChild(childId)?.status === 'deferred') {
+      const result: RecoveryStageResult = {
+        stage: spec.stage,
+        status: 'deferred',
+        wrote: 0,
+        wroteStats: { entities: 0, facts: 0, relations: 0, timeline: 0 },
+        section: {
+          section: spec.stage,
+          state: 'incomplete',
+          wrote: 0,
+          reason: 'unparsed-answer',
+        },
+        failed: false,
+        error: 'unparsed-answer',
+      };
+      stageResults.push(result);
+      sections.push(result.section);
+      return result;
+    }
+    const rosterFingerprint = spec.stage === 'relations'
+      ? runtime.controller.snapshotRoster(projectId).fingerprint
+      : '';
+    const fingerprint = spec.fingerprint ?? runtime.stageFingerprint(window, spec.stage, rosterFingerprint);
+    runtime.controller.setStageFingerprint(childId, spec.stage, fingerprint, runtime.owner, fencing);
+    const existing = runtime.controller.getCoverage(childId, spec.stage, fingerprint);
+    if (
+      existing &&
+      (existing.status === 'complete' ||
+        existing.status === 'empty' ||
+        existing.status === 'not_applicable')
+    ) {
+      finishReasons.set(spec.stage, undefined);
+      if (existing.status === 'empty') anyEmpty = anyEmpty && true;
+      else if (existing.status === 'complete') anyEmpty = false;
+      const result: RecoveryStageResult = {
+        stage: spec.stage,
+        status: existing.status,
+        wrote: 0,
+        wroteStats: { entities: 0, facts: 0, relations: 0, timeline: 0 },
+        section: {
+          section: spec.stage,
+          state: existing.status === 'not_applicable' ? 'skipped' : 'succeeded',
+          wrote: 0,
+        },
+        failed: false,
+      };
+      stageResults.push(result);
+      sections.push(result.section);
+      return result;
+    }
+    if (existing?.status === 'deferred') {
+      const result: RecoveryStageResult = {
+        stage: spec.stage,
+        status: 'deferred',
+        wrote: 0,
+        wroteStats: { entities: 0, facts: 0, relations: 0, timeline: 0 },
+        section: {
+          section: spec.stage,
+          state: 'incomplete',
+          wrote: 0,
+          reason: 'unparsed-answer',
+        },
+        failed: false,
+        error: 'unparsed-answer',
+      };
+      stageResults.push(result);
+      sections.push(result.section);
+      return result;
+    }
+
+    const staged = runtime.controller.latestStagedBatch(childId, spec.stage, fingerprint);
+    if (staged) {
+      if (spec.validateSnapshot && !spec.validateSnapshot()) {
+        const result: RecoveryStageResult = {
+          stage: spec.stage,
+          status: 'invalidated',
+          wrote: 0,
+          wroteStats: { entities: 0, facts: 0, relations: 0, timeline: 0 },
+          section: { section: spec.stage, state: 'incomplete', wrote: 0, reason: 'unparsed-answer' },
+          failed: false,
+          error: 'roster-changed',
+        };
+        stageResults.push(result);
+        sections.push(result.section);
+        return result;
+      }
+      try {
+        const payload = JSON.parse(staged.payload_json) as Record<string, unknown>;
+        const status = payload.notApplicable === true
+          ? 'not_applicable'
+          : recoveryPayloadEmpty(spec.stage, payload)
+            ? 'empty'
+            : 'complete';
+        let wrote = 0;
+        const beforeStats = { entities: stats.entities, facts: stats.facts, relations: stats.relations, timeline: stats.timeline };
+        const membership = stagedMembership(payload);
+        runtime.controller.applyCoverage({
+          childId,
+          projectId,
+          stage: spec.stage,
+          fingerprint,
+          attemptId: staged.attempt_id,
+          owner: runtime.owner,
+          fencing,
+          status,
+          result: {
+            replayedBatch: staged.id,
+            truncatedPassages: windowTruncatedPassages,
+            ...(membership ? { stagedEntityUids: membership } : {}),
+          },
+          apply: () => {
+            const prepared = payload;
+            wrote = applyRecoveryPayload(spec.stage, prepared, {
+              db,
+              projectId,
+              childId,
+              window,
+              entityIdByName,
+              stats,
+              neighboursOf,
+              nameIndex,
+              trace,
+              index,
+              fingerprint,
+              runtime,
+              rosterRows: spec.rosterRows,
+            });
+          },
+        });
+        if (status === 'empty') anyEmpty = anyEmpty && true;
+        else anyEmpty = false;
+        const result: RecoveryStageResult = {
+          stage: spec.stage,
+          status,
+          wrote,
+          wroteStats: {
+            entities: stats.entities - beforeStats.entities,
+            facts: stats.facts - beforeStats.facts,
+            relations: stats.relations - beforeStats.relations,
+            timeline: stats.timeline - beforeStats.timeline,
+          },
+          section: { section: spec.stage, state: 'succeeded', wrote },
+          failed: false,
+        };
+        stageResults.push(result);
+        sections.push(result.section);
+        return result;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        runtime.controller.deferStage({
+          childId,
+          projectId,
+          stage: spec.stage,
+          fingerprint,
+          attemptId: staged.attempt_id,
+          owner: runtime.owner,
+          fencing,
+          reason: `replay-${message}`,
+        });
+        const result: RecoveryStageResult = {
+          stage: spec.stage,
+          status: 'deferred',
+          wrote: 0,
+          wroteStats: { entities: 0, facts: 0, relations: 0, timeline: 0 },
+          section: { section: spec.stage, state: 'incomplete', wrote: 0, reason: 'unparsed-answer' },
+          failed: true,
+          error: message,
+        };
+        stageResults.push(result);
+        sections.push(result.section);
+        return result;
+      }
+    }
+
+    let lastError: string | undefined;
+    let lastReason: ExtractionIncompleteReason | undefined;
+    for (let attemptNumber = 1; attemptNumber <= runtime.controller.policy.maxAttempts; attemptNumber++) {
+      const attempt = runtime.controller.beginAttempt(
+        childId,
+        spec.stage,
+        runtime.owner,
+        fencing,
+        fingerprint,
+      );
+      if (!attempt.ok || attempt.attemptId === undefined) {
+        if (attempt.reason === 'attempts-exhausted' || attempt.reason === 'deferred') {
+          runtime.controller.deferStage({
+            childId,
+            projectId,
+            stage: spec.stage,
+            fingerprint,
+            owner: runtime.owner,
+            fencing,
+            reason: lastError ?? lastReason ?? attempt.reason ?? 'attempts-exhausted',
+          });
+          const result: RecoveryStageResult = {
+            stage: spec.stage,
+            status: 'deferred',
+            wrote: 0,
+            wroteStats: { entities: 0, facts: 0, relations: 0, timeline: 0 },
+            section: {
+              section: spec.stage,
+              state: 'incomplete',
+              wrote: 0,
+              reason: lastReason ?? 'unparsed-answer',
+            },
+            failed: lastError !== undefined,
+            error: lastError ?? lastReason,
+          };
+          stageResults.push(result);
+          sections.push(result.section);
+          return result;
+        }
+        throw new Error(`recovery-${attempt.reason ?? 'attempt-failed'}`);
+      }
+
+      try {
+        const response = await ask(spec.system(), spec.maxTokens, spec.temperature);
+        finishReasons.set(spec.stage, response.finishReason);
+        const prepared = await spec.prepare(response.text, response.finishReason);
+        parsedClaims += prepared.parsedClaims;
+        if (prepared.completion.complete) {
+          if (spec.validateSnapshot && !spec.validateSnapshot()) {
+            throw new Error('roster-changed');
+          }
+          runtime.controller.stageBatch({
+            attemptId: attempt.attemptId,
+            childId,
+            projectId,
+            stage: spec.stage,
+            fingerprint,
+            payload: runtime.fragmentMode
+              ? annotateFragmentPayload(spec.stage, prepared.payload, window, neighboursOf)
+              : prepared.payload,
+            finishReason: response.finishReason ?? '',
+            complete: true,
+          });
+          const status = prepared.completion.empty ? 'empty' : 'complete';
+          let wrote = 0;
+          const beforeStats = { entities: stats.entities, facts: stats.facts, relations: stats.relations, timeline: stats.timeline };
+          const membership = stagedMembership(prepared.payload);
+          runtime.controller.applyCoverage({
+            childId,
+            projectId,
+            stage: spec.stage,
+            fingerprint,
+            attemptId: attempt.attemptId,
+            owner: runtime.owner,
+            fencing,
+            status,
+            result: {
+              attemptNumber,
+              parsedClaims: prepared.parsedClaims,
+              truncatedPassages: windowTruncatedPassages,
+              ...(membership ? { stagedEntityUids: membership } : {}),
+            },
+            apply: () => {
+              wrote = prepared.apply(fingerprint);
+            },
+          });
+          anyEmpty = anyEmpty && prepared.completion.empty;
+          const result: RecoveryStageResult = {
+            stage: spec.stage,
+            status,
+            wrote,
+            wroteStats: {
+              entities: stats.entities - beforeStats.entities,
+              facts: stats.facts - beforeStats.facts,
+              relations: stats.relations - beforeStats.relations,
+              timeline: stats.timeline - beforeStats.timeline,
+            },
+            section: { section: spec.stage, state: 'succeeded', wrote },
+            failed: false,
+          };
+          stageResults.push(result);
+          sections.push(result.section);
+          return result;
+        }
+        lastReason = prepared.completion.reason;
+        runtime.controller.finishAttempt(attempt.attemptId, 'incomplete', {
+          finishReason: response.finishReason ?? '',
+          errorCode: prepared.completion.reason ?? 'unparsed-answer',
+          owner: runtime.owner,
+          fencing,
+        });
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+        if (lastError === 'roster-changed') {
+          runtime.controller.finishAttempt(attempt.attemptId, 'stale', {
+            finishReason: finishReasons.get(spec.stage) ?? '',
+            errorCode: lastError,
+            owner: runtime.owner,
+            fencing,
+          });
+          const result: RecoveryStageResult = {
+            stage: spec.stage,
+            status: 'invalidated',
+            wrote: 0,
+            wroteStats: { entities: 0, facts: 0, relations: 0, timeline: 0 },
+            section: {
+              section: spec.stage,
+              state: 'incomplete',
+              wrote: 0,
+              reason: 'unparsed-answer',
+            },
+            failed: false,
+            error: lastError,
+          };
+          stageResults.push(result);
+          sections.push(result.section);
+          return result;
+        }
+        runtime.controller.finishAttempt(attempt.attemptId, 'failed', {
+          finishReason: finishReasons.get(spec.stage) ?? '',
+          errorCode: lastError,
+          owner: runtime.owner,
+          fencing,
+        });
+      }
+
+      if (attemptNumber < runtime.controller.policy.maxAttempts) {
+        await runtime.controller.sleep(runtime.controller.backoff(attemptNumber));
+      }
+    }
+
+    runtime.controller.deferStage({
+      childId,
+      projectId,
+      stage: spec.stage,
+      fingerprint,
+      owner: runtime.owner,
+      fencing,
+      reason: lastError ?? lastReason ?? 'attempts-exhausted',
+    });
+    const result: RecoveryStageResult = {
+      stage: spec.stage,
+      status: 'deferred',
+      wrote: 0,
+      wroteStats: { entities: 0, facts: 0, relations: 0, timeline: 0 },
+      section: {
+        section: spec.stage,
+        state: 'incomplete',
+        wrote: 0,
+        reason: lastReason ?? 'unparsed-answer',
+      },
+      failed: lastError !== undefined,
+      error: lastError ?? lastReason,
+    };
+    stageResults.push(result);
+    sections.push(result.section);
+    return result;
+  };
+
+  try {
+    if (singlePrompt) {
+      await runStage({
+        stage: 'legacy',
+        system: () => EXTRACT_SYSTEM,
+        maxTokens,
+        temperature: 0.1,
+        prepare: async (text, finishReason) => {
+          const observations = new Map<string, ExtractionParseObservation>();
+          const parsed = parseExtraction(text, (key, observation) => {
+            observations.set(key, observation);
+          });
+          const entries = (['entities', 'facts', 'relations', 'timeline'] as const).map((section) => ({
+            section,
+            completion: recoveryCompletionOf(observations.get(section), finishReason),
+          }));
+          const complete = entries.every((entry) => entry.completion.complete);
+          const empty = entries.every((entry) => entry.completion.empty);
+          return {
+            payload: parsed,
+            parsedClaims:
+              parsed.entities.length + parsed.facts.length + parsed.relations.length + parsed.timeline.length,
+            completion: {
+              complete,
+              empty,
+              reason: entries.find((entry) => !entry.completion.complete)?.completion.reason,
+            },
+            apply: (claimFingerprint) =>
+              applyRecoveryPayload('legacy', parsed, {
+                db,
+                projectId,
+                childId,
+                window,
+                entityIdByName,
+                stats,
+                neighboursOf,
+                nameIndex,
+                trace,
+                index,
+                fingerprint: claimFingerprint,
+                runtime,
+              }),
+          };
+        },
+      });
+    } else {
+      await runStage({
+        stage: 'entities-facts',
+        system: () => EXTRACT_ENTITIES_SYSTEM,
+        maxTokens: Math.min(1600, maxTokens),
+        temperature: 0,
+        prepare: async (text, finishReason) => {
+          let entitiesObservation: ExtractionParseObservation | undefined;
+          let factsObservation: ExtractionParseObservation | undefined;
+          const entities = parseSection(
+            text,
+            'entities',
+            (observation) => { entitiesObservation = observation; },
+            false,
+          );
+          const facts = parseSection(
+            text,
+            'facts',
+            (observation) => { factsObservation = observation; },
+            false,
+          );
+          const entityCompletion = recoveryCompletionOf(entitiesObservation, finishReason);
+          const factCompletion = recoveryCompletionOf(factsObservation, finishReason);
+          return {
+            payload: { entities, facts },
+            parsedClaims: entities.length + facts.length,
+            completion: {
+              complete: entityCompletion.complete && factCompletion.complete,
+              empty: entityCompletion.empty && factCompletion.empty,
+              reason: !entityCompletion.complete ? entityCompletion.reason : factCompletion.reason,
+            },
+            apply: (claimFingerprint) =>
+              applyRecoveryPayload('entities-facts', { entities, facts }, {
+                db,
+                projectId,
+                childId,
+                window,
+                entityIdByName,
+                stats,
+                neighboursOf,
+                nameIndex,
+                trace,
+                index,
+                fingerprint: claimFingerprint,
+                runtime,
+              }),
+          };
+        },
+      });
+
+      const rosterInfo = recoveryRosterRows(db, projectId, runtime.parentId, runtime.stageOnly, runtime.rosterChildIds);
+      const names = runtime.stageOnly
+        ? windowEntityNames(db, projectId, window, roster, rosterInfo.promptEntities)
+        : process.env.FANFABLE_REL_ROSTER === '1' && roster
+          ? windowRosterNames(window, roster)
+          : windowEntityNames(db, projectId, window, roster, rosterInfo.promptEntities);
+      if (runtime.controller.getChild(childId)?.status === 'deferred') {
+        const result: RecoveryStageResult = {
+          stage: 'relations',
+          status: 'deferred',
+          wrote: 0,
+          wroteStats: { entities: 0, facts: 0, relations: 0, timeline: 0 },
+          section: { section: 'relations', state: 'incomplete', wrote: 0, reason: 'unparsed-answer' },
+          failed: false,
+          error: 'unparsed-answer',
+        };
+        stageResults.push(result);
+        sections.push(result.section);
+      } else if (!names.length) {
+        const snapshot = runtime.controller.snapshotRelationStage(
+          projectId,
+          [],
+          rosterInfo.resolverRows,
+        );
+        const fingerprint = runtime.stageFingerprint(window, 'relations', snapshot.fingerprint);
+        runtime.controller.setStageFingerprint(childId, 'relations', fingerprint, runtime.owner, fencing);
+        const existing = runtime.controller.getCoverage(childId, 'relations', fingerprint);
+        if (
+          existing &&
+          (existing.status === 'complete' ||
+            existing.status === 'empty' ||
+            existing.status === 'not_applicable')
+        ) {
+          const status = existing.status as RecoveryStageStatus;
+          const result: RecoveryStageResult = {
+            stage: 'relations',
+            status,
+            wrote: 0,
+            wroteStats: { entities: 0, facts: 0, relations: 0, timeline: 0 },
+            section: {
+              section: 'relations',
+              state: status === 'not_applicable' ? 'skipped' : 'succeeded',
+              wrote: 0,
+            },
+            failed: false,
+          };
+          stageResults.push(result);
+          sections.push(result.section);
+        } else {
+          const sealed = runtime.controller.latestStagedBatch(childId, 'relations', fingerprint);
+          if (sealed) {
+            try {
+              runtime.controller.applyCoverage({
+                childId,
+                projectId,
+                stage: 'relations',
+                fingerprint,
+                attemptId: sealed.attempt_id,
+                owner: runtime.owner,
+                fencing,
+                status: 'not_applicable',
+                result: {
+                  replayedBatch: sealed.id,
+                  reason: 'no-roster-names',
+                  truncatedPassages: windowTruncatedPassages,
+                },
+              });
+              const result: RecoveryStageResult = {
+                stage: 'relations',
+                status: 'not_applicable',
+                wrote: 0,
+                wroteStats: { entities: 0, facts: 0, relations: 0, timeline: 0 },
+                section: { section: 'relations', state: 'skipped', wrote: 0 },
+                failed: false,
+              };
+              stageResults.push(result);
+              sections.push(result.section);
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              runtime.controller.deferStage({
+                childId,
+                projectId,
+                stage: 'relations',
+                fingerprint,
+                attemptId: sealed.attempt_id,
+                owner: runtime.owner,
+                fencing,
+                reason: `replay-${message}`,
+              });
+              const result: RecoveryStageResult = {
+                stage: 'relations',
+                status: 'deferred',
+                wrote: 0,
+                wroteStats: { entities: 0, facts: 0, relations: 0, timeline: 0 },
+                section: { section: 'relations', state: 'incomplete', wrote: 0, reason: 'unparsed-answer' },
+                failed: true,
+                error: message,
+              };
+              stageResults.push(result);
+              sections.push(result.section);
+            }
+          } else {
+            const attempt = runtime.controller.beginAttempt(
+              childId,
+              'relations',
+              runtime.owner,
+              fencing,
+              fingerprint,
+            );
+            if (!attempt.ok || attempt.attemptId === undefined) {
+              runtime.controller.deferStage({
+                childId,
+                projectId,
+                stage: 'relations',
+                fingerprint,
+                owner: runtime.owner,
+                fencing,
+                reason: attempt.reason ?? 'attempt-failed',
+              });
+              const result: RecoveryStageResult = {
+                stage: 'relations',
+                status: 'deferred',
+                wrote: 0,
+                wroteStats: { entities: 0, facts: 0, relations: 0, timeline: 0 },
+                section: { section: 'relations', state: 'incomplete', wrote: 0, reason: 'unparsed-answer' },
+                failed: true,
+                error: attempt.reason ?? 'attempt-failed',
+              };
+              stageResults.push(result);
+              sections.push(result.section);
+            } else {
+              runtime.controller.stageBatch({
+                attemptId: attempt.attemptId,
+                childId,
+                projectId,
+                stage: 'relations',
+                fingerprint,
+                payload: { notApplicable: true, reason: 'no-roster-names' },
+                finishReason: 'stop',
+                complete: true,
+              });
+              runtime.controller.finishAttempt(attempt.attemptId, 'succeeded', {
+                parserRoute: 'not-applicable',
+                owner: runtime.owner,
+                fencing,
+              });
+              runtime.controller.applyCoverage({
+                childId,
+                projectId,
+                stage: 'relations',
+                fingerprint,
+                attemptId: attempt.attemptId,
+                owner: runtime.owner,
+                fencing,
+                status: 'not_applicable',
+                result: { reason: 'no-roster-names', truncatedPassages: windowTruncatedPassages },
+              });
+              const result: RecoveryStageResult = {
+                stage: 'relations',
+                status: 'not_applicable',
+                wrote: 0,
+                wroteStats: { entities: 0, facts: 0, relations: 0, timeline: 0 },
+                section: { section: 'relations', state: 'skipped', wrote: 0 },
+                failed: false,
+              };
+              stageResults.push(result);
+              sections.push(result.section);
+            }
+          }
+        }
+      } else {
+        let relationReplans = 0;
+        while (true) {
+          const rosterInfo = recoveryRosterRows(db, projectId, runtime.parentId, runtime.stageOnly, runtime.rosterChildIds);
+          const promptNames = runtime.stageOnly
+            ? windowEntityNames(db, projectId, window, roster, rosterInfo.promptEntities)
+            : process.env.FANFABLE_REL_ROSTER === '1' && roster
+              ? windowRosterNames(window, roster)
+              : windowEntityNames(db, projectId, window, roster, rosterInfo.promptEntities);
+          const snapshot = runtime.controller.snapshotRelationStage(
+            projectId,
+            promptNames,
+            rosterInfo.resolverRows,
+          );
+          const fingerprint = runtime.stageFingerprint(window, 'relations', snapshot.fingerprint);
+          const system = `${relationsSystemPrompt()}\n\n${formatKnownEntities(snapshot.promptNames)}`;
+          const result = await runStage({
+            stage: 'relations',
+            system: () => system,
+            maxTokens: Math.min(3000, maxTokens),
+            temperature: 0,
+            fingerprint,
+            rosterRows: snapshot.entities,
+            validateSnapshot: () => {
+              const current = recoveryRosterRows(db, projectId, runtime.parentId, runtime.stageOnly, runtime.rosterChildIds);
+              const currentNames = runtime.stageOnly
+                ? windowEntityNames(db, projectId, window, roster, current.promptEntities)
+                : process.env.FANFABLE_REL_ROSTER === '1' && roster
+                  ? windowRosterNames(window, roster)
+                  : windowEntityNames(db, projectId, window, roster, current.promptEntities);
+              return runtime.controller.snapshotRelationStage(
+                projectId,
+                currentNames,
+                current.resolverRows,
+              ).fingerprint === snapshot.fingerprint;
+            },
+            prepare: async (text, finishReason) => {
+              let observation: ExtractionParseObservation | undefined;
+              let relations = parseSection(
+                text,
+                'relations',
+                (value) => { observation = value; },
+                true,
+              );
+              if (strictRelationsEnabled()) {
+                relations = relations.map((raw) => ({
+                  ...raw,
+                  kind: strictRelationKind(String(raw.kind ?? '')),
+                }));
+                await retryRelationQuotes(db, llm, projectId, window, relations, stats, trace, index);
+              }
+              const completion = recoveryCompletionOf(observation, finishReason);
+              return {
+                payload: { relations },
+                parsedClaims: relations.length,
+                completion,
+                apply: (claimFingerprint) =>
+                  applyRecoveryPayload('relations', { relations }, {
+                    db,
+                    projectId,
+                    childId,
+                    window,
+                    entityIdByName,
+                    stats,
+                    neighboursOf,
+                    nameIndex,
+                    trace,
+                    index,
+                    fingerprint: claimFingerprint,
+                    runtime,
+                    rosterRows: snapshot.entities,
+                  }),
+              };
+            },
+          });
+          if (result.status !== 'invalidated') break;
+          // Remove the invalidated shell; the next snapshot starts a new stage
+          // fingerprint with its own bounded attempt budget.
+          if (stageResults[stageResults.length - 1] === result) stageResults.pop();
+          if (sections[sections.length - 1] === result.section) sections.pop();
+          if (relationReplans >= runtime.controller.policy.maxRosterReplans) {
+            runtime.controller.deferStage({
+              childId,
+              projectId,
+              stage: 'relations',
+              fingerprint,
+              owner: runtime.owner,
+              fencing,
+              reason: 'roster-replan-exhausted',
+            });
+            const deferred: RecoveryStageResult = {
+              stage: 'relations',
+              status: 'deferred',
+              wrote: 0,
+              wroteStats: { entities: 0, facts: 0, relations: 0, timeline: 0 },
+              section: { section: 'relations', state: 'incomplete', wrote: 0, reason: 'unparsed-answer' },
+              failed: true,
+              error: 'roster-replan-exhausted',
+            };
+            stageResults.push(deferred);
+            sections.push(deferred.section);
+            break;
+          }
+          relationReplans++;
+        }
+      }
+
+      await runStage({
+        stage: 'timeline',
+        system: () => EXTRACT_EVENTS_SYSTEM,
+        maxTokens: Math.min(1200, maxTokens),
+        temperature: 0,
+        prepare: async (text, finishReason) => {
+          let observation: ExtractionParseObservation | undefined;
+          const timeline = parseSection(
+            text,
+            'timeline',
+            (value) => { observation = value; },
+            true,
+          );
+          const completion = recoveryCompletionOf(observation, finishReason);
+          return {
+            payload: { timeline },
+            parsedClaims: timeline.length,
+            completion,
+            apply: (claimFingerprint) =>
+              applyRecoveryPayload('timeline', { timeline }, {
+                db,
+                projectId,
+                childId,
+                window,
+                entityIdByName,
+                stats,
+                neighboursOf,
+                nameIndex,
+                trace,
+                index,
+                fingerprint: claimFingerprint,
+                runtime,
+              }),
+          };
+        },
+      });
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/stale-fencing|lease-lost|stale-attempt|stale-fingerprint/.test(message)) {
+      try {
+        runtime.controller.abortChild(childId, runtime.owner, fencing, message);
+      } catch {
+        /* preserve the original failure; lease expiry remains the recovery path */
+      }
+    }
+    throw error;
+  } finally {
+    heartbeat.stop();
+  }
+
+  stats.passages += window.length;
+  const failedSections = stageResults.filter((result) => result.failed).map((result) => result.stage);
+  const incompleteSections = stageResults
+    .filter((result) => result.status === 'deferred' || result.status === 'failed')
+    .map((result) => result.stage);
+  const wrote = stageResults.reduce(
+    (sum, result) => ({
+      entities: sum.entities + result.wroteStats.entities,
+      facts: sum.facts + result.wroteStats.facts,
+      relations: sum.relations + result.wroteStats.relations,
+      timeline: sum.timeline + result.wroteStats.timeline,
+    }),
+    { entities: 0, facts: 0, relations: 0, timeline: 0 },
+  );
+  const detail = stageResults
+    .filter((result) => result.status === 'deferred' || result.status === 'failed')
+    .map((result) => `${result.stage}: ${result.error ?? 'deferred'}`)
+    .join('; ');
+  const buildOutcome = (status: string, error = ''): WindowOutcome => {
+    const state: 'complete' | 'partial' | 'failed' =
+      status === 'complete'
+        ? 'complete'
+        : stageResults.some((result) => result.wrote > 0)
+          ? 'partial'
+          : 'failed';
+    return {
+      state,
+      sections,
+      failedSections,
+      incompleteSections,
+      wrote,
+      error: error || detail || (status === 'complete' ? '' : `recovery-${status}`),
+      provenanceWritten: false,
+    };
+  };
+
+  let outcome: WindowOutcome | undefined;
+  let childStatus: string = 'failed';
+  try {
+    childStatus = runtime.controller.finalizeChild(
+      childId,
+      runtime.owner,
+      fencing,
+      (status) => {
+        const candidate = buildOutcome(status);
+        if (!runtime.stageOnly) {
+          // The legacy run/window row is written inside the same transaction as
+          // child completion, coverage and lore_mined. A failure rolls all of
+          // them back; success is never reported without authoritative
+          // provenance.
+          recordExtractionWindow(
+            db,
+            runtime.runId as number,
+            projectId,
+            window,
+            index,
+            candidate,
+            windowStartedAt,
+            nowIso(),
+          );
+          candidate.provenanceWritten = true;
+        }
+        outcome = candidate;
+      },
+      !runtime.stageOnly,
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/stale-fencing|lease-lost|stale-attempt|stale-fingerprint/.test(message)) {
+      try {
+        runtime.controller.abortChild(childId, runtime.owner, fencing, message);
+      } catch {
+        /* preserve the original failure; lease expiry remains the recovery path */
+      }
+    }
+    outcome = buildOutcome('failed', `finalize: ${message}`);
+  }
+
+  if (!outcome) outcome = buildOutcome(childStatus);
+  if (!runtime.stageOnly && !outcome.provenanceWritten && childStatus === 'deferred') {
+    // Deferred work has no completion to protect, but still gets a visible
+    // legacy provenance record when the write succeeds.
+    try {
+      recordExtractionWindow(
+        db,
+        runtime.runId as number,
+        projectId,
+        window,
+        index,
+        outcome,
+        windowStartedAt,
+        nowIso(),
+      );
+      outcome.provenanceWritten = true;
+    } catch {
+      /* the durable recovery ledger remains the visible authority */
+    }
+  }
+  if (outcome.state !== 'complete') {
+    stats.windowIssues.push({
+      index,
+      locator: window[0]?.locator ?? '',
+      state: outcome.state,
+      sections,
+      failedSections,
+      incompleteSections,
+      succeededSections: sections.filter((section) => section.state === 'succeeded').map((section) => section.section),
+      wrote,
+      detail: outcome.error || detail || `recovery-${childStatus}`,
+    });
+  } else if (anyEmpty && parsedClaims === 0) {
+    stats.emptyWindows.push({
+      index,
+      locator: window[0]?.locator ?? '',
+      reason: 'empty-answer',
+      detail: 'explicit complete-empty batch finalized as zero-result coverage',
+    });
+  }
+  return outcome;
+}
+
+
+function stageRecoveryPayload(
+  stage: RecoveryStage,
+  payload: Record<string, unknown>,
+  context: {
+    projectId: number;
+    childId: number;
+    window: ChunkRow[];
+    stats: ExtractLoreResult;
+    fingerprint: string;
+    neighboursOf: (id: number | undefined) => ChunkRow[];
+    runtime: RecoveryRuntime;
+  },
+): number {
+  let total = 0;
+  const stageClaims = (
+    raws: Record<string, unknown>[],
+    claimType: string,
+    statKey: 'entities' | 'facts' | 'relations' | 'timeline',
+  ): void => {
+    const claims = recoveryClaims(
+      context.window,
+      claimType,
+      raws,
+      context.neighboursOf,
+      true,
+    ).map((claim) => ({ ...claim, uid: stagedRecoveryContributionUid(claim.uid) }));
+    const claimed = claimRecoveryClaims(
+      context.runtime,
+      context.projectId,
+      context.childId,
+      stage,
+      claims,
+      claimType,
+      context.fingerprint,
+    );
+    for (const claim of claimed) {
+      if (claim.contributionId !== undefined) {
+        context.runtime.controller.finalizeContribution(claim.contributionId, {
+          disposition: 'staged',
+        });
+      }
+    }
+    context.stats[statKey] += claimed.length;
+    total += claimed.length;
+  };
+  if (stage === 'entities-facts' || stage === 'legacy') {
+    stageClaims(asRecordArray(payload.entities), 'entity', 'entities');
+    stageClaims(asRecordArray(payload.facts), 'fact', 'facts');
+  }
+  if (stage === 'relations' || stage === 'legacy') {
+    stageClaims(asRecordArray(payload.relations), 'relation', 'relations');
+  }
+  if (stage === 'timeline' || stage === 'legacy') {
+    stageClaims(asRecordArray(payload.timeline), 'timeline', 'timeline');
+  }
+  return total;
+}
+
+function applyRecoveryPayload(
+  stage: RecoveryStage,
+  payload: Record<string, unknown>,
+  context: {
+    db: Db;
+    projectId: number;
+    childId: number;
+    window: ChunkRow[];
+    entityIdByName: Map<string, number>;
+    stats: ExtractLoreResult;
+    neighboursOf: (id: number | undefined) => ChunkRow[];
+    nameIndex?: RosterIndex;
+    trace?: ExtractionTrace | null;
+    index: number;
+    fingerprint: string;
+    runtime: RecoveryRuntime;
+    rosterRows?: Array<{ id: number; kind: string; name: string; aliases: string; review_status: string }>;
+  },
+): number {
+  const { db, projectId, childId, window, entityIdByName, stats, neighboursOf, nameIndex, trace, index, fingerprint, runtime, rosterRows } = context;
+  if (runtime.stageOnly) {
+    return stageRecoveryPayload(stage, payload, {
+      projectId,
+      childId,
+      window,
+      stats,
+      fingerprint,
+      neighboursOf,
+      runtime,
+    });
+  }
+  let wrote = 0;
+  if (stage === 'entities-facts' || stage === 'legacy') {
+    const entityClaims = claimRecoveryClaims(
+      runtime,
+      projectId,
+      childId,
+      stage,
+      recoveryClaims(window, 'entity', asRecordArray(payload.entities)),
+      'entity',
+      fingerprint,
+    );
+    const factClaims = claimRecoveryClaims(
+      runtime,
+      projectId,
+      childId,
+      stage,
+      recoveryClaims(window, 'fact', asRecordArray(payload.facts)),
+      'fact',
+      fingerprint,
+    );
+    const entities = entityClaims.map((claim) => claim.raw);
+    const facts = factClaims.map((claim) => claim.raw);
+    wrote += applyEntities(db, projectId, entities, window, entityIdByName, stats, neighboursOf, true);
+    finalizeRecoveryClaims(runtime, entityClaims, 'canon_entity', (raw) => {
+      const name = String(raw.name ?? '').trim();
+      if (!name) return null;
+      return findEntityId(db, projectId, normaliseKind(String(raw.kind ?? 'character')), name) ?? null;
+    });
+    wrote += applyFacts(db, projectId, facts, window, stats, neighboursOf, true);
+    finalizeRecoveryClaims(runtime, factClaims, 'canon_fact', (raw) => {
+      const statement = String(raw.statement ?? '').trim();
+      if (!statement) return null;
+      return db.get<{ id: number }>(
+        'SELECT id FROM canon_fact WHERE project_id = ? AND statement = ? ORDER BY id DESC LIMIT 1',
+        projectId,
+        statement,
+      )?.id ?? null;
+    });
+  }
+  if (stage === 'relations' || stage === 'legacy') {
+    const relationClaims = claimRecoveryClaims(
+      runtime,
+      projectId,
+      childId,
+      stage,
+      recoveryClaims(window, 'relation', asRecordArray(payload.relations)),
+      'relation',
+      fingerprint,
+    );
+    const relations = relationClaims.map((claim) => claim.raw);
+    const candidateIds = traceRelationCandidates(trace, index, relations);
+    wrote += applyRelations(
+      db,
+      projectId,
+      relations,
+      window,
+      stats,
+      neighboursOf,
+      true,
+      nameIndex,
+      trace,
+      index,
+      candidateIds,
+      rosterRows,
+    );
+    finalizeRecoveryClaims(runtime, relationClaims, 'canon_relation', (raw) => {
+      const from = resolveEntityDetailed(db, projectId, String(raw.from ?? '').trim()).id;
+      const to = resolveEntityDetailed(db, projectId, String(raw.to ?? '').trim()).id;
+      if (!from || !to) return null;
+      return db.get<{ id: number }>(
+        `SELECT id FROM canon_relation
+          WHERE project_id = ? AND from_entity = ? AND to_entity = ? AND lower(kind) = lower(?)
+          ORDER BY id DESC LIMIT 1`,
+        projectId,
+        from,
+        to,
+        String(raw.kind ?? '').trim(),
+      )?.id ?? null;
+    });
+  }
+  if (stage === 'timeline' || stage === 'legacy') {
+    const timelineClaims = claimRecoveryClaims(
+      runtime,
+      projectId,
+      childId,
+      stage,
+      recoveryClaims(window, 'timeline', asRecordArray(payload.timeline)),
+      'timeline',
+      fingerprint,
+    );
+    const timeline = timelineClaims.map((claim) => claim.raw);
+    wrote += applyTimeline(db, projectId, timeline, window, stats, neighboursOf, true);
+    finalizeRecoveryClaims(runtime, timelineClaims, 'canon_timeline', (raw) => {
+      const title = String(raw.title ?? '').trim();
+      if (!title) return null;
+      return db.get<{ id: number }>(
+        `SELECT id FROM canon_timeline
+          WHERE project_id = ? AND title = ? AND summary = ? AND evidence = ?
+          ORDER BY id DESC LIMIT 1`,
+        projectId,
+        title,
+        String(raw.summary ?? '').trim(),
+        String(raw.evidence ?? '').trim(),
+      )?.id ?? null;
+    });
+  }
+  return wrote;
 }
 
 /** Is an extraction answer well-formed but empty (all arrays empty)? */
@@ -10521,17 +13851,12 @@ function findEntityId(db: Db, projectId: number, kind: EntityKind, name: string)
  * or fall through to a different kind. No result is cached: extraction adds
  * entities between windows, and a unique short form can become ambiguous.
  */
-function resolveEntityDetailed(
-  db: Db,
-  projectId: number,
+function resolveEntityDetailedFromRows(
+  rows: Array<{ id: number; name: string; aliases: string }>,
   name: string,
 ): TracedEndpointResolution {
   const query = canonicalName(name);
   if (!query) return { method: 'empty', candidateIds: [] };
-  const rows = db.all<{ id: number; name: string; aliases: string }>(
-    'SELECT id, name, aliases FROM canon_entity WHERE project_id = ? ORDER BY id',
-    projectId,
-  );
 
   const nameHits = rows
     .filter((row) => canonicalName(row.name) === query)
@@ -10570,6 +13895,18 @@ function resolveEntityDetailed(
   if (shortHits.length === 1) return { id: shortHits[0], method: 'short-name', candidateIds: shortHits };
   if (shortHits.length > 1) return { method: 'short-collision', candidateIds: shortHits };
   return { method: 'none', candidateIds: [] };
+}
+
+function resolveEntityDetailed(
+  db: Db,
+  projectId: number,
+  name: string,
+): TracedEndpointResolution {
+  const rows = db.all<{ id: number; name: string; aliases: string }>(
+    'SELECT id, name, aliases FROM canon_entity WHERE project_id = ? ORDER BY id',
+    projectId,
+  );
+  return resolveEntityDetailedFromRows(rows, name);
 }
 
 function resolveEntity(

@@ -1272,6 +1272,9 @@ test('extraction trace omits provider and model settings and adversarial sentine
     windowSize: 8,
     concurrency: 1,
     maxWindows: 1,
+    // Trace is a legacy/provenance feature. Staging-only runs intentionally do
+    // not create an extraction_run or trace rows.
+    recovery: { enabled: false },
     trace: { enabled: true },
   });
   assert.ok(stats.traceId);

@@ -811,13 +811,12 @@ async function viewBookLore() {
     <div class="section">
       <div class="section-head">
         <div class="section-title">Extraction</div>
-        <button class="btn btn-sm btn-primary" id="extract-lore">Extract the book's lore</button>
+        <button class="btn btn-sm btn-primary" id="extract-lore">Stage extraction (not canon)</button>
       </div>
       <div class="card muted small">
-        Reads the imported passages and records the people, places, things, rules, relationships
-        and facts the source establishes — each with the line it came from. The writer is grounded
-        in this index, and the continuity checker uses it to catch a character who is dead in the
-        book but acts in your story.
+        Reads the imported passages into generation-local staging only. Staged work is not canon,
+        is not visible to the writer or retrieval, does not change mined flags, and has no
+        publication path yet. A separate review/publication step is required before use.
       </div>
     </div>
 
@@ -845,8 +844,8 @@ async function viewBookLore() {
           ${Object.keys(e.attributes ?? {}).length ? `<div class="small faint">${Object.entries(e.attributes).map(([k, v]) => `${esc(k)}: ${esc(v)}`).join(' · ')}</div>` : ''}
           ${e.evidence ? `<div class="small" style="color:var(--text-faint);margin-top:6px">“${esc(e.evidence)}”${e.sourceRefs?.length ? ` <span class="faint">— ${esc(e.sourceRefs[0].source)}, ${esc(e.sourceRefs[0].locator)}</span>` : ''}</div>` : ''}
         </div>`).join('') :
-        emptyState('No lore extracted yet', 'Run the extraction to turn the imported material into a structured index of people, places, rules and facts.',
-          '<button class="btn btn-primary" id="extract-lore-2">Extract the book\'s lore</button>')}
+        emptyState('No lore in canon yet', 'Staging reads the imported material without publishing it. A separate publication/review path is not implemented.',
+          '<button class="btn btn-primary" id="extract-lore-2">Stage extraction (not canon)</button>')}
     </div>
 
     ${d.relations.length ? `
@@ -893,9 +892,83 @@ async function viewBookLore() {
   }));
 
   const extract = async () => {
-    const res = await runJob('/api/book-lore/extract', {}, 'Reading the book');
+    const res = await runJob('/api/book-lore/extract', {}, 'Staging the book');
     modal.close();
-    toast('Lore extracted', `${res.entities} entities, ${res.relations} relationships, ${res.facts} facts.`, 'ok');
+    const legacyNote = res.legacyBlockedFragments || res.legacyBlockedWindows
+      ? ` ${res.fragmentMode ? res.legacyBlockedFragments ?? 0 : res.legacyBlockedWindows ?? 0} ` +
+        `${res.fragmentMode ? 'fragment' : 'window'}(s) were left untouched because legacy canon blocks them.`
+      : '';
+    const coverageNote = res.truncatedPassages
+      ? ` ${res.truncatedPassages} passage(s) exceeded ${res.promptPassageChars ?? 1400} characters; ` +
+        'only the prefix was read, so coverage is not exhaustive.'
+      : '';
+    const fragmentCoverageNote = res.fragmentCoverage
+      ? ` Source coverage ${res.fragmentCoverage.status}: ` +
+        `${res.fragmentCoverage.completeFragments}/${res.fragmentCoverage.plannedFragments} fragments complete, ` +
+        `${res.fragmentCoverage.partialSourceChunks} source chunk(s) partial.` +
+        (res.fragmentCoverage.staleRelationFragments
+          ? ` ${res.fragmentCoverage.staleRelationFragments} relation stage(s) need revalidation.`
+          : '')
+      : '';
+    const recoveryIncomplete = !!res.recovery && res.recovery.status !== 'complete';
+    const relationStaleNote = !res.fragmentCoverage && res.recoveryRelationStale
+      ? ` ${res.recoveryRelationStale} relation stage(s) need revalidation against the final roster.`
+      : '';
+    const incompleteFragmentCoverage =
+      (res.fragmentCoverage && res.fragmentCoverage.status !== 'complete') || recoveryIncomplete;
+    const incompleteIssues = res.windowIssues?.length ?? 0;
+    const incompleteDeferred = res.recovery?.deferredChildren ?? 0;
+    const emptyErrors = res.emptyWindows?.filter((entry) => entry.reason === 'error').length ?? 0;
+    const executionFailures = Math.max(res.executionFailures ?? 0, emptyErrors);
+    const incompleteFragmentCount = incompleteIssues + incompleteDeferred + executionFailures;
+    const unit = res.fragmentMode ? 'fragment' : 'window';
+    const incompleteFragmentNote = incompleteFragmentCoverage || incompleteFragmentCount
+      ? ` ${incompleteIssues} incomplete ${unit}(s), ${executionFailures} failed, ` +
+        `${incompleteDeferred} deferred; review and rerun with an explicit retry.`
+      : '';
+    const coverageIncomplete =
+      (res.fragmentCoverage && res.fragmentCoverage.status !== 'complete') || recoveryIncomplete;
+    const stagedFragmentHeading = !coverageIncomplete
+      ? 'Staged only — not published'
+      : res.fragmentCoverage?.status === 'none' ||
+          res.recovery?.status === 'failed' ||
+          res.recovery?.status === 'deferred'
+        ? 'Staging incomplete — not published'
+        : 'Staged partially — not published';
+    const legacyStagedNote = res.legacyStagedContributions?.count
+      ? ` ${res.legacyStagedContributions.count} pre-namespace staged contribution(s) are incompatible; ` +
+        'they are not reused and need manual review before publication.'
+      : '';
+    if (res.emptySource) {
+      toast(
+        res.stageOnly === true ? 'Nothing to stage' : 'Nothing to extract',
+        'No imported passages are available, so no lore was read.' + legacyStagedNote,
+        '',
+      );
+    } else if (res.recoveryNoEligibleWork) {
+      toast(
+        incompleteFragmentCoverage ? 'No complete source coverage yet' : 'Nothing to stage',
+        'Every candidate unit is already complete or deferred. Completed work is reused; ' +
+          'deferred work needs an explicit retry after review.' +
+          legacyNote + coverageNote + fragmentCoverageNote + relationStaleNote + incompleteFragmentNote + legacyStagedNote,
+        '',
+      );
+    } else if (res.stageOnly === true || res.recovery?.readiness === 'staged_only') {
+      toast(
+        stagedFragmentHeading,
+        `${res.entities} entities, ${res.relations} relationships, ${res.facts} facts staged locally. ` +
+          'Canon, mined flags and embeddings were not changed; publication is not implemented.' +
+          legacyNote + coverageNote + fragmentCoverageNote + relationStaleNote + incompleteFragmentNote + legacyStagedNote,
+        '',
+      );
+    } else {
+      toast(
+        'Lore extracted',
+        `${res.entities} entities, ${res.relations} relationships, ${res.facts} facts.` +
+          coverageNote + fragmentCoverageNote + relationStaleNote + incompleteFragmentNote + legacyStagedNote,
+        coverageNote || fragmentCoverageNote || relationStaleNote || incompleteFragmentNote || legacyStagedNote ? '' : 'ok',
+      );
+    }
     refresh();
   };
   const b1 = $('#extract-lore');

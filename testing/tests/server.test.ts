@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { request, type Server } from 'node:http';
 import type { Db } from '../../fanfable/src/core/db.ts';
 import { once } from 'node:events';
@@ -46,6 +47,160 @@ test('the UI API serves the project state', async () => {
     };
     assert.ok(lore.passages.length > 0, 'canon search works through the API');
     assert.ok(lore.passages[0].sourceTitle.length > 0);
+  });
+});
+
+test('an empty project reports a truthful empty extraction result through the API', async () => {
+  const { db } = tempDb();
+  const project = controller.createProject(db, 'empty-server');
+  controller.updateProjectSettings(db, project.id, { provider: 'mock' });
+  const server: Server = startServer({ db, projectId: project.id, port: 0 });
+  await once(server, 'listening');
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    const start = await fetch(`${base}/api/book-lore/extract`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    assert.equal(start.status, 200);
+    const { jobId } = (await start.json()) as { jobId: string };
+    let job: { status: string; result?: { emptySource?: boolean; entities?: number; windows?: number } } = {
+      status: 'running',
+    };
+    for (let i = 0; i < 50; i++) {
+      job = (await (await fetch(`${base}/api/jobs/${jobId}`)).json()) as typeof job;
+      if (job.status !== 'running') break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(job.status, 'done');
+    assert.equal(job.result?.emptySource, true);
+    assert.equal(job.result?.entities, 0);
+    assert.equal(job.result?.windows, 0);
+    assert.equal(
+      db.get<{ n: number }>('SELECT COUNT(*) AS n FROM extraction_run WHERE project_id = ?', project.id)?.n,
+      0,
+      'an empty source does not create extraction provenance',
+    );
+    assert.equal(
+      db.get<{ n: number }>('SELECT COUNT(*) AS n FROM extraction_recovery_parent WHERE project_id = ?', project.id)?.n,
+      0,
+      'an empty source does not create a recovery parent',
+    );
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    db.close();
+  }
+});
+
+test('explicit staging mode forces the staging boundary for a mock provider', async () => {
+  await withServer(async (base, projectId, db) => {
+    const start = await fetch(`${base}/api/book-lore/extract`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    assert.equal(start.status, 200);
+    const { jobId } = (await start.json()) as { jobId: string };
+    let job: { status: string; result?: { stageOnly?: boolean; recovery?: { readiness?: string } } } = {
+      status: 'running',
+    };
+    for (let i = 0; i < 120; i++) {
+      job = (await (await fetch(`${base}/api/jobs/${jobId}`)).json()) as typeof job;
+      if (job.status !== 'running') break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(job.status, 'done');
+    assert.equal(job.result?.stageOnly, true);
+    assert.equal(job.result?.recovery?.readiness, 'staged_only');
+    for (const table of ['canon_entity', 'canon_fact', 'canon_relation', 'canon_timeline', 'extraction_run', 'embedding']) {
+      assert.equal(
+        db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table} WHERE project_id = ?`, projectId)?.n,
+        0,
+        `${table} is untouched by forced staging`,
+      );
+    }
+    assert.equal(
+      db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_chunk WHERE project_id = ? AND lore_mined = 1', projectId)?.n,
+      0,
+      'staging never sets mined flags',
+    );
+  });
+});
+
+test('browser job serialization redacts raw window errors but keeps safe failure counts', async () => {
+  await withServer(async (base, projectId, db) => {
+    const secret = 'SENTINEL_SERVER_SECRET_WINDOW_ERROR';
+    db.exec(`
+      CREATE TRIGGER synthetic_browser_error
+      BEFORE INSERT ON extraction_chunk_lease
+      BEGIN SELECT RAISE(ABORT, '${secret}'); END;
+    `);
+    try {
+      const start = await fetch(`${base}/api/book-lore/extract`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      assert.equal(start.status, 200);
+      const { jobId } = (await start.json()) as { jobId: string };
+      let job: {
+        status: string;
+        result?: {
+          executionFailures?: number;
+          emptyWindows?: Array<{ reason?: string; detail?: string }>;
+          windowIssues?: Array<{ detail?: string }>;
+        };
+      } = { status: 'running' };
+      for (let i = 0; i < 120; i++) {
+        job = (await (await fetch(`${base}/api/jobs/${jobId}`)).json()) as typeof job;
+        if (job.status !== 'running') break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      assert.equal(job.status, 'done');
+      assert.ok((job.result?.executionFailures ?? 0) >= 1);
+      assert.equal(job.result?.emptyWindows?.[0]?.reason, 'error');
+      assert.equal(job.result?.emptyWindows?.[0]?.detail, undefined);
+      assert.equal(job.result?.windowIssues?.every((entry) => entry.detail === undefined), true);
+      assert.equal(JSON.stringify(job).includes(secret), false, 'raw error text is not browser-facing');
+    } finally {
+      db.exec('DROP TRIGGER synthetic_browser_error');
+    }
+  });
+});
+
+test('extraction progress never exposes raw note-ingestion errors', async () => {
+  await withServer(async (base, projectId, db) => {
+    const secret = 'SENTINEL_PROGRESS_SECRET_NOTE_ERROR';
+    db.exec(`
+      CREATE TRIGGER synthetic_progress_error
+      BEFORE INSERT ON trace
+      BEGIN SELECT RAISE(ABORT, '${secret}'); END;
+    `);
+    try {
+      const start = await fetch(`${base}/api/book-lore/extract`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ legacy: true }),
+      });
+      assert.equal(start.status, 200);
+      const { jobId } = (await start.json()) as { jobId: string };
+      let job: { status: string; message?: string; result?: unknown } = { status: 'running' };
+      const observed: string[] = [];
+      for (let i = 0; i < 300; i++) {
+        job = (await (await fetch(`${base}/api/jobs/${jobId}`)).json()) as typeof job;
+        observed.push(JSON.stringify(job));
+        if (job.status !== 'running') break;
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      assert.equal(job.status, 'done');
+      assert.equal(observed.some((payload) => payload.includes(secret)), false);
+      const lorebookSource = readFileSync(new URL('../../fanfable/src/lorebook.ts', import.meta.url), 'utf8');
+      assert.match(lorebookSource, /note ingestion skipped for window.*see diagnostics/);
+      assert.doesNotMatch(lorebookSource, /note ingestion skipped[^\n]*err\.message/);
+    } finally {
+      db.exec('DROP TRIGGER synthetic_progress_error');
+    }
   });
 });
 
