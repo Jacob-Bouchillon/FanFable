@@ -41,6 +41,17 @@ const SYSTEM = [
   'Reply with JSON only: {"verdict":"supported|not_supported","reason":"at most twelve words"}.',
 ].join(' ');
 
+const LOOSE_SYSTEM = [
+  'You judge one sentence from a book for a relationship claim.',
+  'Two named people and one sentence are given.',
+  'Answer supported iff the sentence SUPPORTS or SUGGESTS a tie between exactly these two people:',
+  'a verb of feeling or action toward the other, a stated role, coordination as a pair,',
+  'or any implication a careful reader would draw.',
+  'Pure co-presence with no connective tissue, list membership, or scene-sharing must be not_supported.',
+  'Never use knowledge from outside the sentence.',
+  'Reply with JSON only: {"verdict":"supported|not_supported","reason":"at most twelve words"}.',
+].join(' ');
+
 const PASSAGE_SYSTEM = [
   'You judge one passage from a book for a relationship claim.',
   'Two named people, a quoted line, and the passage it cites are given.',
@@ -150,7 +161,7 @@ async function judgeOnce(
   model: string,
   row: SheetRow,
   seed: number,
-  mode: 'sentence' | 'passage',
+  mode: 'sentence' | 'loose' | 'passage',
 ): Promise<Verdict> {
   const content = mode === 'passage'
     ? `People: ${row.pair}\nQuote: ${row.quote ?? ''}\nPassage: ${row.passage ?? ''}`
@@ -158,7 +169,7 @@ async function judgeOnce(
   const body = {
     model,
     messages: [
-      { role: 'system', content: mode === 'passage' ? PASSAGE_SYSTEM : SYSTEM },
+      { role: 'system', content: mode === 'passage' ? PASSAGE_SYSTEM : mode === 'loose' ? LOOSE_SYSTEM : SYSTEM },
       { role: 'user', content },
     ],
     stream: false,
@@ -187,7 +198,7 @@ async function judgeWithRetry(
   model: string,
   row: SheetRow,
   run: number,
-  mode: 'sentence' | 'passage',
+  mode: 'sentence' | 'loose' | 'passage',
 ): Promise<{ ok: true; verdict: Verdict } | { ok: false; error: string }> {
   let last = 'unknown';
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -212,12 +223,14 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const dir = flag(args, 'dir');
   if (!dir) {
-    process.stderr.write('usage: precision-judge.ts --dir <sheet dir> [--model spark-x2-q8:latest] [--prompt sentence|passage]\n');
+    process.stderr.write('usage: precision-judge.ts --dir <sheet dir> [--model spark-x2-q8:latest] [--prompt sentence|loose|passage]\n');
     process.exit(2);
   }
   const model = flag(args, 'model') ?? 'spark-x2-q8:latest';
   const host = flag(args, 'host') ?? process.env.OLLAMA_HOST ?? 'http://127.0.0.1:11434';
-  const mode: 'sentence' | 'passage' = flag(args, 'prompt') === 'passage' ? 'passage' : 'sentence';
+  const promptArg = flag(args, 'prompt');
+  const mode: 'sentence' | 'loose' | 'passage' =
+    promptArg === 'passage' ? 'passage' : promptArg === 'loose' ? 'loose' : 'sentence';
   const runs = 3;
   const rows = readSheet(dir);
   if (!rows.length) throw new Error('sheet has no rows');
