@@ -73,7 +73,11 @@ test('direction comes from the judge, not from the candidate order', async () =>
   const { db, project, candidate, tor, mara } = setup('scan-direction', sentence);
   const llm = mockProvider(() => JSON.stringify({ tie: true, kind: 'mentor of', from: 'Tor', to: 'Mara' }));
   const result = await lorebook.verifySentenceCandidates(db, llm, project.id, [candidate]);
-  assert.equal(result.accepted, 1);
+  // The judge supplies no numeric confidence, and a missing score must not
+  // default to full marks: the row keeps the judge's direction but stays
+  // provisional for review.
+  assert.equal(result.accepted, 0);
+  assert.equal(result.parked, 1);
   const row = db.get<{ from_entity: number; to_entity: number }>(
     'SELECT from_entity, to_entity FROM canon_relation WHERE project_id = ?',
     project.id,

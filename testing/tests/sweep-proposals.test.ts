@@ -151,6 +151,92 @@ test('a pair holding a keeper is skipped', async () => {
   db.close();
 });
 
+test('a user-confirmed keeper also suppresses a proposal', async () => {
+  const { db, project, mara, corin } = setup('sweep-keeper-confirmed');
+  addRelation(db, project, mara, corin, 'friend of', 'user_confirmed');
+  const result = await runNameSweep(db, sweepProvider(), project, { batchSize: 60 });
+  assert.equal(result.proposals, 0);
+  assert.equal(result.skippedKeeper, 1);
+  db.close();
+});
+
+test('a provisional row does not suppress a proposal', async () => {
+  const { db, project, mara, corin } = setup('sweep-keeper-provisional');
+  addRelation(db, project, mara, corin, 'friend of', 'provisional');
+  const result = await runNameSweep(db, sweepProvider(), project, { batchSize: 60 });
+  assert.equal(result.proposals, 1);
+  assert.equal(result.skippedKeeper, 0);
+  db.close();
+});
+
+test('a needs-review row does not suppress a proposal', async () => {
+  const { db, project, mara, corin } = setup('sweep-keeper-needs-review');
+  addRelation(db, project, mara, corin, 'friend of', 'needs_review');
+  const result = await runNameSweep(db, sweepProvider(), project, { batchSize: 60 });
+  assert.equal(result.proposals, 1);
+  assert.equal(result.skippedKeeper, 0);
+  db.close();
+});
+
+test('a resolved note for the same pair and kind suppresses the proposal without a constraint error', async () => {
+  const { db, project, mara, corin } = setup('sweep-resolved-note');
+  db.run(
+    `INSERT INTO canon_tie_note
+       (project_id, from_entity, to_entity, attempted_kind, reason, evidence, source_refs,
+        status, ruling, ruled_at, created_at)
+     VALUES (?, ?, ?, 'brother of', 'evaluation', 'an older quote', '[]', 'resolved', 'merge', ?, ?)`,
+    project, mara, corin, AT, AT,
+  );
+  const result = await runNameSweep(db, sweepProvider(), project, { batchSize: 60 });
+  assert.equal(result.proposals, 0);
+  assert.equal(result.skippedPending, 1, 'any-status note counts as existing');
+  assert.equal(
+    db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_tie_note WHERE project_id = ?', project)!.n,
+    1,
+    'the earlier note is intact and no duplicate is queued',
+  );
+  db.close();
+});
+
+for (const status of ['parked', 'dropped'] as const) {
+  test(`a ${status} note for the same pair and kind also suppresses the proposal`, async () => {
+    const { db, project, mara, corin } = setup(`sweep-${status}-note`);
+    db.run(
+      `INSERT INTO canon_tie_note
+         (project_id, from_entity, to_entity, attempted_kind, reason, evidence, source_refs,
+          status, ruling, ruled_at, created_at)
+       VALUES (?, ?, ?, 'brother of', 'evaluation', 'an older quote', '[]', ?, '', '', ?)`,
+      project, mara, corin, status, AT,
+    );
+    const result = await runNameSweep(db, sweepProvider(), project, { batchSize: 60 });
+    assert.equal(result.proposals, 0);
+    assert.equal(result.skippedPending, 1);
+    db.close();
+  });
+}
+
+test('each sweep proposal records its court objection', async () => {
+  const { db, project, mara, corin } = setup('sweep-ruling');
+  const result = await runNameSweep(db, sweepProvider(), project, { batchSize: 60 });
+  assert.equal(result.proposals, 1);
+  const ruling = db.get<{
+    subject: string;
+    role: string;
+    actor: string;
+    standard: string;
+    to_status: string;
+  }>(
+    "SELECT subject, role, actor, standard, to_status FROM canon_ruling WHERE project_id = ? AND standard = 'sweep-proposal'",
+    project,
+  );
+  assert.ok(ruling, 'a ruling exists for the inserted note');
+  assert.equal(ruling.role, 'objection');
+  assert.equal(ruling.actor, 'bank');
+  assert.equal(ruling.to_status, 'pending');
+  assert.equal(ruling.subject, `pair:${Math.min(mara, corin)}:${Math.max(mara, corin)}`);
+  db.close();
+});
+
 test('a second sweep adds no duplicates', async () => {
   const { db, project } = setup('sweep-idempotent');
   const first = await runNameSweep(db, sweepProvider(), project, { batchSize: 60 });

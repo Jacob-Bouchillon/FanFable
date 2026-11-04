@@ -5,15 +5,11 @@
  * and answering lore questions with citations. Canon is write-once — nothing in
  * the story pipeline may modify a canon_source, canon_chunk or canon_event row.
  */
-import { createHash } from 'node:crypto';
-import { statSync } from 'node:fs';
 import { Db, nowIso, strList } from '../core/db.ts';
 import { asRecordArray, extractJson, salvageJsonArray, toStringArray } from '../core/json.ts';
 import type { LlmClient } from '../core/llm.ts';
-import { chunkText, lexicalScore, titleFromPath, trimFrontBackMatter, truncate, wordCount } from '../core/text.ts';
-import { STOPWORDS } from '../core/vocab.ts';
+import { truncate } from '../core/text.ts';
 import { SEARCH_CANDIDATE_POOL, SEARCH_CANDIDATE_POOL_MAX } from '../support/search-policy.ts';
-import { nameMentioned } from '../identity/names.ts';
 import { importFile, readTextFile, type ImportedText } from '../support/importer.ts';
 import * as lorebook from '../lorebook.ts';
 
@@ -40,24 +36,7 @@ export interface Passage {
   score: number;
 }
 
-import {
-  importSource,
-  importSourceAsync,
-  listSources,
-} from '../support/lore-import.ts';
-import {
-  expandQuery,
-  getChunk,
-  getChunks,
-  searchCanon,
-  toMatchExpression,
-} from './lore-search.ts';
-import {
-  answerLoreQuestion,
-  formatPassages,
-  formatLoreIndex,
-  passageNamesBoth,
-} from './lore-ask.ts';
+import { formatPassages } from './lore-ask.ts';
 export {
   importSource,
   importSourceAsync,
@@ -244,11 +223,13 @@ export async function extractCanonEvents(
   const windowSize = opts.windowSize ?? 8;
   const totalWindows = Math.ceil(chunks.length / windowSize);
   const created: CanonEvent[] = [];
+  let duplicates = 0;
   let done = 0;
   for (let start = 0; start < chunks.length; start += windowSize) {
     const window = chunks.slice(start, start + windowSize);
     const found = await extractEventsFromWindow(db, llm, projectId, window, opts);
-    created.push(...found);
+    created.push(...found.events);
+    duplicates += found.duplicates;
     done++;
     opts.onProgress?.(`read passages ${start + 1}-${start + window.length} of ${chunks.length}`);
     opts.onWindow?.({
@@ -262,6 +243,7 @@ export async function extractCanonEvents(
     // by passage 262 and the loop stopped, silently indexing half the book.
     if (opts.maxEvents !== undefined && created.length >= opts.maxEvents) break;
   }
+  if (duplicates > 0) opts.onProgress?.(`skipped ${duplicates} duplicate event(s)`);
   // The lore pass may already have written timeline entries; join them to the
   // events that now exist.
   lorebook.linkTimelineToEvents(db, projectId);
@@ -284,7 +266,7 @@ async function extractEventsFromWindow(
     path: string;
   }[],
   opts: { maxEvents?: number },
-): Promise<CanonEvent[]> {
+): Promise<{ events: CanonEvent[]; duplicates: number }> {
   const res = await llm.chat({
     system:
       'You index narrative events from a book for a fanfiction tool. ' +
@@ -311,6 +293,7 @@ async function extractEventsFromWindow(
     ? asRecordArray(Array.isArray(parsedAny) ? parsedAny : ((parsedAny as any)?.events ?? parsedAny))
     : salvageJsonArray(res.text);
   const created: CanonEvent[] = [];
+  let duplicates = 0;
   const max = opts.maxEvents ?? Number.POSITIVE_INFINITY;
   for (const obj of objects) {
     if (created.length >= max) break;
@@ -325,6 +308,23 @@ async function extractEventsFromWindow(
     if (/\bchapter\b/i.test(title)) continue;
     const participants = toStringArray(obj.participants);
     const kind = String(obj.kind ?? 'event');
+    // No unique index on (project, source, chunk, title) in this schema
+    // version, so the guard lives here: a repeat extraction skips an event it
+    // already indexed instead of duplicating it. The title is the identity of
+    // one narrated happening within one passage.
+    const existing = db.get<{ id: number }>(
+      `SELECT id FROM canon_event
+        WHERE project_id = ? AND source_id = ? AND chunk_id = ? AND title = ?
+        LIMIT 1`,
+      projectId,
+      chunk.source_id,
+      chunk.id,
+      title,
+    );
+    if (existing) {
+      duplicates++;
+      continue;
+    }
     const r = db.run(
       `INSERT INTO canon_event (project_id, source_id, chunk_id, locator, title, summary, participants, location, time_label, kind, quote, seq, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -356,7 +356,7 @@ async function extractEventsFromWindow(
       quote: truncate(chunk.text, 400),
     });
   }
-  return created;
+  return { events: created, duplicates };
 }
 
 export function listCanonEvents(db: Db, projectId: number, limit = 100): CanonEvent[] {

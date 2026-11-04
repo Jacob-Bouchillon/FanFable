@@ -5,6 +5,7 @@ import { runMigrations, hasColumn, tableExists } from '../../fanfable/src/core/m
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
 test('a new database gets the whole schema', () => {
   const db = new Db(':memory:');
@@ -71,6 +72,41 @@ test('an old database is migrated forward without losing data', () => {
   assert.equal(names[0].name, 'Serena');
   assert.ok(hasColumn(migrated.raw, 'canon_entity', 'confidence'), 'the new columns were added');
   migrated.close();
+});
+
+test('a version-32 database with no tables is rebuilt to the full schema', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fanfable-migrate-empty-'));
+  const path = join(dir, 'empty-v32.db');
+  const raw = new DatabaseSync(path);
+  raw.exec('PRAGMA user_version = 32');
+  raw.close();
+
+  const db = new Db(path);
+  const version = db.raw.prepare('PRAGMA user_version').get() as { user_version: number };
+  assert.ok(version.user_version >= 32, 'the stale high version does not suppress later migrations');
+  for (const table of ['claim_proof', 'trace', 'canon_thread', 'canon_tie_note', 'extraction_recovery_child']) {
+    assert.ok(tableExists(db.raw, table), `${table} was recreated`);
+  }
+  assert.ok(hasColumn(db.raw, 'canon_entity', 'quarantine_reason'));
+  db.close();
+});
+
+test('a version-32 database missing canon_thread recreates it', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fanfable-migrate-missing-'));
+  const path = join(dir, 'missing-thread.db');
+  const full = new Db(path);
+  full.close();
+
+  const raw = new DatabaseSync(path);
+  raw.exec('PRAGMA foreign_keys = OFF');
+  raw.exec('DROP TABLE canon_thread');
+  raw.exec('PRAGMA user_version = 32');
+  raw.close();
+
+  const db = new Db(path);
+  assert.ok(tableExists(db.raw, 'canon_thread'), 'canon_thread is recreated');
+  assert.ok(tableExists(db.raw, 'canon_thread_note'), 'dependent thread tables remain');
+  db.close();
 });
 
 test('migrations are safe to run twice', () => {

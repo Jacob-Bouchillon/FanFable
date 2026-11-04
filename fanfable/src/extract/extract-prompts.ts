@@ -37,8 +37,7 @@ Reply with JSON only:
   "facts": [
     {"topic":"the subject of the fact","statement":"what the book establishes",
      "kind":"rule|fact|background","certainty":"confirmed|inferred","subject":"name it concerns",
-     "chunk_index":0,"evidence":"a short exact quote",
-     "modality":"asserted|denied|possible|suspected — only include when not asserted"}
+     "chunk_index":0,"evidence":"a short exact quote"}
   ]
 }
 
@@ -67,7 +66,6 @@ Rules:
 - chunk_index is the number shown in front of each passage. Use it for every entry.
 - evidence must be a short phrase copied from the passage, not your own words.
 - If the passages contain no new people, places or facts, return empty arrays.
-- If the passage denies, doubts, or frames something as merely possible, record the claim normally but set modality to denied/possible/suspected with the denying quote as evidence; never store a denial as a plain fact.
 - No prose outside the JSON.`;
 
 /**
@@ -119,8 +117,7 @@ Reply with JSON only:
      "names_both": false, "other_person": "named|pronoun|role|absent",
      "asserted": true, "hedge": "certain|hedged|doubted|denied",
      "kind_fit": "yes|partly|no", "strength": 0.7,
-     "why":"one sentence of reasoning",
-     "modality":"asserted|denied|possible|suspected — only include when not asserted"}
+     "why":"one sentence of reasoning"}
   ]
 }
 
@@ -135,7 +132,7 @@ Rules:
 - The direction matters: "from" is the one who has the relationship and "to" is the one it is to. If Harry is Petunia's nephew, it is from="Harry", to="Petunia", kind="nephew of".
 - chunk_index is the number shown in front of each passage.
 - names_both is true when the quote itself names both people; other_person says how the other side is named (named, pronoun, role, absent). asserted is true when the quote states the tie rather than only implying it. hedge is certain, hedged, doubted or denied. kind_fit is yes, partly or no. strength is your answer to the last question, from 0 to 1. why is one sentence of reasoning, stored for audit and never parsed.
-- If the passage denies, doubts, or frames something as merely possible, set asserted=false, hedge to doubted or denied, and the low strength that follows; also set modality.
+- If the passage denies, doubts, or frames something as merely possible, set asserted=false, hedge to doubted or denied, and the low strength that follows.
 ${ASSESSMENT_QUESTIONS}
 - No prose outside the JSON.`;
 
@@ -165,7 +162,6 @@ Rules:
 - chunk_index is the number shown in front of each passage.
 - evidence must be a short phrase copied from the passage, not your own words.
 - If the passages narrate no event, return an empty array.
-- If the passage denies, doubts, or frames something as merely possible, record the claim normally but set modality to denied/possible/suspected with the denying quote as evidence; never store a denial as a plain fact.
 - No prose outside the JSON.`;
 
 /**

@@ -251,6 +251,22 @@ export function inverseFamilyOf(family: RelationFamily): RelationFamily {
 }
 
 /**
+ * Every family that names the other side of this family's tie.
+ *
+ * The relation is not an involution: both `master` and `employer` take
+ * `servant` as their inverse, so inverting twice can land on a sibling
+ * family (`employer -> servant -> master`). Callers that need "the other
+ * side" must test membership here rather than invert a second time.
+ */
+export function inverseFamiliesOf(family: RelationFamily): Set<RelationFamily> {
+  const out = new Set<RelationFamily>([inverseFamilyOf(family)]);
+  for (const rule of RELATION_FAMILIES) {
+    if (rule.inverseFamily === family) out.add(rule.family);
+  }
+  return out;
+}
+
+/**
  * What intake must do with one model-proposed kind: bank it, or park it.
  *
  * A kind outside the twelve families is never a proof kind and never banks,

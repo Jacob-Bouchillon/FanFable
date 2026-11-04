@@ -418,8 +418,11 @@ test('trace write failure does not change lore trails output or HTML', () => {
   assert.ok(normal.traceId);
   const htmlFile = 'trails-who-is-serena-marsh-s-sibling.html';
   const normalHtml = readFileSync(join(normal.cwd, htmlFile), 'utf8');
-  fixture.db.exec('DROP TABLE trace_event');
-  fixture.db.exec('DROP TABLE trace');
+  // Force trace persistence to fail without dropping the ledger: migration
+  // recovery now rebuilds a missing trace table when the CLI opens the bank.
+  fixture.db.exec(
+    "CREATE TRIGGER fail_trace_write BEFORE INSERT ON trace BEGIN SELECT RAISE(ABORT, 'trace write failed'); END",
+  );
   const failed = runTrails(fixture);
   assert.equal(failed.status, 0, failed.stderr);
   assert.match(failed.stdout, /wrote/);

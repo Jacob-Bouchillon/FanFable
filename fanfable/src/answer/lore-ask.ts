@@ -5,7 +5,6 @@
  */
 import { createHash } from 'node:crypto';
 import { Db, nowIso } from '../core/db.ts';
-import { extractJson, toStringArray } from '../core/json.ts';
 import type { LlmClient } from '../core/llm.ts';
 import { nameMentionedExact, buildRosterIndex, deriveNameVariants, canonicalName, nameRelation, type RosterIndex } from '../identity/names.ts';
 import * as lorebook from '../lorebook.ts';
@@ -312,9 +311,26 @@ function openTermDirection(
   return subject === 'a' && object === 'b' ? 'a-to-b' : subject === 'b' && object === 'a' ? 'b-to-a' : 'unknown';
 }
 
+/** Words that deny or soften the clause they precede. Used only near the
+ * asserted relationship term, never to excuse a whole sentence. */
+const CLAIM_NEGATORS = new Set(['not', 'never', 'cannot', "can't", "isn't", "wasn't", "aren't", "weren't", "don't", "doesn't", "didn't", 'without', 'hardly', 'barely']);
+const CLAIM_HEDGES = new Set(['perhaps', 'possibly', 'maybe', 'might', 'may', 'could', 'probably', 'apparently', 'seemingly', 'suspected', 'rumoured', 'rumored']);
+
+/** True when the relation term at `at` is itself denied or hedged by the four
+ * tokens before it. "No doubt, Asha is Bram's sister" keeps its claim; "Asha
+ * is not Bram's sister" and "Perhaps Asha is Bram's sister" do not. */
+function claimDenied(sentence: string, at: number): boolean {
+  const before = sentence.slice(0, Math.max(0, at)).toLowerCase().replace(/[^a-z']+/g, ' ').trim();
+  if (!before) return false;
+  return before
+    .split(' ')
+    .filter(Boolean)
+    .slice(-4)
+    .some((word) => CLAIM_NEGATORS.has(word) || CLAIM_HEDGES.has(word));
+}
+
 function assertedClaims(
   draft: string,
-  pair: { a: string; b: string },
   sideAVariants: string[],
   sideBVariants: string[],
 ): AssertedClaim[] {
@@ -322,10 +338,7 @@ function assertedClaims(
   const sideBTokens = nameTokensOf(sideBVariants);
   const claims = new Map<string, AssertedClaim>();
   const sentences = draft.split(/[.!?\n]+/).map((sentence) => sentence.trim()).filter(Boolean);
-  const negated = (sentence: string): boolean =>
-    /\b(no|not|never|cannot|can't|does not|do not|isn't|wasn't|without|unsupported|unconfirmed|missing|unknown)\b/i.test(sentence);
   for (const sentence of sentences) {
-    if (negated(sentence)) continue;
     const lower = sentence.toLowerCase();
     const namesA = sideAVariants.some((variant) => lower.includes(variant.toLowerCase()));
     const namesB = sideBVariants.some((variant) => lower.includes(variant.toLowerCase()));
@@ -333,12 +346,18 @@ function assertedClaims(
     if (!(namesA && namesB) && !((namesA || namesB) && pronoun)) continue;
     for (const head of CLOSED_HEADS) {
       const forms = [head, PLURAL_HEADS[head]].filter(Boolean) as string[];
-      if (!forms.some((form) => new RegExp(`\\b${form}\\b`, 'i').test(sentence))) continue;
+      const match = new RegExp(`\\b(?:${forms.join('|')})\\b`, 'i').exec(sentence);
+      if (!match) continue;
+      // Only a denial of *this* claim suppresses it. A negation elsewhere in
+      // the sentence ("No doubt, Asha is Bram's sister") is not a denial.
+      if (claimDenied(sentence, match.index)) continue;
       const direction = claimDirection(sentence, head, sideATokens, sideBTokens);
       claims.set(`${head}|${direction}`, { head, direction });
     }
     for (const term of OPEN_TERMS) {
-      if (!term.re.test(sentence)) continue;
+      const match = term.re.exec(sentence);
+      if (!match) continue;
+      if (claimDenied(sentence, match.index)) continue;
       const kind = term.kind;
       const head = kind ? relationHead(kind) : term.term;
       const direction = openTermDirection(sentence, term, sideATokens, sideBTokens);
@@ -361,14 +380,15 @@ function assertedClaims(
   }
   if (!claims.size) {
     for (const sentence of sentences) {
-      if (negated(sentence)) continue;
       const lower = sentence.toLowerCase();
       const oneSide = sideAVariants.some((variant) => lower.includes(variant.toLowerCase())) ||
         sideBVariants.some((variant) => lower.includes(variant.toLowerCase()));
       if (!oneSide) continue;
       for (const head of CLOSED_HEADS) {
         const forms = [head, PLURAL_HEADS[head]].filter(Boolean) as string[];
-        if (!forms.some((form) => new RegExp(`\\b${form}\\b`, 'i').test(sentence))) continue;
+        const match = new RegExp(`\\b(?:${forms.join('|')})\\b`, 'i').exec(sentence);
+        if (!match) continue;
+        if (claimDenied(sentence, match.index)) continue;
         claims.set(`${head}|off`, { head, direction: 'unknown', offPair: true });
         break;
       }
@@ -458,15 +478,15 @@ function quotedSpans(draft: string): string[] {
   let match: RegExpExecArray | null;
   while ((match = re.exec(draft)) !== null) {
     const span = match[1]!.trim();
-    if (span.split(/\s+/).filter(Boolean).length < 6) continue;
-    // A quote attributed only to the extracted index ([Lore: ...]) is not a
-    // passage quotation; it never claims passage evidence.
-    const lineStart = draft.lastIndexOf('\n', match.index) + 1;
-    const lineEnd = draft.indexOf('\n', match.index);
-    const line = draft.slice(lineStart, lineEnd < 0 ? undefined : lineEnd);
-    // A quote attributed only to the extracted index ([Lore: ...]) is not a
-    // passage quotation; it never claims passage evidence.
-    if (/\[Lore:/i.test(line) && !/\[S\d/i.test(line)) continue;
+    // Every quoted span is checked, however short: "moon is cheese" claims
+    // passage evidence exactly as a long quotation does.
+    if (!span) continue;
+    const lineEndAt = draft.indexOf('\n', match.index + match[0].length);
+    const tail = draft.slice(match.index + match[0].length, lineEndAt < 0 ? undefined : lineEndAt);
+    // The extracted-index exemption belongs to *this quote*: the [Lore: ...]
+    // marker must immediately follow the closing quotation mark. A marker
+    // elsewhere on the line does not excuse a fabricated passage quote.
+    if (/^\s*[.,;:]?\s*\[Lore:/i.test(tail) && !/\[S\d/i.test(tail)) continue;
     spans.push(span);
   }
   return spans;
@@ -552,7 +572,7 @@ export function enforceStatusTieGuard(
   }
   const sideA = entityVariantsFor(entities, pair.a, index);
   const sideB = entityVariantsFor(entities, pair.b, index);
-  const claims = assertedClaims(draft, pair, sideA.variants, sideB.variants);
+  const claims = assertedClaims(draft, sideA.variants, sideB.variants);
   if (!claims.length) return draft;
   const results = claims.map((claim) => ({ claim, result: verifyClaim(db, projectId, pair, sideA, sideB, claim) }));
   const unsupported = results.filter((row) => !row.result.supported);

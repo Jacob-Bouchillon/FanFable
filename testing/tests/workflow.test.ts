@@ -309,6 +309,47 @@ test('re-approving an edited chapter does not duplicate memory records', async (
   db.close();
 });
 
+test('editing an approved chapter returns it to draft and clears its derived memory', async () => {
+  const { db } = tempDb();
+  const project = seedProject(db, 'edit-draft');
+  const llm = scriptedProvider();
+  const data = await planner.draftOutline(llm, { premise: 'p', chapterCount: 1 });
+  planner.approveOutline(db, project.id, planner.saveOutline(db, project.id, { ...data }).id);
+  await controller.writeChapter(db, llm, project.id, { chapterNumber: 1 });
+  await controller.approveChapter(db, llm, project.id, 1);
+  assert.ok(memory.listAuEvents(db, project.id).length > 0, 'approval derived events');
+  assert.ok(memory.currentStates(db, project.id).length > 0, 'approval derived states');
+
+  const edited = controller.setChapterBody(db, project.id, 1, 'Serena crossed the bridge alone.');
+  assert.equal(edited.status, 'draft', 'the edit is a draft');
+  assert.equal(memory.listAuEvents(db, project.id).length, 0, 'derived events are cleared');
+  assert.equal(memory.currentStates(db, project.id).length, 0, 'derived states are cleared');
+  assert.equal(memory.listKnowledge(db, project.id).length, 0, 'derived knowledge is cleared');
+  assert.equal(memory.listRelationships(db, project.id).length, 0, 'derived relationships are cleared');
+  assert.equal(memory.listSummaries(db, project.id).length, 0, 'the old summary is cleared');
+  db.close();
+});
+
+test('impact after an edit uses the chapter’s real material, not a chapter-N phrase', () => {
+  const { db } = tempDb();
+  const project = seedProject(db, 'edit-impact');
+  memory.upsertCharacter(db, project.id, 'Serena Marsh');
+  controller.saveChapter(db, project.id, 1, {
+    title: 'The Crossing',
+    body: 'Serena Marsh crossed the bridge.',
+    status: 'draft',
+  });
+  controller.saveChapter(db, project.id, 2, {
+    title: 'The Far Bank',
+    body: 'Serena Marsh waited on the far bank.',
+    status: 'draft',
+  });
+  const impacted = controller.impactedByChapterEdit(db, project.id, 1);
+  assert.ok(impacted.some((hit) => hit.chapter.number === 2), 'chapter 2 mentions the edited material');
+  assert.deepEqual(controller.impactedByChapterEdit(db, project.id, 1).map((hit) => hit.chapter.number), [2]);
+  db.close();
+});
+
 test('context requests are logged so the author can see them', async () => {
   const { db } = tempDb();
   const project = seedProject(db, 'requests');

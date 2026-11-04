@@ -53,7 +53,8 @@ import {
   type TracedEndpointResolution,
 } from './trace/extraction-trace.ts';
 import { entitySubject, recordRuling } from './court/ruling.ts';
-import { newClaimUid } from './court/claim-proof.ts';
+import { CURRENT_PROOF_POLICY_VERSION, SEMANTIC_GATE_POLICY_VERSION, newClaimUid } from './court/claim-proof.ts';
+import { readRelationClaimState, transitionClaim } from './court/claim-transition.ts';
 import { findHeadings, lexicalScore, normalise, splitSentences, tokenize, truncate } from './core/text.ts';
 import {
   ANSWER_CUE_STOPWORDS,
@@ -745,6 +746,8 @@ export interface ChunkRow {
   source_title: string;
   path: string;
   source_id: number;
+  /** 1 when the extraction pipeline has already mined this passage. */
+  lore_mined?: number;
   /** UTF-16 offset into the canonical chunk text for this fragment (inclusive). */
   chunk_start?: number;
   /** UTF-16 offset into the canonical chunk text for this fragment (exclusive). */
@@ -3143,9 +3146,10 @@ export function minedChunkProvenance(db: Db, projectId: number): MinedChunkProve
 }
 
 /** Every passage of a project (or one source), in window order. */
-function loadOrderedChunks(db: Db, projectId: number, sourceId?: number): ChunkRow[] {
+export function loadOrderedChunks(db: Db, projectId: number, sourceId?: number): ChunkRow[] {
   const params: unknown[] = [projectId];
-  let sql = `SELECT c.id, c.seq, c.heading, c.locator, c.text, s.title AS source_title, s.path, c.source_id
+  let sql = `SELECT c.id, c.seq, c.heading, c.locator, c.text, s.title AS source_title, s.path, c.source_id,
+                    c.lore_mined
              FROM canon_chunk c JOIN canon_source s ON s.id = c.source_id
              WHERE c.project_id = ?`;
   if (sourceId) {
@@ -6081,6 +6085,16 @@ export interface PairKeeper {
 }
 
 /**
+ * One definition of a keeper: exactly these two review statuses, everywhere a
+ * bank-facing check asks whether a tie is proven. `conflict_status` is a
+ * separate eligibility exclusion where a query reads it.
+ */
+export const KEEPER_STATUSES: readonly string[] = ['accepted', 'user_confirmed'];
+
+/** The keeper set as a SQL predicate (all keeper queries share one wording). */
+export const KEEPER_STATUS_SQL = "review_status IN ('accepted','user_confirmed')";
+
+/**
  * One keeper lookup for an explicit pair. It returns every accepted or
  * user-confirmed row between the named sides, in either direction, keeping the
  * guard's existing "any accepted tie" semantics. The answer line filters this
@@ -6096,7 +6110,7 @@ export function lookupKeeperPair(
   projectId: number,
   a: string,
   b: string,
-  statuses: readonly string[] = ['accepted', 'user_confirmed'],
+  statuses: readonly string[] = KEEPER_STATUSES,
 ): PairKeeper[] {
   const entities = listEntities(db, projectId);
   const roster = buildRosterIndex(
@@ -10920,6 +10934,7 @@ export function assignAttestedTiers(
   const rows = db
     .all<{
       id: number;
+      claim_uid: string | null;
       from_entity: number;
       to_entity: number;
       kind: string;
@@ -10937,7 +10952,7 @@ export function assignAttestedTiers(
       to_aliases: string;
       to_status: string;
     }>(
-      'SELECT r.id, r.from_entity, r.to_entity, r.kind, r.evidence, r.source_refs, r.kind_source, r.anchor_evidence, r.supporting_evidence, r.confidence, r.review_status, a.name AS from_name, a.aliases AS from_aliases, a.review_status AS from_status, b.name AS to_name, b.aliases AS to_aliases, b.review_status AS to_status FROM canon_relation r JOIN canon_entity a ON a.id = r.from_entity JOIN canon_entity b ON b.id = r.to_entity WHERE r.project_id = ? AND r.review_status IN (\'provisional\',\'needs_review\') ORDER BY r.id',
+      'SELECT r.id, r.claim_uid, r.from_entity, r.to_entity, r.kind, r.evidence, r.source_refs, r.kind_source, r.anchor_evidence, r.supporting_evidence, r.confidence, r.review_status, a.name AS from_name, a.aliases AS from_aliases, a.review_status AS from_status, b.name AS to_name, b.aliases AS to_aliases, b.review_status AS to_status FROM canon_relation r JOIN canon_entity a ON a.id = r.from_entity JOIN canon_entity b ON b.id = r.to_entity WHERE r.project_id = ? AND r.review_status IN (\'provisional\',\'needs_review\') ORDER BY r.id',
       projectId,
     )
     .slice(0, opts.limit === undefined ? undefined : Math.max(0, Math.floor(opts.limit)));
@@ -11075,24 +11090,56 @@ export function assignAttestedTiers(
         if (fixed !== undefined) {
           db.run('UPDATE canon_relation SET evidence = ? WHERE id = ? AND project_id = ?', fixed, id, projectId);
         }
-        const changed = db.run(
-          "UPDATE canon_relation SET review_status = 'accepted' WHERE id = ? AND project_id = ? AND review_status IN ('provisional','needs_review')",
-          id,
-          projectId,
-        ).changes;
-        result.changed += changed;
-        if (changed) {
-          recordRuling(db, projectId, {
-            relationId: id,
-            role: 'appeal',
-            actor: 'guard',
-            standard: 'sentence-proof',
-            fromStatus: priorStatus.get(id) ?? '',
-            toStatus: 'accepted',
-            basis: 'proven quote and threshold',
-          });
+        const row = rows.find((candidate) => candidate.id === id);
+        let claimUid = String(row?.claim_uid ?? '');
+        if (!claimUid) {
+          // Legacy rows may predate claim identity. The owner needs one, so
+          // mint it here; this writes identity only, never status.
+          claimUid = newClaimUid('relation');
+          db.run(
+            "UPDATE canon_relation SET claim_uid = ? WHERE id = ? AND project_id = ? AND (claim_uid IS NULL OR claim_uid = '')",
+            claimUid,
+            id,
+            projectId,
+          );
         }
-
+        // The gate already passed in the scan (`decision.ok`). The owner
+        // re-checks claim identity and appends the proof attempt + ruling in
+        // the same transition; it never decides proof itself.
+        const current = readRelationClaimState(db, projectId, claimUid);
+        if (!current) {
+          result.still['wired-claim-missing'] = (result.still['wired-claim-missing'] ?? 0) + 1;
+          continue;
+        }
+        const transition = transitionClaim(db, projectId, {
+          claim: { type: 'relation', uid: claimUid },
+          intent: 'promotion',
+          expect: {
+            reviewStatus: current.reviewStatus,
+            authorization: current.authorization,
+            proofAttemptSeq: current.proofAttemptSeq,
+            policyVersion: current.policyVersion,
+            fingerprints: current.fingerprints,
+          },
+          target: { reviewStatus: 'accepted' },
+          gateResult: {
+            outcome: 'verified',
+            standard: 'sentence',
+            policyVersion: CURRENT_PROOF_POLICY_VERSION,
+            gateVersion: SEMANTIC_GATE_POLICY_VERSION,
+            fingerprints: current.fingerprints,
+            detail: 'proven quote and threshold',
+          },
+          actor: 'guard',
+          role: 'appeal',
+          standard: 'sentence-proof',
+          basis: 'proven quote and threshold',
+        });
+        if (transition.kind === 'applied') {
+          result.changed++;
+        } else {
+          result.still[`wired-${transition.kind}`] = (result.still[`wired-${transition.kind}`] ?? 0) + 1;
+        }
       }
     });
   }

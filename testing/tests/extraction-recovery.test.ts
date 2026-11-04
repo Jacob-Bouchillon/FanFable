@@ -2751,6 +2751,15 @@ test('CLI --trace fails fast without --legacy and help states the canon boundary
   assert.match(help.stdout, /--trace requires --legacy/);
   assert.match(help.stdout, /stage-only extraction does not write traces/);
   assert.match(help.stdout, /only on a disposable database/);
+  for (const heading of ['CONFLICTS', 'GRAPH']) {
+    assert.equal(
+      // ANSI color codes sit directly before the heading text, so a word
+      // boundary would fail against the trailing 'm' of the escape sequence.
+      (help.stdout.match(new RegExp(heading, 'g')) ?? []).length,
+      1,
+      `help should print the ${heading} section once`,
+    );
+  }
 
   const out = spawnSync(
     process.execPath,
@@ -5392,6 +5401,124 @@ try {
     0,
   );
   afterResume.close();
+});
+
+/** Drive one child through its only stage to a complete, mined state. */
+function completeChild(
+  controller: RecoveryController,
+  projectId: number,
+  childId: number,
+  owner = 'owner-a',
+  fingerprint = stageFingerprint(),
+): number {
+  setFingerprint(controller, childId, 'entities-facts', fingerprint, owner);
+  const fencing = claim(controller, childId, owner);
+  const attempt = controller.beginAttempt(childId, 'entities-facts', owner, fencing, fingerprint);
+  controller.stageBatch({
+    attemptId: attempt.attemptId!,
+    childId,
+    projectId,
+    stage: 'entities-facts',
+    fingerprint,
+    payload: { entities: [], facts: [] },
+    finishReason: 'stop',
+    complete: true,
+  });
+  controller.applyCoverage({
+    childId,
+    projectId,
+    stage: 'entities-facts',
+    fingerprint,
+    attemptId: attempt.attemptId!,
+    owner,
+    fencing,
+    status: 'empty',
+    apply: () => {},
+  });
+  assert.equal(controller.finalizeChild(childId, owner, fencing), 'complete');
+  return fencing;
+}
+
+test('a live lease blocks a complete-child reopen and leaves the child complete', () => {
+  const { db } = tempDb();
+  const project = seedProject(db, 'recovery-reopen-overlap');
+  const ids = projectChunks(db, project.id);
+  const controller = new RecoveryController(db, { leaseMs: 60_000, heartbeatMs: 60_000, backoffMs: [1] });
+  const { childId } = parentChild(controller, project.id, [ids[0]!]);
+  completeChild(controller, project.id, childId);
+  assert.equal(minedCount(db, project.id), 1);
+
+  // Another child takes a live lease on the same chunk.
+  const { childId: otherChild } = parentChild(controller, project.id, [ids[0]!]);
+  claim(controller, otherChild, 'owner-b');
+
+  const result = controller.claimChild(childId, 'owner-a', {
+    expectedStageFingerprints: { 'entities-facts': 'changed-generation' },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'overlap');
+  assert.equal(controller.getChild(childId)!.status, 'complete', 'the child is not mutated');
+  assert.equal(minedCount(db, project.id), 1, 'the window stays published');
+  db.close();
+});
+
+test('a legitimate reopen makes its chunks minable again', () => {
+  const { db } = tempDb();
+  const project = seedProject(db, 'recovery-reopen-mined');
+  const ids = projectChunks(db, project.id);
+  const controller = new RecoveryController(db, { leaseMs: 60_000, heartbeatMs: 60_000, backoffMs: [1] });
+  const { childId } = parentChild(controller, project.id, [ids[0]!]);
+  completeChild(controller, project.id, childId);
+  assert.equal(minedCount(db, project.id), 1);
+
+  const reopened = controller.claimChild(childId, 'owner-a', {
+    expectedStageFingerprints: { 'entities-facts': 'changed-generation' },
+  });
+  assert.equal(reopened.ok, true);
+  assert.equal(controller.getChild(childId)!.status, 'running');
+  assert.equal(minedCount(db, project.id), 0, 'the reopened window can be read again');
+  db.close();
+});
+
+test('a fenceless or stale deferral cannot expire a live lease', () => {
+  const { db } = tempDb();
+  const project = seedProject(db, 'recovery-defer-auth');
+  const controller = new RecoveryController(db, { leaseMs: 60_000, heartbeatMs: 60_000, backoffMs: [1] });
+  const { childId } = parentChild(controller, project.id, projectChunks(db, project.id));
+  const fingerprint = stageFingerprint();
+  const fencing = setFingerprint(controller, childId, 'entities-facts', fingerprint);
+  assert.throws(
+    () =>
+      controller.deferStage({
+        childId,
+        projectId: project.id,
+        stage: 'entities-facts',
+        fingerprint,
+        reason: 'no-ownership',
+      } as never),
+    /stale-fencing/,
+  );
+  const before = db.get<{ lease_until: string }>(
+    'SELECT lease_until FROM extraction_chunk_lease WHERE child_id = ? LIMIT 1',
+    childId,
+  )!;
+  assert.ok(Date.parse(before.lease_until) > Date.now(), 'the original lease is still live');
+  assert.equal(controller.getChild(childId)!.status, 'running');
+  assert.throws(
+    () =>
+      controller.deferStage({
+        childId,
+        projectId: project.id,
+        stage: 'entities-facts',
+        fingerprint,
+        owner: 'owner-a',
+        fencing: fencing + 1,
+        reason: 'stale',
+      }),
+    /stale-fencing/,
+  );
+  assert.equal(controller.getChild(childId)!.status, 'running');
+  db.close();
 });
 
 test('the default policy is the approved bounded three-attempt policy', () => {

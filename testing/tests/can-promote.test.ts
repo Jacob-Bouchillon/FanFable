@@ -85,7 +85,9 @@ function decide(fixture: Fixture, chunkText = [fixture.evidence, fixture.anchorE
       kind: fixture.kind,
       evidence: fixture.evidence,
       anchorEvidence: fixture.anchorEvidence,
-      confidence: fixture.confidence,
+      // The gate no longer invents a score for a caller that omits one; these
+      // fixtures are explicit claims at full strength unless stated otherwise.
+      confidence: fixture.confidence ?? 1,
     },
     { db, projectId: project.id, chunkText, index },
   );
@@ -183,7 +185,7 @@ test('a PARK on an unrelated kind does not block the pair', () => {
   });
   const quote = "Asha is Bram's master.";
   const decision = lorebook.canPromote(
-    { fromId, toId, fromName: 'Asha', toName: 'Bram', kind: 'master of', evidence: quote },
+    { fromId, toId, fromName: 'Asha', toName: 'Bram', kind: 'master of', evidence: quote, confidence: 1 },
     { db, projectId: project.id, chunkText: quote },
   );
   assert.deepEqual(decision, { ok: true });
@@ -201,7 +203,7 @@ test('direction is not judged', () => {
   const { db, project, fromId, toId } = setup('Bram', 'Asha');
   const quote = "Asha is Bram's sister.";
   const decision = lorebook.canPromote(
-    { fromId, toId, fromName: 'Bram', toName: 'Asha', kind: 'sister of', evidence: quote },
+    { fromId, toId, fromName: 'Bram', toName: 'Asha', kind: 'sister of', evidence: quote, confidence: 1 },
     { db, projectId: project.id, chunkText: quote },
   );
   assert.deepEqual(decision, { ok: true });

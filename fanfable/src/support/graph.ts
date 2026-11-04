@@ -168,9 +168,15 @@ export interface GraphEdge {
   evidence: string;
   confidence: number;
   reviewStatus: string;
-  /** Inclusive start and end on the timeline, when the edge is time-bound. */
+  /** Inclusive start and end on the timeline, when the edge is time-bound.
+   * Story edges store AU event ids here, not positions. */
   validFrom?: number;
   validTo?: number;
+  /** Resolved story orders for `validFrom`/`validTo` when they hold event ids. */
+  validFromOrder?: number;
+  validToOrder?: number;
+  /** A bound names an event that cannot be resolved: temporal filters exclude. */
+  temporalUnresolved?: boolean;
   sourceRefs?: SourceRef[];
   extra?: Record<string, unknown>;
 }
@@ -251,6 +257,14 @@ export function loadGraph(db: Db, projectId: number, opts: GraphLoadOptions = {}
   const maxNodes = opts.maxNodes ?? 20_000;
   const excludeQuarantined = opts.excludeQuarantined === true;
   const graph: Graph = { nodes: new Map(), edges: [], adjacency: new Map(), byNumeric: new Map() };
+  // Story edges store event ids; resolve them to story order once at load.
+  const storyOrders = new Map<number, number>();
+  if (scope === 'story' || scope === 'both') {
+    for (const row of db.all<{ id: number; story_order: number }>(
+      'SELECT id, story_order FROM au_event WHERE project_id = ?',
+      projectId,
+    )) storyOrders.set(row.id, row.story_order);
+  }
   const trace = opts.trace;
   const emit = (event: Parameters<RetrievalTraceSink['emit']>[0]): void => {
     trace?.emit({ stage: 'retrieval', ...event });
@@ -948,6 +962,11 @@ export function loadGraph(db: Db, projectId: number, opts: GraphLoadOptions = {}
         reviewStatus: 'accepted',
         validFrom: r.valid_from_event_id ?? undefined,
         validTo: r.valid_to_event_id ?? undefined,
+        validFromOrder: r.valid_from_event_id === null ? undefined : storyOrders.get(r.valid_from_event_id),
+        validToOrder: r.valid_to_event_id === null ? undefined : storyOrders.get(r.valid_to_event_id),
+        temporalUnresolved:
+          (r.valid_from_event_id !== null && !storyOrders.has(r.valid_from_event_id)) ||
+          (r.valid_to_event_id !== null && !storyOrders.has(r.valid_to_event_id)),
         extra: { sentiment: r.sentiment, relationshipId: r.id },
       });
     }
@@ -1149,6 +1168,11 @@ export function loadGraph(db: Db, projectId: number, opts: GraphLoadOptions = {}
         reviewStatus: 'accepted',
         validFrom: m.valid_from_event_id ?? undefined,
         validTo: m.valid_to_event_id ?? undefined,
+        validFromOrder: m.valid_from_event_id === null ? undefined : storyOrders.get(m.valid_from_event_id),
+        validToOrder: m.valid_to_event_id === null ? undefined : storyOrders.get(m.valid_to_event_id),
+        temporalUnresolved:
+          (m.valid_from_event_id !== null && !storyOrders.has(m.valid_from_event_id)) ||
+          (m.valid_to_event_id !== null && !storyOrders.has(m.valid_to_event_id)),
       });
     }
   }
@@ -1260,7 +1284,9 @@ export function traverse(graph: Graph, opts: TraverseOptions): TraversalResult {
       scopeExcluded++;
       return false;
     }
-    if (opts.temporal) {
+    // Canon is whole-book source material: its order is canon sequence, not a
+    // story position, so a story before/after anchor must never hide it.
+    if (opts.temporal && node.scope !== 'canon') {
       if (opts.beforeOrder !== undefined && node.order > opts.beforeOrder) {
         temporalExcluded++;
         return false;
@@ -1274,15 +1300,23 @@ export function traverse(graph: Graph, opts: TraverseOptions): TraversalResult {
   };
 
   const edgeAllowed = (edge: GraphEdge): boolean => {
-    if (opts.temporal) {
-      if (opts.beforeOrder !== undefined && edge.validFrom !== undefined && edge.validFrom > opts.beforeOrder) {
-        temporalExcluded++;
-        return false;
-      }
-      if (opts.afterOrder !== undefined && edge.validTo !== undefined && edge.validTo < opts.afterOrder) {
-        temporalExcluded++;
-        return false;
-      }
+    if (!opts.temporal) return true;
+    // Canon edges are whole-book too; never compare canon sequence to story order.
+    if (edge.scope === 'canon') return true;
+    if (edge.temporalUnresolved) {
+      temporalExcluded++;
+      return false;
+    }
+    // Story bounds hold event ids at rest; compare their resolved story orders.
+    const from = edge.validFromOrder ?? edge.validFrom;
+    const to = edge.validToOrder ?? edge.validTo;
+    if (opts.beforeOrder !== undefined && from !== undefined && from > opts.beforeOrder) {
+      temporalExcluded++;
+      return false;
+    }
+    if (opts.afterOrder !== undefined && to !== undefined && to < opts.afterOrder) {
+      temporalExcluded++;
+      return false;
     }
     return true;
   };

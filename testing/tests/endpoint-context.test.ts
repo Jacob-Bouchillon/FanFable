@@ -202,7 +202,7 @@ test('a pronoun-only dialogue is not attributed to a nearby name', () => {
 test('a same-sentence co-mention does not supply the missing endpoint', () => {
   assert.deepEqual(
     decide(
-      { fromName: 'Mara', toName: 'Jobal', kind: 'ally of', evidence: 'Mara trusted Tor.' },
+      { fromName: 'Mara', toName: 'Jobal', kind: 'ally of', evidence: 'Mara trusted Tor' },
       'Mara trusted Tor, and Jobal watched.',
     ),
     { ok: false, reason: 'endpoint-unnamed' },

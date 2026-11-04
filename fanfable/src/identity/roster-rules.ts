@@ -10,7 +10,7 @@
  * quarantined for a hearing, never merged, because a wrong merge invents a
  * person and every relation of theirs thereafter.
  */
-import { canonicalName, nameRelation, nameTokens } from './names.ts';
+import { canonicalName, isTitleToken, nameRelation, nameTokens } from './names.ts';
 
 /** Entity kinds that are a person. Everything else is a thing, place or role. */
 export const PERSON_KINDS: ReadonlySet<string> = new Set(['character']);
@@ -19,19 +19,6 @@ export const PERSON_KINDS: ReadonlySet<string> = new Set(['character']);
 export function isPersonKind(kind: string): boolean {
   return PERSON_KINDS.has(String(kind ?? '').trim().toLowerCase());
 }
-
-/**
- * A short form made only of honorifics and kin titles identifies nobody:
- * "Captain" is a rank, not a name.
- */
-const TITLE_ONLY = new Set([
-  'mr', 'mrs', 'ms', 'miss', 'dr', 'doctor', 'professor', 'prof', 'captain',
-  'commander', 'general', 'admiral', 'colonel', 'major', 'sergeant',
-  'sir', 'lady', 'lord', 'king', 'queen', 'prince', 'princess', 'emperor',
-  'empress', 'count', 'countess', 'duke', 'duchess', 'baron', 'boss',
-  'senator', 'chancellor', 'viceroy', 'magister', 'master', 'mistress',
-  'uncle', 'aunt', 'father', 'mother', 'brother', 'sister',
-]);
 
 export type MergeAction = 'merge' | 'quarantine' | 'separate';
 
@@ -102,7 +89,7 @@ function shorterName(a: string, b: string): string {
 function isTitleOnly(name: string): boolean {
   const tokens = nameTokens(name);
   if (!tokens.length) return false;
-  return tokens.every((token) => TITLE_ONLY.has(token));
+  return tokens.every((token) => isTitleToken(token));
 }
 
 /**

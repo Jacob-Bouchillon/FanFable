@@ -19,10 +19,20 @@ test('lorebook re-exports the prompts module identically', () => {
   assert.equal(lorebook.formatKnownEntities, prompts.formatKnownEntities);
 });
 
+test('no extraction prompt asks for a modality the schema cannot store', () => {
+  for (const [name, prompt] of [
+    ['entities', prompts.EXTRACT_ENTITIES_SYSTEM],
+    ['relations', prompts.EXTRACT_RELATIONS_SYSTEM],
+    ['events', prompts.EXTRACT_EVENTS_SYSTEM],
+  ] as const) {
+    assert.equal(/modality/i.test(prompt), false, `${name} prompt names modality`);
+  }
+});
+
 test('prompt bytes are locked', () => {
-  assert.equal(sha(prompts.EXTRACT_ENTITIES_SYSTEM), '477e7d8a0243986b24f39ddcc032acb44f0c933974876dc2d6db53b18a8136fc');
-  assert.equal(sha(prompts.EXTRACT_RELATIONS_SYSTEM), '2644f3de376bdc0420bae2f8d79fbbddf5251e2397bc927ad3b4edf2e0e896aa');
-  assert.equal(sha(prompts.EXTRACT_EVENTS_SYSTEM), 'a37a771dcddac1611c12faa69e7b99b0c87c93a8554cf8f3c79bf23a2c272705');
+  assert.equal(sha(prompts.EXTRACT_ENTITIES_SYSTEM), 'bec452aa82113ff98e42cf2a51ba52f5c6a618b707e5ecb783b57be51f391cec');
+  assert.equal(sha(prompts.EXTRACT_RELATIONS_SYSTEM), '7b3f6702bc89c038e73a8fbbc4e71ab551eb058d80b9fc148bef7cf9b0e3b518');
+  assert.equal(sha(prompts.EXTRACT_EVENTS_SYSTEM), '4f9ff6cc13acec76a3f93fb7db07a5e74bfc1f683bfde2a0d4f38d90675b4fa1');
   assert.equal(sha(prompts.ASSESSMENT_QUESTIONS), '1606c19e2b58a81c0a0d70bb91b4989cccd490e08e432136f80d70b5abb465f5');
   assert.equal(
     prompts.formatKnownEntities(['Asha', 'Bram']),

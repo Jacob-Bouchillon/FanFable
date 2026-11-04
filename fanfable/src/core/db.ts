@@ -19,6 +19,10 @@ export class Db {
     this.raw.exec('PRAGMA busy_timeout = 5000');
     this.raw.exec('PRAGMA foreign_keys = ON');
     runMigrations(this.raw);
+    // Two version fields by design, not two answers: PRAGMA user_version is
+    // the migration level and runMigrations owns it; schema_meta.version
+    // records the base-schema generation for diagnostics. Never compare them
+    // for equality.
     // Keep enum-ish columns tidy when the model invents its own wording.
     this.raw.exec(
       "UPDATE plot_thread SET status = 'open' WHERE status IS NULL OR status NOT IN ('open','resolved','dropped')",
@@ -63,8 +67,8 @@ export class Db {
       }
     }
     this.depth = 1;
-    this.raw.exec(opts.immediate ? 'BEGIN IMMEDIATE' : 'BEGIN');
     try {
+      this.raw.exec(opts.immediate ? 'BEGIN IMMEDIATE' : 'BEGIN');
       const out = fn();
       this.raw.exec('COMMIT');
       return out;

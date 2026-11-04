@@ -9,7 +9,7 @@
  * run as a background job and polled by the page.
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { join, extname, basename, normalize, resolve, sep } from 'node:path';
 import { Db } from '../core/db.ts';
 import * as controller from '../plan/controller.ts';
@@ -162,25 +162,39 @@ function json(res: ServerResponse, code: number, body: unknown): void {
 function readBody(req: IncomingMessage, maxBytes = 2 * 1024 * 1024): Promise<string> {
   return new Promise((resolve, reject) => {
     let size = 0;
+    let settled = false;
     const chunks: Buffer[] = [];
     req.on('data', (c: string | Buffer) => {
+      if (settled) return;
       const chunk = typeof c === 'string' ? Buffer.from(c) : c;
       size += chunk.length;
       if (size > maxBytes) {
+        settled = true;
+        chunks.length = 0;
         reject(Object.assign(new Error('request body too large'), { statusCode: 413 }));
-        req.destroy();
         return;
       }
       chunks.push(chunk);
     });
     // Decode once: an HTTP chunk can end in the middle of a UTF-8 character.
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
-    req.on('error', (e) => reject(e));
+    req.on('end', () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks).toString('utf-8'));
+    });
+    req.on('error', (e) => {
+      if (settled) return;
+      settled = true;
+      reject(e);
+    });
   });
 }
 
-async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
-  const raw = await readBody(req);
+async function readJson(
+  req: IncomingMessage,
+  maxBytes = 2 * 1024 * 1024,
+): Promise<Record<string, unknown>> {
+  const raw = await readBody(req, maxBytes);
   if (!raw) return {};
   try {
     const value: unknown = JSON.parse(raw);
@@ -196,15 +210,35 @@ const MIME: Record<string, string> = {
   '.css': 'text/css; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.ico': 'image/x-icon',
+  '.json': 'application/json; charset=utf-8',
+  '.map': 'application/json; charset=utf-8',
+  '.woff2': 'font/woff2',
 };
 
 function serveStatic(res: ServerResponse, file: string): void {
-  if (!existsSync(file)) {
+  // Read first, then write: a directory or an unreadable path must not leave
+  // 200 headers committed when the read throws and the error handler replies.
+  let body: Buffer;
+  try {
+    if (!statSync(file).isFile()) {
+      json(res, 404, { error: 'not found' });
+      return;
+    }
+    body = readFileSync(file);
+  } catch {
     json(res, 404, { error: 'not found' });
     return;
   }
-  res.writeHead(200, { 'content-type': MIME[extname(file)] ?? 'text/plain; charset=utf-8' });
-  res.end(readFileSync(file));
+  res.writeHead(200, {
+    'content-type': MIME[extname(file).toLowerCase()] ?? 'application/octet-stream',
+  });
+  res.end(body);
 }
 
 /* ----------------------------------------------------------------- server */
@@ -428,7 +462,9 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
       }
 
       if (path === '/api/sources/import' && method === 'POST') {
-        const body = await readJson(req);
+        // Book files arrive base64-encoded and several may be sent at once, so
+        // this route needs a larger body budget than ordinary JSON calls.
+        const body = await readJson(req, 64 * 1024 * 1024);
         const files = (body.files ?? []) as { name: string; contentBase64: string }[];
         if (!files.length) {
           json(res, 400, { error: 'no files' });
@@ -884,7 +920,7 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
           String(body.body ?? ''),
           'edited in the browser',
         );
-        const impacted = controller.impactedMaterial(db, p.id, `chapter ${body.number}`);
+        const impacted = controller.impactedByChapterEdit(db, p.id, Number(body.number));
         json(res, 200, { chapter, impacted: impacted.map((i) => i.chapter.number) });
         return;
       }
@@ -895,7 +931,18 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
         const n = Number(body.number);
         const chapter = controller.getChapter(db, p.id, n);
         if (chapter) {
-          db.run('DELETE FROM chapter WHERE project_id = ? AND number = ?', p.id, n);
+          db.transaction(() => {
+            // The text and everything approved from it go together. Without
+            // this, most derived tables keep their rows with chapter_id NULL
+            // and later context reads orphans as live story state.
+            memory.clearChapterExtraction(db, p.id, chapter.id);
+            db.run(
+              "UPDATE state_conflict SET status = 'resolved' WHERE project_id = ? AND chapter_id = ? AND status = 'open'",
+              p.id,
+              chapter.id,
+            );
+            db.run('DELETE FROM chapter WHERE project_id = ? AND number = ?', p.id, n);
+          });
         }
         json(res, 200, { ok: true });
         return;
@@ -1099,7 +1146,9 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
   });
 
   server.listen(port, '127.0.0.1', () => {
-    console.log(`fanfable UI: http://127.0.0.1:${port}`);
+    const address = server.address();
+    const boundPort = address && typeof address !== 'string' ? address.port : port;
+    console.log(`fanfable UI: http://127.0.0.1:${boundPort}`);
   });
   return server;
 }

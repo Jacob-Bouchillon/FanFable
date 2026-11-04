@@ -10,6 +10,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
+import { seedProject, tempDb } from './helpers.ts';
+import * as lorebook from '../../fanfable/src/lorebook.ts';
+import { readRelationClaimState } from '../../fanfable/src/court/claim-transition.ts';
 
 const ROOT = resolve(import.meta.dirname, '../../fanfable/src');
 
@@ -31,7 +34,9 @@ const RELATION_STATUS_GRANDFATHERS: Counts = {
     promoteProvisional: 1,
     reclassifyAccepted: 1,
     auditAcceptedRelations: 1,
-    assignAttestedTiers: 2,
+    // The keeper promotion branch now goes through transitionClaim; only the
+    // passage-proof attestation update remains a direct write here.
+    assignAttestedTiers: 1,
     promoteProvisionalWithEvidence: 1,
     evaluateTies: 1,
     mergeEntityPair: 1,
@@ -204,4 +209,130 @@ test('relation status, authorization, proof and ruling writes stay behind the ow
     ...rulingProblems,
   ];
   assert.deepEqual(problems, []);
+});
+
+test('exactly one production module adopts transitionClaim', () => {
+  const adopters = sourceFiles(ROOT)
+    .filter((absolute) => relative(ROOT, absolute).replaceAll('\\', '/') !== OWNER)
+    .filter((absolute) => /\btransitionClaim\s*\(/.test(readFileSync(absolute, 'utf8')))
+    .map((absolute) => relative(ROOT, absolute).replaceAll('\\', '/'));
+  assert.deepEqual(adopters, ['lorebook.ts']);
+});
+
+const AT = '2026-01-01T00:00:00.000Z';
+
+function entity(db: ReturnType<typeof tempDb>['db'], projectId: number, name: string): number {
+  return Number(db.run(
+    'INSERT INTO canon_entity (project_id, kind, name, aliases, review_status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    projectId, 'character', name, '[]', 'accepted', AT, AT,
+  ).lastInsertRowid);
+}
+
+function chunk(db: ReturnType<typeof tempDb>['db'], projectId: number, text: string): number {
+  const source = Number(db.run(
+    'INSERT INTO canon_source (project_id, path, title, sha256, imported_at) VALUES (?, ?, ?, ?, ?)',
+    projectId, `/court-${Math.random().toString(36).slice(2)}`, 'Court', 'sha-court', AT,
+  ).lastInsertRowid);
+  return Number(db.run(
+    'INSERT INTO canon_chunk (source_id, project_id, seq, locator, heading, text, words) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    source, projectId, 1, 'p. 1', '', text, text.split(/\s+/).length,
+  ).lastInsertRowid);
+}
+
+function provisionalRelation(
+  db: ReturnType<typeof tempDb>['db'],
+  projectId: number,
+  from: number,
+  to: number,
+  kind: string,
+  text: string,
+  chunkId: number,
+): number {
+  return Number(db.run(
+    `INSERT INTO canon_relation
+       (project_id, from_entity, to_entity, kind, description, evidence, source_refs, confidence,
+        review_status, supporting_evidence, created_at)
+     VALUES (?, ?, ?, ?, '', ?, ?, 0.8, 'provisional', ?, ?)`,
+    projectId,
+    from,
+    to,
+    kind,
+    text,
+    JSON.stringify([{ source: 'Court', locator: 'p. 1', chunk: chunkId }]),
+    lorebook.assessmentSupporting({
+      names_both: false,
+      other_person: 'pronoun',
+      asserted: true,
+      hedge: 'certain',
+      kind_fit: 'yes',
+      strength: 0.8,
+      why: 'test assessment',
+    }),
+    AT,
+  ).lastInsertRowid);
+}
+
+test('the wired promotion writes proof and a ruling; an unwired writer stays not_evaluated', () => {
+  const { db } = tempDb();
+  const project = seedProject(db, 'court-adoption');
+  const mara = entity(db, project.id, 'Mara');
+  const tor = entity(db, project.id, 'Tor');
+  const passage = chunk(db, project.id, 'Mara is the aunt of Tor. The gate was cold.');
+  const wired = provisionalRelation(db, project.id, mara, tor, 'aunt of', 'Mara is the aunt of Tor.', passage);
+
+  const result = lorebook.assignAttestedTiers(db, project.id, { write: true, promoteKeeper: true });
+  assert.equal(result.changed, 1);
+  const row = db.get<{ review_status: string; claim_uid: string }>(
+    'SELECT review_status, claim_uid FROM canon_relation WHERE id = ?',
+    wired,
+  )!;
+  assert.equal(row.review_status, 'accepted');
+  const state = readRelationClaimState(db, project.id, row.claim_uid)!;
+  assert.equal(state.sourceProof, 'verified', 'the promotion now appends a proof attempt');
+  assert.equal(
+    db.get<{ n: number }>("SELECT COUNT(*) AS n FROM claim_proof WHERE claim_type = 'relation' AND claim_uid = ?", row.claim_uid)!.n,
+    1,
+  );
+  assert.equal(
+    db.get<{ n: number }>("SELECT COUNT(*) AS n FROM canon_ruling WHERE relation_id = ? AND standard = 'sentence-proof'", wired)!.n,
+    1,
+  );
+
+  // A grandfathered direct writer still leaves the claim unevaluated.
+  const unwired = provisionalRelation(db, project.id, mara, tor, 'friend of', 'Mara is the aunt of Tor.', passage);
+  db.run("UPDATE canon_relation SET claim_uid = 'rel-unwired-test' WHERE id = ?", unwired);
+  db.run("UPDATE canon_relation SET review_status = 'accepted' WHERE id = ?", unwired);
+  const unwiredUid = db.get<{ claim_uid: string }>('SELECT claim_uid FROM canon_relation WHERE id = ?', unwired)!.claim_uid;
+  const untouched = readRelationClaimState(db, project.id, unwiredUid)!;
+  assert.equal(untouched.sourceProof, 'not_evaluated', 'the unwired writer adds no proof');
+  db.close();
+});
+
+test('a gate-failing row is refused with no status or proof change', () => {
+  const { db } = tempDb();
+  const project = seedProject(db, 'court-adoption-refusal');
+  const mara = entity(db, project.id, 'Mara');
+  const tor = entity(db, project.id, 'Tor');
+  const passage = chunk(db, project.id, 'Mara and Tor waited by the gate. The gate was cold.');
+  const row = provisionalRelation(
+    db,
+    project.id,
+    mara,
+    tor,
+    'aunt of',
+    'Mara and Tor waited by the gate.',
+    passage,
+  );
+
+  const result = lorebook.assignAttestedTiers(db, project.id, { write: true, promoteKeeper: true });
+  assert.equal(result.keeperPromoted, 0, 'the gate refused the tie');
+  assert.equal(result.changed, 0);
+  const saved = db.get<{ review_status: string }>('SELECT review_status FROM canon_relation WHERE id = ?', row)!;
+  assert.equal(saved.review_status, 'provisional');
+  assert.equal(
+    db.get<{ n: number }>("SELECT COUNT(*) AS n FROM claim_proof WHERE claim_type = 'relation'")!.n,
+    0,
+    'no proof row without a gate pass',
+  );
+  db.close();
 });

@@ -46,7 +46,7 @@ function decision(
   return lorebook.canPromote(
     {
       fromId: ids.get(from)!, toId: ids.get(to)!,
-      fromName: from, toName: to, kind, evidence,
+      fromName: from, toName: to, kind, evidence, confidence: 1,
     },
     { db, projectId, chunkText: chunk.text, minConfidence: 0.7 },
   );

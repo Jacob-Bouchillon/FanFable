@@ -112,6 +112,16 @@ test('each grade lands in its own section and never upgrades', () => {
   db.close();
 });
 
+test('an accepted row is proven in the brief', () => {
+  const { db, project, chunk, mara, corin } = setup('brief-accepted');
+  addRelation(db, project, mara, corin, 'accepted', { chunk, kind: 'sister of' });
+  const brief = buildWebBrief(db, project, { entities: ['Mara Voss', 'Corin Hale'] });
+  assert.equal(brief.proven.length, 1);
+  assert.equal(brief.proven[0]!.grade, 'proven');
+  assert.equal(brief.proven[0]!.kind, 'sister of');
+  db.close();
+});
+
 test('an item without a locator is marked uncited', () => {
   const { db, project, mara, corin } = setup('brief-uncited');
   addRelation(db, project, mara, corin, 'user_confirmed', { chunk: null });

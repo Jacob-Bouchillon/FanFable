@@ -10,6 +10,7 @@ import { Db, fromJson, nowIso } from '../core/db.ts';
 import * as lorebook from '../lorebook.ts';
 import type { LlmClient } from '../core/llm.ts';
 import { nameRelation } from '../identity/names.ts';
+import { recordRuling } from '../court/ruling.ts';
 
 const norm = (text: string): string =>
   (text ?? '')
@@ -350,6 +351,9 @@ export async function runNameSweep(
       skippedPending: 0,
       unresolvedTargets: [],
     };
+    // One transaction for this character's proposals: a constraint or court
+    // failure leaves no partial queue behind.
+    db.transaction(() => {
     for (const tie of ties) {
       const target = resolveTarget(tie.to);
       if (!target) {
@@ -358,11 +362,17 @@ export async function runNameSweep(
         continue;
       }
       if (target.id === character.id) continue;
+      // Keeper existence is pair-wide on purpose: any proven tie between the
+      // two people means the bank already holds it, whatever its kind. The
+      // pending-note check below stays kind-specific, because a different
+      // claimed kind is a different proposal. Only the status set is shared
+      // with lookupKeeperPair; a contested keeper never suppresses a proposal.
       const keeper = db.get<{ id: number }>(
         `SELECT id FROM canon_relation
           WHERE project_id = ?
             AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))
-            AND review_status = 'accepted'
+            AND ${lorebook.KEEPER_STATUS_SQL}
+            AND conflict_status != 'contested'
           LIMIT 1`,
         projectId,
         character.id,
@@ -375,7 +385,10 @@ export async function runNameSweep(
         skippedKeeper++;
         continue;
       }
-      const pending = ((): { id: number } | undefined => {
+      // Any note for the same pair and kind is a duplicate, whatever its
+      // status: the unique index covers every status, so a pending-only check
+      // would hit SQLITE_CONSTRAINT on a resolved, parked or dropped note.
+      const existingNote = ((): { id: number } | undefined => {
         const directional = lorebook.isDirectionalKind(tie.kind);
         const pairSql = directional
           ? '(from_entity = ? AND to_entity = ?)'
@@ -385,7 +398,7 @@ export async function runNameSweep(
           : [character.id, target.id, target.id, character.id];
         return db.get<{ id: number }>(
           `SELECT id FROM canon_tie_note
-            WHERE project_id = ? AND attempted_kind = ? AND status = 'pending'
+            WHERE project_id = ? AND attempted_kind = ?
               AND ${pairSql}
             LIMIT 1`,
           projectId,
@@ -393,7 +406,7 @@ export async function runNameSweep(
           ...pairArgs,
         );
       })();
-      if (pending) {
+      if (existingNote) {
         characterResult.skippedPending++;
         skippedPending++;
         continue;
@@ -415,10 +428,22 @@ export async function runNameSweep(
         sourceRefs,
         nowIso(),
       );
+      // The sweep is inside the court: the proposal and its record are one
+      // transaction, so a docket objection always has its history.
+      recordRuling(db, projectId, {
+        subject: `pair:${Math.min(character.id, target.id)}:${Math.max(character.id, target.id)}`,
+        role: 'objection',
+        actor: 'bank',
+        standard: 'sweep-proposal',
+        toStatus: 'pending',
+        basis: `sweep proposed ${tie.kind}`,
+        quote: tie.quote,
+      });
       characterResult.proposals++;
       proposals++;
       writtenPairs.add([character.id, target.id].sort((a, b) => a - b).join('|'));
     }
+    }, { immediate: true });
     runNotes.push(...notes);
     results.push(characterResult);
     opts.onProgress?.(

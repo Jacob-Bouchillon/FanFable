@@ -1,13 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { request, type Server } from 'node:http';
 import type { Db } from '../../fanfable/src/core/db.ts';
 import { once } from 'node:events';
-import type { AddressInfo } from 'node:net';
+import { createServer, type AddressInfo } from 'node:net';
+import { resolve } from 'node:path';
 import { startServer } from '../../fanfable/src/product/server.ts';
 import * as controller from '../../fanfable/src/plan/controller.ts';
 import * as lorebook from '../../fanfable/src/lorebook.ts';
+import * as memory from '../../fanfable/src/product/memory.ts';
 import { mockProvider, seedProject, tempDb } from './helpers.ts';
 
 /** Start the UI server on a free port and hand the base URL to the test. */
@@ -48,6 +51,107 @@ test('the UI API serves the project state', async () => {
     };
     assert.ok(lore.passages.length > 0, 'canon search works through the API');
     assert.ok(lore.passages[0].sourceTitle.length > 0);
+  });
+});
+
+test('editing a chapter through the API returns it to draft and clears derived memory', async () => {
+  await withServer(async (base, projectId, db) => {
+    const chapter = controller.saveChapter(db, projectId, 1, {
+      title: 'One',
+      body: 'Serena Marsh crossed the bridge.',
+      status: 'approved',
+    });
+    const serena = memory.upsertCharacter(db, projectId, 'Serena Marsh');
+    const other = memory.upsertCharacter(db, projectId, 'Kade');
+    memory.addCharacterState(db, projectId, serena, { location: 'the far bank', chapterId: chapter.id });
+    memory.addKnowledge(db, projectId, { characterId: serena, fact: 'the bridge is safe', chapterId: chapter.id });
+    memory.upsertRelationship(db, projectId, serena, other, { kind: 'friend', chapterId: chapter.id });
+
+    const response = (await (await fetch(`${base}/api/chapter/edit`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ number: 1, body: 'Serena crossed alone.' }),
+    })).json()) as { chapter: { status: string }; impacted: number[] };
+
+    assert.equal(response.chapter.status, 'draft');
+    assert.deepEqual(response.impacted, []);
+    assert.equal(memory.currentStates(db, projectId).length, 0);
+    assert.equal(memory.listKnowledge(db, projectId).length, 0);
+    assert.equal(memory.listRelationships(db, projectId).length, 0);
+  });
+});
+
+test('deleting a chapter through the API removes its derived memory and leaves no orphans', async () => {
+  await withServer(async (base, projectId, db) => {
+    const chapter = controller.saveChapter(db, projectId, 7, {
+      title: 'Seven',
+      body: 'Serena Marsh crossed the bridge.',
+      status: 'approved',
+    });
+    const serena = memory.upsertCharacter(db, projectId, 'Serena Marsh');
+    const other = memory.upsertCharacter(db, projectId, 'Kade');
+    const now = '2026-01-01T00:00:00.000Z';
+    memory.addCharacterState(db, projectId, serena, { location: 'the far bank', chapterId: chapter.id });
+    memory.addKnowledge(db, projectId, { characterId: serena, fact: 'the bridge is safe', chapterId: chapter.id });
+    memory.upsertRelationship(db, projectId, serena, other, { kind: 'friend', chapterId: chapter.id });
+    db.run(
+      `INSERT INTO au_event (project_id, chapter_id, title, created_at) VALUES (?, ?, 'The crossing', ?)`,
+      projectId,
+      chapter.id,
+      now,
+    );
+    db.run(
+      `INSERT INTO story_fact (project_id, content, chapter_id, created_at) VALUES (?, 'She crossed', ?, ?)`,
+      projectId,
+      chapter.id,
+      now,
+    );
+    db.run(
+      `INSERT INTO motivation (project_id, subject_type, subject_id, statement, chapter_id, created_at)
+       VALUES (?, 'character', ?, 'to cross', ?, ?)`,
+      projectId,
+      serena,
+      chapter.id,
+      now,
+    );
+    db.run(
+      `INSERT INTO secret (project_id, title, chapter_id, created_at) VALUES (?, 'The lantern', ?, ?)`,
+      projectId,
+      chapter.id,
+      now,
+    );
+    db.run(
+      `INSERT INTO state_conflict (project_id, chapter_id, kind, subject, message, status, created_at)
+       VALUES (?, ?, 'fact', 'bridge', 'conflict', 'open', ?)`,
+      projectId,
+      chapter.id,
+      now,
+    );
+
+    await fetch(`${base}/api/chapter/delete`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ number: 7 }),
+    });
+
+    assert.equal(controller.getChapter(db, projectId, 7), undefined);
+    for (const table of [
+      'au_event',
+      'character_state',
+      'character_knowledge',
+      'story_fact',
+      'relationship',
+      'motivation',
+      'secret',
+    ]) {
+      const row = db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table} WHERE project_id = ?`, projectId)!;
+      assert.equal(row.n, 0, `${table} has no orphan row`);
+    }
+    const conflict = db.get<{ status: string }>(
+      'SELECT status FROM state_conflict WHERE project_id = ?',
+      projectId,
+    )!;
+    assert.equal(conflict.status, 'resolved');
   });
 });
 
@@ -353,6 +457,23 @@ test('JSON endpoints reject non-object bodies as client errors', async () => {
   });
 });
 
+test('oversized JSON gets a 413 while large import bodies are accepted', async () => {
+  await withServer(async (base) => {
+    const big = 'x'.repeat(3 * 1024 * 1024);
+    const headers = { 'content-type': 'application/json' };
+    const tooLarge = await fetch(`${base}/api/story-state/fact`, {
+      method: 'POST', headers, body: JSON.stringify({ content: big }),
+    });
+    assert.equal(tooLarge.status, 413, 'an oversized ordinary request is a client error, not a reset socket');
+
+    const importRequest = await fetch(`${base}/api/sources/import`, {
+      method: 'POST', headers, body: JSON.stringify({ files: [], padding: big }),
+    });
+    assert.equal(importRequest.status, 400, 'the import route accepts bodies larger than the JSON default');
+    assert.match((await importRequest.json() as { error: string }).error, /no files/);
+  });
+});
+
 test('session output never exposes a project API key', async () => {
   await withServer(async (base, projectId, db) => {
     controller.updateProjectSettings(db, projectId, { apiKey: 'private-project-key' });
@@ -431,10 +552,68 @@ test('the static interface is served', async () => {
 
     const css = await fetch(`${base}/ui/style.css`);
     assert.equal(css.status, 200);
+    assert.equal(css.headers.get('content-type'), 'text/css; charset=utf-8');
     const js = await fetch(`${base}/ui/app.js`);
     assert.equal(js.status, 200);
+    assert.equal(js.headers.get('content-type'), 'text/javascript; charset=utf-8');
+    const png = await fetch(`${base}/ui/fanfable.png`);
+    assert.equal(png.status, 200);
+    assert.equal(png.headers.get('content-type'), 'image/png');
     for (const path of ['/ui/dev-viz.html', '/ui/%64ev-viz.html', '/ui/%64ev-viz.js']) {
       assert.equal((await fetch(base + path)).status, 404, path);
     }
+    // A directory-shaped static path must be an ordinary 404, not a crash
+    // after 200 headers have already been written.
+    for (const path of ['/ui/', '/ui/.', '/ui/style.css/..', '/ui/style.css%2F..']) {
+      const res = await fetch(base + path);
+      assert.equal(res.status, 404, path);
+    }
+    const after = await fetch(`${base}/api/session`);
+    assert.equal(after.status, 200, 'the server is still serving after directory paths');
   });
+});
+
+test('serve honors an explicit --project over the remembered project', async () => {
+  const { db, path } = tempDb();
+  controller.createProject(db, 'serve-alpha');
+  const beta = controller.createProject(db, 'serve-beta');
+  controller.createProject(db, 'serve-gamma');
+  db.close();
+
+  const port = await new Promise<number>((resolvePort, reject) => {
+    const probe = createServer();
+    probe.once('error', reject);
+    probe.listen(0, '127.0.0.1', () => {
+      const bound = (probe.address() as AddressInfo).port;
+      probe.close(() => resolvePort(bound));
+    });
+  });
+  const cli = resolve(import.meta.dirname, '../../fanfable/src/cli.ts');
+  const child = spawn(
+    process.execPath,
+    ['--no-warnings', cli, '--db', path, '--project', 'serve-beta', 'serve', '--port', String(port)],
+    { stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  let logs = '';
+  child.stdout.on('data', (chunk: Buffer) => { logs += chunk.toString(); });
+  child.stderr.on('data', (chunk: Buffer) => { logs += chunk.toString(); });
+  try {
+    let session: { currentProjectId: number } | undefined;
+    for (let attempt = 0; attempt < 50 && !session; attempt++) {
+      try {
+        session = (await (await fetch(`http://127.0.0.1:${port}/api/session`)).json()) as typeof session;
+      } catch {
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    }
+    assert.ok(session, `server did not start: ${logs}`);
+    assert.equal(session!.currentProjectId, beta.id, 'explicit --project must not be ignored');
+  } finally {
+    child.kill('SIGTERM');
+    await Promise.race([
+      new Promise((r) => child.once('exit', r)),
+      new Promise((r) => setTimeout(r, 5000)),
+    ]);
+    if (child.exitCode === null) child.kill('SIGKILL');
+  }
 });

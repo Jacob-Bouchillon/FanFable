@@ -17,7 +17,7 @@
 import { createHash } from 'node:crypto';
 import { Db, fromJson, nowIso } from '../core/db.ts';
 import { pickPeriodThread } from './threads.ts';
-import { isClosedRoleKind, projectMinConfidence, storedAssessment } from '../lorebook.ts';
+import { isClosedRoleKind, loadOrderedChunks, projectMinConfidence, storedAssessment } from '../lorebook.ts';
 import { recordRuling } from '../court/ruling.ts';
 import { finishTrace, recordTraceEvent, startTrace, type TraceRefs } from '../trace/trace.ts';
 
@@ -1642,10 +1642,14 @@ export function starvedWindowScores(
   opts: { windowSize?: number; limit?: number; olderThanDays?: number } = {},
 ): { windows: StarvedWindow[]; threadsCovered: number; threadsConsidered: number } {
   const windowSize = Math.max(1, opts.windowSize ?? 8);
-  const chunks = db.all<{ id: number; seq: number; lore_mined: number }>(
-    'SELECT id, seq, lore_mined FROM canon_chunk WHERE project_id = ? ORDER BY seq, id',
-    projectId,
-  );
+  // Same list extraction windows use: source_id, seq. Ordering by seq alone
+  // interleaves sources whose seqs overlap, so a reserved index would point
+  // into a different window than the one the starved thread lives in.
+  const chunks = loadOrderedChunks(db, projectId).map((chunk) => ({
+    id: chunk.id,
+    seq: chunk.seq,
+    lore_mined: chunk.lore_mined === 1 ? 1 : 0,
+  }));
   if (!chunks.length) return { windows: [], threadsCovered: 0, threadsConsidered: 0 };
   const windowOf = new Map<number, number>();
   chunks.forEach((chunk, position) => windowOf.set(chunk.id, Math.floor(position / windowSize)));

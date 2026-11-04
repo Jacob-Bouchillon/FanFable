@@ -288,8 +288,14 @@ export async function retrieve(
     if (!a || !b) return;
     composedPath = graph.findComposedPath(db, projectId, a.id, b.id) ?? undefined;
     if (!composedPath) {
+      // Only a keeper (and an uncontested one) suppresses the stranger
+      // verdict; a lone provisional or rejected row is not proof that the two
+      // people have a recorded connection.
       const direct = db.get<{ id: number }>(
-        `SELECT id FROM canon_relation WHERE project_id = ? AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?)) LIMIT 1`,
+        `SELECT id FROM canon_relation
+          WHERE project_id = ? AND ${lorebook.KEEPER_STATUS_SQL} AND conflict_status != 'contested'
+            AND ((from_entity = ? AND to_entity = ?) OR (from_entity = ? AND to_entity = ?))
+          LIMIT 1`,
         projectId, a.id, b.id, b.id, a.id,
       );
       if (!direct) strangers = { a: a.name, b: b.name };

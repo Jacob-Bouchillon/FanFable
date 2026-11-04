@@ -17,7 +17,7 @@
  * nothing new to flag.
  */
 import { Db } from '../core/db.ts';
-import { nameRelation } from './names.ts';
+import { isTitleToken, nameRelation } from './names.ts';
 import { entitySubject, recordRuling } from '../court/ruling.ts';
 import {
   NAME_GROUP_CAP,
@@ -51,18 +51,6 @@ export interface IdentityCheckResult {
   /** Pairs rejected because the short form was too generic. */
   skippedByGroupCap: number;
   written: boolean;
-}
-
-const TITLE_TOKENS = new Set([
-  'mr', 'mrs', 'ms', 'dr', 'sir', 'lady', 'lord', 'master', 'mistress', 'captain', 'commander',
-  'general', 'admiral', 'colonel', 'major', 'sergeant', 'king', 'queen', 'prince', 'princess',
-  'emperor', 'empress', 'count', 'countess', 'duke', 'duchess', 'baron', 'boss', 'senator',
-  'chancellor', 'viceroy', 'magister', 'aunt', 'uncle', 'great', 'father', 'mother',
-  'brother', 'sister', 'son', 'daughter', 'clan',
-]);
-
-function isTitleToken(token: string): boolean {
-  return TITLE_TOKENS.has(token);
 }
 
 function collisionReason(self: number, others: number[]): string {

@@ -305,11 +305,56 @@ export function listCharacterStates(db: Db, projectId: number, characterId?: num
   }));
 }
 
-/** The most recent state recorded for each character. */
+/**
+ * The current state recorded for each character.
+ *
+ * Ordering is story order, not row id: re-approving an older chapter must not
+ * make its older state current again. A user override outranks extraction
+ * regardless of where it sits. Chapter number is the primary order (a state
+ * knows its chapter), event story order breaks ties inside one chapter, and
+ * the row id is only the final deterministic tie-break.
+ */
 export function currentStates(db: Db, projectId: number): CharacterState[] {
-  const all = listCharacterStates(db, projectId);
+  const rows = db.all<{
+    id: number;
+    character_id: number;
+    character_name: string;
+    location: string;
+    condition: string;
+    emotional: string;
+    situation: string;
+    source: string;
+    as_of_event_id: number | null;
+    chapter_id: number | null;
+  }>(
+    `SELECT s.*, c.name AS character_name
+       FROM character_state s
+       JOIN character c ON c.id = s.character_id
+       LEFT JOIN chapter ch ON ch.id = s.chapter_id
+       LEFT JOIN au_event ev ON ev.id = s.as_of_event_id
+      WHERE s.project_id = ?
+      ORDER BY s.character_id,
+               CASE WHEN s.source = 'user' THEN 1 ELSE 0 END,
+               COALESCE(ch.number, 0),
+               COALESCE(ev.story_order, 0),
+               s.id`,
+    projectId,
+  );
   const latest = new Map<number, CharacterState>();
-  for (const s of all) latest.set(s.characterId, s);
+  for (const r of rows) {
+    latest.set(r.character_id, {
+      id: r.id,
+      characterId: r.character_id,
+      characterName: r.character_name,
+      location: r.location,
+      condition: r.condition,
+      emotional: r.emotional,
+      situation: r.situation,
+      source: r.source,
+      asOfEventId: r.as_of_event_id,
+      chapterId: r.chapter_id,
+    });
+  }
   return [...latest.values()];
 }
 
@@ -471,7 +516,7 @@ export function listRelationships(db: Db, projectId: number): Relationship[] {
   }>(
     `SELECT r.*, a.name AS a_name, b.name AS b_name FROM relationship r
      JOIN character a ON a.id = r.character_a JOIN character b ON b.id = r.character_b
-     WHERE r.project_id = ? ORDER BY r.id`,
+     WHERE r.project_id = ? AND r.closed = 0 ORDER BY r.id`,
     projectId,
   );
   return rows.map((r) => ({
@@ -1187,7 +1232,9 @@ export async function extractState(
     secrets: arr('secrets').map((x) => ({
       title: String(x.title ?? '').trim(),
       statement: String(x.statement ?? '').trim(),
-      knownBy: toStringArray(x.known_by),
+      // The prompt asks for "knownBy"; accept the snake_case alias too so a
+      // model that follows either spelling is not silently discarded.
+      knownBy: toStringArray(x.knownBy ?? x.known_by),
       revealed: x.revealed === true || x.revealed === 'true',
     })),
     links: arr('links').map((l) => ({
@@ -1234,6 +1281,9 @@ export function applyStateExtraction(
     }
 
     const eventIds = new Map<string, number>();
+    // Which AU event adapted each canon event, so a canon change can ride the
+    // one event it belongs to instead of being duplicated across all of them.
+    const eventByCanon = new Map<number, number>();
     for (const ev of extraction.events) {
       if (!ev.title) continue;
       const adapts = existingCanonEvent(db, projectId, ev.adaptsCanonEventId);
@@ -1244,6 +1294,7 @@ export function applyStateExtraction(
         storyOrder: ev.storyOrder || nextStoryOrder(db, projectId),
       });
       eventIds.set(ev.title.toLowerCase(), id);
+      if (adapts !== null && !eventByCanon.has(adapts)) eventByCanon.set(adapts, id);
 
       // Typed participation edges: who was in this event.
       for (const name of ev.participants) {
@@ -1255,21 +1306,26 @@ export function applyStateExtraction(
           character.id,
         );
       }
+    }
 
-      for (const ch of extraction.canonChanges) {
-        if (!ch.description) continue;
-        db.run(
-          `INSERT INTO canon_change (project_id, au_event_id, canon_event_id, change_type, description, confirmed, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          projectId,
-          id,
-          existingCanonEvent(db, projectId, ch.canonEventId ?? ev.adaptsCanonEventId),
-          ch.changeType ?? 'altered',
-          ch.description,
-          0,
-          nowIso(),
-        );
-      }
+    // Canon changes are chapter-level differences: one row per change, never
+    // one row per event (N events × M changes was N×M duplicates). A change
+    // that names an adapted canon event rides that event; every other change
+    // is recorded with no event, including when the chapter has no events.
+    for (const ch of extraction.canonChanges) {
+      if (!ch.description) continue;
+      const canonId = existingCanonEvent(db, projectId, ch.canonEventId);
+      db.run(
+        `INSERT INTO canon_change (project_id, au_event_id, canon_event_id, change_type, description, confirmed, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        projectId,
+        canonId === null ? null : eventByCanon.get(canonId) ?? null,
+        canonId,
+        ch.changeType ?? 'altered',
+        ch.description,
+        0,
+        nowIso(),
+      );
     }
 
     // Cause and consequence between events. The link usually reaches back to

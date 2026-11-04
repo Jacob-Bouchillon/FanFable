@@ -239,14 +239,6 @@ ${C.bold('GRAPH')}
   graph                          Node and connection counts
   graph <name> [--hops n]        What a person or thing is connected to
 
-${C.bold('CONFLICTS')}
-  conflicts                       Chapters that disagree with established state
-  conflicts resolve <id>          Accept or resolve a conflict
-
-${C.bold('GRAPH')}
-  graph                          Node and connection counts
-  graph <name> [--hops n]        What a person or thing is connected to
-
 ${C.bold('MEMORY')}
   state                            Overview of the story state
   state characters                 Characters, states and knowledge
@@ -2404,7 +2396,7 @@ async function cmdWrite(args: Args): Promise<void> {
       throw new Error('provide --file <path> or --text "<body>"');
     }
     const chapter = controller.setChapterBody(db, project.id, n, body, 'user edit');
-    const impacted = controller.impactedMaterial(db, project.id, `chapter ${n}`);
+    const impacted = controller.impactedByChapterEdit(db, project.id, n);
     console.log(`Saved chapter ${n} as a ${C.yellow('draft')} (${chapter.wordCount} words).`);
     if (impacted.length) {
       console.log(C.dim(`  ${impacted.length} other chapters mention this material and may need review.`));
@@ -3400,9 +3392,17 @@ async function main(): Promise<void> {
         await cmdLlm(args);
         break;
       case 'serve': {
-        // The configured project may live in a different database; fall back to
-        // the most recently used one, and say so clearly if there is none.
-        let project = controller.getProjectByName(db, (globalState().lastProject as string) ?? '');
+        // An explicit --project must win, including when the database has other
+        // projects. Only without one do we fall back to the last used project
+        // (which may live in another database) and then to the first project.
+        const requestedProject = flagString(args, 'project');
+        const rememberedProject = typeof globalState().lastProject === 'string'
+          ? globalState().lastProject as string
+          : '';
+        let project = controller.getProjectByName(db, requestedProject || rememberedProject);
+        if (!project && requestedProject) {
+          throw new Error(`no project named "${requestedProject}"`);
+        }
         if (!project) {
           const all = controller.listProjects(db);
           project = all[0];

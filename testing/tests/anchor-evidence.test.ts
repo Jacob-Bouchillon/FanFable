@@ -65,6 +65,7 @@ test('an anchor that asserts the tie carries it', () => {
       kind: 'aunt of',
       evidence: 'Tor walked in with him.',
       anchorEvidence: "Mara was Tor's aunt, and had raised him.",
+      confidence: 1,
     },
     { db, projectId: project.id, chunkText: text },
   );
@@ -83,6 +84,7 @@ test('an anchor that only names both people is not relationship proof', () => {
       kind: 'aunt of',
       evidence: 'Tor walked in with him.',
       anchorEvidence: 'Mara and Tor went to town.',
+      confidence: 1,
     },
     { db, projectId: project.id, chunkText: 'Tor walked in with him. Mara and Tor went to town.' },
   );
@@ -101,6 +103,7 @@ test('an anchor that is not in the passage is refused', () => {
       kind: 'aunt of',
       evidence: 'Tor walked in with him.',
       anchorEvidence: "Mara was Tor's mother, and had raised him.",
+      confidence: 1,
     },
     { db, projectId: project.id, chunkText: text },
   );

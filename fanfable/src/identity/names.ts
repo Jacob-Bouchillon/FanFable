@@ -24,14 +24,27 @@ export const NAME_FUZZY_WEIGHT = 0.5;
 /** A name token carried by more entities than this is a title, not a name. */
 export const NAME_DF_CAP = 10;
 
-/** Titles a person can carry, universal across books. Leading such a token
- * with more tokens behind it makes it a title, not a distinguishing name. */
-const UNIVERSAL_TITLES = new Set([
-  'mr', 'mrs', 'miss', 'ms', 'dr', 'doctor', 'professor', 'captain',
-  'sir', 'lady', 'lord', 'king', 'queen', 'prince', 'princess',
-  'uncle', 'aunt', 'father', 'mother', 'brother', 'sister',
-  'grandfather', 'grandmother',
+/**
+ * Every honorific, rank and kin title the roster treats as a title.
+ *
+ * One owner for the four lists that used to disagree (names, identity,
+ * identity-check, roster-rules): the union below. Match-time only — a title
+ * never identifies a person by itself and nothing here is stored or merged.
+ */
+export const TITLE_TOKENS: ReadonlySet<string> = new Set([
+  'admiral', 'aunt', 'baron', 'boss', 'brother', 'captain', 'chancellor',
+  'clan', 'colonel', 'commander', 'count', 'countess', 'daughter', 'doctor',
+  'dr', 'duke', 'duchess', 'emperor', 'empress', 'father', 'general', 'great',
+  'grandfather', 'grandmother', 'king', 'lady', 'lord', 'magister', 'major',
+  'master', 'miss', 'mistress', 'mother', 'mr', 'mrs', 'ms', 'prince',
+  'princess', 'prof', 'professor', 'queen', 'senator', 'sergeant', 'sir',
+  'son', 'sister', 'uncle', 'viceroy',
 ]);
+
+/** True when a canonical token is a title, never a distinguishing name. */
+export function isTitleToken(token: string): boolean {
+  return TITLE_TOKENS.has(String(token ?? '').toLowerCase());
+}
 
 /** Whole-word, case-sensitive occurrences of a term in source text, with
  * regex metacharacters escaped. This is the predicate the suspect-character
@@ -150,7 +163,7 @@ export function deriveNameVariants(
     out.push(canonical);
   }
   const isTitle = (token: string): boolean =>
-    UNIVERSAL_TITLES.has(token) || (index.titleFreq.get(token) ?? 0) > NAME_DF_CAP;
+    isTitleToken(token) || (index.titleFreq.get(token) ?? 0) > NAME_DF_CAP;
   for (const form of explicit) {
     const tokens = canonicalName(form).split(' ').filter(Boolean);
     const strippedTokens = [...tokens];

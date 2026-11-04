@@ -333,35 +333,43 @@ class OllamaProvider implements LlmClient {
       reader = res.body?.getReader();
       if (!reader) throw new LlmError('LLM response has no body');
       const decoder = new TextDecoder();
+      let pending = '';
+      const consumeLine = (rawLine: string): void => {
+        const line = rawLine.trim();
+        if (!line || done) return;
+        let data: any;
+        try {
+          data = JSON.parse(line);
+        } catch (parseErr) {
+          throw new LlmError(
+            `Malformed Ollama response line: ${(parseErr as Error).message}: ${line.slice(0, 200)}`,
+          );
+        }
+        if (data.error) {
+          throw new LlmError(`Ollama error: ${data.error}`);
+        }
+        if (typeof data.message?.content === 'string') {
+          text += data.message.content;
+        }
+        if (data.done === true) {
+          finalModel = data.model ?? finalModel;
+          promptTokens = data.prompt_eval_count ?? promptTokens;
+          completionTokens = data.eval_count ?? completionTokens;
+          finishReason = data.done_reason ?? finishReason;
+          done = true;
+        }
+      };
       while (!done) {
         const { value, done: readerDone } = await reader.read();
         if (readerDone) break;
-        const chunk = decoder.decode(value, { stream: true });
-        for (const rawLine of chunk.split('\n')) {
-          const line = rawLine.trim();
-          if (!line) continue;
-          let data: any;
-          try {
-            data = JSON.parse(line);
-          } catch (parseErr) {
-            throw new LlmError(
-              `Malformed Ollama response line: ${(parseErr as Error).message}: ${line.slice(0, 200)}`,
-            );
-          }
-          if (data.error) {
-            throw new LlmError(`Ollama error: ${data.error}`);
-          }
-          if (typeof data.message?.content === 'string') {
-            text += data.message.content;
-          }
-          if (data.done === true) {
-            finalModel = data.model ?? finalModel;
-            promptTokens = data.prompt_eval_count ?? promptTokens;
-            completionTokens = data.eval_count ?? completionTokens;
-            finishReason = data.done_reason ?? finishReason;
-            done = true;
-          }
-        }
+        // Network reads can end in the middle of an NDJSON line. Keep the
+        // incomplete tail until a later read completes it.
+        const lines = (pending + decoder.decode(value, { stream: true })).split('\n');
+        pending = lines.pop() ?? '';
+        for (const rawLine of lines) consumeLine(rawLine);
+      }
+      if (!done) {
+        consumeLine(pending + decoder.decode());
       }
     } catch (err) {
       if (err instanceof LlmError) throw err;

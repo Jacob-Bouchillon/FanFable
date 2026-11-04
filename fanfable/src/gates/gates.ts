@@ -15,6 +15,7 @@ import {
   RELATION_FAMILIES,
   familiesHeldByName,
   familyOfKind,
+  inverseFamiliesOf,
   inverseFamilyOf,
   isAsymmetricFamily,
   type RelationFamily,
@@ -182,7 +183,7 @@ export function labelHeadForms(kind: string): Set<string> {
 
 /** Negation and uncertainty markers. An asserted tie cannot ride on a denied or
  * merely possible clause. Structural, not a synonym list. */
-const NEGATORS = new Set(['not', 'never', 'no', 'nor', 'neither', 'without', 'hardly', 'barely']);
+const NEGATORS = new Set(['not', 'never', 'nor', 'neither', 'without', 'hardly', 'barely']);
 const HEDGES = new Set([
   'perhaps', 'possibly', 'maybe', 'might', 'may', 'could', 'probably', 'apparently',
   'seemingly', 'seemed', 'seems', 'suspected', 'suspect', 'rumoured', 'rumored',
@@ -250,13 +251,40 @@ export function leadingDenialOrHedge(sentence: string, row: PromoteRow, index?: 
   const anchors = new Set<string>(cited);
   const head = kindHeadWord(row.kind);
   if (head) anchors.add(head);
+  // The kind label's head need not appear in the sentence ("friend of" for
+  // "did not trust"). Anchor on the whole family's forms as well, and test
+  // every occurrence, so an inflection or a different family word still
+  // carries its own denial.
+  const family = familyOfKind(row.kind);
+  if (family !== 'other') {
+    for (const form of familyHeadForms(family)) {
+      if (form.includes(' ')) {
+        // Multi-word keys ("trained by") are not single tokens here; their
+        // component words are common and would over-match.
+        continue;
+      }
+      anchors.add(form);
+    }
+    // Passive family verbs are not single-word family keys ("trained by",
+    // "born to"), but a denial sits directly before them too.
+    for (const { verb } of PASSIVE_AGENT) {
+      anchors.add(verb);
+      for (const form of headForms(verb)) anchors.add(form);
+    }
+  }
   if (!anchors.size) return false;
-  const at = words.findIndex((word) => anchors.has(word));
-  if (at < 0) return false;
   // A hedge or negator just before the assertion softens or denies it. Looking
   // back a few tokens covers "Perhaps Mara feared Tor" and "Mara did not trust
   // Tor" without importing an unrelated clause earlier in the sentence.
-  return words.slice(Math.max(0, at - 4), at).some((word) => NEGATORS.has(word) || HEDGES.has(word));
+  for (let at = 0; at < words.length; at++) {
+    if (!anchors.has(words[at]!)) continue;
+    // Bare "no" is a negator only when it directly modifies the relation noun
+    // ("no friend of Tor"). "there's no one I trust" affirms the tie, and
+    // "no doubt, Asha is Bram's sister" is not a denial.
+    if (at > 0 && words[at - 1] === 'no') return true;
+    if (words.slice(Math.max(0, at - 4), at).some((word) => NEGATORS.has(word) || HEDGES.has(word))) return true;
+  }
+  return false;
 }
 
 
@@ -332,6 +360,50 @@ function familyTermPresent(text: string, family: RelationFamily): boolean {
   return forms.some((form) => new RegExp(`\\b${rx(form)}\\b`, 'i').test(text));
 }
 
+/**
+ * Role nouns whose family is fixed by what the person in that role holds.
+ * The family tables' `keys` are *classification* forms and deliberately mix
+ * both sides ("student" sits in master's keys), so they must never decide
+ * the arrow. Direction uses heads plus these explicit roles.
+ */
+const DIRECTION_ROLE: Record<string, RelationFamily> = {
+  student: 'servant',
+  disciple: 'servant',
+  padawan: 'servant',
+  employee: 'servant',
+};
+
+/** Past-participle forms that put the other endpoint in the actor role:
+ * "Mara was trained by Tor" makes Tor the master, not Mara. `born to` is a
+ * passive kinship construction with the same shape. */
+const PASSIVE_AGENT: ReadonlyArray<{ verb: string; agent: RelationFamily; preposition: 'by' | 'to' }> = [
+  { verb: 'trained', agent: 'master', preposition: 'by' },
+  { verb: 'taught', agent: 'master', preposition: 'by' },
+  { verb: 'mentored', agent: 'master', preposition: 'by' },
+  { verb: 'tutored', agent: 'master', preposition: 'by' },
+  { verb: 'hired', agent: 'employer', preposition: 'by' },
+  { verb: 'employed', agent: 'employer', preposition: 'by' },
+  { verb: 'born', agent: 'parent', preposition: 'to' },
+  { verb: 'raised', agent: 'parent', preposition: 'by' },
+];
+
+/** Head nouns and explicit role nouns a sentence uses to state this family. */
+function directionNouns(family: RelationFamily): Set<string> {
+  const out = new Set<string>();
+  const rule = familyRule(family);
+  if (!rule) return out;
+  for (const head of rule.heads) {
+    out.add(head);
+    for (const form of headForms(head)) out.add(form);
+  }
+  for (const [noun, roleFamily] of Object.entries(DIRECTION_ROLE)) {
+    if (roleFamily !== family) continue;
+    out.add(noun);
+    for (const form of headForms(noun)) out.add(form);
+  }
+  return out;
+}
+
 function heldFamilies(row: PromoteRow, side: 'from' | 'to', text: string, index?: RosterIndex): Set<RelationFamily> {
   const out = new Set<RelationFamily>();
   for (const variant of variantsFor(row, side, index)) {
@@ -349,17 +421,21 @@ function possessiveDirection(row: PromoteRow, family: RelationFamily, index?: Ro
   const inverse = inverseFamilyOf(family);
   const from = aliasAlt(row, 'from', index);
   const to = aliasAlt(row, 'to', index);
-  const fHeads = [...familyHeadForms(family)].map(rx).join('|');
-  const iHeads = [...familyHeadForms(inverse)].map(rx).join('|');
+  const fHeads = [...directionNouns(family)].map(rx).join('|');
+  const iHeads = [...directionNouns(inverse)].map(rx).join('|');
   const text = citationText(row);
   if (!from || !to || !fHeads || !iHeads) return 'none';
+  // An ordinary qualifier may sit between the possessive and the head:
+  // "Tor's business partner", "Tor's old friend". Two words at most so a
+  // different clause cannot supply the head.
+  const gap = '(?:[a-z][a-z-]*\\s+){0,2}';
   const patterns: Array<[RegExp, 'forward' | 'reverse']> = [
-    [new RegExp(`\\b(?:${from})\\b\\s+(?:is|was|became)\\s+(?:${to})(?:'s|’s|s')\\s+(?:${fHeads})\\b`, 'i'), 'forward'],
-    [new RegExp(`\\b(?:${from})\\b\\s+(?:is|was|became)\\s+(?:${to})(?:'s|’s|s')\\s+(?:${iHeads})\\b`, 'i'), 'reverse'],
-    [new RegExp(`\\b(?:${to})\\b\\s+(?:is|was|became)\\s+(?:${from})(?:'s|’s|s')\\s+(?:${fHeads})\\b`, 'i'), 'reverse'],
-    [new RegExp(`\\b(?:${to})\\b\\s+(?:is|was|became)\\s+(?:${from})(?:'s|’s|s')\\s+(?:${iHeads})\\b`, 'i'), 'forward'],
-    [new RegExp(`\\b(?:${to})(?:'s|’s|s')\\s+(?:${fHeads})\\b\\s+(?:is|was)\\s+(?:${from})\\b`, 'i'), 'forward'],
-    [new RegExp(`\\b(?:${from})(?:'s|’s|s')\\s+(?:${iHeads})\\b\\s+(?:is|was)\\s+(?:${to})\\b`, 'i'), 'forward'],
+    [new RegExp(`\\b(?:${from})\\b\\s+(?:is|was|became)\\s+(?:${to})(?:'s|’s|s')\\s+${gap}(?:${fHeads})\\b`, 'i'), 'forward'],
+    [new RegExp(`\\b(?:${from})\\b\\s+(?:is|was|became)\\s+(?:${to})(?:'s|’s|s')\\s+${gap}(?:${iHeads})\\b`, 'i'), 'reverse'],
+    [new RegExp(`\\b(?:${to})\\b\\s+(?:is|was|became)\\s+(?:${from})(?:'s|’s|s')\\s+${gap}(?:${fHeads})\\b`, 'i'), 'reverse'],
+    [new RegExp(`\\b(?:${to})\\b\\s+(?:is|was|became)\\s+(?:${from})(?:'s|’s|s')\\s+${gap}(?:${iHeads})\\b`, 'i'), 'forward'],
+    [new RegExp(`\\b(?:${to})(?:'s|’s|s')\\s+${gap}(?:${fHeads})\\b\\s+(?:is|was)\\s+(?:${from})\\b`, 'i'), 'forward'],
+    [new RegExp(`\\b(?:${from})(?:'s|’s|s')\\s+${gap}(?:${iHeads})\\b\\s+(?:is|was)\\s+(?:${to})\\b`, 'i'), 'forward'],
   ];
   for (const [re, dir] of patterns) if (re.test(text)) return dir;
   return 'none';
@@ -376,21 +452,75 @@ function firstMention(text: string, row: PromoteRow, side: 'from' | 'to', index?
   return best;
 }
 
+/**
+ * Direction from an active verb/role noun placed between the two names.
+ *
+ * A form's *owning family* decides the arrow, not just its position: a form
+ * from the claimed family between the names is forward, a form from the
+ * inverse family is reverse. This stops the inverse family's keys ("student"
+ * inside master's keys) from certifying an inversion. Ambiguous forms that
+ * belong to both sides cancel and leave `none` (fail closed).
+ */
 function verbOrderDirection(row: PromoteRow, family: RelationFamily, index?: RosterIndex): 'forward' | 'reverse' | 'none' {
   const inverse = inverseFamilyOf(family);
   const text = citationText(row);
   const masked = maskText(text, row, index);
-  const forms = [...familyHeadForms(family), ...familyHeadForms(inverse)];
+  const owners = new Map<string, RelationFamily>();
+  for (const form of directionNouns(family)) owners.set(form, family);
+  for (const form of directionNouns(inverse)) if (!owners.has(form)) owners.set(form, inverse);
   const fromAt = firstMention(text, row, 'from', index);
   const toAt = firstMention(text, row, 'to', index);
   if (!Number.isFinite(fromAt) || !Number.isFinite(toAt)) return 'none';
-  for (const form of forms.sort((a, b) => b.length - a.length)) {
+  let forward = false;
+  let reverse = false;
+  for (const [form, owner] of [...owners].sort(([a], [b]) => b.length - a.length)) {
     const re = new RegExp(`\\b${rx(form)}\\b`, 'gi');
     let m: RegExpExecArray | null;
     while ((m = re.exec(masked)) !== null) {
       const at = m.index;
-      if (fromAt < at && at < toAt) return 'forward';
-      if (toAt < at && at < fromAt) return 'reverse';
+      if (fromAt < at && at < toAt) {
+        if (owner === family) forward = true;
+        else if (owner === inverse) reverse = true;
+      } else if (toAt < at && at < fromAt) {
+        if (owner === family) reverse = true;
+        else if (owner === inverse) forward = true;
+      }
+    }
+  }
+  if (forward === reverse) return 'none';
+  return forward ? 'forward' : 'reverse';
+}
+
+/**
+ * Direction from a passive construction: "FROM was trained by TO" gives TO
+ * the actor role, so the claim "FROM master of TO" is backwards while
+ * "FROM servant of TO" is forwards. Never infers from a bare `by`; the verb
+ * must be one of the closed passive forms above.
+ */
+function passiveDirection(row: PromoteRow, family: RelationFamily, index?: RosterIndex): 'forward' | 'reverse' | 'none' {
+  const from = aliasAlt(row, 'from', index);
+  const to = aliasAlt(row, 'to', index);
+  const text = citationText(row);
+  if (!from || !to) return 'none';
+  const between = '[^.!?]{0,60}?';
+  for (const { verb, agent, preposition } of PASSIVE_AGENT) {
+    // FROM was VERB prep TO  -> TO is the agent.
+    const fromPatient = new RegExp(
+      `\\b(?:${from})\\b${between}\\b(?:was|were|is|are|been|being)\\b${between}\\b${verb}\\b${between}\\b${preposition}\\b\\s+(?:${to})\\b`,
+      'i',
+    );
+    if (fromPatient.test(text)) {
+      if (agent === family) return 'reverse';
+      if (inverseFamiliesOf(agent).has(family)) return 'forward';
+    }
+    // TO was VERB prep FROM -> FROM is the agent.
+    const toPatient = new RegExp(
+      `\\b(?:${to})\\b${between}\\b(?:was|were|is|are|been|being)\\b${between}\\b${verb}\\b${between}\\b${preposition}\\b\\s+(?:${from})\\b`,
+      'i',
+    );
+    if (toPatient.test(text)) {
+      if (agent === family) return 'forward';
+      if (inverseFamiliesOf(agent).has(family)) return 'reverse';
     }
   }
   return 'none';
@@ -486,13 +616,71 @@ function bothEndpointsIn(text: string, row: PromoteRow, index?: RosterIndex): bo
   return has('from') && has('to');
 }
 
+/** A family title bound to an endpoint: "Aunt Mara", "Captain Voss". The
+ * title must sit immediately before the name, so "her friend had arrived"
+ * names no endpoint and proves nothing. */
+function titledEndpoint(row: PromoteRow, family: RelationFamily, index: RosterIndex | undefined, text: string): boolean {
+  const forms = [...familyHeadForms(family)].sort((a, b) => b.length - a.length);
+  const names = [...variantsFor(row, 'from', index), ...variantsFor(row, 'to', index)].filter((v) => v.trim() !== '');
+  return forms.some((form) => names.some(
+    (name) => new RegExp(`\\b${rx(form)}\\b\\s+(?:the\\s+)?${rx(name)}\\b`, 'i').test(text),
+  ));
+}
+
+/** A family noun explicitly linked to an endpoint by a preposition:
+ * "a secret partnership with Tor". The noun must be the one the preposition
+ * attaches to the endpoint, so a third party's friend or enemy is not proof. */
+function linkedFamilyTerm(row: PromoteRow, family: RelationFamily, index: RosterIndex | undefined, text: string): boolean {
+  const forms = [...familyHeadForms(family)].sort((a, b) => b.length - a.length);
+  const names = [...variantsFor(row, 'from', index), ...variantsFor(row, 'to', index)]
+    .filter((v) => v.trim() !== '')
+    .map(rx)
+    .join('|');
+  if (!names) return false;
+  return forms.some((form) => new RegExp(
+    `\\b${rx(form)}\\b\\s+(?:with|of|to|for|toward|towards|against)\\s+(?:the\\s+|a\\s+|an\\s+)?(?:${names})\\b`,
+    'i',
+  ).test(text));
+}
+
+/** A family verb between a subject and an object: "Mara feared Tor", or a
+ * pronoun pair whose antecedent the anchor names ("She feared him."). The
+ * form must be the verb relating the two, never a noun in another phrase. */
+function boundFamilyTerm(row: PromoteRow, family: RelationFamily, index: RosterIndex | undefined, text: string): boolean {
+  const forms = [...familyHeadForms(family)].filter((form) => !form.includes(' ')).sort((a, b) => b.length - a.length);
+  const names = [...variantsFor(row, 'from', index), ...variantsFor(row, 'to', index)]
+    .filter((v) => v.trim() !== '')
+    .map(rx)
+    .join('|');
+  if (!names || !forms.length) return false;
+  const anchored = (row.anchorEvidence ?? '').trim() !== '';
+  const subject = anchored ? `(?:${names}|he|she|they|i)` : `(?:${names})`;
+  // A pronoun object's antecedent must come from the anchor; without one the
+  // sentence names neither person and cannot prove a tie.
+  const object = anchored ? `(?:${names}|him|her|them|me|us|you)` : `(?:${names})`;
+  const gap = '(?:[a-z]+\\s+){0,2}?';
+  return forms.some((form) => new RegExp(
+    `\\b${subject}\\s+${gap}${rx(form)}\\b\\s+${object}\\b`,
+    'i',
+  ).test(text));
+}
+
+/**
+ * A symmetric tie stated in one clause. Only grammatical constructions that
+ * bind the family word to the two people count: a title on an endpoint, a
+ * noun linked to an endpoint by a preposition, or the model's own verbatim
+ * kind source. A family word that merely appears somewhere in the clause may
+ * belong to an unnamed third party ("Mara told Tor that her friend had
+ * arrived") and never proves a tie on its own.
+ */
 function sameClauseWithBothEndpoints(row: PromoteRow, family: RelationFamily, index?: RosterIndex): boolean {
   const source = (row.kindSource ?? '').trim();
   for (const clause of clausesOf(citationText(row))) {
     if (!bothEndpointsIn(clause, row, index)) continue;
-    const masked = maskText(clause, row, index);
-    if (familyTermPresent(masked, family)) return true;
-    if (source && normalise(masked).includes(normalise(source))) return true;
+    if (titledEndpoint(row, family, index, clause)) return true;
+    if (linkedFamilyTerm(row, family, index, clause)) return true;
+    if (boundFamilyTerm(row, family, index, clause)) return true;
+    if (source && normalise(maskText(clause, row, index)).includes(normalise(source))) return true;
   }
   return false;
 }
@@ -590,6 +778,9 @@ export function relationEntailmentReason(row: PromoteRow, index?: RosterIndex): 
     const possessive = possessiveDirection(row, family, index);
     if (possessive === 'forward') return null;
     if (possessive === 'reverse') return 'direction-mismatch';
+    const passive = passiveDirection(row, family, index);
+    if (passive === 'forward') return null;
+    if (passive === 'reverse') return 'direction-mismatch';
     const vocative = vocativeDirection(row, family, index);
     if (vocative === 'forward') return null;
     if (vocative === 'reverse') return 'direction-mismatch';
@@ -603,11 +794,49 @@ export function relationEntailmentReason(row: PromoteRow, index?: RosterIndex): 
   const toFamilies = heldFamilies(row, 'to', citation, index);
   if (fromFamilies.has(family) && toFamilies.has(family)) return null;
   if (coordinatedSymmetric(row, family, index)) return null;
+  // A possessive states a symmetric tie whichever endpoint owns the noun.
+  if (possessiveDirection(row, family, index) !== 'none') return null;
   if (sameClauseWithBothEndpoints(row, family, index)) return null;
   if (definiteDescriptionAnchor(row, family, index)) return null;
   if (contiguousDefiniteDescription(row, family, index)) return null;
   if (dialogueAttributionEntails(row, family, index)) return null;
   return 'relationship-not-entailed';
+}
+
+/**
+ * Gate-local proof normaliser. Folds presentation exactly the way the
+ * integrity audit's `auditNormalize` does (curly quotes, dashes, case,
+ * whitespace) so a row that passes this gate also passes `findUnverifiedKeepers`.
+ * It deliberately keeps punctuation, unlike `core/text.normalise`, whose
+ * output feeds claim fingerprints — this function is for the promotion path
+ * only and must never replace that one.
+ */
+export function proofNormalise(text: string): string {
+  return (text ?? '')
+    .replace(/[“”«»]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/[–—−]/g, '-')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/** Substring match that cannot start or end inside a word: "art" is not in
+ * "cart". The audit only needs `includes`; this is the stricter gate form, so
+ * a gate pass still implies an audit pass. */
+function containsVerbatim(haystack: string, needle: string): boolean {
+  if (!needle) return false;
+  const wordChar = /[a-z0-9']/;
+  let from = 0;
+  while (from <= haystack.length) {
+    const at = haystack.indexOf(needle, from);
+    if (at < 0) return false;
+    const before = at === 0 ? '' : haystack[at - 1]!;
+    const after = haystack[at + needle.length] ?? '';
+    if (!wordChar.test(before) && !wordChar.test(after)) return true;
+    from = at + 1;
+  }
+  return false;
 }
 
 /**
@@ -618,11 +847,12 @@ export function relationEntailmentReason(row: PromoteRow, index?: RosterIndex): 
  */
 export function quoteVerbatimReason(row: PromoteRow, chunkText?: string | null): PromoteReason | null {
   const chunk = chunkText ?? '';
-  if (!row.evidence.trim() || !chunk || !normalise(chunk).includes(normalise(row.evidence))) {
+  const chunkProof = proofNormalise(chunk);
+  if (!row.evidence.trim() || !chunk || !containsVerbatim(chunkProof, proofNormalise(row.evidence))) {
     return 'quote-not-verbatim';
   }
   const anchor = (row.anchorEvidence ?? '').trim();
-  if (anchor && !normalise(chunk).includes(normalise(anchor))) return 'quote-not-verbatim';
+  if (anchor && !containsVerbatim(chunkProof, proofNormalise(anchor))) return 'quote-not-verbatim';
   return null;
 }
 
@@ -1053,7 +1283,9 @@ export function provenRelation(
   const quoteReason = keeperQuoteReason(guarded, context.chunkText, context.index);
   if (quoteReason) return { ok: false, reason: quoteReason };
   const min = context.minConfidence ?? DEFAULT_MIN_CONFIDENCE;
-  if (claimTier(guarded.confidence ?? 1, min) !== 'accepted') return { ok: false, reason: 'below-threshold' };
+  // A caller that forgets the model's score has not judged the claim: the
+  // missing value must fail the bar, never take the maximum.
+  if (claimTier(guarded.confidence ?? 0, min) !== 'accepted') return { ok: false, reason: 'below-threshold' };
   const entailment = relationEntailmentReason(guarded, context.index);
   if (entailment) return { ok: false, reason: entailment };
   return { ok: true };

@@ -17,6 +17,8 @@ import { toStringArray } from '../core/json.ts';
 import { clientFrom, createClient } from '../core/llm.ts';
 import type { LlmClient, LlmSettings } from '../core/llm.ts';
 import * as lore from '../answer/lore.ts';
+import * as evidence from '../answer/evidence.ts';
+import * as evidenceRetrieval from '../answer/evidence-retrieval.ts';
 import * as lorebook from '../lorebook.ts';
 import * as retrieval from '../answer/retrieval.ts';
 import * as graph from '../support/graph.ts';
@@ -31,7 +33,7 @@ import { WRITE_TRACE_MAX_EVENTS, WriteTrace } from '../trace/write-trace.ts';
 import * as writer from '../product/writer.ts';
 import * as continuity from '../product/continuity.ts';
 import { continuitySettings, filterBySeverity } from '../product/continuity-settings.ts';
-import { truncate, wordCount } from '../core/text.ts';
+import { splitSentences, truncate, wordCount } from '../core/text.ts';
 import { nameMentioned, nameMentionedExact } from '../identity/names.ts';
 
 export interface Project {
@@ -198,17 +200,24 @@ export function saveChapter(
 }
 
 export function setChapterBody(db: Db, projectId: number, number: number, body: string, note = ''): Chapter {
-  const existing = getChapter(db, projectId, number);
-  if (existing) {
-    db.run(
-      'INSERT INTO chapter_revision (chapter_id, body, note, created_at) VALUES (?, ?, ?, ?)',
-      existing.id,
-      existing.body,
-      note || 'previous version',
-      nowIso(),
-    );
-  }
-  return saveChapter(db, projectId, number, { body });
+  return db.transaction(() => {
+    const existing = getChapter(db, projectId, number);
+    if (existing) {
+      db.run(
+        'INSERT INTO chapter_revision (chapter_id, body, note, created_at) VALUES (?, ?, ?, ?)',
+        existing.id,
+        existing.body,
+        note || 'previous version',
+        nowIso(),
+      );
+    }
+    // An edit is a new draft, always: the approved text and the approved
+    // memory end together. The old extraction is cleared so a later approval
+    // cannot merge two versions of the same events, states and facts.
+    const saved = saveChapter(db, projectId, number, { body, status: 'draft' });
+    if (existing) memory.clearChapterExtraction(db, projectId, existing.id);
+    return saved;
+  });
 }
 
 /* ------------------------------------------------------- context assembly */
@@ -1399,6 +1408,45 @@ export function impactedMaterial(
   return out;
 }
 
+/**
+ * Real subjects an edit can affect: the chapter title and the names of the
+ * story characters it mentions. The old `chapter N` phrase was a synthetic
+ * subject that matched only chapters literally containing that text.
+ */
+export function chapterImpactSubjects(db: Db, projectId: number, number: number): string[] {
+  const chapter = getChapter(db, projectId, number);
+  if (!chapter) return [];
+  const subjects = new Set<string>();
+  if (chapter.title.trim()) subjects.add(chapter.title.trim());
+  const body = chapter.body.toLowerCase();
+  for (const character of memory.listCharacters(db, projectId)) {
+    if (character.name && body.includes(character.name.toLowerCase())) subjects.add(character.name);
+  }
+  return [...subjects];
+}
+
+/** Other chapters that mention material changed by this chapter's edit. */
+export function impactedByChapterEdit(
+  db: Db,
+  projectId: number,
+  number: number,
+): { chapter: Chapter; matches: string[] }[] {
+  const merged = new Map<number, { chapter: Chapter; matches: string[] }>();
+  for (const subject of chapterImpactSubjects(db, projectId, number)) {
+    for (const hit of impactedMaterial(db, projectId, subject, { excludeChapter: number })) {
+      const existing = merged.get(hit.chapter.number);
+      if (existing) {
+        for (const match of hit.matches) {
+          if (existing.matches.length < 5 && !existing.matches.includes(match)) existing.matches.push(match);
+        }
+      } else {
+        merged.set(hit.chapter.number, { chapter: hit.chapter, matches: [...hit.matches] });
+      }
+    }
+  }
+  return [...merged.values()].sort((a, b) => a.chapter.number - b.chapter.number);
+}
+
 /* --------------------------------------------------------------- planning */
 
 /**
@@ -1525,6 +1573,31 @@ function castRelationshipBlock(db: Db, projectId: number, text: string): string 
     .join('\n');
 }
 
+/** A prompt block for a validated packet: support is citable, the rest is not. */
+function renderEvidencePacket(packet: evidence.Packet): string {
+  const lines: string[] = ['EVIDENCE PACKET (validated against the bank):'];
+  lines.push('SUPPORT (citable; cite only these):');
+  if (!packet.support.length) lines.push('- none');
+  for (const entry of packet.support) {
+    lines.push(`- [${entry.source}:${entry.eventId}] ${entry.title} | locator: ${entry.locator || 'none'} | claim: ${entry.claim}`);
+  }
+  lines.push('GAPS (uncertainty; never invent support for these):');
+  if (!packet.gaps.length) lines.push('- none');
+  for (const gap of packet.gaps) lines.push(`- ${gap.reason}: ${gap.claim}`);
+  lines.push('BACKGROUND (never citable, context only):');
+  if (!packet.context.length) lines.push('- none');
+  for (const entry of packet.context) {
+    lines.push(`- [${entry.source}:${entry.eventId}] ${entry.title} | locator: ${entry.locator || 'none'}`);
+  }
+  if (packet.suspiciousReuse.length) {
+    lines.push('SUSPICIOUS REUSE (one event offered for several unrelated claims):');
+    for (const entry of packet.suspiciousReuse) {
+      lines.push(`- [${entry.source}:${entry.eventId}] ${entry.title} | claims: ${entry.claims.join(' / ')}`);
+    }
+  }
+  return lines.join('\n');
+}
+
 export async function draftPlan(
   db: Db,
   llm: LlmClient,
@@ -1535,8 +1608,14 @@ export async function draftPlan(
     chapterCount?: number;
     preferences?: Record<string, string>;
     userNotes?: string;
+    /** Opt-in: ground scenes from a validated evidence packet. Default off. */
+    evidencePacket?: boolean;
   },
-): Promise<{ outline: planner.Outline; warnings: string[] }> {
+): Promise<{
+  outline: planner.Outline;
+  warnings: string[];
+  evidence?: { enabled: boolean; fallback: boolean; support: number; context: number; gaps: number; suspiciousReuse: number };
+}> {
   const premiseText = `${req.premise} ${req.divergence ?? ''}`;
   const passages = await lore.searchCanon(db, projectId, premiseText, {
     limit: 8,
@@ -1563,7 +1642,7 @@ export async function draftPlan(
   // The connected view of the premise: who it touches, what it connects to, and
   // what the story has already changed. The planner needs the consequences, not
   // just the names.
-  const graphContext = graph.buildGraphContext(db, projectId, {
+  let graphContext = graph.buildGraphContext(db, projectId, {
     query: `${req.premise} ${req.divergence ?? ''}`,
     focus: graph.terms(`${req.premise} ${req.divergence ?? ''}`).slice(0, 4),
     hops: 1,
@@ -1575,7 +1654,55 @@ export async function draftPlan(
   // planner whose context is full cannot finish its outline. The events that
   // the premise actually touches come first, and the whole index is kept
   // inside a character budget.
-  const canonEvents = selectCanonEvents(db, projectId, req.premise, req.divergence ?? '');
+  let canonEvents = selectCanonEvents(db, projectId, req.premise, req.divergence ?? '');
+  let evidenceSummary: { enabled: boolean; fallback: boolean; support: number; context: number; gaps: number; suspiciousReuse: number } | undefined;
+
+  if (req.evidencePacket === true) {
+    // Flag-on is a separate path: the default branch above stays byte-identical.
+    const claims: evidence.ClaimRequirement[] = splitSentences(req.premise)
+      .map((text) => text.trim())
+      .filter(Boolean)
+      .map((text) => ({ text, kind: 'canon' }));
+    const divergence = (req.divergence ?? '').trim();
+    if (divergence) claims.push({ text: divergence, kind: 'au' as const });
+    const requirements: evidence.SceneRequirements = {
+      title: req.premise.slice(0, 80),
+      characters: cast,
+      requires: claims.length ? claims : [{ text: req.premise, kind: 'canon' as const }],
+      constraints: [],
+    };
+    let packet: evidence.Packet | null = null;
+    try {
+      const retrieval = evidenceRetrieval.loadEvidenceRecords(db, projectId, requirements);
+      const candidate = evidence.selectEvidence(requirements, retrieval.records);
+      const validation = evidenceRetrieval.validatePacket(db, projectId, candidate);
+      if (validation.ok) packet = candidate;
+    } catch {
+      packet = null;
+    }
+    if (!packet) {
+      // Fail closed: any retrieval/validation failure falls back to the old
+      // selection path and reports the fallback count.
+      canonEvents = selectCanonEvents(db, projectId, req.premise, req.divergence ?? '');
+      evidenceSummary = { enabled: true, fallback: true, support: 0, context: 0, gaps: 0, suspiciousReuse: 0 };
+    } else {
+      const citable = new Set(packet.support.filter((entry) => entry.source === 'canon').map((entry) => entry.eventId));
+      canonEvents = lore
+        .listCanonEvents(db, projectId, 5000)
+        .filter((event) => citable.has(event.id))
+        .sort((a, b) => a.id - b.id);
+      const block = renderEvidencePacket(packet);
+      graphContext = graphContext ? `${graphContext}\n\n${block}` : block;
+      evidenceSummary = {
+        enabled: true,
+        fallback: false,
+        support: packet.support.length,
+        context: packet.context.length,
+        gaps: packet.gaps.length,
+        suspiciousReuse: packet.suspiciousReuse.length,
+      };
+    }
+  }
 
   const data = await planner.draftOutline(llm, {
     premise: req.premise,
@@ -1626,7 +1753,7 @@ export async function draftPlan(
   }
 
   const outline = planner.saveOutline(db, projectId, { ...data, status: 'draft' });
-  return { outline, warnings };
+  return evidenceSummary ? { outline, warnings, evidence: evidenceSummary } : { outline, warnings };
 }
 
 /* ------------------------------------------------------------------ facade */

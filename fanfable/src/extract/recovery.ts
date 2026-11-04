@@ -787,6 +787,24 @@ export class RecoveryController {
     return this.db.transaction(
       () => {
         let child = this.requireChild(childId);
+        // Leases a live worker holds on any of these chunks block a reopen.
+        const leaseConflicts = (ids: number[]): number[] => {
+          const conflicts: number[] = [];
+          for (const chunkId of ids) {
+            const lease = this.db.get<{ child_id: number; owner: string; lease_until: string }>(
+              'SELECT child_id, owner, lease_until FROM extraction_chunk_lease WHERE chunk_id = ?',
+              chunkId,
+            );
+            if (
+              lease &&
+              Date.parse(lease.lease_until) > now &&
+              (lease.child_id !== childId || lease.owner !== owner)
+            ) {
+              conflicts.push(chunkId);
+            }
+          }
+          return conflicts;
+        };
         if (child.status === 'complete') {
           const expected = options.expectedStageFingerprints;
           const stored = this.stageFingerprints(child);
@@ -796,13 +814,27 @@ export class RecoveryController {
           if (stillCurrent) {
             return { ok: true, fencing: child.fencing, alreadyComplete: true };
           }
-          // A completed work unit whose stage generation changed is reopened.
-          // Existing staged work/coverage remains; only new fingerprints are
-          // eligible. Do not touch lore_mined or legacy rows here.
+          // Check ownership before mutating the child: reopening a complete
+          // child while another worker holds a lease used to leave the child
+          // pending and its windows marked lore_mined, so retry could never
+          // publish them. Overlap returns without touching any row.
+          const reopenIds = this.chunkIds(child);
+          const conflicts = leaseConflicts(reopenIds);
+          if (conflicts.length) return { ok: false, reason: 'overlap', conflicts };
           this.db.run(
             "UPDATE extraction_recovery_child SET status = 'pending', completed_at = NULL WHERE id = ?",
             childId,
           );
+          // A reopen is retryable again: the same chunks must be minable, as
+          // they were before the child first published. Existing canon rows
+          // and staged work stay untouched.
+          if (reopenIds.length) {
+            const placeholders = reopenIds.map(() => '?').join(',');
+            this.db.run(
+              `UPDATE canon_chunk SET lore_mined = 0 WHERE id IN (${placeholders})`,
+              ...reopenIds,
+            );
+          }
           child = this.requireChild(childId);
         }
         if (child.status === 'deferred') {
@@ -841,20 +873,7 @@ export class RecoveryController {
             );
           });
         if (sameOwner) return { ok: true, fencing: child.fencing };
-        const conflicts: number[] = [];
-        for (const chunkId of ids) {
-          const lease = this.db.get<{ child_id: number; owner: string; lease_until: string }>(
-            'SELECT child_id, owner, lease_until FROM extraction_chunk_lease WHERE chunk_id = ?',
-            chunkId,
-          );
-          if (
-            lease &&
-            Date.parse(lease.lease_until) > now &&
-            (lease.child_id !== childId || lease.owner !== owner)
-          ) {
-            conflicts.push(chunkId);
-          }
-        }
+        const conflicts = leaseConflicts(ids);
         if (conflicts.length) return { ok: false, reason: 'overlap', conflicts };
         const fencing = child.fencing + 1;
         for (const chunkId of ids) {
@@ -1288,8 +1307,9 @@ export class RecoveryController {
     stage: RecoveryStage;
     fingerprint: string;
     attemptId?: number;
-    owner?: string;
-    fencing?: number;
+    /** Required: a deferral expires leases and must prove ownership. */
+    owner: string;
+    fencing: number;
     reason: string;
   }): void {
     const now = this.now();
@@ -1297,13 +1317,11 @@ export class RecoveryController {
       () => {
         const child = this.requireChild(input.childId);
         if (child.project_id !== input.projectId) throw new Error('stale-child');
-        if (input.owner !== undefined && input.fencing !== undefined) {
-          if (child.fencing !== input.fencing || child.status !== 'running') {
-            throw new Error('stale-fencing');
-          }
-          const ownership = this.ownsChunks(child, input.owner, input.fencing, now);
-          if (!ownership.ok) throw new Error(ownership.reason);
+        if (child.fencing !== input.fencing || child.status !== 'running') {
+          throw new Error('stale-fencing');
         }
+        const ownership = this.ownsChunks(child, input.owner, input.fencing, now);
+        if (!ownership.ok) throw new Error(ownership.reason);
         if (input.attemptId !== undefined) {
           const attempt = this.requireAttempt(input.attemptId);
           if (
@@ -1313,10 +1331,7 @@ export class RecoveryController {
           ) {
             throw new Error('stale-attempt');
           }
-          if (
-            input.owner !== undefined &&
-            (attempt.owner !== input.owner || attempt.fencing !== input.fencing)
-          ) {
+          if (attempt.owner !== input.owner || attempt.fencing !== input.fencing) {
             throw new Error('stale-fencing');
           }
         }
@@ -1368,10 +1383,13 @@ export class RecoveryController {
             parentId,
           );
         }
+        // Fencing is the ownership predicate: a stale caller cannot expire a
+        // live owner's leases even if it still knows the child id.
         this.db.run(
-          'UPDATE extraction_chunk_lease SET lease_until = ? WHERE child_id = ?',
+          'UPDATE extraction_chunk_lease SET lease_until = ? WHERE child_id = ? AND fencing = ?',
           iso(now),
           input.childId,
+          input.fencing,
         );
       },
       { immediate: true },

@@ -98,7 +98,7 @@ test('promotion accepts two separate mentions', () => {
   const b = entity(db, p.id, 'Tor');
   const evidence = 'Mara was an ally of Tor.';
   const decision = lorebook.canPromote(
-    { fromId: a, toId: b, fromName: 'Mara', toName: 'Tor', kind: 'ally of', evidence },
+    { fromId: a, toId: b, fromName: 'Mara', toName: 'Tor', kind: 'ally of', evidence, confidence: 1 },
     { db, projectId: p.id, chunkText: evidence },
   );
   assert.equal(decision.ok, true);

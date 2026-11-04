@@ -12,6 +12,7 @@
  */
 import { Db, fromJson, strList } from '../core/db.ts';
 import { createResolver, loadIdentityContext, type EntityResolution } from '../identity/identity.ts';
+import { KEEPER_STATUSES } from '../lorebook.ts';
 
 export type BriefGrade = 'proven' | 'attested' | 'provisional';
 
@@ -163,7 +164,8 @@ export function buildWebBrief(db: Db, projectId: number, opts: BriefOptions = {}
     );
     for (const row of rows) {
       let grade: BriefGrade | null = null;
-      if (row.review_status === 'user_confirmed') grade = 'proven';
+      // Keeper and brief agree: accepted and user_confirmed are both proven.
+      if (KEEPER_STATUSES.includes(row.review_status)) grade = 'proven';
       else if (row.review_status === 'attested') grade = 'attested';
       else if (row.review_status === 'provisional' || row.review_status === 'needs_review') {
         if (!hasAssessment(row.supporting_evidence)) continue;

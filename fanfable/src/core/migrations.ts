@@ -1166,9 +1166,9 @@ export function runMigrations(db: DatabaseSync): number {
   const version = Number(db.prepare('PRAGMA user_version').get()?.user_version ?? 0);
 
   // The base schema is written with IF NOT EXISTS throughout, so running it
-  // again is harmless. It is run whenever the database is missing any of its
-  // tables, even if the version number says otherwise — a database written by
-  // an older version can carry a version number without the tables behind it.
+  // again is harmless. It is run whenever the database is missing any known
+  // table or a later column, even if the version number says otherwise — a
+  // database can carry a high version without the objects behind it.
   const BASE_TABLES = [
     'project',
     'canon_source',
@@ -1183,14 +1183,101 @@ export function runMigrations(db: DatabaseSync): number {
     'character',
     'story_fact',
   ];
-  const missing = BASE_TABLES.filter((t) => !tableExists(db, t));
-
+  // Every table the current schema owns, not only the original twelve: a
+  // version-32 database missing claim_proof, trace, canon_thread or the
+  // recovery ledger must be rebuilt too, not silently served.
+  const REQUIRED_TABLES = [
+    ...BASE_TABLES,
+    'schema_meta',
+    'au_event_link',
+    'au_event_participant',
+    'canon_birth',
+    'canon_change',
+    'canon_event_participant',
+    'canon_meeting',
+    'canon_meeting_exchange',
+    'canon_meeting_resolution',
+    'canon_open_end',
+    'canon_pair_thread',
+    'canon_ruling',
+    'canon_thread',
+    'canon_thread_conflict',
+    'canon_thread_note',
+    'canon_thread_note_ref',
+    'canon_thread_passage',
+    'canon_tie_hint',
+    'canon_tie_note',
+    'chapter_revision',
+    'chapter_summary',
+    'character_knowledge',
+    'character_state',
+    'claim_proof',
+    'context_request',
+    'continuity_issue',
+    'embedding',
+    'extraction_attempt',
+    'extraction_chunk_lease',
+    'extraction_contribution',
+    'extraction_effect',
+    'extraction_recovery_child',
+    'extraction_recovery_chunk_work',
+    'extraction_recovery_parent',
+    'extraction_recovery_run_child',
+    'extraction_roster_snapshot',
+    'extraction_run',
+    'extraction_stage_coverage',
+    'extraction_staged_batch',
+    'extraction_window_run',
+    'graph_write',
+    'message',
+    'motivation',
+    'outline',
+    'plot_thread',
+    'quarantine_alias',
+    'relationship',
+    'secret',
+    'state_conflict',
+    'thread_event',
+    'trace',
+    'trace_event',
+  ];
   const ordered = [...MIGRATIONS].sort((a, b) => a.version - b.version);
+  // Which migration first creates each table. Missing objects introduced after
+  // the stored version are simply pending work for the normal loop; missing
+  // objects the stored version claims to include mean the high number is a
+  // lie, and the schema must be rebuilt from the base.
+  const tableVersion = new Map<string, number>();
+  let quarantineVersion = 0;
+  for (const migration of ordered) {
+    for (const match of (migration.sql ?? '').matchAll(/CREATE TABLE IF NOT EXISTS\s+([a-z0-9_]+)/gi)) {
+      // Keep the latest creator: an experimental migration edited in place may
+      // have re-created a table it originally missed, so a higher version can
+      // legitimately add it again.
+      tableVersion.set(match[1]!, migration.version);
+    }
+    if ((migration.columns ?? []).some(([table, column]) => table === 'canon_entity' && column === 'quarantine_reason')) {
+      quarantineVersion = migration.version;
+    }
+  }
+  const missingBase = BASE_TABLES.filter((t) => !tableExists(db, t));
+  const staleMissing = REQUIRED_TABLES.filter(
+    (table) =>
+      !BASE_TABLES.includes(table) &&
+      !tableExists(db, table) &&
+      (tableVersion.get(table) ?? 0) <= version,
+  );
+  const staleColumn = !hasColumn(db, 'canon_entity', 'quarantine_reason') && quarantineVersion <= version;
+  const needsRecovery = missingBase.length > 0 || staleMissing.length > 0 || staleColumn;
+
+  // The effective version starts at the stored one but drops to 1 when the
+  // base is rebuilt, so every later idempotent migration runs instead of being
+  // suppressed by the stale high number.
+  let current = version;
   for (const migration of ordered) {
     const isBase = migration.version === 1;
     if (isBase) {
-      if (missing.length === 0) continue;
-    } else if (migration.version <= version) {
+      if (!needsRecovery) continue;
+    } else if (migration.version <= current) {
       continue;
     }
     db.exec('BEGIN');
@@ -1203,10 +1290,11 @@ export function runMigrations(db: DatabaseSync): number {
       if (migration.sql) db.exec(migration.sql);
       db.exec(`PRAGMA user_version = ${migration.version}`);
       db.exec('COMMIT');
+      current = migration.version;
     } catch (err) {
       db.exec('ROLLBACK');
       throw new Error(`migration ${migration.version} (${migration.name}) failed: ${(err as Error).message}`);
     }
   }
-  return Number(db.prepare('PRAGMA user_version').get()?.user_version ?? 0);
+  return Number(db.prepare('PRAGMA user_version').get()?.user_version ?? current);
 }

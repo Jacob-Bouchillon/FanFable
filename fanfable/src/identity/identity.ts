@@ -14,6 +14,7 @@ import {
   NAME_DF_CAP,
   buildRosterIndex,
   canonicalName,
+  isTitleToken,
   nameRelation,
   type RosterIndex,
 } from './names.ts';
@@ -175,7 +176,9 @@ export function createResolver(context: IdentityContext): Resolver {
         continue;
       }
     }
-    const direct = exact.length ? exact : alias;
+    // An exact stored name and another entity's alias are both direct matches;
+    // compare the union instead of silently preferring the exact row.
+    const direct = [...new Set([...exact, ...alias])];
     if (direct.length) {
       const how: ResolutionHow = exact.length ? 'exact' : 'alias';
       const unique = [...new Set(direct)].sort((a, b) => a - b);
@@ -245,19 +248,6 @@ export function createResolver(context: IdentityContext): Resolver {
       return { a: left, b: right, status };
     },
   };
-}
-
-/** Universal honorifics and kin titles: a bare title never identifies anyone. */
-const TITLE_TOKENS = new Set([
-  'mr', 'mrs', 'ms', 'dr', 'sir', 'lady', 'lord', 'master', 'mistress', 'captain', 'commander',
-  'general', 'admiral', 'colonel', 'major', 'sergeant', 'king', 'queen', 'prince', 'princess',
-  'emperor', 'empress', 'count', 'countess', 'duke', 'duchess', 'baron', 'boss', 'senator',
-  'chancellor', 'viceroy', 'magister', 'aunt', 'uncle', 'great', 'father', 'mother',
-  'brother', 'sister', 'son', 'daughter', 'clan',
-]);
-
-function isTitleToken(token: string): boolean {
-  return TITLE_TOKENS.has(token);
 }
 
 /** Resolve one name against the project's entities. */

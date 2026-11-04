@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as memory from '../../fanfable/src/product/memory.ts';
 import { Db } from '../../fanfable/src/core/db.ts';
-import { seedProject, tempDb } from './helpers.ts';
+import { mockProvider, seedProject, tempDb } from './helpers.ts';
 
 test('characters, states and knowledge are stored and retrieved', () => {
   const { db } = tempDb();
@@ -119,6 +119,145 @@ test('a partial relationship update keeps sentiment and source', () => {
   assert.equal(relationship.description, 'share a secret');
   assert.equal(relationship.sentiment, 'warm', 'the unspecified sentiment stays');
   assert.equal(relationship.source, 'au', 'the unspecified source stays');
+  db.close();
+});
+
+test('canon changes are chapter-level: N events × M changes inserts M rows', () => {
+  const { db } = tempDb();
+  const project = seedProject(db, 'canon-changes');
+  const chapterId = Number(db.run(
+    "INSERT INTO chapter (project_id, number, title, status, body, created_at, updated_at) VALUES (?, 1, 'One', 'approved', 'text', '2024-01-01', '2024-01-01')",
+    project.id,
+  ).lastInsertRowid);
+  const event = (title: string): memory.AuEvent => ({
+    id: 0,
+    chapterId: null,
+    chapterNumber: null,
+    title,
+    summary: '',
+    storyTime: '',
+    storyOrder: 0,
+    participants: [],
+    location: '',
+    kind: 'event',
+    adaptsCanonEventId: null,
+    divergenceNote: '',
+  });
+  memory.applyStateExtraction(db, project.id, chapterId, {
+    summary: '',
+    events: [event('One'), event('Two')],
+    characters: [],
+    states: [],
+    knowledge: [],
+    relationships: [],
+    threads: [],
+    facts: [],
+    canonChanges: [
+      { changeType: 'altered', description: 'first change' },
+      { changeType: 'added', description: 'second change' },
+    ],
+  });
+  const rows = db.all<{ description: string; au_event_id: number | null }>(
+    'SELECT description, au_event_id FROM canon_change WHERE project_id = ? ORDER BY id',
+    project.id,
+  );
+  assert.equal(rows.length, 2, 'two changes, not four');
+  assert.deepEqual(rows.map((row) => row.description), ['first change', 'second change']);
+  assert.deepEqual(rows.map((row) => row.au_event_id), [null, null]);
+  db.close();
+});
+
+test('canon changes survive a chapter with zero events', () => {
+  const { db } = tempDb();
+  const project = seedProject(db, 'canon-changes-none');
+  const chapterId = Number(db.run(
+    "INSERT INTO chapter (project_id, number, title, status, body, created_at, updated_at) VALUES (?, 1, 'One', 'approved', 'text', '2024-01-01', '2024-01-01')",
+    project.id,
+  ).lastInsertRowid);
+  memory.applyStateExtraction(db, project.id, chapterId, {
+    summary: '',
+    events: [],
+    characters: [],
+    states: [],
+    knowledge: [],
+    relationships: [],
+    threads: [],
+    facts: [],
+    canonChanges: [
+      { changeType: 'altered', description: 'first change' },
+      { changeType: 'added', description: 'second change' },
+    ],
+  });
+  const rows = db.all<{ au_event_id: number | null }>(
+    'SELECT au_event_id FROM canon_change WHERE project_id = ? ORDER BY id',
+    project.id,
+  );
+  assert.equal(rows.length, 2, 'zero events does not drop the changes');
+  assert.deepEqual(rows.map((row) => row.au_event_id), [null, null]);
+  db.close();
+});
+
+test('knownBy survives extraction and creates the knowledge rows', async () => {
+  const { db } = tempDb();
+  const project = seedProject(db, 'known-by');
+  const llm = mockProvider(() => JSON.stringify({
+    summary: '',
+    events: [],
+    characters: [{ name: 'Serena Marsh' }],
+    states: [],
+    knowledge: [],
+    relationships: [],
+    threads: [],
+    facts: [],
+    canonChanges: [],
+    secrets: [{ title: 'The lantern', statement: 'Serena took the lantern', knownBy: ['Serena Marsh'] }],
+  }));
+  const extraction = await memory.extractState(llm as never, 'chapter text');
+  assert.deepEqual(extraction.secrets?.[0]?.knownBy, ['Serena Marsh']);
+  const chapterId = Number(db.run(
+    "INSERT INTO chapter (project_id, number, title, status, body, created_at, updated_at) VALUES (?, 1, 'One', 'approved', 'text', '2024-01-01', '2024-01-01')",
+    project.id,
+  ).lastInsertRowid);
+  memory.applyStateExtraction(db, project.id, chapterId, extraction);
+  const knowledge = memory.listKnowledge(db, project.id);
+  assert.ok(
+    knowledge.some((row) => row.characterName === 'Serena Marsh' && row.fact === 'Serena took the lantern'),
+    'the knownBy names become knowledge rows',
+  );
+  db.close();
+});
+
+test('only the open relationship is listed', () => {
+  const { db } = tempDb();
+  const project = seedProject(db, 'open-relationships');
+  const a = memory.upsertCharacter(db, project.id, 'Serena');
+  const b = memory.upsertCharacter(db, project.id, 'Ilsa');
+  memory.upsertRelationship(db, project.id, a, b, { kind: 'friend' });
+  memory.upsertRelationship(db, project.id, a, b, { kind: 'estranged' });
+  const listed = memory.listRelationships(db, project.id);
+  assert.equal(listed.length, 1);
+  assert.equal(listed[0].kind, 'estranged');
+  db.close();
+});
+
+test('current states follow chapter order and user overrides win', () => {
+  const { db } = tempDb();
+  const project = seedProject(db, 'current-states');
+  const serena = memory.upsertCharacter(db, project.id, 'Serena');
+  const chapter1 = Number(db.run(
+    "INSERT INTO chapter (project_id, number, title, status, body, created_at, updated_at) VALUES (?, 1, 'One', 'approved', 'text', '2024-01-01', '2024-01-01')",
+    project.id,
+  ).lastInsertRowid);
+  const chapter2 = Number(db.run(
+    "INSERT INTO chapter (project_id, number, title, status, body, created_at, updated_at) VALUES (?, 2, 'Two', 'approved', 'text', '2024-01-01', '2024-01-01')",
+    project.id,
+  ).lastInsertRowid);
+  memory.addCharacterState(db, project.id, serena, { location: 'the far bank', chapterId: chapter2 });
+  memory.addCharacterState(db, project.id, serena, { location: 'the ridge', chapterId: chapter1 });
+  assert.equal(memory.currentStates(db, project.id)[0].location, 'the far bank', 'chapter order wins over row id');
+
+  memory.addCharacterState(db, project.id, serena, { location: 'home', source: 'user', chapterId: chapter1 });
+  assert.equal(memory.currentStates(db, project.id)[0].location, 'home', 'a user override wins');
   db.close();
 });
 

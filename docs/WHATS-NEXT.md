@@ -42,11 +42,13 @@ A claim fails three ways — contradicts canon (error, with quote), contradicts 
 ## 4. Commands
 
 ```bash
-npm run typecheck && npm test          # 609 green at last full run
+npm run typecheck && npm test          # offline suite; run it before citing any number
 
 # judge variants (42 rows) / blind re-read
 node --experimental-strip-types testing/trials/claim-confidence/judge-variants.ts categories
 node --experimental-strip-types testing/trials/claim-confidence/blind-gold.ts out.json
+node testing/trials/claim-confidence/measure-precision.ts sample --db /tmp/opencode/bank-copy.db --out /tmp/opencode/precision --seed 42 --n 120
+node testing/trials/claim-confidence/measure-precision.ts score --dir /tmp/opencode/precision
 
 # extraction: ONE window first, always
 cp testing/trials/model-ab/hp3.db /tmp/opencode/smoke.db
