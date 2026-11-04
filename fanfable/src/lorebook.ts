@@ -6580,7 +6580,7 @@ export function strictRelationKind(kind: string): string {
 }
 
 /** How many narrow quote re-asks one window may spend. */
-export const MAX_RELATION_RETRIES_PER_WINDOW = 5;
+export const MAX_RELATION_RETRIES_PER_WINDOW = 8;
 
 interface RelationEndpoint {
   id: number;
@@ -6609,6 +6609,53 @@ function sentenceFromPassage(passage: string, sentence: string): boolean {
   if (!needle || needle.length < 8) return false;
   if (!normalise(passage).includes(needle)) return false;
   return splitSentences(passage).some((candidate) => normalise(candidate).includes(needle));
+}
+
+/** Jaccard similarity over lowercased word tokens, punctuation stripped. */
+function tokenSimilarity(a: string, b: string): number {
+  const tokens = (text: string): Set<string> =>
+    new Set(normalise(text).split(' ').filter(Boolean));
+  const left = tokens(a);
+  const right = tokens(b);
+  if (!left.size || !right.size) return 0;
+  let intersection = 0;
+  for (const token of left) if (right.has(token)) intersection++;
+  return intersection / (left.size + right.size - intersection);
+}
+
+/**
+ * Find the passage sentence a paraphrased retry meant, deterministically.
+ *
+ * The model often answers with the right sentence in its own words. Cut the
+ * real sentence instead of rejecting: the candidate must name both endpoints
+ * and score at least 0.6 token similarity to the proposal. A tie or a score
+ * below the floor returns null (fail closed).
+ */
+export function locateSentence(
+  passage: string,
+  proposed: string,
+  from: RelationEndpoint,
+  to: RelationEndpoint,
+): string | null {
+  const candidates = splitSentences(passage)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence && quoteNamesBothEntities(from, to, sentence));
+  if (!candidates.length) return null;
+  let best: string | null = null;
+  let bestScore = 0;
+  let tied = false;
+  for (const candidate of candidates) {
+    const score = tokenSimilarity(proposed, candidate);
+    if (score < 0.6) continue;
+    if (score > bestScore + 1e-9) {
+      best = candidate;
+      bestScore = score;
+      tied = false;
+    } else if (Math.abs(score - bestScore) <= 1e-9) {
+      tied = true;
+    }
+  }
+  return best && !tied ? best : null;
 }
 
 async function askRelationSentence(
@@ -6700,23 +6747,32 @@ async function retryRelationQuotes(
     stats.verification.retried++;
     const candidateId = candidateIds[ordinal];
     const sentence = await askRelationSentence(llm, passage, from.name, to.name, String(raw.kind ?? ''));
-    if (
-      sentence &&
+    const verbatim =
+      sentence !== null &&
       sentenceFromPassage(passage, sentence) &&
-      quoteNamesBothEntities(endpoints.from, endpoints.to, sentence)
-    ) {
+      quoteNamesBothEntities(endpoints.from, endpoints.to, sentence);
+    if (verbatim) {
       raw.evidence = sentence;
       stats.verification.retriedFixed++;
       if (candidateId) trace?.retry(candidateId, 'fixed', 'verbatim-both-names', used);
     } else {
-      stats.verification.retriedFailed++;
-      if (candidateId) {
-        const reason: RetryReason = !sentence
-          ? 'no-usable-sentence'
-          : !sentenceFromPassage(passage, sentence)
-            ? 'not-verbatim'
-            : 'missing-endpoint';
-        trace?.retry(candidateId, 'failed', reason, used);
+      // The sentence may exist; the model just paraphrased it. Cut the real
+      // sentence when one names both endpoints and matches the proposal.
+      const located = sentence ? locateSentence(passage, sentence, endpoints.from, endpoints.to) : null;
+      if (located) {
+        raw.evidence = located;
+        stats.verification.retriedFixed++;
+        if (candidateId) trace?.retry(candidateId, 'fixed', 'located-verbatim', used);
+      } else {
+        stats.verification.retriedFailed++;
+        if (candidateId) {
+          const reason: RetryReason = !sentence
+            ? 'no-usable-sentence'
+            : !sentenceFromPassage(passage, sentence)
+              ? 'not-verbatim'
+              : 'missing-endpoint';
+          trace?.retry(candidateId, 'failed', reason, used);
+        }
       }
     }
   }

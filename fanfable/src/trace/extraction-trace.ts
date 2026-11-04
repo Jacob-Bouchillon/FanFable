@@ -134,6 +134,7 @@ export interface ExtractionClaimRefs {
 
 export type RetryReason =
   | 'verbatim-both-names'
+  | 'located-verbatim'
   | 'no-usable-sentence'
   | 'not-verbatim'
   | 'missing-endpoint'
@@ -219,7 +220,7 @@ const ENDPOINT_METHODS = new Set<EndpointResolutionMethod>([
   'short-name', 'short-collision', 'none', 'empty',
 ]);
 const RETRY_REASONS = new Set<RetryReason>([
-  'verbatim-both-names', 'no-usable-sentence', 'not-verbatim', 'missing-endpoint', 'window-cap',
+  'verbatim-both-names', 'located-verbatim', 'no-usable-sentence', 'not-verbatim', 'missing-endpoint', 'window-cap',
 ]);
 const CITATION_REASONS = new Set<CitationReason>([
   'quote-verified', 'quote-repointed', 'quote-not-found', 'quote-not-verbatim',

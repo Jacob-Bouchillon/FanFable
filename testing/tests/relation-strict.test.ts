@@ -161,11 +161,35 @@ test('a failed retry leaves the original quote, which can bank on its own', asyn
   db.close();
 });
 
-test('retries stop at five per window', async () => {
+test('a paraphrased retry answer is located back to the exact sentence', async () => {
   const { db, project } = setup();
   const counter = { retries: 0 };
   const llm = mock(
-    Array.from({ length: 7 }, () => relation('Asha waited by the gate.')),
+    [relation('Asha waited by the gate.')],
+    JSON.stringify({ quote: "Asha is Bram's sister, basically." }),
+    counter,
+  );
+  const stats = await withStrict(() =>
+    lorebook.extractLore(db, llm as never, project.id, { windowSize: 8, concurrency: 1, maxWindows: 1 } as never),
+  );
+  assert.equal(counter.retries, 1);
+  assert.equal(stats.verification.retried, 1);
+  assert.equal(stats.verification.retriedFixed, 1);
+  assert.equal(stats.verification.retriedFailed, 0);
+  const row = db.get<{ evidence: string; review_status: string }>(
+    "SELECT evidence, review_status FROM canon_relation WHERE project_id = ? AND kind = 'sister of'",
+    project.id,
+  )!;
+  assert.equal(row.evidence, "Asha is Bram's sister.", 'the located sentence is byte-exact');
+  assert.equal(row.review_status, 'needs_review');
+  db.close();
+});
+
+test('retries stop at the per-window cap', async () => {
+  const { db, project } = setup();
+  const counter = { retries: 0 };
+  const llm = mock(
+    Array.from({ length: 9 }, () => relation('Asha waited by the gate.')),
     JSON.stringify({ quote: 'NONE' }),
     counter,
   );
@@ -173,8 +197,8 @@ test('retries stop at five per window', async () => {
     lorebook.extractLore(db, llm as never, project.id, { windowSize: 8, concurrency: 1, maxWindows: 1 } as never),
   );
   assert.equal(counter.retries, lorebook.MAX_RELATION_RETRIES_PER_WINDOW);
-  assert.equal(stats.verification.retried, 5);
-  assert.equal(stats.verification.retriedFailed, 5);
+  assert.equal(stats.verification.retried, lorebook.MAX_RELATION_RETRIES_PER_WINDOW);
+  assert.equal(stats.verification.retriedFailed, lorebook.MAX_RELATION_RETRIES_PER_WINDOW);
   db.close();
 });
 
