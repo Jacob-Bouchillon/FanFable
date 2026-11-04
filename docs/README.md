@@ -15,5 +15,6 @@
 | `RESEARCH.md` | the complete research record: methods, measurements, intake, judgments |
 | `BENCHMARK.md` | the locked 20-pair probe that grades future extractors — read before changing extraction |
 | `REQUIREMENTS.md` | what FanFable needs to run |
+| `REPORT-2026-11-03-staged-extraction-recovery.md` | staging-only recovery implementation, verification, and remaining safety limits |
 
 **Specs vs reports, explained once:** the old folders are gone. A *design* section is a contract for code; a *measurement* next to it is the dated evidence for why. Measurements are never rewritten — a new number gets a dated note. Deleted drafts and session logs live on in git history, not in folders.
