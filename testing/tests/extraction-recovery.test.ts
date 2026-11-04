@@ -8,7 +8,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -105,6 +105,29 @@ function finishProvider(
     return reason === undefined ? response : { ...response, finishReason: reason };
   };
   return llm;
+}
+
+function gatedProvider(handler: Handler) {
+  const llm = mockProvider(handler);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let started!: () => void;
+  const startedPromise = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  let calls = 0;
+  const baseChat = llm.chat.bind(llm);
+  llm.chat = async (req) => {
+    calls++;
+    if (calls === 1) {
+      started();
+      await gate;
+    }
+    return { ...(await baseChat(req)), finishReason: 'stop' as const };
+  };
+  return { llm, started: startedPromise, release, calls: () => calls };
 }
 
 function tinyPolicy(overrides: Record<string, unknown> = {}) {
@@ -1931,6 +1954,68 @@ test('staging-only writes no canon, mined flags, provenance, notes or embeddings
   );
   assert.ok(
     (db.get<{ n: number }>('SELECT COUNT(*) AS n FROM extraction_staged_batch WHERE complete = 1')?.n ?? 0) >= 3,
+  );
+  db.close();
+});
+
+test('stage-only later-window relation prompt carries verified aliases from earlier staged entities', async () => {
+  const { db } = tempDb();
+  const now = new Date().toISOString();
+  const projectId = db.run(
+    `INSERT INTO project (name, created_at, updated_at) VALUES ('recovery-staged-alias-roster', ?, ?)`,
+    now,
+    now,
+  ).lastInsertRowid;
+  const chunkIds = addSourceChunks(db, projectId, 2);
+  db.run('UPDATE canon_chunk SET text = ? WHERE id = ?',
+    'Etta Vale is called Fox by the crew.', chunkIds[0]);
+  db.run('UPDATE canon_chunk SET text = ? WHERE id = ?',
+    'Niko Renn trusts Fox with the route.', chunkIds[1]);
+
+  const etta = {
+    kind: 'character', name: 'Etta Vale', aliases: ['Fox'], summary: 'A scout.',
+    attributes: {}, role: 'scout', status: '', chunk_index: 0,
+    evidence: 'Etta Vale is called Fox by the crew.',
+  };
+  const niko = {
+    kind: 'character', name: 'Niko Renn', aliases: [], summary: 'A route-truster.',
+    attributes: {}, role: '', status: '', chunk_index: 0,
+    evidence: 'Niko Renn trusts Fox with the route.',
+  };
+  const relation = {
+    from: 'Niko Renn', to: 'Fox', kind: 'trusted', description: 'trusts with the route',
+    chunk_index: 0, evidence: 'Niko Renn trusts Fox with the route.',
+  };
+  let laterRelationPrompt = '';
+  const llm = finishProvider((req) => {
+    const system = req.system ?? '';
+    const user = req.messages.map((message) => message.content).join('\n');
+    if (system.includes('KNOWN ENTITIES')) {
+      if (user.includes('Niko Renn')) laterRelationPrompt = system;
+      return JSON.stringify({ relations: user.includes('Niko Renn') ? [relation] : [] });
+    }
+    if (system.includes('"timeline"')) return JSON.stringify({ timeline: [] });
+    if (user.includes('Niko Renn')) return JSON.stringify({ entities: [niko], facts: [] });
+    return JSON.stringify({ entities: [etta], facts: [] });
+  }, 'stop');
+
+  const result = await lorebook.extractLore(db, llm, projectId, {
+    windowSize: 1,
+    concurrency: 1,
+    recovery: recovery({ stageOnly: true }),
+  });
+
+  assert.equal(result.recovery?.completeChildren, 2, 'both synthetic windows should finish their stages');
+  assert.match(laterRelationPrompt, /Etta Vale \(also known as: Fox\)/);
+  assert.match(laterRelationPrompt, /alternate names for the entity on that line, not separate entities/);
+  assert.match(laterRelationPrompt, /use the listed canonical entity name/);
+  assert.equal(count(db, 'canon_entity', projectId), 0, 'stage-only must not write canon entities');
+  assert.equal(count(db, 'canon_relation', projectId), 0, 'stage-only must not write canon relations');
+  assert.equal(minedCount(db, projectId), 0, 'stage-only must not mark chunks mined');
+  assert.equal(
+    db.get<{ n: number }>("SELECT COUNT(*) AS n FROM extraction_contribution WHERE claim_type = 'relation' AND disposition = 'staged'")?.n,
+    1,
+    'the later-window alias relation should be retained in staging',
   );
   db.close();
 });
@@ -4584,8 +4669,8 @@ test('lazy budget skips complete and deferred hits before selecting later eligib
   db.close();
 });
 
-test('a concurrent sibling generation is refreshed before the final stale audit', async () => {
-  const { db } = tempDb();
+test('a sibling connection generation is refreshed before the final stale audit', async () => {
+  const { db, path } = tempDb();
   const now = new Date().toISOString();
   const projectId = db.run(
     `INSERT INTO project (name, created_at, updated_at) VALUES ('recovery-concurrent-sibling', ?, ?)`,
@@ -4652,7 +4737,12 @@ test('a concurrent sibling generation is refreshed before the final stale audit'
   };
   const aPromise = lorebook.ensureWindowsForChunks(db, a, projectId, [ids[0]!], opts);
   await started;
-  const bResult = await lorebook.ensureWindowsForChunks(db, b, projectId, [ids[1]!], opts);
+  // The guard is per Db instance, so a second connection can create the
+  // compatible sibling this final-audit regression needs. Separate processes
+  // have the same unguarded gap and remain an operational constraint.
+  const siblingDb = new Db(path);
+  const bResult = await lorebook.ensureWindowsForChunks(siblingDb, b, projectId, [ids[1]!], opts);
+  siblingDb.close();
   assert.equal(bResult.recovery?.status, 'complete');
   releaseA();
   const aResult = await aPromise;
@@ -4665,6 +4755,643 @@ test('a concurrent sibling generation is refreshed before the final stale audit'
   assert.equal(count(db, 'canon_entity', projectId), 0);
   assert.equal(minedCount(db, projectId), 0);
   db.close();
+});
+
+test('stage-only extraction rejects an overlapping same-project request before its provider runs', async () => {
+  const { db } = tempDb();
+  const project = seedProject(db, 'guard-same-project');
+  const slow = gatedProvider(splitHandler());
+  let rejectedCalls = 0;
+  const secondHandler = splitHandler();
+  const second = finishProvider((req) => {
+    rejectedCalls++;
+    return secondHandler(req);
+  }, 'stop');
+  const opts = {
+    windowSize: 8,
+    concurrency: 1,
+    recovery: recovery({ stageOnly: true }),
+  };
+  const first = lorebook.extractLore(db, slow.llm, project.id, opts);
+  await slow.started;
+  const parentsBefore = db.get<{ n: number }>(
+    'SELECT COUNT(*) AS n FROM extraction_recovery_parent WHERE project_id = ?',
+    project.id,
+  )?.n ?? 0;
+  await assert.rejects(
+    lorebook.extractLore(db, second, project.id, opts),
+    (err: unknown) =>
+      err instanceof lorebook.StageOnlyExtractionBusyError &&
+      err.code === 'stage-only-busy' &&
+      err.message.includes('already running for project'),
+  );
+  assert.equal(slow.calls(), 1, 'the held request made the only provider call');
+  assert.equal(rejectedCalls, 0, 'the rejected request never reaches its provider');
+  assert.equal(
+    db.get<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM extraction_recovery_parent WHERE project_id = ?',
+      project.id,
+    )?.n,
+    parentsBefore,
+    'the rejected request creates no recovery parent',
+  );
+  slow.release();
+  const result = await first;
+  assert.equal(result.recovery?.status, 'complete');
+  assert.equal(count(db, 'canon_entity', project.id), 0);
+  assert.equal(minedCount(db, project.id), 0);
+  assert.ok(
+    (db.get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM extraction_contribution WHERE claim_type = 'entity' AND disposition = 'staged'",
+    )?.n ?? 0) > 0,
+    'only staged contributions are written',
+  );
+  db.close();
+});
+
+test('stage-only extraction lets a different project proceed while one is running', async () => {
+  const { db } = tempDb();
+  const firstProject = seedProject(db, 'guard-project-a');
+  const secondProject = seedProject(db, 'guard-project-b');
+  const slow = gatedProvider(splitHandler());
+  const opts = {
+    windowSize: 8,
+    concurrency: 1,
+    recovery: recovery({ stageOnly: true }),
+  };
+  const first = lorebook.extractLore(db, slow.llm, firstProject.id, opts);
+  await slow.started;
+  let secondCalls = 0;
+  const secondHandler = splitHandler();
+  const second = finishProvider((req) => {
+    secondCalls++;
+    return secondHandler(req);
+  }, 'stop');
+  const secondResult = await lorebook.extractLore(db, second, secondProject.id, opts);
+  assert.equal(secondResult.recovery?.status, 'complete');
+  assert.ok(secondCalls > 0, 'the other project still calls its provider');
+  slow.release();
+  const firstResult = await first;
+  assert.equal(firstResult.recovery?.status, 'complete');
+  assert.equal(count(db, 'canon_entity', firstProject.id), 0);
+  assert.equal(count(db, 'canon_entity', secondProject.id), 0);
+  assert.equal(minedCount(db, firstProject.id), 0);
+  assert.equal(minedCount(db, secondProject.id), 0);
+  db.close();
+});
+
+test('a failed stage-only run releases the guard for an explicit retry', async () => {
+  const { db } = tempDb();
+  const project = seedProject(db, 'guard-retry');
+  const missing = finishProvider(
+    splitHandler({ entitiesFacts: JSON.stringify({ entities: [SERENA] }) }),
+    'stop',
+  );
+  const first = await lorebook.extractLore(db, missing, project.id, {
+    windowSize: 8,
+    concurrency: 1,
+    recovery: recovery({ stageOnly: true }),
+  });
+  assert.equal(first.recovery?.status, 'deferred');
+  const good = finishProvider(splitHandler(), 'stop');
+  const second = await lorebook.extractLore(db, good, project.id, {
+    windowSize: 8,
+    concurrency: 1,
+    recovery: recovery({ stageOnly: true, explicitRetry: true }),
+  });
+  assert.equal(second.recovery?.status, 'complete');
+  assert.equal(count(db, 'canon_entity', project.id), 0);
+  assert.equal(minedCount(db, project.id), 0);
+  db.close();
+});
+
+test('the stage-only guard covers direct lazy extraction and releases after completion', async () => {
+  const { db } = tempDb();
+  const project = seedProject(db, 'guard-lazy');
+  const ids = projectChunks(db, project.id);
+  assert.ok(ids.length >= 2);
+  const slow = gatedProvider(splitHandler());
+  const opts = {
+    windowSize: 1,
+    maxLazyWindows: 1,
+    recovery: recovery({ stageOnly: true }),
+  };
+  const first = lorebook.ensureWindowsForChunks(db, slow.llm, project.id, [ids[0]!], opts);
+  await slow.started;
+  let rejectedCalls = 0;
+  const secondHandler = splitHandler();
+  const second = finishProvider((req) => {
+    rejectedCalls++;
+    return secondHandler(req);
+  }, 'stop');
+  await assert.rejects(
+    lorebook.ensureWindowsForChunks(db, second, project.id, [ids[1]!], opts),
+    /already running for project/,
+  );
+  assert.equal(rejectedCalls, 0);
+  assert.equal(slow.calls(), 1);
+  slow.release();
+  const firstResult = await first;
+  assert.equal(firstResult.recovery?.status, 'complete');
+  let laterCalls = 0;
+  const laterHandler = splitHandler();
+  const later = finishProvider((req) => {
+    laterCalls++;
+    return laterHandler(req);
+  }, 'stop');
+  const laterResult = await lorebook.ensureWindowsForChunks(db, later, project.id, [ids[1]!], opts);
+  assert.equal(laterResult.recovery?.status, 'complete');
+  assert.ok(laterCalls > 0, 'the guard is released after the first lazy run');
+  assert.equal(count(db, 'canon_entity', project.id), 0);
+  assert.equal(minedCount(db, project.id), 0);
+  db.close();
+});
+
+test('CLI reports an incomplete stage-only run without canon writes', () => {
+  const { db, path } = tempDb();
+  const now = new Date().toISOString();
+  const projectName = 'guard-cli-incomplete';
+  const projectId = db.run(
+    `INSERT INTO project (name, created_at, updated_at, settings) VALUES (?, ?, ?, ?)`,
+    projectName,
+    now,
+    now,
+    JSON.stringify({ provider: 'mock' }),
+  ).lastInsertRowid;
+  addSourceChunks(db, projectId, 1, 'Serena Marsh watched it from the ridge.');
+  db.close();
+  const cli = resolve(import.meta.dirname, '../../fanfable/src/cli.ts');
+  const out = spawnSync(
+    process.execPath,
+    ['--no-warnings', cli, '--db', path, '--project', projectName, 'lore', 'extract'],
+    { encoding: 'utf8', timeout: 60000 },
+  );
+  assert.equal(out.status, 0, out.stderr);
+  assert.match(out.stdout, /staging incomplete \(not canon\)/);
+  assert.doesNotMatch(out.stdout, /staged only \(not canon\)/);
+  assert.doesNotMatch(out.stdout, /extracted \d+ entities/);
+  const reopened = new Db(path);
+  assert.equal(
+    reopened.get<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM extraction_recovery_parent WHERE project_id = ?',
+      projectId,
+    )?.n,
+    1,
+  );
+  for (const table of ['canon_entity', 'canon_fact', 'canon_relation', 'canon_timeline', 'extraction_run']) {
+    assert.equal(
+      reopened.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM ${table} WHERE project_id = ?`,
+        projectId,
+      )?.n,
+      0,
+      `${table} is untouched by the incomplete staging run`,
+    );
+  }
+  assert.equal(minedCount(reopened, projectId), 0);
+  reopened.close();
+});
+
+test('a throwing progress callback releases the stage-only guard', async () => {
+  const { db } = tempDb();
+  const now = new Date().toISOString();
+  const projectId = db.run(
+    `INSERT INTO project (name, created_at, updated_at) VALUES ('guard-progress-throw', ?, ?)`,
+    now,
+    now,
+  ).lastInsertRowid;
+  let providerCalls = 0;
+  const llm = mockProvider(() => {
+    providerCalls++;
+    return JSON.stringify({ entities: [], facts: [] });
+  });
+  let threw = false;
+  await assert.rejects(
+    lorebook.extractLore(db, llm, projectId, {
+      recovery: recovery({ stageOnly: true }),
+      onProgress: () => {
+        if (threw) return;
+        threw = true;
+        throw new Error('synthetic progress callback failure');
+      },
+    }),
+    /synthetic progress callback failure/,
+  );
+  assert.equal(threw, true);
+  assert.equal(providerCalls, 0, 'an empty source never reaches the provider');
+  const second = await lorebook.extractLore(db, llm, projectId, {
+    recovery: recovery({ stageOnly: true }),
+  });
+  assert.equal(second.emptySource, true);
+  assert.equal(second.stageOnly, true);
+  assert.equal(second.windows, 0);
+  assert.equal(providerCalls, 0, 'the retry also stays on the empty-source path');
+  assert.equal(count(db, 'canon_entity', projectId), 0);
+  assert.equal(count(db, 'extraction_recovery_parent', projectId), 0);
+  assert.equal(
+    db.get<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM extraction_run WHERE project_id = ?',
+      projectId,
+    )?.n,
+    0,
+  );
+  assert.equal(minedCount(db, projectId), 0);
+  db.close();
+});
+
+test('mixed stage-only entry points share the same Db/project guard', async () => {
+  const { db } = tempDb();
+  const project = seedProject(db, 'guard-mixed-entry');
+  const ids = projectChunks(db, project.id);
+  assert.ok(ids.length > 0);
+  const firstProvider = gatedProvider(splitHandler());
+  const first = lorebook.extractLore(db, firstProvider.llm, project.id, {
+    windowSize: 8,
+    concurrency: 1,
+    recovery: recovery({ stageOnly: true }),
+  });
+  await firstProvider.started;
+  let lazyCalls = 0;
+  const lazyHandler = splitHandler();
+  const lazy = finishProvider((req) => {
+    lazyCalls++;
+    return lazyHandler(req);
+  }, 'stop');
+  await assert.rejects(
+    lorebook.ensureWindowsForChunks(db, lazy, project.id, [ids[0]!], {
+      windowSize: 1,
+      maxLazyWindows: 1,
+      recovery: recovery({ stageOnly: true }),
+    }),
+    /already running for project/,
+  );
+  assert.equal(lazyCalls, 0, 'the mixed-entry call never reaches its provider');
+  firstProvider.release();
+  const firstResult = await first;
+  assert.equal(firstResult.recovery?.status, 'complete');
+  assert.equal(count(db, 'canon_entity', project.id), 0);
+  assert.equal(minedCount(db, project.id), 0);
+  db.close();
+});
+
+test('fragment evidence offsets use UTF-16 indices after a supplementary-plane character', async () => {
+  const { db } = tempDb();
+  const now = new Date().toISOString();
+  const projectId = db.run(
+    `INSERT INTO project (name, created_at, updated_at) VALUES ('recovery-fragment-utf16-offsets', ?, ?)`,
+    now,
+    now,
+  ).lastInsertRowid;
+  const evidence = 'the brass compass pointed north';
+  const text = `${'a'.repeat(1400)}😀${'b'.repeat(20)} ${evidence} ${'c'.repeat(300)}`;
+  addSourceChunks(db, projectId, 1, text);
+  const witness = {
+    kind: 'character',
+    name: 'Compass Witness',
+    aliases: [],
+    summary: '',
+    attributes: {},
+    role: '',
+    status: '',
+    chunk_index: 0,
+    evidence,
+  };
+  const llm = finishProvider((req) => {
+    const system = req.system ?? '';
+    if (system.includes('KNOWN ENTITIES')) return JSON.stringify({ relations: [] });
+    if (system.includes('"timeline"')) return JSON.stringify({ timeline: [] });
+    const body = passageBody(req.messages[0]?.content ?? '');
+    return JSON.stringify({
+      entities: body.includes(evidence) ? [witness] : [],
+      facts: [],
+    });
+  }, 'stop');
+
+  const stats = await lorebook.extractLore(db, llm, projectId, {
+    windowSize: 8,
+    concurrency: 1,
+    recovery: recovery({ stageOnly: true }),
+  });
+  assert.equal(stats.fragmentCoverage?.plannedFragments, 2);
+  assert.equal(stats.fragmentCoverage?.completeFragments, 2);
+  const expectedStart = text.indexOf(evidence);
+  const expectedEnd = expectedStart + evidence.length;
+  assert.ok(expectedStart > 1400, 'evidence is in the second fragment');
+  assert.equal(text.slice(expectedStart, expectedEnd), evidence);
+
+  const entities = db
+    .all<{ payload_json: string }>(
+      "SELECT payload_json FROM extraction_staged_batch WHERE stage = 'entities-facts' ORDER BY id",
+    )
+    .flatMap((row) => {
+      const payload = JSON.parse(row.payload_json) as {
+        entities?: Array<Record<string, unknown>>;
+      };
+      return payload.entities ?? [];
+    })
+    .filter((entity) => entity.name === 'Compass Witness');
+  assert.equal(entities.length, 1, 'the evidence appears in exactly one fragment batch');
+  const staged = entities[0]!;
+  assert.equal(
+    staged.chunk_start,
+    expectedStart,
+    'chunk_start is the canonical UTF-16 index',
+  );
+  assert.equal(
+    staged.chunk_end,
+    expectedEnd,
+    'chunk_end is the canonical UTF-16 index',
+  );
+  assert.equal(
+    text.slice(Number(staged.chunk_start), Number(staged.chunk_end)),
+    evidence,
+    'the persisted half-open range slices to the evidence',
+  );
+  assert.equal(count(db, 'canon_entity', projectId), 0);
+  assert.equal(minedCount(db, projectId), 0);
+  db.close();
+});
+
+test('a subprocess crash resumes the same stage-only recovery child', () => {
+  const { db, path } = tempDb();
+  const now = new Date().toISOString();
+  const projectId = db.run(
+    `INSERT INTO project (name, created_at, updated_at) VALUES ('recovery-subprocess', ?, ?)`,
+    now,
+    now,
+  ).lastInsertRowid;
+  const passage =
+    'Serena Marsh watched it from the ridge. The rain had not stopped for three days.';
+  const [chunkId] = addSourceChunks(db, projectId, 1, passage);
+  assert.ok(chunkId !== undefined);
+  db.close();
+
+  const scriptDir = mkdtempSync(join(tmpdir(), 'fanfable-recovery-child-'));
+  const childPath = join(scriptDir, 'child.mjs');
+  const dbModule = resolve(import.meta.dirname, '../../fanfable/src/core/db.ts');
+  const lorebookModule = resolve(import.meta.dirname, '../../fanfable/src/lorebook.ts');
+  const llmModule = resolve(import.meta.dirname, '../../fanfable/src/core/llm.ts');
+  const childScript = `
+import { writeSync } from 'node:fs';
+const { Db } = await import(${JSON.stringify(dbModule)});
+const lorebook = await import(${JSON.stringify(lorebookModule)});
+const { MockProvider } = await import(${JSON.stringify(llmModule)});
+const [dbPath, projectArg, mode] = process.argv.slice(2);
+const projectId = Number(projectArg);
+const entity = ${JSON.stringify(SERENA)};
+const fact = ${JSON.stringify(FACT)};
+const db = new Db(dbPath);
+const provider = new MockProvider({ provider: 'mock', model: 'subprocess-recovery' });
+const marker = (stage) => writeSync(1, 'CALL ' + stage + '\\n');
+provider.chat = async (req) => {
+  const system = req.system ?? '';
+  if (system.includes('KNOWN ENTITIES')) {
+    marker('relations');
+    if (mode === 'crash') process.exit(73);
+    return {
+      text: JSON.stringify({ relations: [] }),
+      model: provider.settings.model,
+      provider: 'mock',
+      durationMs: 0,
+      finishReason: 'stop',
+    };
+  }
+  if (system.includes('"timeline"')) {
+    marker('timeline');
+    return {
+      text: JSON.stringify({ timeline: [] }),
+      model: provider.settings.model,
+      provider: 'mock',
+      durationMs: 0,
+      finishReason: 'stop',
+    };
+  }
+  marker('entities-facts');
+  return {
+    text: JSON.stringify({ entities: [entity], facts: [fact] }),
+    model: provider.settings.model,
+    provider: 'mock',
+    durationMs: 0,
+    finishReason: 'stop',
+  };
+};
+try {
+  const stats = await lorebook.extractLore(db, provider, projectId, {
+    windowSize: 8,
+    concurrency: 1,
+    recovery: {
+      stageOnly: true,
+      policy: { leaseMs: 60000, heartbeatMs: 60000, backoffMs: [1] },
+    },
+  });
+  writeSync(1, 'STATUS ' + (stats.recovery?.status ?? 'none') + '\\n');
+} finally {
+  db.close();
+}
+`;
+  writeFileSync(childPath, childScript, 'utf8');
+  const runChild = (mode: 'crash' | 'resume') =>
+    spawnSync(
+      process.execPath,
+      ['--no-warnings', childPath, path, String(projectId), mode],
+      { encoding: 'utf8', timeout: 60000 },
+    );
+
+  const crashed = runChild('crash');
+  assert.equal(crashed.status, 73, crashed.stderr || crashed.stdout);
+  assert.match(crashed.stdout, /CALL entities-facts/);
+  assert.doesNotMatch(crashed.stdout, /CALL timeline/);
+
+  const afterCrash = new Db(path);
+  const crashedChild = afterCrash.get<{
+    id: number;
+    parent_id: number;
+    work_key: string;
+    status: string;
+  }>(
+    'SELECT id, parent_id, work_key, status FROM extraction_recovery_child WHERE project_id = ? ORDER BY id LIMIT 1',
+    projectId,
+  )!;
+  assert.equal(crashedChild.status, 'running');
+  const parent = afterCrash.get<{ status: string; readiness: string }>(
+    'SELECT status, readiness FROM extraction_recovery_parent WHERE id = ?',
+    crashedChild.parent_id,
+  )!;
+  assert.equal(parent.readiness, 'staged_only');
+  assert.equal(
+    afterCrash.get<{ status: string }>(
+      "SELECT status FROM extraction_stage_coverage WHERE child_id = ? AND stage = 'entities-facts' ORDER BY id DESC LIMIT 1",
+      crashedChild.id,
+    )?.status,
+    'complete',
+  );
+  assert.equal(
+    afterCrash.get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM extraction_stage_coverage WHERE child_id = ? AND stage = 'relations'",
+      crashedChild.id,
+    )?.n,
+    0,
+    'the crash happens before relation coverage',
+  );
+  assert.equal(
+    afterCrash.get<{ status: string }>(
+      "SELECT status FROM extraction_attempt WHERE child_id = ? AND stage = 'relations' ORDER BY id DESC LIMIT 1",
+      crashedChild.id,
+    )?.status,
+    'running',
+  );
+  const contributionsBefore = afterCrash.all<{
+    contribution_uid: string;
+    payload_sha256: string;
+    disposition: string;
+    claim_type: string;
+  }>(
+    `SELECT contribution_uid, payload_sha256, disposition, claim_type
+       FROM extraction_contribution
+      WHERE project_id = ?
+      ORDER BY contribution_uid`,
+    projectId,
+  );
+  assert.equal(contributionsBefore.length, 2, 'the entity and fact are staged once');
+  assert.ok(contributionsBefore.every((row) => row.disposition === 'staged'));
+  assert.ok(contributionsBefore.every((row) => row.contribution_uid.startsWith('staged:')));
+  const stagedBatchBefore = afterCrash.get<{ payload_json: string }>(
+    `SELECT payload_json
+       FROM extraction_staged_batch
+      WHERE child_id = ? AND stage = 'entities-facts'
+      ORDER BY id DESC LIMIT 1`,
+    crashedChild.id,
+  )!;
+  assert.match(stagedBatchBefore.payload_json, /Serena Marsh/);
+  assert.match(stagedBatchBefore.payload_json, /rain/);
+  for (const table of ['canon_entity', 'canon_fact', 'canon_relation', 'canon_timeline', 'extraction_run']) {
+    assert.equal(
+      afterCrash.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM ${table} WHERE project_id = ?`,
+        projectId,
+      )?.n,
+      0,
+      `${table} is untouched after the crash`,
+    );
+  }
+  assert.equal(
+    afterCrash.get<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM canon_chunk WHERE project_id = ? AND lore_mined = 1',
+      projectId,
+    )?.n,
+    0,
+  );
+  assert.ok(
+    (afterCrash.get<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM extraction_chunk_lease WHERE child_id = ?',
+      crashedChild.id,
+    )?.n ?? 0) > 0,
+    'the crashed child left a lease to expire',
+  );
+  const past = new Date(Date.now() - 60_000).toISOString();
+  afterCrash.run(
+    'UPDATE extraction_chunk_lease SET lease_until = ? WHERE child_id = ?',
+    past,
+    crashedChild.id,
+  );
+  afterCrash.run(
+    "UPDATE extraction_attempt SET lease_until = ? WHERE child_id = ? AND status = 'running'",
+    past,
+    crashedChild.id,
+  );
+  afterCrash.close();
+
+  const resumed = runChild('resume');
+  assert.equal(resumed.status, 0, resumed.stderr || resumed.stdout);
+  assert.match(resumed.stdout, /CALL relations/);
+  assert.match(resumed.stdout, /CALL timeline/);
+  assert.doesNotMatch(resumed.stdout, /CALL entities-facts/);
+  assert.match(resumed.stdout, /STATUS complete/);
+
+  const afterResume = new Db(path);
+  const resumedChild = afterResume.get<{
+    id: number;
+    work_key: string;
+    status: string;
+  }>(
+    'SELECT id, work_key, status FROM extraction_recovery_child WHERE project_id = ? ORDER BY id LIMIT 1',
+    projectId,
+  )!;
+  assert.equal(resumedChild.id, crashedChild.id, 'the same recovery child resumes');
+  assert.equal(resumedChild.work_key, crashedChild.work_key, 'the same work identity resumes');
+  assert.equal(resumedChild.status, 'complete');
+  const contributionsAfter = afterResume.all<{
+    contribution_uid: string;
+    payload_sha256: string;
+    disposition: string;
+    claim_type: string;
+  }>(
+    `SELECT contribution_uid, payload_sha256, disposition, claim_type
+       FROM extraction_contribution
+      WHERE project_id = ?
+      ORDER BY contribution_uid`,
+    projectId,
+  );
+  assert.deepEqual(contributionsAfter, contributionsBefore, 'no staged contribution is duplicated');
+  const stagedBatchAfter = afterResume.get<{ payload_json: string }>(
+    `SELECT payload_json
+       FROM extraction_staged_batch
+      WHERE child_id = ? AND stage = 'entities-facts'
+      ORDER BY id DESC LIMIT 1`,
+    crashedChild.id,
+  )!;
+  assert.equal(stagedBatchAfter.payload_json, stagedBatchBefore.payload_json);
+  assert.equal(
+    afterResume.get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM extraction_staged_batch WHERE child_id = ? AND stage = 'entities-facts'",
+      crashedChild.id,
+    )?.n,
+    1,
+    'the committed entities-facts batch is reused, not re-sealed',
+  );
+  assert.equal(
+    afterResume.get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM extraction_attempt WHERE child_id = ? AND stage = 'entities-facts'",
+      crashedChild.id,
+    )?.n,
+    1,
+    'the resumed child never re-calls entities-facts',
+  );
+  const latestParent = afterResume.get<{ status: string; readiness: string }>(
+    'SELECT status, readiness FROM extraction_recovery_parent WHERE project_id = ? ORDER BY id DESC LIMIT 1',
+    projectId,
+  )!;
+  assert.equal(latestParent.status, 'complete');
+  assert.equal(latestParent.readiness, 'staged_only');
+  const coverage = new Map(
+    afterResume
+      .all<{ stage: string; status: string }>(
+        'SELECT stage, status FROM extraction_stage_coverage WHERE child_id = ?',
+        crashedChild.id,
+      )
+      .map((row) => [row.stage, row.status]),
+  );
+  assert.equal(coverage.get('entities-facts'), 'complete');
+  assert.equal(coverage.get('relations'), 'empty');
+  assert.equal(coverage.get('timeline'), 'empty');
+  for (const table of ['canon_entity', 'canon_fact', 'canon_relation', 'canon_timeline', 'extraction_run']) {
+    assert.equal(
+      afterResume.get<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM ${table} WHERE project_id = ?`,
+        projectId,
+      )?.n,
+      0,
+      `${table} is untouched after the resumed run`,
+    );
+  }
+  assert.equal(
+    afterResume.get<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM canon_chunk WHERE project_id = ? AND lore_mined = 1',
+      projectId,
+    )?.n,
+    0,
+  );
+  afterResume.close();
 });
 
 test('the default policy is the approved bounded three-attempt policy', () => {

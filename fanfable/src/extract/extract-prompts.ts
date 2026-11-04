@@ -173,6 +173,26 @@ Rules:
  * exactly as banked, one per line. The caller's only naming rule is never
  * to add, widen, or guess a name that is not on this list.
  */
-export function formatKnownEntities(names: string[]): string {
-  return `KNOWN ENTITIES:\n${names.map((n) => `- ${n}`).join('\n')}`;
+export function formatKnownEntities(
+  names: string[],
+  entities: Array<{ name: string; aliases?: string[] | string }> = [],
+): string {
+  const aliasesByName = new Map<string, string[]>();
+  for (const entity of entities) {
+    let aliases: string[] = [];
+    if (Array.isArray(entity.aliases)) aliases = entity.aliases;
+    else if (typeof entity.aliases === 'string') {
+      try {
+        const parsed: unknown = JSON.parse(entity.aliases);
+        if (Array.isArray(parsed)) aliases = parsed.map(String);
+      } catch {
+        aliases = [];
+      }
+    }
+    aliasesByName.set(entity.name.trim().toLocaleLowerCase(), aliases.map((alias) => alias.trim()).filter(Boolean));
+  }
+  return `KNOWN ENTITIES:\nParenthetical aliases are alternate names for the entity on that line, not separate entities or relationship endpoints. Use them to resolve mentions; when writing a relationship endpoint, use the listed canonical entity name.\n${names.map((name) => {
+    const aliases = aliasesByName.get(name.trim().toLocaleLowerCase()) ?? [];
+    return `- ${name}${aliases.length ? ` (also known as: ${aliases.join(', ')})` : ''}`;
+  }).join('\n')}`;
 }

@@ -53,6 +53,8 @@ interface Job {
   message: string;
   result?: unknown;
   error?: string;
+  /** Fixed public text for a known-safe rejection; raw errors stay server-side. */
+  publicError?: string;
   startedAt: number;
   finishedAt?: number;
 }
@@ -90,7 +92,10 @@ function startJob(
     } catch (err) {
       job.status = 'error';
       job.error = err instanceof Error ? err.message : String(err);
-      job.message = job.error;
+      if (err instanceof lorebook.StageOnlyExtractionBusyError) {
+        job.publicError = lorebook.StageOnlyExtractionBusyError.publicMessage;
+      }
+      job.message = job.publicError ?? job.error;
     } finally {
       job.finishedAt = Date.now();
     }
@@ -133,12 +138,13 @@ function publicJobResult(value: unknown): unknown {
 
 function publicJobView(job: Job): Record<string, unknown> {
   const result = job.result === undefined ? undefined : publicJobResult(job.result);
+  const publicError = job.status === 'error' ? job.publicError ?? 'job failed' : undefined;
   return {
     id: job.id,
     name: job.name,
     status: job.status,
-    message: job.status === 'error' ? 'job failed' : job.message,
-    ...(job.status === 'error' ? { error: 'job failed' } : {}),
+    message: publicError ?? job.message,
+    ...(publicError === undefined ? {} : { error: publicError }),
     ...(result === undefined ? {} : { result }),
     startedAt: job.startedAt,
     ...(job.finishedAt === undefined ? {} : { finishedAt: job.finishedAt }),

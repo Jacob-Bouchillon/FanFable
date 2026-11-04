@@ -24,5 +24,12 @@ test('prompt bytes are locked', () => {
   assert.equal(sha(prompts.EXTRACT_RELATIONS_SYSTEM), '2644f3de376bdc0420bae2f8d79fbbddf5251e2397bc927ad3b4edf2e0e896aa');
   assert.equal(sha(prompts.EXTRACT_EVENTS_SYSTEM), 'a37a771dcddac1611c12faa69e7b99b0c87c93a8554cf8f3c79bf23a2c272705');
   assert.equal(sha(prompts.ASSESSMENT_QUESTIONS), '1606c19e2b58a81c0a0d70bb91b4989cccd490e08e432136f80d70b5abb465f5');
-  assert.equal(prompts.formatKnownEntities(['Asha', 'Bram']), 'KNOWN ENTITIES:\n- Asha\n- Bram');
+  assert.equal(
+    prompts.formatKnownEntities(['Asha', 'Bram']),
+    'KNOWN ENTITIES:\nParenthetical aliases are alternate names for the entity on that line, not separate entities or relationship endpoints. Use them to resolve mentions; when writing a relationship endpoint, use the listed canonical entity name.\n- Asha\n- Bram',
+  );
+  assert.equal(
+    prompts.formatKnownEntities(['Etta Vale'], [{ name: 'Etta Vale', aliases: ['Fox'] }]),
+    'KNOWN ENTITIES:\nParenthetical aliases are alternate names for the entity on that line, not separate entities or relationship endpoints. Use them to resolve mentions; when writing a relationship endpoint, use the listed canonical entity name.\n- Etta Vale (also known as: Fox)',
+  );
 });

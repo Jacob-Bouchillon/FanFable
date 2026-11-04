@@ -7,7 +7,8 @@ import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import { startServer } from '../../fanfable/src/product/server.ts';
 import * as controller from '../../fanfable/src/plan/controller.ts';
-import { seedProject, tempDb } from './helpers.ts';
+import * as lorebook from '../../fanfable/src/lorebook.ts';
+import { mockProvider, seedProject, tempDb } from './helpers.ts';
 
 /** Start the UI server on a free port and hand the base URL to the test. */
 async function withServer(fn: (base: string, projectId: number, db: Db) => Promise<void>): Promise<void> {
@@ -124,6 +125,117 @@ test('explicit staging mode forces the staging boundary for a mock provider', as
       db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_chunk WHERE project_id = ? AND lore_mined = 1', projectId)?.n,
       0,
       'staging never sets mined flags',
+    );
+  });
+});
+
+test('a second stage-only extraction job is rejected safely and writes no canon', async () => {
+  await withServer(async (base, projectId, db) => {
+    const serena = {
+      kind: 'character',
+      name: 'Serena Marsh',
+      aliases: [],
+      summary: '',
+      attributes: {},
+      role: '',
+      status: '',
+      chunk_index: 0,
+      evidence: 'Serena Marsh watched it from the ridge',
+    };
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let started!: () => void;
+    const startedPromise = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let calls = 0;
+    const llm = mockProvider((req) => {
+      const system = req.system ?? '';
+      if (system.includes('KNOWN ENTITIES')) return JSON.stringify({ relations: [] });
+      if (system.includes('"timeline"')) return JSON.stringify({ timeline: [] });
+      return JSON.stringify({ entities: [serena], facts: [] });
+    });
+    const baseChat = llm.chat.bind(llm);
+    llm.chat = async (req) => {
+      calls++;
+      if (calls === 1) {
+        started();
+        await gate;
+      }
+      return { ...(await baseChat(req)), finishReason: 'stop' as const };
+    };
+    const direct = lorebook.extractLore(db, llm, projectId, {
+      windowSize: 8,
+      concurrency: 1,
+      recovery: { stageOnly: true },
+    });
+    await startedPromise;
+    let directResult: Awaited<ReturnType<typeof lorebook.extractLore>> | undefined;
+    try {
+      const parentsBefore = db.get<{ n: number }>(
+        'SELECT COUNT(*) AS n FROM extraction_recovery_parent WHERE project_id = ?',
+        projectId,
+      )?.n ?? 0;
+      const start = await fetch(`${base}/api/book-lore/extract`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      assert.equal(start.status, 200);
+      const { jobId } = (await start.json()) as { jobId: string };
+      let job: { status: string; error?: string; message?: string } = { status: 'running' };
+      for (let i = 0; i < 120; i++) {
+        job = (await (await fetch(`${base}/api/jobs/${jobId}`)).json()) as typeof job;
+        if (job.status !== 'running') break;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      const busy = 'stage-only extraction is already running for this project; ' +
+        'only one extraction process per project may run at a time';
+      assert.equal(job.status, 'error');
+      assert.equal(job.error, busy);
+      assert.equal(job.message, busy);
+      assert.equal(calls, 1, 'the rejected job never reaches a provider');
+      assert.equal(
+        db.get<{ n: number }>(
+          'SELECT COUNT(*) AS n FROM extraction_recovery_parent WHERE project_id = ?',
+          projectId,
+        )?.n,
+        parentsBefore,
+        'the rejected job creates no recovery parent',
+      );
+      assert.equal(
+        db.get<{ n: number }>(
+          'SELECT COUNT(*) AS n FROM extraction_run WHERE project_id = ?',
+          projectId,
+        )?.n,
+        0,
+      );
+      assert.equal(
+        db.get<{ n: number }>(
+          'SELECT COUNT(*) AS n FROM canon_chunk WHERE project_id = ? AND lore_mined = 1',
+          projectId,
+        )?.n,
+        0,
+      );
+    } finally {
+      release();
+      directResult = await direct;
+    }
+    assert.equal(directResult?.recovery?.status, 'complete');
+    for (const table of ['canon_entity', 'canon_fact', 'canon_relation', 'canon_timeline']) {
+      assert.equal(
+        db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table} WHERE project_id = ?`, projectId)?.n,
+        0,
+        `${table} remains untouched by stage-only extraction`,
+      );
+    }
+    assert.ok(
+      (db.get<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM extraction_contribution WHERE claim_type = 'entity' AND disposition = 'staged'",
+      )?.n ?? 0) > 0,
+      'the active stage-only run keeps its staged contribution',
     );
   });
 });

@@ -1021,6 +1021,58 @@ function recoveryStageOnlyFor(
   return llm.settings.provider !== 'mock';
 }
 
+/**
+ * Process-local guard for stage-only extraction. It protects one Db instance
+ * and project inside this process. It is deliberately not a durable lock:
+ * separate processes can still overlap, so operators must run only one
+ * extraction process per project at a time.
+ */
+const activeStageOnlyExtractions = new WeakMap<Db, Set<number>>();
+
+export class StageOnlyExtractionBusyError extends Error {
+  readonly code = 'stage-only-busy';
+  readonly projectId: number;
+  static readonly publicMessage =
+    'stage-only extraction is already running for this project; ' +
+    'only one extraction process per project may run at a time';
+  constructor(projectId: number) {
+    super(
+      `stage-only extraction is already running for project ${projectId}; ` +
+        'only one extraction process per project may run at a time',
+    );
+    this.projectId = projectId;
+    this.name = 'StageOnlyExtractionBusyError';
+  }
+}
+
+function acquireStageOnlyExtraction(db: Db, projectId: number): () => void {
+  const active = activeStageOnlyExtractions.get(db) ?? new Set<number>();
+  activeStageOnlyExtractions.set(db, active);
+  if (active.has(projectId)) throw new StageOnlyExtractionBusyError(projectId);
+  active.add(projectId);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    active.delete(projectId);
+    if (!active.size) activeStageOnlyExtractions.delete(db);
+  };
+}
+
+async function withStageOnlyExtractionGuard<T>(
+  db: Db,
+  projectId: number,
+  stageOnly: boolean,
+  run: () => Promise<T>,
+): Promise<T> {
+  if (!stageOnly) return run();
+  const release = acquireStageOnlyExtraction(db, projectId);
+  try {
+    return await run();
+  } finally {
+    release();
+  }
+}
 
 function recoveryStageConfigHash(
   llm: LlmClient,
@@ -1330,6 +1382,20 @@ function createRecoveryRuntime(
  * everything runs, which is today's behavior.
  */
 export async function extractLore(
+  db: Db,
+  llm: LlmClient,
+  projectId: number,
+  opts: ExtractOptions = {},
+): Promise<ExtractLoreResult> {
+  return withStageOnlyExtractionGuard(
+    db,
+    projectId,
+    recoveryEnabledFor(opts, llm) && recoveryStageOnlyFor(opts, llm),
+    () => extractLoreInternal(db, llm, projectId, opts),
+  );
+}
+
+async function extractLoreInternal(
   db: Db,
   llm: LlmClient,
   projectId: number,
@@ -2452,6 +2518,21 @@ function computeFragmentCoverage(
 }
 
 export async function ensureWindowsForChunks(
+  db: Db,
+  llm: LlmClient,
+  projectId: number,
+  chunkIds: number[],
+  opts: LazyMineOptions = {},
+): Promise<ExtractLoreResult> {
+  return withStageOnlyExtractionGuard(
+    db,
+    projectId,
+    recoveryEnabledFor(opts, llm) && recoveryStageOnlyFor(opts, llm),
+    () => ensureWindowsForChunksInternal(db, llm, projectId, chunkIds, opts),
+  );
+}
+
+async function ensureWindowsForChunksInternal(
   db: Db,
   llm: LlmClient,
   projectId: number,
@@ -7525,7 +7606,7 @@ async function extractWindowSplit(
     ? windowRosterNames(window, roster)
     : windowEntityNames(db, projectId, window, roster);
   if (names.length) {
-    const system = `${relationsSystemPrompt()}\n\n${formatKnownEntities(names)}`;
+    const system = `${relationsSystemPrompt()}\n\n${formatKnownEntities(names, listEntities(db, projectId))}`;
     const second = await ask('relations', system, Math.min(3000, maxTokens), 0);
     if (second !== null) {
       let relationsObservation: ExtractionParseObservation | undefined;
@@ -8867,7 +8948,7 @@ async function extractWindowWithRecovery(
             rosterInfo.resolverRows,
           );
           const fingerprint = runtime.stageFingerprint(window, 'relations', snapshot.fingerprint);
-          const system = `${relationsSystemPrompt()}\n\n${formatKnownEntities(snapshot.promptNames)}`;
+          const system = `${relationsSystemPrompt()}\n\n${formatKnownEntities(snapshot.promptNames, snapshot.entities)}`;
           const result = await runStage({
             stage: 'relations',
             system: () => system,
