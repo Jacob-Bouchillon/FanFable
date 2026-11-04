@@ -39,17 +39,17 @@ The current working-tree implementation has passed the offline test suite as rep
 
 ## Verification
 
-The final full suite was run with temporary databases under `/dev/shm` and a watchdog that stopped the run if free space fell below 4 GiB. No cleanup was performed.
+The post-push full suite was run against the pushed code and report commits, with temporary databases under `/dev/shm` and a watchdog that stopped the run if free space fell below 4 GiB. No cleanup was performed.
 
 | Check | Result |
 |---|---|
-| `npm test` | **1,383 passed, 0 failed** (Coder run after the final CLI/test correction) |
-| `npm run typecheck` | Passed |
-| `node --check fanfable/src/ui/app.js` | Passed |
-| `git diff --check` | Clean |
+| `npm test` | **1,383 passed, 0 failed** after push; independently rerun on the pushed state |
+| `npm run typecheck` | Passed after push |
+| `node --check fanfable/src/ui/app.js` | Passed after push |
+| `git diff --check` | Clean after push |
 | Focused extraction-recovery + extraction-trace tests | 102/102 passed in the final CLI/test correction run |
 
-I also independently ran the full suite on the immediately preceding code state: 1,382/1,382 passed. The final 1,383/1,383 result is the Coder’s run on the post-correction state; a post-push run is still required by the task. The suite uses synthetic databases and mock providers. It does not establish model extraction quality, exercise a live browser, or test a real canon database.
+Before the last CLI/test correction, I independently ran the suite on the preceding code state: 1,382/1,382 passed. After the two commits were pushed, I reran the suite and independently observed 1,383/1,383 passing, exit 0, in 9.8 seconds; `/dev/shm` ended with 5.6 GiB free, above the 4 GiB reserve. The suite uses synthetic databases and mock providers. It does not establish model extraction quality, exercise a live browser, or test a real canon database.
 
 ## Known limitations and operational constraints
 
