@@ -27,6 +27,8 @@ interface SheetRow {
   relId: number;
   pair: string;
   sentence: string;
+  quote?: string;
+  passage?: string;
 }
 
 const SYSTEM = [
@@ -36,6 +38,16 @@ const SYSTEM = [
   '(family, marriage, a lasting role, lasting friendship or lasting enmity) as fact.',
   'If the sentence merely places them together, describes an event or a moment, leaves the tie implied by context,',
   'or is unclear, answer not_supported. Never use knowledge from outside the sentence.',
+  'Reply with JSON only: {"verdict":"supported|not_supported","reason":"at most twelve words"}.',
+].join(' ');
+
+const PASSAGE_SYSTEM = [
+  'You judge one passage from a book for a relationship claim.',
+  'Two named people, a quoted line, and the passage it cites are given.',
+  'Answer supported iff the PASSAGE establishes the pair’s lasting tie as fact anywhere within it,',
+  'possibly across sentences. Both names need not share one sentence, but both must appear in the passage.',
+  'Co-presence without a stated tie, contradiction-only, implication from outside knowledge, or unclear',
+  'must be not_supported. Never use knowledge from outside the passage.',
   'Reply with JSON only: {"verdict":"supported|not_supported","reason":"at most twelve words"}.',
 ].join(' ');
 
@@ -96,16 +108,28 @@ function readSheet(dir: string): SheetRow[] {
   const path = join(dir, 'sheet.csv');
   if (!existsSync(path)) throw new Error(`sheet not found: ${path}`);
   const table = parseCsv(readFileSync(path, 'utf8'));
-  if (table[0]?.join(',') !== 'id,relId,pair,sentence,locator') {
-    throw new Error('sheet header must be exactly id,relId,pair,sentence,locator');
+  const header = table[0]?.join(',') ?? '';
+  const wide = header === 'id,relId,pair,quote,passage,locator';
+  if (header !== 'id,relId,pair,sentence,locator' && !wide) {
+    throw new Error('sheet header must be id,relId,pair,sentence,locator or id,relId,pair,quote,passage,locator');
   }
   return table.slice(1).map((cells, index) => {
-    const [id, relId, pair, sentence] = cells;
+    const [id, relId, pair] = cells;
     const rowId = Number(id);
     const rel = Number(relId);
     if (!Number.isInteger(rowId) || rowId <= 0) throw new Error(`sheet row ${index + 1} has no id`);
     if (!Number.isInteger(rel) || rel <= 0) throw new Error(`sheet row ${index + 1} has no relId`);
-    return { id: rowId, relId: rel, pair: pair ?? '', sentence: sentence ?? '' };
+    if (wide) {
+      return {
+        id: rowId,
+        relId: rel,
+        pair: pair ?? '',
+        sentence: '',
+        quote: cells[3] ?? '',
+        passage: cells[4] ?? '',
+      };
+    }
+    return { id: rowId, relId: rel, pair: pair ?? '', sentence: cells[3] ?? '' };
   });
 }
 
@@ -126,12 +150,16 @@ async function judgeOnce(
   model: string,
   row: SheetRow,
   seed: number,
+  mode: 'sentence' | 'passage',
 ): Promise<Verdict> {
+  const content = mode === 'passage'
+    ? `People: ${row.pair}\nQuote: ${row.quote ?? ''}\nPassage: ${row.passage ?? ''}`
+    : `People: ${row.pair}\nSentence: ${row.sentence}`;
   const body = {
     model,
     messages: [
-      { role: 'system', content: SYSTEM },
-      { role: 'user', content: `People: ${row.pair}\nSentence: ${row.sentence}` },
+      { role: 'system', content: mode === 'passage' ? PASSAGE_SYSTEM : SYSTEM },
+      { role: 'user', content },
     ],
     stream: false,
     think: false,
@@ -159,11 +187,12 @@ async function judgeWithRetry(
   model: string,
   row: SheetRow,
   run: number,
+  mode: 'sentence' | 'passage',
 ): Promise<{ ok: true; verdict: Verdict } | { ok: false; error: string }> {
   let last = 'unknown';
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      return { ok: true, verdict: await judgeOnce(host, model, row, 42 + run) };
+      return { ok: true, verdict: await judgeOnce(host, model, row, 42 + run, mode) };
     } catch (error) {
       last = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
     }
@@ -183,11 +212,12 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const dir = flag(args, 'dir');
   if (!dir) {
-    process.stderr.write('usage: precision-judge.ts --dir <sheet dir> [--model spark-x2-q8:latest] [--host http://127.0.0.1:11434]\n');
+    process.stderr.write('usage: precision-judge.ts --dir <sheet dir> [--model spark-x2-q8:latest] [--prompt sentence|passage]\n');
     process.exit(2);
   }
   const model = flag(args, 'model') ?? 'spark-x2-q8:latest';
   const host = flag(args, 'host') ?? process.env.OLLAMA_HOST ?? 'http://127.0.0.1:11434';
+  const mode: 'sentence' | 'passage' = flag(args, 'prompt') === 'passage' ? 'passage' : 'sentence';
   const runs = 3;
   const rows = readSheet(dir);
   if (!rows.length) throw new Error('sheet has no rows');
@@ -205,7 +235,10 @@ async function main(): Promise<void> {
 
   for (let index = 0; index < rows.length; index++) {
     const row = rows[index]!;
-    if (!row.sentence.trim()) {
+    const emptyRow = mode === 'passage'
+      ? !String(row.quote ?? '').trim() || !String(row.passage ?? '').trim()
+      : !row.sentence.trim();
+    if (emptyRow) {
       empty++;
       verdicts.push({ id: row.id, verdict: 'not_supported', reason: 'no evidence' });
       voteRows.push({ id: row.id, votes: ['not_supported', 'not_supported', 'not_supported'] });
@@ -214,7 +247,7 @@ async function main(): Promise<void> {
     const votes: Verdict[] = [];
     let rowFailures = 0;
     for (let run = 0; run < runs; run++) {
-      const result = await judgeWithRetry(host, model, row, run);
+      const result = await judgeWithRetry(host, model, row, run, mode);
       if (!result.ok) {
         rowFailures++;
         failedCalls++;

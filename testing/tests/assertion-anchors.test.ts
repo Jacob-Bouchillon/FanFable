@@ -32,11 +32,14 @@ const decide = (
     { chunkText, minConfidence: 0.7 },
   );
 
-test('a pronoun-bound claim with a verbatim anchor banks', () => {
+test('a pronoun-bound claim parks under B2-strict', () => {
+  // B2-strict accepts a symmetric verb only when the sentence names both
+  // sides. An anchored pronoun pair no longer banks; the recall cost is
+  // accepted to stop grammatical-but-unconvincing ties.
   const text = 'She feared him. Mara was afraid of Tor.';
   assert.deepEqual(
     decide({ evidence: 'She feared him.', anchorEvidence: 'Mara was afraid of Tor.', kind: 'feared' }, text),
-    { ok: true },
+    { ok: false, reason: 'relationship-not-entailed' },
   );
 });
 

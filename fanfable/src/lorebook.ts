@@ -11528,6 +11528,475 @@ export function findUnverifiedKeepers(db: Db, projectId: number): UnverifiedKeep
   return out;
 }
 
+export interface RegatherResult {
+  keepers: number;
+  unverified: number;
+  repointed: number;
+  parked: number;
+  untouched: number;
+}
+
+/**
+ * Stages B+C: give every unverified keeper a stating passage, or park it.
+ *
+ * Deterministic code search only; no model call. A keeper that gains a quote
+ * keeps its status, kind, endpoints and direction. A keeper with no stating
+ * passage goes to needs_review with a tie note. Attested and endpoint-unnamed
+ * rows are out of scope. Dry run by default.
+ */
+export function regatherRelationEvidence(
+  db: Db,
+  projectId: number,
+  opts: { dryRun?: boolean; limit?: number } = {},
+): RegatherResult {
+  const dryRun = opts.dryRun !== false;
+  const keepers = Number(
+    db.get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM canon_relation WHERE project_id = ? AND review_status IN ('accepted','user_confirmed')",
+      projectId,
+    )?.n ?? 0,
+  );
+  const unverified = findUnverifiedKeepers(db, projectId).filter(
+    (row) => row.reason === 'no-ref' || row.reason === 'quote-not-verbatim',
+  );
+  const target = opts.limit === undefined ? unverified : unverified.slice(0, Math.max(0, opts.limit));
+
+  const chunks = db.all<{
+    id: number;
+    text: string;
+    locator: string;
+    seq: number;
+    title: string;
+  }>(
+    `SELECT c.id, c.text, c.locator, c.seq, s.title
+       FROM canon_chunk c JOIN canon_source s ON s.id = c.source_id
+      WHERE c.project_id = ?
+      ORDER BY c.source_id, c.seq, c.id`,
+    projectId,
+  );
+
+  let repointed = 0;
+  let parked = 0;
+  for (const row of target) {
+    const relation = db.get<{
+      id: number;
+      claim_uid: string | null;
+      from_entity: number;
+      to_entity: number;
+      review_status: string;
+    }>(
+      'SELECT id, claim_uid, from_entity, to_entity, review_status FROM canon_relation WHERE id = ? AND project_id = ?',
+      row.id,
+      projectId,
+    );
+    if (!relation) continue;
+    const fromEntity = db.get<{ name: string; aliases: string }>(
+      'SELECT name, aliases FROM canon_entity WHERE id = ? AND project_id = ?',
+      relation.from_entity,
+      projectId,
+    );
+    const toEntity = db.get<{ name: string; aliases: string }>(
+      'SELECT name, aliases FROM canon_entity WHERE id = ? AND project_id = ?',
+      relation.to_entity,
+      projectId,
+    );
+    const fromAliases = [row.fromName, ...strList(fromEntity?.aliases)].filter(Boolean);
+    const toAliases = [row.toName, ...strList(toEntity?.aliases)].filter(Boolean);
+    const names = (text: string, list: string[]): boolean =>
+      list.some((name) => name.trim() !== '' && nameMentionedExact(name, text));
+
+    const candidates: { quote: string; anchor: string; chunk: (typeof chunks)[number] }[] = [];
+    const seen = new Set<string>();
+    const add = (quote: string, anchor: string, chunk: (typeof chunks)[number]): void => {
+      const key = `${chunk.id}\u0000${quote}\u0000${anchor}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      candidates.push({ quote, anchor, chunk });
+    };
+    for (const chunk of chunks) {
+      if (!names(chunk.text, fromAliases) || !names(chunk.text, toAliases)) continue;
+      const sentences = splitSentences(chunk.text).map((sentence) => sentence.trim()).filter(Boolean);
+      for (let index = 0; index < sentences.length; index++) {
+        const sentence = sentences[index]!;
+        const hasFrom = names(sentence, fromAliases);
+        const hasTo = names(sentence, toAliases);
+        if (hasFrom && hasTo) add(sentence, '', chunk);
+        else if (hasFrom || hasTo) {
+          for (const adjacent of [index - 1, index + 1]) {
+            const other = sentences[adjacent];
+            if (!other) continue;
+            if ((hasFrom && names(other, toAliases)) || (hasTo && names(other, fromAliases))) {
+              add(sentence, other, chunk);
+            }
+          }
+        }
+      }
+    }
+
+    let best: { quote: string; anchor: string; chunk: (typeof chunks)[number] } | null = null;
+    for (const candidate of candidates) {
+      const promoteRow: PromoteRow = {
+        fromId: relation.from_entity,
+        toId: relation.to_entity,
+        fromName: row.fromName,
+        toName: row.toName,
+        fromAliases: strList(fromEntity?.aliases),
+        toAliases: strList(toEntity?.aliases),
+        kind: row.kind,
+        evidence: candidate.quote,
+        ...(candidate.anchor ? { anchorEvidence: candidate.anchor } : {}),
+      };
+      if (keeperQuoteReason(promoteRow, candidate.chunk.text) !== null) continue;
+      if (relationEntailmentReason(promoteRow) !== null) continue;
+      best = candidate;
+      break;
+    }
+
+    if (best) {
+      if (!dryRun) {
+        db.transaction(() => {
+          const refs = JSON.stringify([{ source: best!.chunk.title, locator: best!.chunk.locator, chunk: best!.chunk.id }]);
+          db.run(
+            'UPDATE canon_relation SET evidence = ?, source_refs = ? WHERE id = ? AND project_id = ?',
+            best!.quote,
+            refs,
+            row.id,
+            projectId,
+          );
+          recordRuling(db, projectId, {
+            relationId: row.id,
+            role: 'appeal',
+            actor: 'guard',
+            standard: 'sentence-proof',
+            fromStatus: relation.review_status,
+            toStatus: relation.review_status,
+            basis: 'regathered stating passage',
+            quote: best!.quote,
+          });
+        });
+      }
+      repointed++;
+      continue;
+    }
+
+    // No stating passage: park for review, never demote truth silently.
+    let claimUid = String(relation.claim_uid ?? '');
+    if (!claimUid) {
+      claimUid = newClaimUid('relation');
+      if (!dryRun) {
+        db.run(
+          "UPDATE canon_relation SET claim_uid = ? WHERE id = ? AND project_id = ? AND (claim_uid IS NULL OR claim_uid = '')",
+          claimUid,
+          row.id,
+          projectId,
+        );
+      }
+    }
+    const bestQuote = candidates[0]?.quote ?? '';
+    const refs = candidates[0]
+      ? JSON.stringify([{ source: candidates[0].chunk.title, locator: candidates[0].chunk.locator, chunk: candidates[0].chunk.id }])
+      : '[]';
+    if (!dryRun) {
+      const current = readRelationClaimState(db, projectId, claimUid);
+      if (!current) continue;
+      const targetStatus: { reviewStatus: string; authorization?: 'user_confirmed' } =
+        current.reviewStatus === 'user_confirmed' && !current.confirmedByUser
+          ? { reviewStatus: 'needs_review', authorization: 'user_confirmed' }
+          : { reviewStatus: 'needs_review' };
+      const transition = transitionClaim(db, projectId, {
+        claim: { type: 'relation', uid: claimUid },
+        intent: 'administrative',
+        expect: {
+          reviewStatus: current.reviewStatus,
+          authorization: current.authorization,
+          proofAttemptSeq: current.proofAttemptSeq,
+          policyVersion: current.policyVersion,
+          fingerprints: current.fingerprints,
+        },
+        target: targetStatus,
+        actor: 'guard',
+        role: 'appeal',
+        standard: 'sentence-proof',
+        basis: 'no stating passage found; parked for review',
+        quote: bestQuote,
+      });
+      if (transition.kind !== 'applied') continue;
+      persistTieNote(
+        db,
+        projectId,
+        relation.from_entity,
+        relation.to_entity,
+        row.kind,
+        row.reason === 'no-ref' ? 'no-ref' : 'unsupported',
+        bestQuote,
+        refs,
+        'regather: no stating passage',
+      );
+    }
+    parked++;
+  }
+
+  return {
+    keepers,
+    unverified: unverified.length,
+    repointed,
+    parked,
+    untouched: unverified.length - repointed - parked,
+  };
+}
+
+export interface RegatherUnprovingResult {
+  keepers: number;
+  unverified: number;
+  unproving: number;
+  repointed: number;
+  parked: number;
+  untouched: number;
+}
+
+/**
+ * Regather v2: re-evidence keepers whose quote is verbatim but does not state
+ * the tie.
+ *
+ * Verbatim presence is not proof. Every keeper whose current quote fails the
+ * full gate against its cited chunk is searched again; a stating passage
+ * repoints evidence+refs, and none parks the row for review. A user-confirmed
+ * row's truth is untouched: the ruling says the park is about proof, never the
+ * author's word. Deterministic code only; dry run by default.
+ */
+export function regatherUnprovingEvidence(
+  db: Db,
+  projectId: number,
+  opts: { dryRun?: boolean; limit?: number } = {},
+): RegatherUnprovingResult {
+  const dryRun = opts.dryRun !== false;
+  const keepers = Number(
+    db.get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM canon_relation WHERE project_id = ? AND review_status IN ('accepted','user_confirmed')",
+      projectId,
+    )?.n ?? 0,
+  );
+  const unverified = findUnverifiedKeepers(db, projectId).filter(
+    (row) => row.reason === 'no-ref' || row.reason === 'quote-not-verbatim',
+  );
+  const unverifiedIds = new Set(unverified.map((row) => row.id));
+  const minConfidence = projectMinConfidence(db, projectId);
+
+  const chunks = db.all<{
+    id: number;
+    text: string;
+    locator: string;
+    seq: number;
+    title: string;
+  }>(
+    `SELECT c.id, c.text, c.locator, c.seq, s.title
+       FROM canon_chunk c JOIN canon_source s ON s.id = c.source_id
+      WHERE c.project_id = ?
+      ORDER BY c.source_id, c.seq, c.id`,
+    projectId,
+  );
+  const chunkById = new Map(chunks.map((chunk) => [chunk.id, chunk]));
+
+  const rows = db.all<{
+    id: number;
+    claim_uid: string | null;
+    from_entity: number;
+    to_entity: number;
+    kind: string;
+    kind_source: string;
+    anchor_evidence: string;
+    evidence: string;
+    source_refs: string;
+    confidence: number;
+    review_status: string;
+    from_name: string;
+    from_aliases: string;
+    to_name: string;
+    to_aliases: string;
+  }>(
+    `SELECT r.id, r.claim_uid, r.from_entity, r.to_entity, r.kind, r.kind_source, r.anchor_evidence,
+            r.evidence, r.source_refs, r.confidence, r.review_status,
+            a.name AS from_name, a.aliases AS from_aliases, b.name AS to_name, b.aliases AS to_aliases
+       FROM canon_relation r
+       JOIN canon_entity a ON a.id = r.from_entity
+       JOIN canon_entity b ON b.id = r.to_entity
+      WHERE r.project_id = ? AND r.review_status IN ('accepted','user_confirmed')
+      ORDER BY r.id`,
+    projectId,
+  );
+
+  const target = rows
+    .filter((row) => !unverifiedIds.has(row.id))
+    .slice(0, opts.limit === undefined ? undefined : Math.max(0, opts.limit));
+
+  let unproving = 0;
+  let repointed = 0;
+  let parked = 0;
+  for (const row of target) {
+    const refs = fromJson<{ chunk?: unknown }[]>(row.source_refs, []);
+    const holding = refs
+      .map((ref) => Number(ref?.chunk))
+      .filter((id) => Number.isFinite(id))
+      .map((id) => chunkById.get(id))
+      .filter((chunk): chunk is (typeof chunks)[number] => Boolean(chunk))
+      .filter((chunk) => auditNormalize(chunk.text).includes(auditNormalize(row.evidence)));
+    if (!holding.length) continue;
+    const currentRow: PromoteRow = {
+      fromId: row.from_entity,
+      toId: row.to_entity,
+      fromName: row.from_name,
+      toName: row.to_name,
+      fromAliases: strList(row.from_aliases),
+      toAliases: strList(row.to_aliases),
+      kind: row.kind,
+      kindSource: row.kind_source || undefined,
+      anchorEvidence: row.anchor_evidence || undefined,
+      evidence: row.evidence,
+      confidence: row.confidence,
+    };
+    if (holding.some((chunk) => provenRelation(currentRow, { chunkText: chunk.text, minConfidence }).ok)) continue;
+    unproving++;
+
+    const fromAliases = [row.from_name, ...strList(row.from_aliases)].filter(Boolean);
+    const toAliases = [row.to_name, ...strList(row.to_aliases)].filter(Boolean);
+    const names = (text: string, list: string[]): boolean =>
+      list.some((name) => name.trim() !== '' && nameMentionedExact(name, text));
+    const candidates: { quote: string; anchor: string; chunk: (typeof chunks)[number] }[] = [];
+    const seen = new Set<string>();
+    const add = (quote: string, anchor: string, chunk: (typeof chunks)[number]): void => {
+      const key = `${chunk.id}\u0000${quote}\u0000${anchor}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      candidates.push({ quote, anchor, chunk });
+    };
+    for (const chunk of chunks) {
+      if (!names(chunk.text, fromAliases) || !names(chunk.text, toAliases)) continue;
+      const sentences = splitSentences(chunk.text).map((sentence) => sentence.trim()).filter(Boolean);
+      for (let index = 0; index < sentences.length; index++) {
+        const sentence = sentences[index]!;
+        const hasFrom = names(sentence, fromAliases);
+        const hasTo = names(sentence, toAliases);
+        if (hasFrom && hasTo) add(sentence, '', chunk);
+        else if (hasFrom || hasTo) {
+          for (const adjacent of [index - 1, index + 1]) {
+            const other = sentences[adjacent];
+            if (!other) continue;
+            if ((hasFrom && names(other, toAliases)) || (hasTo && names(other, fromAliases))) {
+              add(sentence, other, chunk);
+            }
+          }
+        }
+      }
+    }
+
+    let best: { quote: string; anchor: string; chunk: (typeof chunks)[number] } | null = null;
+    for (const candidate of candidates) {
+      const candidateRow: PromoteRow = {
+        ...currentRow,
+        evidence: candidate.quote,
+        anchorEvidence: candidate.anchor || undefined,
+      };
+      if (provenRelation(candidateRow, { chunkText: candidate.chunk.text, minConfidence }).ok) {
+        best = candidate;
+        break;
+      }
+    }
+
+    if (best) {
+      if (!dryRun) {
+        db.transaction(() => {
+          db.run(
+            'UPDATE canon_relation SET evidence = ?, source_refs = ? WHERE id = ? AND project_id = ?',
+            best!.quote,
+            JSON.stringify([{ source: best!.chunk.title, locator: best!.chunk.locator, chunk: best!.chunk.id }]),
+            row.id,
+            projectId,
+          );
+          recordRuling(db, projectId, {
+            relationId: row.id,
+            role: 'appeal',
+            actor: 'guard',
+            standard: 'sentence-proof',
+            fromStatus: row.review_status,
+            toStatus: row.review_status,
+            basis: 'regathered proving passage (entailment check)',
+            quote: best!.quote,
+          });
+        });
+      }
+      repointed++;
+      continue;
+    }
+
+    let claimUid = String(row.claim_uid ?? '');
+    if (!claimUid) {
+      claimUid = newClaimUid('relation');
+      if (!dryRun) {
+        db.run(
+          "UPDATE canon_relation SET claim_uid = ? WHERE id = ? AND project_id = ? AND (claim_uid IS NULL OR claim_uid = '')",
+          claimUid,
+          row.id,
+          projectId,
+        );
+      }
+    }
+    const bestQuote = candidates[0]?.quote ?? '';
+    const refsOut = candidates[0]
+      ? JSON.stringify([{ source: candidates[0].chunk.title, locator: candidates[0].chunk.locator, chunk: candidates[0].chunk.id }])
+      : '[]';
+    if (!dryRun) {
+      const current = readRelationClaimState(db, projectId, claimUid);
+      if (!current) continue;
+      const targetStatus: { reviewStatus: string; authorization?: 'user_confirmed' } =
+        current.reviewStatus === 'user_confirmed' && !current.confirmedByUser
+          ? { reviewStatus: 'needs_review', authorization: 'user_confirmed' }
+          : { reviewStatus: 'needs_review' };
+      const basis = row.review_status === 'user_confirmed'
+        ? 'no proving passage found; parked for proof review; user confirmation unchanged'
+        : 'no proving passage found; parked for review';
+      const transition = transitionClaim(db, projectId, {
+        claim: { type: 'relation', uid: claimUid },
+        intent: 'administrative',
+        expect: {
+          reviewStatus: current.reviewStatus,
+          authorization: current.authorization,
+          proofAttemptSeq: current.proofAttemptSeq,
+          policyVersion: current.policyVersion,
+          fingerprints: current.fingerprints,
+        },
+        target: targetStatus,
+        actor: 'guard',
+        role: 'appeal',
+        standard: 'sentence-proof',
+        basis,
+        quote: bestQuote,
+      });
+      if (transition.kind !== 'applied') continue;
+      persistTieNote(
+        db,
+        projectId,
+        row.from_entity,
+        row.to_entity,
+        row.kind,
+        'unsupported',
+        bestQuote,
+        refsOut,
+        'regather v2: quote is verbatim but does not state the tie',
+      );
+    }
+    parked++;
+  }
+
+  return {
+    keepers,
+    unverified: unverified.length,
+    unproving,
+    repointed,
+    parked,
+    untouched: unproving - repointed - parked,
+  };
+}
+
 /** Park a dropped tie for the batched relabeling pass. Reruns collide on
  * the pair-plus-label index and add nothing. */
 export function persistTieNote(

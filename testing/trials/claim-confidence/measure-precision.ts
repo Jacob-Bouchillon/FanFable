@@ -275,14 +275,17 @@ function readSheet(dir: string): { rows: SheetRow[]; manifest: Record<string, un
   if (!existsSync(sheetPath)) throw new Error(`sheet not found: ${sheetPath}`);
   if (!existsSync(manifestPath)) throw new Error(`manifest not found: ${manifestPath}`);
   const { header, rows } = readCsv(sheetPath);
-  if (header.join(',') !== SHEET_COLUMNS.join(',')) {
-    throw new Error(`sheet header must be exactly ${SHEET_COLUMNS.join(',')}`);
+  const joined = header.join(',');
+  const wide = joined === 'id,relId,pair,quote,passage,locator';
+  if (joined !== SHEET_COLUMNS.join(',') && !wide) {
+    throw new Error(`sheet header must be ${SHEET_COLUMNS.join(',')} or id,relId,pair,quote,passage,locator`);
   }
   const parsed = rows.map((cells, index) => {
-    const [id, relId, pair, sentence, locator] = cells;
+    const [id, relId, pair, fourth] = cells;
+    const locator = wide ? cells[5] : cells[4];
     const rel = Number(relId);
     if (!Number.isInteger(rel) || rel <= 0) throw new Error(`sheet row ${index + 1} has no relId`);
-    return { id: Number(id), relId: rel, pair: pair ?? '', sentence: sentence ?? '', locator: locator ?? '' };
+    return { id: Number(id), relId: rel, pair: pair ?? '', sentence: fourth ?? '', locator: locator ?? '' };
   });
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as Record<string, unknown>;
   return { rows: parsed, manifest };

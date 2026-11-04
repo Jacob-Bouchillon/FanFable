@@ -196,6 +196,8 @@ ${C.bold('SOURCE MATERIAL')}
   lore notes [--prioritise] [--max n]  Rank parked ties for human review (no writes)
   lore promote [--dry-run] [--limit n] [--find-evidence]
                            Re-check provisional ties; only the proven rule decides
+  lore regather [--write] [--limit n]
+                           Attach a stating passage to keepers missing one, or park them (dry run by default; use a disposable copy first)
   lore integrity [--limit n]  List keepers whose evidence is not verbatim (exit 1 if any)
   lore evaluate [--max n]        Judge each banked tie with understanding; failures park as notes
   lore status [--watch [secs]]     How much of the book is read, banked, and waiting
@@ -1841,6 +1843,26 @@ async function cmdLore(args: Args): Promise<void> {
       }
     }
     console.log(C.dim(`${pending} pending`));
+    return;
+  }
+
+  if (sub === 'regather') {
+    const dryRun = args.flags['dry-run'] === true || args.flags.write !== true;
+    const limit = args.flags.limit === undefined
+      ? undefined
+      : Math.max(0, Math.floor(flagNumber(args, 'limit', 0)));
+    heading(dryRun ? 'Evidence regather (dry run)' : 'Evidence regather');
+    const unverified = lorebook.regatherRelationEvidence(db, project.id, { dryRun, limit });
+    const unproving = lorebook.regatherUnprovingEvidence(db, project.id, { dryRun, limit });
+    console.log(JSON.stringify({
+      keepers: unverified.keepers,
+      unverified: unverified.unverified,
+      unproving: unproving.unproving,
+      repointed: unverified.repointed + unproving.repointed,
+      parked: unverified.parked + unproving.parked,
+      untouched: unverified.untouched + unproving.untouched,
+    }));
+    if (dryRun) console.log(C.dim('dry run: nothing written. Run with --write on a disposable copy.'));
     return;
   }
 

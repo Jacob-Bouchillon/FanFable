@@ -17,13 +17,13 @@ const AT = '2026-01-01T00:00:00.000Z';
 function decide(
   row: {
     fromName: string; toName: string; kind: string; evidence: string;
-    kindSource?: string; confidence?: number;
+    kindSource?: string; anchorEvidence?: string; confidence?: number;
   },
   minConfidence = 0,
 ) {
   return lorebook.provenRelation(
     { fromId: 1, toId: 2, ...row },
-    { chunkText: row.evidence, minConfidence },
+    { chunkText: row.anchorEvidence ? `${row.evidence} ${row.anchorEvidence}` : row.evidence, minConfidence },
   );
 }
 
@@ -92,6 +92,42 @@ test('B2: an endpoint\'s enemy that the other endpoint merely admired is not the
       fromName: 'Mara', toName: 'Tor', kind: 'enemy of',
       evidence: "Mara admired Tor's enemy.", confidence: 1,
     }),
+    { ok: false, reason: 'relationship-not-entailed' },
+  );
+});
+
+test('B2-strict: coordinated partners still bank', () => {
+  assert.deepEqual(
+    decide({ fromName: 'Mara', toName: 'Tor', kind: 'friend of', evidence: 'Mara and Tor are partners.', confidence: 1 }),
+    { ok: true },
+  );
+});
+
+test('B2-strict: a possessive partner still banks', () => {
+  assert.deepEqual(
+    decide({ fromName: 'Mara', toName: 'Tor', kind: 'friend of', evidence: "Mara is Tor's partner.", confidence: 1 }),
+    { ok: true },
+  );
+});
+
+test('B2-strict: a title on the claim’s own endpoint banks when no third person is present', () => {
+  assert.deepEqual(
+    decide({ fromName: 'Mara', toName: 'Tor', kind: 'aunt of', evidence: 'Aunt Mara took Tor to the market.', confidence: 1 }),
+    { ok: true },
+  );
+});
+
+test('B2-strict: a pronoun pair parks even with an anchor naming both', () => {
+  // Recall cost accepted: the sentence itself must name both sides for a
+  // symmetric verb, so an anchored pronoun pair no longer proves the tie.
+  assert.deepEqual(
+    decide(
+      {
+        fromName: 'Mara', toName: 'Tor', kind: 'feared',
+        evidence: 'She feared him.', anchorEvidence: 'Mara was afraid of Tor.', confidence: 1,
+      },
+      0,
+    ),
     { ok: false, reason: 'relationship-not-entailed' },
   );
 });

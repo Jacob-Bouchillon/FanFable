@@ -183,6 +183,11 @@ export function labelHeadForms(kind: string): Set<string> {
 
 /** Negation and uncertainty markers. An asserted tie cannot ride on a denied or
  * merely possible clause. Structural, not a synonym list. */
+/** Ablation switch: unset or any value except "1" keeps current strict behavior. */
+function ablation(name: string): boolean {
+  return process.env[`FANFABLE_ABLATE_${name}`] === '1';
+}
+
 const NEGATORS = new Set(['not', 'never', 'nor', 'neither', 'without', 'hardly', 'barely']);
 const HEDGES = new Set([
   'perhaps', 'possibly', 'maybe', 'might', 'may', 'could', 'probably', 'apparently',
@@ -616,10 +621,18 @@ function bothEndpointsIn(text: string, row: PromoteRow, index?: RosterIndex): bo
   return has('from') && has('to');
 }
 
-/** A family title bound to an endpoint: "Aunt Mara", "Captain Voss". The
- * title must sit immediately before the name, so "her friend had arrived"
- * names no endpoint and proves nothing. */
+/**
+ * A family title bound to an endpoint: "Aunt Mara", "Captain Voss".
+ *
+ * Strict form: the clause must name the claim's own endpoint pair and no other
+ * person. A pronoun or a third roster name makes the title ambiguous, so it
+ * cannot bind the tie.
+ */
 function titledEndpoint(row: PromoteRow, family: RelationFamily, index: RosterIndex | undefined, text: string): boolean {
+  if (!ablation('SYMMETRIC_STRICT')) {
+    if (/\b(?:he|she|him|her|his|hers|they|them|their|theirs|i|me|my|we|us|our|you|your)\b/i.test(text)) return false;
+    if (namesOtherEntity(text, row, index)) return false;
+  }
   const forms = [...familyHeadForms(family)].sort((a, b) => b.length - a.length);
   const names = [...variantsFor(row, 'from', index), ...variantsFor(row, 'to', index)].filter((v) => v.trim() !== '');
   return forms.some((form) => names.some(
@@ -627,25 +640,41 @@ function titledEndpoint(row: PromoteRow, family: RelationFamily, index: RosterIn
   ));
 }
 
+/** The only nouns that may link an endpoint by preposition. */
+const LINKED_NOUNS = new Set([
+  'partner', 'partners', 'partnership', 'partnerships',
+  'ally', 'allies', 'alliance', 'alliances',
+  'friend', 'friends', 'friendship', 'friendships',
+]);
+
 /** A family noun explicitly linked to an endpoint by a preposition:
- * "a secret partnership with Tor". The noun must be the one the preposition
- * attaches to the endpoint, so a third party's friend or enemy is not proof. */
+ * "a secret partnership with Tor". Only the closed ally nouns count, and at
+ * most one word may sit between the noun and the preposition. */
 function linkedFamilyTerm(row: PromoteRow, family: RelationFamily, index: RosterIndex | undefined, text: string): boolean {
-  const forms = [...familyHeadForms(family)].sort((a, b) => b.length - a.length);
   const names = [...variantsFor(row, 'from', index), ...variantsFor(row, 'to', index)]
     .filter((v) => v.trim() !== '')
     .map(rx)
     .join('|');
   if (!names) return false;
+  if (ablation('SYMMETRIC_STRICT')) {
+    const broad = [...familyHeadForms(family)].sort((a, b) => b.length - a.length);
+    return broad.some((form) => new RegExp(
+      `\\b${rx(form)}\\b\\s+(?:with|of|to|for|toward|towards|against)\\s+(?:the\\s+|a\\s+|an\\s+)?(?:${names})\\b`,
+      'i',
+    ).test(text));
+  }
+  if (family !== 'ally') return false;
+  const forms = [...LINKED_NOUNS].sort((a, b) => b.length - a.length);
   return forms.some((form) => new RegExp(
-    `\\b${rx(form)}\\b\\s+(?:with|of|to|for|toward|towards|against)\\s+(?:the\\s+|a\\s+|an\\s+)?(?:${names})\\b`,
+    `\\b${rx(form)}\\b\\s+(?:[a-z][a-z-]*\\s+)?(?:with|of|to|for|toward|towards|against)\\s+(?:the\\s+|a\\s+|an\\s+)?(?:${names})\\b`,
     'i',
   ).test(text));
 }
 
-/** A family verb between a subject and an object: "Mara feared Tor", or a
- * pronoun pair whose antecedent the anchor names ("She feared him."). The
- * form must be the verb relating the two, never a noun in another phrase. */
+/** A family verb between a NAMED subject and a NAMED object: "Mara feared
+ * Tor". Pronoun pairs are deliberately refused: even with an anchor naming
+ * both, the sentence itself does not bind the tie (recall cost accepted).
+ * The form must be the verb relating the two, never a noun in another phrase. */
 function boundFamilyTerm(row: PromoteRow, family: RelationFamily, index: RosterIndex | undefined, text: string): boolean {
   const forms = [...familyHeadForms(family)].filter((form) => !form.includes(' ')).sort((a, b) => b.length - a.length);
   const names = [...variantsFor(row, 'from', index), ...variantsFor(row, 'to', index)]
@@ -653,14 +682,24 @@ function boundFamilyTerm(row: PromoteRow, family: RelationFamily, index: RosterI
     .map(rx)
     .join('|');
   if (!names || !forms.length) return false;
-  const anchored = (row.anchorEvidence ?? '').trim() !== '';
-  const subject = anchored ? `(?:${names}|he|she|they|i)` : `(?:${names})`;
-  // A pronoun object's antecedent must come from the anchor; without one the
-  // sentence names neither person and cannot prove a tie.
-  const object = anchored ? `(?:${names}|him|her|them|me|us|you)` : `(?:${names})`;
+  if (ablation('SYMMETRIC_STRICT')) {
+    const anchored = (row.anchorEvidence ?? '').trim() !== '';
+    const subject = anchored ? `(?:${names}|he|she|they|i)` : `(?:${names})`;
+    const object = anchored ? `(?:${names}|him|her|them|me|us|you)` : `(?:${names})`;
+    const gap = '(?:[a-z]+\\s+){0,2}?';
+    return forms.some((form) => new RegExp(
+      `\\b${subject}\\s+${gap}${rx(form)}\\b\\s+${object}\\b`,
+      'i',
+    ).test(text));
+  }
+  const subject = `(?:${names})`;
+  const object = `(?:${names})`;
   const gap = '(?:[a-z]+\\s+){0,2}?';
+  // A named object may be introduced by a closed particle ("married to Tor"),
+  // but both sides remain named; this is not a pronoun escape hatch.
+  const particle = '(?:(?:to|with|for|of)\\s+)?';
   return forms.some((form) => new RegExp(
-    `\\b${subject}\\s+${gap}${rx(form)}\\b\\s+${object}\\b`,
+    `\\b${subject}\\s+${gap}${rx(form)}\\b\\s+${particle}${object}\\b`,
     'i',
   ).test(text));
 }
@@ -771,22 +810,40 @@ export function relationEntailmentReason(row: PromoteRow, index?: RosterIndex): 
     const fromFamilies = heldFamilies(row, 'from', citation, index);
     const toFamilies = heldFamilies(row, 'to', citation, index);
     if (fromFamilies.has(family) && toFamilies.has(inverse)) return null;
-    if (fromFamilies.has(inverse) && toFamilies.has(family)) return 'direction-mismatch';
+    if (fromFamilies.has(inverse) && toFamilies.has(family)) {
+      if (ablation('DIRECTION')) return null;
+      return 'direction-mismatch';
+    }
     const dialogue = dialogueDirection(row, family, index);
     if (dialogue === 'forward') return null;
-    if (dialogue === 'reverse') return 'direction-mismatch';
+    if (dialogue === 'reverse') {
+      if (ablation('DIRECTION')) return null;
+      return 'direction-mismatch';
+    }
     const possessive = possessiveDirection(row, family, index);
     if (possessive === 'forward') return null;
-    if (possessive === 'reverse') return 'direction-mismatch';
+    if (possessive === 'reverse') {
+      if (ablation('DIRECTION')) return null;
+      return 'direction-mismatch';
+    }
     const passive = passiveDirection(row, family, index);
     if (passive === 'forward') return null;
-    if (passive === 'reverse') return 'direction-mismatch';
+    if (passive === 'reverse') {
+      if (ablation('DIRECTION')) return null;
+      return 'direction-mismatch';
+    }
     const vocative = vocativeDirection(row, family, index);
     if (vocative === 'forward') return null;
-    if (vocative === 'reverse') return 'direction-mismatch';
+    if (vocative === 'reverse') {
+      if (ablation('DIRECTION')) return null;
+      return 'direction-mismatch';
+    }
     const verb = verbOrderDirection(row, family, index);
     if (verb === 'forward') return null;
-    if (verb === 'reverse') return 'direction-mismatch';
+    if (verb === 'reverse') {
+      if (ablation('DIRECTION')) return null;
+      return 'direction-mismatch';
+    }
     return 'relationship-not-entailed';
   }
 
@@ -848,11 +905,13 @@ function containsVerbatim(haystack: string, needle: string): boolean {
 export function quoteVerbatimReason(row: PromoteRow, chunkText?: string | null): PromoteReason | null {
   const chunk = chunkText ?? '';
   const chunkProof = proofNormalise(chunk);
-  if (!row.evidence.trim() || !chunk || !containsVerbatim(chunkProof, proofNormalise(row.evidence))) {
+  const holds = (needle: string): boolean =>
+    ablation('VERBATIM_BOUNDARY') ? chunkProof.includes(needle) : containsVerbatim(chunkProof, needle);
+  if (!row.evidence.trim() || !chunk || !holds(proofNormalise(row.evidence))) {
     return 'quote-not-verbatim';
   }
   const anchor = (row.anchorEvidence ?? '').trim();
-  if (anchor && !containsVerbatim(chunkProof, proofNormalise(anchor))) return 'quote-not-verbatim';
+  if (anchor && !holds(proofNormalise(anchor))) return 'quote-not-verbatim';
   return null;
 }
 
@@ -873,7 +932,7 @@ export function keeperQuoteReason(row: PromoteRow, chunkText?: string | null, in
   // "Perhaps Mara feared Tor" as though the hedge were not there.
   for (const span of anchor ? [row.evidence, anchor] : [row.evidence]) {
     const holding = splitSentences(chunk).find((sentence) => normalise(sentence).includes(normalise(span))) ?? span;
-    if (leadingDenialOrHedge(holding, row, index)) return 'assertion-missing';
+    if (!ablation('DENIAL') && leadingDenialOrHedge(holding, row, index)) return 'assertion-missing';
   }
   // Mechanical proof: the citation must put both people in the sentence, not
   // merely in the roster. A quote that names neither side proves no tie.
@@ -894,7 +953,7 @@ export function attestedQuoteReason(row: PromoteRow, chunkText?: string | null, 
   const anchor = (row.anchorEvidence ?? '').trim();
   for (const span of anchor ? [row.evidence, anchor] : [row.evidence]) {
     const holding = splitSentences(chunk).find((sentence) => normalise(sentence).includes(normalise(span))) ?? span;
-    if (leadingDenialOrHedge(holding, row, index)) return 'assertion-missing';
+    if (!ablation('DENIAL') && leadingDenialOrHedge(holding, row, index)) return 'assertion-missing';
   }
   return null;
 }
@@ -1282,7 +1341,7 @@ export function provenRelation(
   const guarded = contextualEvidence(row, context.chunkText, context.index) ?? row;
   const quoteReason = keeperQuoteReason(guarded, context.chunkText, context.index);
   if (quoteReason) return { ok: false, reason: quoteReason };
-  const min = context.minConfidence ?? DEFAULT_MIN_CONFIDENCE;
+  const min = ablation('THRESHOLD') ? 0 : (context.minConfidence ?? DEFAULT_MIN_CONFIDENCE);
   // A caller that forgets the model's score has not judged the claim: the
   // missing value must fail the bar, never take the maximum.
   if (claimTier(guarded.confidence ?? 0, min) !== 'accepted') return { ok: false, reason: 'below-threshold' };
