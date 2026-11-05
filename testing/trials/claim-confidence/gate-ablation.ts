@@ -15,7 +15,7 @@ import * as gates from '../../../fanfable/src/gates/gates.ts';
 const REPO_ROOT = resolve(import.meta.dirname, '../../..');
 const OUT = '/tmp/opencode/gate-ablation';
 const CAP = 2000;
-const SWITCHES = ['DIRECTION', 'DENIAL', 'SYMMETRIC_STRICT', 'VERBATIM_BOUNDARY', 'THRESHOLD'] as const;
+const SWITCHES = ['DIRECTION', 'DENIAL', 'SYMMETRIC_STRICT', 'VERBATIM_BOUNDARY', 'THRESHOLD', 'ENDPOINT', 'ENTAILMENT'] as const;
 const ENV_NAMES = SWITCHES.map((name) => `FANFABLE_ABLATE_${name}`);
 
 function flag(args: string[], name: string): string | undefined {

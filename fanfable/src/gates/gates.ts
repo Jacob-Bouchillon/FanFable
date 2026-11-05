@@ -780,6 +780,7 @@ function contiguousDefiniteDescription(row: PromoteRow, family: RelationFamily, 
  * stays provisional/needs_review under the existing lifecycle.
  */
 export function relationEntailmentReason(row: PromoteRow, index?: RosterIndex): PromoteReason | null {
+  if (ablation('ENTAILMENT')) return null;
   const family = familyOfKind(row.kind);
   const text = maskedCitation(row, index);
   const citation = citationText(row);
@@ -936,7 +937,8 @@ export function keeperQuoteReason(row: PromoteRow, chunkText?: string | null, in
   }
   // Mechanical proof: the citation must put both people in the sentence, not
   // merely in the roster. A quote that names neither side proves no tie.
-  if (!citationNamesBothEndpoints(row, index)) return 'endpoint-unnamed';
+  // Ablation: FANFABLE_ABLATE_ENDPOINT=1 measures what the rule costs.
+  if (!ablation('ENDPOINT') && !citationNamesBothEndpoints(row, index)) return 'endpoint-unnamed';
   return null;
 }
 

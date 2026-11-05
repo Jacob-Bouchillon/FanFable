@@ -25,6 +25,7 @@ import * as continuity from './continuity.ts';
 import { DEFAULT_LLM_SETTINGS, clientFrom, loadGlobalConfig, saveGlobalConfig } from '../core/llm.ts';
 import { DEFAULT_CONTINUITY_SETTINGS, continuitySettings } from './continuity-settings.ts';
 import { devGraphSummary } from './dev-summary.ts';
+import { buildWebGraph, webThreadDetail } from './web3d.ts';
 
 /** Settings returned to the UI never carry the whole API key. */
 export function maskSettingsForOutput<T extends Record<string, unknown>>(settings: T): T {
@@ -291,6 +292,10 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
       /* ---------------------------------------------------------- static */
       if (method === 'GET' && (path === '/' || path === '/index.html')) {
         serveStatic(res, join(UI_DIR, 'index.html'));
+        return;
+      }
+      if (method === 'GET' && (path === '/web3d' || path === '/web3d/')) {
+        serveStatic(res, join(UI_DIR, 'web3d.html'));
         return;
       }
       if (method === 'GET' && (path === '/dev-viz' || path === '/dev-viz/')) {
@@ -669,6 +674,54 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
           (String(body.resolution ?? 'accepted') as 'open' | 'accepted' | 'resolved'),
         );
         json(res, 200, { ok: true });
+        return;
+      }
+
+      if (path === '/api/web/graph' && method === 'GET') {
+        if (activeId() === null) {
+          json(res, 200, {
+            unchanged: true,
+            revision: '',
+            projectId: null,
+            counts: { personThreads: 0, pairThreads: 0, notes: 0, meetings: 0, births: 0, openEnds: 0 },
+            nodes: [],
+            links: [],
+            openEnds: [],
+            updatedAt: '',
+          });
+          return;
+        }
+        const p = project();
+        const limitRaw = Number(url.searchParams.get('limit') ?? 1500);
+        const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(5000, Math.floor(limitRaw))) : 1500;
+        const all = url.searchParams.get('all') === '1';
+        const notes = url.searchParams.get('notes') === '1';
+        const graph = buildWebGraph(db, p.id, { limit, all, notes });
+        if (url.searchParams.get('rev') === graph.revision) {
+          json(res, 200, { unchanged: true, revision: graph.revision });
+          return;
+        }
+        json(res, 200, graph);
+        return;
+      }
+
+      if (path === '/api/web/thread' && method === 'GET') {
+        if (activeId() === null) {
+          json(res, 404, { error: 'not found' });
+          return;
+        }
+        const p = project();
+        const id = Number(url.searchParams.get('id'));
+        if (!Number.isInteger(id) || id <= 0) {
+          json(res, 400, { error: 'bad thread id' });
+          return;
+        }
+        const detail = webThreadDetail(db, p.id, id);
+        if (!detail) {
+          json(res, 404, { error: 'not found' });
+          return;
+        }
+        json(res, 200, detail);
         return;
       }
 

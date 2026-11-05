@@ -9774,11 +9774,11 @@ export const KIND_GLOSSES: Readonly<Record<string, { says: string; direction: Ki
     direction: 'symmetric',
   },
   'friend of': {
-    says: 'Holds personal affection and companionable regard for the other person beyond a working tie; differs from acquaintance in closeness, and from ally of in affection rather than a shared cause.',
+    says: 'Holds personal affection and companionable regard for the other person beyond a working tie; shared meals, lessons or company alone are not enough. Differs from acquaintance in closeness, and from ally of in affection rather than a shared cause.',
     direction: 'symmetric',
   },
   'enemy of': {
-    says: 'Actively opposes, fights or works against the other person with harm intended; differs from disliked in open conflict, and from rival of in seeking harm rather than only to outdo.',
+    says: 'Seeks to harm, injure, kill or destroy the other person: open violence, an attack, a curse or a plot is required. Differs from disliked, distrusted and rival of in requiring harm sought, not merely hatred, distrust, competition, bullying or teacher-student friction.',
     direction: 'directional',
   },
   'ally of': {
@@ -9790,11 +9790,11 @@ export const KIND_GLOSSES: Readonly<Record<string, { says: string; direction: Ki
     direction: 'directional',
   },
   'student of': {
-    says: 'Is instructed by the other person; differs from apprentice of in formal study rather than a trade bound to a master, and from teacher of in the direction of instruction.',
+    says: 'Is instructed by the other person in a subject or skill; merely attending the same school or being in the same room is not enough. Differs from apprentice of in formal study rather than a trade bound to a master, and from teacher of in the direction of instruction.',
     direction: 'directional',
   },
   'mentor of': {
-    says: 'Guides the other person over time, shaping judgment and character; differs from teacher of in guidance beyond instruction, and from guardian of in development rather than safety.',
+    says: 'Guides the other person over time, shaping judgment and character; a single act of help or protection is not mentorship. Differs from teacher of in guidance beyond instruction, and from guardian of in development rather than safety.',
     direction: 'directional',
   },
   'leader of': {
@@ -9806,11 +9806,11 @@ export const KIND_GLOSSES: Readonly<Record<string, { says: string; direction: Ki
     direction: 'directional',
   },
   'peer of': {
-    says: 'Holds equal standing with the other person in the same body or rank; differs from colleague of in equality of rank rather than shared work, and from friend of in station rather than affection.',
+    says: 'Holds equal standing with the other person in the same body, rank or school; includes classmates and fellow students. Differs from colleague of in equal standing rather than shared work, and from friend of in station rather than affection.',
     direction: 'symmetric',
   },
   'colleague of': {
-    says: 'Works alongside the other person in the same organisation or calling; differs from peer of in shared work rather than formal rank, and from ally of in routine cooperation rather than a cause.',
+    says: 'Works alongside the other person in the same organisation or calling; schoolmates, classmates and fellow students are peer of, not colleague. Differs from peer of in shared work rather than equal standing, and from ally of in routine cooperation rather than a cause.',
     direction: 'symmetric',
   },
   'aide of': {
@@ -9854,7 +9854,7 @@ export const KIND_GLOSSES: Readonly<Record<string, { says: string; direction: Ki
     direction: 'symmetric',
   },
   'acquaintance': {
-    says: 'Knows the other person by name and has met them, without a close personal bond; differs from friend of in lacking affection, and from colleague of in lacking a shared working role.',
+    says: 'Knows the other person by name through repeated encounters and would recognise them; a single meeting, errand or confrontation is not enough. Differs from friend of in lacking affection, and from colleague of in lacking a shared working role.',
     direction: 'symmetric',
   },
   'disliked': {
