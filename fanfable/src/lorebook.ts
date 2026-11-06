@@ -7645,7 +7645,7 @@ async function extractWindowSplit(
   };
 
   // (a) The things the passages establish, and the facts they state.
-  const first = await ask('entities-facts', EXTRACT_ENTITIES_SYSTEM, Math.min(1600, maxTokens));
+  const first = await ask('entities-facts', EXTRACT_ENTITIES_SYSTEM, maxTokens);
   if (first !== null) {
     let entitiesObservation: ExtractionParseObservation | undefined;
     let factsObservation: ExtractionParseObservation | undefined;
@@ -7677,7 +7677,7 @@ async function extractWindowSplit(
     : windowEntityNames(db, projectId, window, roster);
   if (names.length) {
     const system = `${relationsSystemPrompt()}\n\n${formatKnownEntities(names, listEntities(db, projectId))}`;
-    const second = await ask('relations', system, Math.min(3000, maxTokens), 0);
+    const second = await ask('relations', system, maxTokens, 0);
     if (second !== null) {
       let relationsObservation: ExtractionParseObservation | undefined;
       let relations = parseSection(
@@ -7723,7 +7723,7 @@ async function extractWindowSplit(
   }
 
   // (c) What happens, in order.
-  const third = await ask('timeline', EXTRACT_EVENTS_SYSTEM, Math.min(1200, maxTokens));
+  const third = await ask('timeline', EXTRACT_EVENTS_SYSTEM, maxTokens);
   if (third !== null) {
     let timelineObservation: ExtractionParseObservation | undefined;
     const timeline = parseSection(
@@ -8787,7 +8787,7 @@ async function extractWindowWithRecovery(
       await runStage({
         stage: 'entities-facts',
         system: () => EXTRACT_ENTITIES_SYSTEM,
-        maxTokens: Math.min(1600, maxTokens),
+        maxTokens: maxTokens,
         temperature: 0,
         prepare: async (text, finishReason) => {
           let entitiesObservation: ExtractionParseObservation | undefined;
@@ -9022,7 +9022,7 @@ async function extractWindowWithRecovery(
           const result = await runStage({
             stage: 'relations',
             system: () => system,
-            maxTokens: Math.min(3000, maxTokens),
+            maxTokens: maxTokens,
             temperature: 0,
             fingerprint,
             rosterRows: snapshot.entities,
@@ -9113,7 +9113,7 @@ async function extractWindowWithRecovery(
       await runStage({
         stage: 'timeline',
         system: () => EXTRACT_EVENTS_SYSTEM,
-        maxTokens: Math.min(1200, maxTokens),
+        maxTokens: maxTokens,
         temperature: 0,
         prepare: async (text, finishReason) => {
           let observation: ExtractionParseObservation | undefined;

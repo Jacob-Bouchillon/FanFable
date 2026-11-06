@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Relationship map</title>
+  <link rel="stylesheet" href="/ui/style.css">
+</head>
+<body class="w3d-body w3d-map-body">
+  <main id="w3d">
+    <canvas id="w3d-canvas" aria-label="Relationship map"></canvas>
+
+    <header class="w3d-head">
+      <div class="w3d-title">
+        <strong>Relationship map</strong>
+        <span id="w3d-status" class="w3d-muted">loading…</span>
+      </div>
+      <div id="w3d-counts" class="w3d-counts"></div>
+      <div class="w3d-controls">
+        <label><input type="checkbox" id="f-isolated"> Show isolated people</label>
+        <button id="w3d-reset" class="w3d-btn" type="button">Reset view</button>
+        <a class="w3d-btn" href="/web3d/evidence">Evidence web</a>
+      </div>
+    </header>
+
+    <div id="w3d-tooltip" class="w3d-tooltip" hidden></div>
+
+    <aside id="w3d-panel" class="w3d-panel" hidden>
+      <button id="w3d-close" class="w3d-close" type="button" aria-label="Close">×</button>
+      <div id="w3d-detail"></div>
+    </aside>
+
+    <div class="w3d-hint">Drag to pan · wheel to zoom · click a person or relation</div>
+  </main>
+  <script src="/ui/web3d-map.js"></script>
+</body>
+</html>

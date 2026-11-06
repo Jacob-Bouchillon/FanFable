@@ -28,6 +28,7 @@
     personByName: new Map(),
     lastRev: '',
     selected: null,
+    selectedView: null,
     yaw: 0.6,
     pitch: -0.25,
     zoom: 1,
@@ -312,7 +313,9 @@
       pushFeed(diffCounts(previousCounts, data.counts));
       statusEl.textContent = 'live';
       if (state.selected && state.byId.has(state.selected)) {
-        showDetail(state.byId.get(state.selected).threadId);
+        const node = state.byId.get(state.selected);
+        if (state.selectedView === 'person' && node.entityId != null) showPerson(node.entityId);
+        else showDetail(node.threadId);
       }
     } catch (error) {
       statusEl.textContent = 'offline';
@@ -360,6 +363,7 @@
 
   async function showDetail(threadId) {
     state.selected = `t:${threadId}`;
+    state.selectedView = 'thread';
     panel.hidden = false;
     detailEl.replaceChildren(el('p', 'w3d-muted', 'loading…'));
     try {
@@ -402,6 +406,56 @@
     }
   }
 
+  async function showPerson(entityId) {
+    state.selectedView = 'person';
+    panel.hidden = false;
+    detailEl.replaceChildren(el('p', 'w3d-muted', 'loading…'));
+    try {
+      const res = await fetch(`/api/web/person?id=${encodeURIComponent(entityId)}`, { cache: 'no-store' });
+      if (!res.ok) throw new Error(String(res.status));
+      const data = await res.json();
+      const nodes = [];
+      const person = data.person;
+      nodes.push(el('h2', '', person.name));
+      if (person.aliases && person.aliases.length) {
+        nodes.push(el('div', 'w3d-muted', person.aliases.join(' · ')));
+      }
+      nodes.push(el('div', 'w3d-muted', person.kind));
+      nodes.push(el('div', 'w3d-muted',
+        `${data.counts.total} ties · ${data.counts.accepted} accepted · ${data.counts.needsReview} needs review`));
+      if (data.duplicates && data.duplicates.length) {
+        const warning = el('div', 'w3d-warn w3d-duplicates');
+        for (const duplicate of data.duplicates) {
+          warning.append(el('div', '', `Also in the bank: ${duplicate.name} (${duplicate.reason}) — not merged.`));
+        }
+        nodes.push(warning);
+      }
+      for (const group of data.groups) {
+        nodes.push(el('h3', 'w3d-family', group.family));
+        for (const tie of group.ties) {
+          const card = el('div', 'w3d-note w3d-tie');
+          const head = el('div', 'w3d-evidence-head');
+          head.append(el('span', 'w3d-tie-direction',
+            tie.direction === 'out' ? `→ ${tie.counterpart.name}` : `${tie.counterpart.name} ←`));
+          head.append(el('span', 'w3d-muted', tie.kind));
+          const badgeClass = tie.status === 'accepted'
+            ? 'w3d-status-accepted'
+            : tie.status === 'needs_review' ? 'w3d-status-review' : 'w3d-status-other';
+          head.append(el('span', `w3d-status ${badgeClass}`, tie.status));
+          card.append(head);
+          card.append(el('q', 'w3d-tie-quote', tie.quote));
+          if (tie.locator) card.append(el('div', 'w3d-muted', tie.locator));
+          if (tie.description) card.append(el('div', 'w3d-muted w3d-model-note', `model note: ${tie.description}`));
+          nodes.push(card);
+        }
+      }
+      if (!data.groups.length) nodes.push(el('p', 'w3d-muted', 'no banked relationships yet'));
+      detailEl.replaceChildren(...nodes);
+    } catch (error) {
+      detailEl.replaceChildren(el('p', 'w3d-muted', 'Could not load person.'));
+    }
+  }
+
   function hitTest(clientX, clientY, radius = 22) {
     if (!state.projected) return null;
     let best = null;
@@ -438,7 +492,13 @@
     const id = hitTest(clientX - rect.left, clientY - rect.top, 22);
     if (!id || !state.byId.has(id)) return;
     lastSelectAt = Date.now();
-    showDetail(state.byId.get(id).threadId);
+    const node = state.byId.get(id);
+    if (node.kind === 'person' && node.entityId != null) {
+      state.selected = id;
+      showPerson(node.entityId);
+    } else {
+      showDetail(node.threadId);
+    }
   }
   canvas.addEventListener('pointerdown', () => { dragDistance = 0; });
   canvas.addEventListener('pointermove', (event) => {
@@ -481,11 +541,13 @@
     state.pitch = -0.25;
     state.zoom = 1;
     state.selected = null;
+    state.selectedView = null;
     panel.hidden = true;
   });
   document.getElementById('w3d-close').addEventListener('click', () => {
     panel.hidden = true;
     state.selected = null;
+    state.selectedView = null;
   });
   for (const key of ['people', 'pairs', 'births', 'meetings', 'open']) {
     filter[key].addEventListener('change', () => { /* redraw reads the filters */ });

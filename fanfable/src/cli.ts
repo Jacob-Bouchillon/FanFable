@@ -141,7 +141,7 @@ ${C.bold('SOURCE MATERIAL')}
   sources                          List imported sources
   lore search <query>              Search canon, show passages with references
   lore ask <question>              Answer a lore question with citations
-  lore extract [--model m] [--max-windows n] [--starved-first n] [--starved-reserve n] [--priority-first n] [--random-floor f] [--seed n] [--full] [--retry] [--legacy] [--trace]
+  lore extract [--model m] [--max-windows n] [--max-tokens n] [--starved-first n] [--starved-reserve n] [--priority-first n] [--random-floor f] [--seed n] [--full] [--retry] [--legacy] [--trace]
                            Extract the book's lore: people, places, rules, facts.
                            No budget flags mines everything; --max-windows caps it (top priority
                            first, seeded sample of the rest); --full ignores the budget.
@@ -1139,6 +1139,10 @@ async function cmdLore(args: Args): Promise<void> {
       sourceId: flagNumber(args, 'source', 0) || undefined,
       windowSize: flagNumber(args, 'window', 8),
       concurrency: flagNumber(args, 'concurrency', 3),
+      // Output budget per window. The 3000 default truncates the
+      // entities+facts answer on nearly every window, which silently drops
+      // the tail of each entity list.
+      maxTokens: flagNumber(args, 'max-tokens', 0) || undefined,
       fresh: args.flags.fresh === true,
       maxWindows: budgetFlag(args, 'max-windows'),
       starvedFirst: budgetFlag(args, 'starved-first'),

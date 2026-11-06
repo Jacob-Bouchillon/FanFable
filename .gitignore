@@ -55,3 +55,8 @@ testing/trials/**/*.md
 !testing/trials/*/README.md
 testing/trials/**/backup/
 testing/trials/tmp-archive*/
+
+# Deliberate baseline bank snapshots (small, versioned on purpose).
+!testing/banks/
+!testing/banks/*.db
+!testing/banks/*.log

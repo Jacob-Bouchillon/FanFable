@@ -137,7 +137,7 @@ test('a model that thinks out loud can be told not to', async () => {
     await client.chat({ messages: [{ role: 'user', content: 'hello' }] });
     assert.equal(received[0].think, false);
     assert.equal(received[0].options.seed, 42);
-    assert.equal(received[0].options.num_ctx, 16384);
+    assert.equal(received[0].options.num_ctx, 32768);
   } finally {
     server.close();
   }

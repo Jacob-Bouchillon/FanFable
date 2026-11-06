@@ -55,9 +55,10 @@ export const DEFAULT_LLM_SETTINGS: LlmSettings = {
   model: 'llama3.1:8b',
   temperature: 0.8,
   maxTokens: 2048,
-  // 16k rather than 8k: the planner's prompt alone is close to 6k tokens, and
-  // a model that has no room left cannot finish its answer.
-  contextTokens: 16384,
+  // 32k, not 16k: measured 6.7 GB with qwen3.5:9b on the 16 GB card, which
+  // leaves room under the 8 GB ceiling for a longer prompt plus a full answer.
+  // Every 16k costs about 0.6 GB because Ollama quantises the KV cache.
+  contextTokens: 32768,
   timeoutMs: 600_000,
 };
 

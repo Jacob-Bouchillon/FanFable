@@ -25,7 +25,7 @@ import * as continuity from './continuity.ts';
 import { DEFAULT_LLM_SETTINGS, clientFrom, loadGlobalConfig, saveGlobalConfig } from '../core/llm.ts';
 import { DEFAULT_CONTINUITY_SETTINGS, continuitySettings } from './continuity-settings.ts';
 import { devGraphSummary } from './dev-summary.ts';
-import { buildWebGraph, webThreadDetail } from './web3d.ts';
+import { buildWebGraph, buildWebMap, webPersonDossier, webThreadDetail } from './web3d.ts';
 
 /** Settings returned to the UI never carry the whole API key. */
 export function maskSettingsForOutput<T extends Record<string, unknown>>(settings: T): T {
@@ -294,8 +294,13 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
         serveStatic(res, join(UI_DIR, 'index.html'));
         return;
       }
-      if (method === 'GET' && (path === '/web3d' || path === '/web3d/')) {
+      if (method === 'GET' && (path === '/web3d/evidence' || path === '/web3d/evidence/'
+        || path === '/web3d-evidence' || path === '/web3d-evidence/')) {
         serveStatic(res, join(UI_DIR, 'web3d.html'));
+        return;
+      }
+      if (method === 'GET' && (path === '/web3d' || path === '/web3d/')) {
+        serveStatic(res, join(UI_DIR, 'web3d-map.html'));
         return;
       }
       if (method === 'GET' && (path === '/dev-viz' || path === '/dev-viz/')) {
@@ -705,6 +710,16 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
         return;
       }
 
+      if (path === '/api/web/map' && method === 'GET') {
+        if (activeId() === null) {
+          json(res, 200, { nodes: [], edges: [] });
+          return;
+        }
+        const p = project();
+        json(res, 200, buildWebMap(db, p.id, { includeIsolated: url.searchParams.get('isolated') === '1' }));
+        return;
+      }
+
       if (path === '/api/web/thread' && method === 'GET') {
         if (activeId() === null) {
           json(res, 404, { error: 'not found' });
@@ -722,6 +737,26 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
           return;
         }
         json(res, 200, detail);
+        return;
+      }
+
+      if (path === '/api/web/person' && method === 'GET') {
+        if (activeId() === null) {
+          json(res, 404, { error: 'not found' });
+          return;
+        }
+        const p = project();
+        const id = Number(url.searchParams.get('id'));
+        if (!Number.isInteger(id) || id <= 0) {
+          json(res, 400, { error: 'bad person id' });
+          return;
+        }
+        const dossier = webPersonDossier(db, p.id, id);
+        if (!dossier) {
+          json(res, 404, { error: 'not found' });
+          return;
+        }
+        json(res, 200, dossier);
         return;
       }
 

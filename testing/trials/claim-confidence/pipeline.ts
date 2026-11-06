@@ -72,7 +72,7 @@ async function main(): Promise<void> {
   const dbPath = flag(args, 'db');
   const projectName = flag(args, 'project');
   if (!dbPath || !projectName) {
-    process.stderr.write('usage: pipeline.ts --db <copy.db> --project <name> [--models a,b,c] [--notes 8] [--limit n] [--write]\n');
+    process.stderr.write('usage: pipeline.ts --db <copy.db> --project <name> [--models a,b,c] [--notes 8] [--limit n] [--write] [--filters]\n');
     process.exit(2);
   }
   if (!existsSync(dbPath)) throw new Error(`database not found: ${dbPath}`);
@@ -80,6 +80,7 @@ async function main(): Promise<void> {
   const noteLimit = Number(flag(args, 'notes') ?? 8);
   const limit = Number(flag(args, 'limit') ?? 0) || undefined;
   const write = args.includes('--write');
+  const filters = args.includes('--filters');
   const idsFile = flag(args, 'ids');
   const onlyIds = idsFile ? new Set(readFileSync(idsFile, 'utf8').split(/[^0-9]+/).map(Number).filter(Boolean)) : null;
 
@@ -111,9 +112,10 @@ async function main(): Promise<void> {
     }[]
   ).filter((row) => (onlyIds ? onlyIds.has(row.id) : true)).slice(0, limit);
 
-  let accepted = 0;
-  let rejected = 0;
-  for (const [index, row] of rows.entries()) {
+  // Assemble every case file before judging. A case file depends only on the
+  // row, its pair notes and the cited chunk, so it can be built once and
+  // reused across models without changing any prompt byte.
+  const cases = rows.map((row) => {
     const lo = Math.min(row.from_entity, row.to_entity);
     const hi = Math.max(row.from_entity, row.to_entity);
     const thread = db
@@ -141,23 +143,82 @@ async function main(): Promise<void> {
     }
 
     const user = `PAIR: ${row.a} / ${row.b}\nCLAIMED TIE: ${row.kind}\n\nQUOTE:\n${row.evidence}\n\nPASSAGE:\n${passage || '(no passage)'}\n\nPAIR NOTES:\n${noteText}`;
+    return { row, user };
+  });
 
-    const truthVotes: boolean[] = [];
-    const kindVotes: boolean[] = [];
-    for (const model of models) {
+  // Model-outer, not row-outer. On a 16 GB card only one of the three models is
+  // resident at a time, so row-outer ordering paid two ~6 s unload/reload cycles
+  // per row. Grouping by model loads each model once for the whole run. The
+  // votes are identical: the same calls, the same per-model seed majorities, the
+  // same cross-model majority, only accumulated in a different order.
+  const votes = new Map<number, { truth: boolean[]; kind: boolean[] }>(
+    rows.map((row) => [row.id, { truth: [], kind: [] }]),
+  );
+  let judged = 0;
+  for (const model of models) {
+    for (const { row, user } of cases) {
       const modelVotes = await Promise.all(SEEDS.map((seed) => ask(model, user, seed)));
-      const truth = modelVotes.filter((v) => v.truth).length >= 2;
-      const kind = modelVotes.filter((v) => v.kind).length >= 2;
-      truthVotes.push(truth);
-      kindVotes.push(kind);
+      const tally = votes.get(row.id)!;
+      tally.truth.push(modelVotes.filter((v) => v.truth).length >= 2);
+      tally.kind.push(modelVotes.filter((v) => v.kind).length >= 2);
+      judged++;
+      if (judged % 10 === 0) process.stderr.write(`judged ${judged}/${rows.length * models.length}\n`);
     }
-    const truth = truthVotes.filter(Boolean).length * 2 > models.length;
-    const kindMatch = kindVotes.filter(Boolean).length * 2 > models.length;
-    const pass = truth && kindMatch;
+    process.stderr.write(`model done: ${model}\n`);
+  }
+
+  const verdicts = rows.map((row) => {
+    const tally = votes.get(row.id)!;
+    const truth = tally.truth.filter(Boolean).length * 2 > models.length;
+    const kindMatch = tally.kind.filter(Boolean).length * 2 > models.length;
+    return { row, truth, kindMatch, pass: truth && kindMatch };
+  });
+
+  // Mechanical filters run after the judge and can only demote. They measure
+  // the claim's representation, not its truth: the same tie accepted twice must
+  // not count twice. Directional kinds (student/teacher, parent/child) are
+  // deliberately absent from the symmetric set, because reversing one states a
+  // different tie rather than a duplicate.
+  const SYMMETRIC_KINDS = new Set([
+    'acquaintance', 'friend of', 'enemy of', 'ally of', 'rival of', 'colleague of',
+    'brother of', 'sister of', 'sibling of', 'cousin of', 'relative of', 'spouse of',
+    'partner', 'peer', 'disliked', 'distrusted', 'trusted', 'feared', 'admired',
+    'jealous of', 'friend', 'enemy',
+  ]);
+  const mechanical = new Map<number, string>();
+  if (filters) {
+    const orderedSeen = new Map<string, number>();
+    const unorderedSeen = new Map<string, number>();
+    for (const verdict of verdicts) {
+      if (!verdict.pass) continue;
+      const { row } = verdict;
+      const lo = Math.min(row.from_entity, row.to_entity);
+      const hi = Math.max(row.from_entity, row.to_entity);
+      const kind = row.kind.toLowerCase().trim();
+      const ordered = `${row.from_entity}-${row.to_entity}|${kind}`;
+      const unordered = SYMMETRIC_KINDS.has(kind) ? `${lo}-${hi}|${kind}` : null;
+      const duplicateOf = unordered ? unorderedSeen.get(unordered) : orderedSeen.get(ordered);
+      if (duplicateOf !== undefined) {
+        verdict.pass = false;
+        mechanical.set(row.id, unordered ? 'symmetric-duplicate' : 'duplicate-claim');
+        continue;
+      }
+      orderedSeen.set(ordered, row.id);
+      if (unordered) unorderedSeen.set(unordered, row.id);
+    }
+  }
+
+  let accepted = 0;
+  let rejected = 0;
+  for (const { row, truth, kindMatch, pass } of verdicts) {
+    const filterReason = mechanical.get(row.id);
 
     if (write) {
       const target = pass ? 'accepted' : 'needs_review';
-      if (target !== row.review_status) {
+      // A filtered row may already sit at needs_review, in which case the
+      // status does not move. Record the ruling anyway: the mechanical reason
+      // is an audit fact, not a side effect of a transition.
+      if (target !== row.review_status || filterReason) {
         db.prepare('UPDATE canon_relation SET review_status = ? WHERE id = ? AND project_id = ?').run(target, row.id, project.id);
         db.prepare(
           `INSERT INTO canon_ruling (project_id, subject, relation_id, role, actor, standard, from_status, to_status, basis, quote_hash, created_at)
@@ -168,17 +229,20 @@ async function main(): Promise<void> {
           row.id,
           row.review_status,
           target,
-          pass ? 'case file: truth and kind majorities' : `case file: truth=${truth} kind=${kindMatch}`,
+          pass
+            ? 'case file: truth and kind majorities'
+            : filterReason
+              ? `mechanical: ${filterReason}`
+              : `case file: truth=${truth} kind=${kindMatch}`,
           new Date().toISOString(),
         );
       }
     }
     if (pass) accepted++;
     else rejected++;
-    if ((index + 1) % 10 === 0) process.stderr.write(`judged ${index + 1}/${rows.length}\n`);
   }
 
-  process.stderr.write(`rows=${rows.length} accepted=${accepted} parked=${rejected} models=${models.join(',')} write=${write}\n`);
+  process.stderr.write(`rows=${rows.length} accepted=${accepted} parked=${rejected} filtered=${mechanical.size} models=${models.join(',')} write=${write}\n`);
   db.close();
 }
 
