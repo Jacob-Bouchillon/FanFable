@@ -6,6 +6,32 @@ import { runMigrations } from './migrations.ts';
 
 export type Row = Record<string, unknown>;
 
+/** Block the current thread for a few milliseconds without a timer. */
+function sleepMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Open a database, retrying while another connection holds the write lock.
+ *
+ * Two agents can open the same bank at the same moment (the concurrent
+ * promotion test does exactly this). `node:sqlite` has no busy timeout at
+ * open time, so the second connection fails with SQLITE_BUSY before any
+ * PRAGMA can help. Retry briefly instead of failing a legitimate race.
+ */
+function openWithBusyRetry(path: string): DatabaseSync {
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    try {
+      return new DatabaseSync(path);
+    } catch (err) {
+      const code = (err as { errcode?: number }).errcode;
+      if ((code !== 5 && code !== 6) || Date.now() >= deadline) throw err;
+      sleepMs(50);
+    }
+  }
+}
+
 export class Db {
   readonly raw: DatabaseSync;
   readonly path: string;
@@ -14,9 +40,11 @@ export class Db {
   constructor(path: string) {
     this.path = path;
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
-    this.raw = new DatabaseSync(path);
-    this.raw.exec('PRAGMA journal_mode = WAL');
+    this.raw = openWithBusyRetry(path);
+    // The busy timeout must precede the journal-mode change: switching to WAL
+    // takes a lock, and without the timeout a concurrent opener fails.
     this.raw.exec('PRAGMA busy_timeout = 5000');
+    this.raw.exec('PRAGMA journal_mode = WAL');
     this.raw.exec('PRAGMA foreign_keys = ON');
     runMigrations(this.raw);
     // Two version fields by design, not two answers: PRAGMA user_version is
