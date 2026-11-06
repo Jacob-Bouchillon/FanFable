@@ -32,6 +32,16 @@ Trusted requires demonstrated reliance on the other's conduct; protection or kin
 Relative requires family by blood or marriage, not household membership or friendship.
 Use the whole case file. No outside knowledge. Reply JSON only: {"verdict":"true"|"false","kind_match":"yes"|"no","reason":"at most 12 words"}.`;
 
+const STRICT_QUOTE_SUFFIX = `
+
+STRICT QUOTE MODE: judge the QUOTE, not the passage. The passage is present only to resolve a
+pronoun or a name the quote leaves implicit. If the quoted sentence does not itself state or
+directly imply this tie between these two people, answer verdict false. Two people merely
+appearing in the same passage, or one being mentioned near the other, is not a tie.`;
+
+const SYSTEM_STRICT = SYSTEM + STRICT_QUOTE_SUFFIX;
+const SYSTEM_FOR_RUN = process.env.FANFABLE_JUDGE_STRICT_QUOTE === '1' ? SYSTEM_STRICT : SYSTEM;
+
 function flag(args: string[], name: string): string | undefined {
   const at = args.indexOf(`--${name}`);
   if (at < 0) return undefined;
@@ -49,7 +59,7 @@ async function ask(model: string, user: string, seed: number): Promise<{ truth: 
       think: false,
       options: { temperature: 0, seed },
       messages: [
-        { role: 'system', content: SYSTEM },
+        { role: 'system', content: SYSTEM_FOR_RUN },
         { role: 'user', content: user },
       ],
     }),

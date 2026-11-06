@@ -5156,10 +5156,22 @@ function applyEntities(
   gate: boolean,
 ): number {
   let accepted = 0;
+  // The schema caps the list at 30, but the model fills it with props unless
+  // people are ordered first. Backstop the ordering here: a dense window may
+  // still return many items/rules, and those must not crowd out characters.
+  let items = 0;
+  let rules = 0;
   for (const raw of raws) {
     const name = String(raw.name ?? '').trim();
     if (!name) continue;
     const kind = normaliseKind(String(raw.kind ?? 'character'));
+    if (kind === 'item') {
+      if (items >= 5) continue;
+      items++;
+    } else if (kind === 'rule') {
+      if (rules >= 3) continue;
+      rules++;
+    }
     // A description, a conjunction, or a group is never a new character.
     // Skipped here, relations naming it fall into the existing unresolved
     // path and are counted there.

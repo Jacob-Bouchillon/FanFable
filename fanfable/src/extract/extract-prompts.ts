@@ -60,6 +60,7 @@ Entity funnels:
 - Resolve ambiguity by role. A creature or item is decided by whether the book treats it as alive; a faction or species by whether it is an organisation (faction) or a people (species). If it is still unclear, keep it a fact instead of an entity.
 
 Rules:
+- Order the entities: named people first, then places, organisations and creatures, then at most 5 items and 3 rules. A prop never displaces a person.
 - Only record what these passages support. Never fill gaps with general knowledge.
 - Record people by the proper name the passages give. A description is never a new person: "the Potters' son" points at a named Potter when one is known, otherwise it is skipped. A thing or place is never a character.
 - One person per entry. Never bank "A and B" as a single person: "Lily and James Potter" is two entries, not one. A family group ("the Potters") is never a character.

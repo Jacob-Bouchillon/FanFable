@@ -77,6 +77,7 @@ export function characterChapters(
   projectId: number,
   entityId: number,
   limit = 200,
+  extraForms: string[] = [],
 ): ChapterAppearance[] {
   const cap = Number.isFinite(limit) ? Math.max(0, Math.floor(limit)) : 200;
   if (cap === 0) return [];
@@ -86,7 +87,10 @@ export function characterChapters(
     projectId,
   );
   if (!entity) return [];
-  const patterns = patternsFor(entity.name, fromJson<string[]>(entity.aliases, []));
+  const patterns = patternsFor(entity.name, [
+    ...fromJson<string[]>(entity.aliases, []),
+    ...extraForms,
+  ]);
   if (!patterns.length) return [];
 
   const chunks = db.all<{
