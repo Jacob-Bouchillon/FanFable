@@ -74,6 +74,35 @@ at least one partial section:
 Raising the cap further will not fix that. The next lever is constrained/JSON decoding or a
 repair-and-retry pass on a partial array.
 
+### Why the responses were malformed
+
+The trace stores a hash, not the response text, but it records the response size and the number of
+entries salvaged. Across the 23 partial sections with a size recorded:
+
+| response size | sections | reading |
+|---|---:|---|
+| ≥ 24k chars (~6k+ tokens) | 2 | runaway generation, at/near the 8k cap |
+| 12k–24k | 0 | — |
+| 6k–12k | 13 | broken JSON at ordinary length |
+| < 6k | 8 | short broken answers |
+
+The two extremes explain themselves: one entities response was **30,211 characters for 3
+entities** — the model wrote prose/repetition, not a list — and another was **27,398 characters
+for 79 entities**, a list long enough to hit the cap. Both are generation-control failures, not
+prompt-size failures.
+
+The other 21 partial sections are the opposite: ordinary response sizes, invalid JSON. At
+9,304 characters the parser salvaged 4 entities; at 3,110 characters it salvaged 2 relations.
+Those are unescaped quotes, trailing commas, or an array closed without the outer object — the
+kind of failure that a JSON grammar or a repair retry fixes and a larger token budget never will.
+
+Practical fixes, in order:
+
+1. constrain decoding to JSON (Ollama structured outputs / GBNF grammar),
+2. re-ask only the broken section for that window, with the salvaged entries as a prefix,
+3. cap entity count per window in the prompt (a window is 8 passages; 79 entities is a defect),
+4. add a repetition guard for the runaway cases.
+
 ## Coverage — the cast problem remains
 
 Characters went from 84 to 89, and the minor cast is still absent:
