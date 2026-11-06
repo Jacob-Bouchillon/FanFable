@@ -5,6 +5,7 @@ import { createProject } from '../../fanfable/src/plan/controller.ts';
 import {
   applySweep,
   batchSweepPassages,
+  parseRelationSweepAnswer,
   parseSweepAnswer,
   planSweep,
   sweepRelationKey,
@@ -198,6 +199,27 @@ test('validation rejects unknown people, self, missing quotes, bad kinds and dup
     { ok: false, reason: 'names-not-both' },
   );
 
+  const anchorPassage = {
+    chunkId: 1001,
+    locator: 'TEST (p. 3)',
+    seq: 1001,
+    text: "Snape didn't dislike him -- he hated him. Harry was sitting at the table.",
+  };
+  assert.deepEqual(
+    validateSweepTie(
+      {
+        other: 'Harry',
+        kind: 'enemy of',
+        direction: 'out',
+        quote: "Snape didn't dislike him -- he hated him.",
+        anchor: 'Harry was sitting at the table.',
+        chunkIndex: 0,
+      },
+      snapeTarget, [anchorPassage], snapeKnown, SWEEP_KINDS, new Set(),
+    ),
+    { ok: true, toId: 20 },
+  );
+
   const pronounPassage = {
     chunkId: 1000,
     locator: 'TEST (p. 2)',
@@ -307,12 +329,12 @@ test('applySweep dry-runs without writing, then writes relations and rulings ide
     [fixture.hermione, fixture.harry, 'mentor of', 'needs_review'],
   ]);
   const rulings = fixture.db.all<{ actor: string; basis: string }>(
-    'SELECT actor, basis FROM canon_ruling WHERE project_id = ? ORDER BY id',
+    "SELECT actor, basis FROM canon_ruling WHERE project_id = ? AND actor = 'character-sweep' ORDER BY id",
     fixture.projectId,
   );
   assert.deepEqual(rulings.map((ruling) => [ruling.actor, ruling.basis]), [
-    ['bank', 'inserted friend of'],
-    ['bank', 'inserted mentor of'],
+    ['character-sweep', 'sweep: Harry'],
+    ['character-sweep', 'sweep: Harry'],
   ]);
 
   const second = applySweep(fixture.db, fixture.projectId, target, ties, { dryRun: false });
@@ -323,7 +345,7 @@ test('applySweep dry-runs without writing, then writes relations and rulings ide
   );
   assert.equal(
     fixture.db.get<{ n: number }>('SELECT COUNT(*) AS n FROM canon_ruling WHERE project_id = ?', fixture.projectId)!.n,
-    2,
+    4,
   );
   fixture.db.close();
 });
@@ -353,6 +375,24 @@ test('batchSweepPassages splits in sixes and preserves order', () => {
   const batches = batchSweepPassages(passages, 6);
   assert.deepEqual(batches.map((batch) => batch.length), [6, 6, 1]);
   assert.deepEqual(batches.flat().map((passage) => passage.chunkId), passages.map((passage) => passage.chunkId));
+});
+
+test('parseRelationSweepAnswer maps extractor relations involving the target', () => {
+  const fixture = seed();
+  const target = planSweep(fixture.db, fixture.projectId, { cast: ['Harry'], maxPassages: 5 })[0]!;
+  const known = knownFor(fixture);
+  const text = JSON.stringify({
+    relations: [
+      { from: 'Harry', to: 'Ron', kind: 'friend of', evidence: 'Harry and Ron went to the zoo.', chunk_index: 0, description: 'friends' },
+      { from: 'Ron', to: 'Harry', kind: 'enemy of', evidence: 'Ron turned on him.', chunk_index: 1, anchor: 'Harry was there.', why: 'turned' },
+      { from: 'Ron', to: 'Hermione', kind: 'friend of', evidence: 'Ron and Hermione talked.', chunk_index: 0 },
+    ],
+  });
+  assert.deepEqual(parseRelationSweepAnswer(text, target, known), [
+    { other: 'Ron', kind: 'friend of', direction: 'out', quote: 'Harry and Ron went to the zoo.', chunkIndex: 0, reason: 'friends' },
+    { other: 'Ron', kind: 'enemy of', direction: 'in', quote: 'Ron turned on him.', chunkIndex: 1, reason: 'turned', anchor: 'Harry was there.' },
+  ]);
+  fixture.db.close();
 });
 
 test('batched validation unions accepted ties and dedupes across batches', () => {

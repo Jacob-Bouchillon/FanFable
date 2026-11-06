@@ -5,37 +5,25 @@
  * applies them. No model call happens without --model.
  */
 import { Db, fromJson } from '../../fanfable/src/core/db.ts';
+import { formatKnownEntities } from '../../fanfable/src/extract/extract-prompts.ts';
+import { RELATION_FAMILIES } from '../../fanfable/src/identity/relation-proof.ts';
+import { listEntities, relationsSystemPrompt } from '../../fanfable/src/lorebook.ts';
 import * as controller from '../../fanfable/src/plan/controller.ts';
 import {
   applySweep,
   batchSweepPassages,
-  parseSweepAnswer,
+  parseRelationSweepAnswer,
   planSweep,
   sweepRelationKey,
   validateSweepTies,
-  SWEEP_KINDS,
   type SweepPassage,
   type SweepTarget,
   type SweepTie,
 } from '../../fanfable/src/web/character-sweep.ts';
 
-const SYSTEM_PROMPT = `You record the relationships these PASSAGES explicitly establish between the TARGET and
-another named person. A tie must be carried by a sentence: the sentence says they are
-friends, enemies, family, rivals, teacher and student, allies, or that one trusts,
-distrusts, fears, protects or hates the other.
-
-Do NOT list a tie from co-mention alone. Two people standing in the same scene are not a tie.
-Do NOT list a person the passages only name in passing.
-Do NOT use outside knowledge. The quote must be the sentence that carries the tie.
-
-The quote must contain BOTH names: the target's name and the other person's name.
-Never quote a sentence that refers to either person only by pronoun, title or description.
-If no sentence names both, skip the tie.
-
-Return up to 20 ties. For each: other, kind, direction (out = target toward other, in =
-reverse), quote, chunk_index, reason (at most 12 words).`;
-
-const KINDS_LIST = [...SWEEP_KINDS].join(', ');
+const EXTRACTOR_KINDS = new Set(
+  RELATION_FAMILIES.flatMap((rule) => [rule.canonical.replace(/_/g, ' '), ...rule.keys]),
+);
 
 function flag(name: string): string | undefined {
   const index = process.argv.indexOf(`--${name}`);
@@ -78,21 +66,33 @@ function existingRelations(db: Db, projectId: number): Set<string> {
   return existing;
 }
 
-function promptFor(target: SweepTarget, people: string[], passages: SweepPassage[]): string {
-  const lines = [
-    `TARGET: ${target.name}${target.aliases.length ? ` (aliases: ${target.aliases.join(', ')})` : ''}`,
-    'KNOWN PEOPLE:',
-    ...people.map((name) => `- ${name}`),
-    `KINDS: ${KINDS_LIST}`,
-    'PASSAGES:',
-    passages.length
-      ? passages.map((passage, index) =>
-          `[${index}] ${passage.locator} | seq ${passage.seq}\n${passage.text}`).join('\n\n')
-      : '(no passages found)',
-    'Return up to 20 ties, one per person and kind. chunk_index is the 0-based passage number in this batch.',
-    'Schema: {"ties":[{"other":"...","kind":"...","direction":"out"|"in","quote":"...","chunk_index":0,"reason":"..."}]} (maxItems: 20)',
-  ];
-  return lines.join('\n\n');
+function mentions(text: string, form: string): boolean {
+  const value = String(form ?? '').replace(/\s+/g, ' ').trim();
+  if (!value) return false;
+  const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?<![a-z0-9])${escaped}(?![a-z0-9])`, 'i').test(text);
+}
+
+function batchNames(
+  entities: ReturnType<typeof listEntities>,
+  target: SweepTarget,
+  batch: SweepPassage[],
+): string[] {
+  const text = batch.map((passage) => passage.text).join(' ');
+  const names = entities
+    .filter((entity) => [entity.name, ...entity.aliases].some((form) => mentions(text, form)))
+    .map((entity) => entity.name);
+  if (!names.includes(target.name)) names.unshift(target.name);
+  if (!names.length) names.push(target.name);
+  if (!names.slice(0, 80).includes(target.name)) names.unshift(target.name);
+  return [...new Set(names)].slice(0, 80);
+}
+
+function passageBlockFor(batch: SweepPassage[]): string {
+  return 'PASSAGES:\n' + batch
+    .map((passage, index) =>
+      `[#${index}] ${passage.sourceTitle ?? ''} | ${passage.locator}\n${passage.text.slice(0, 1400)}`)
+    .join('\n\n');
 }
 
 const dbPath = flag('db') ?? process.argv[2];
@@ -119,12 +119,12 @@ try {
   }
 
   const targets = planSweep(db, project.id, { cast, minAppearances, maxPassages });
-  const people = db.all<{ name: string }>(
-    `SELECT name FROM canon_entity WHERE project_id = ? AND kind = 'character' ORDER BY name`,
-    project.id,
-  ).map((row) => row.name).slice(0, 200);
+  const allEntities = listEntities(db, project.id);
   const client = model
     ? controller.createClient({ ...project.settings, model } as never)
+    : null;
+  const retryClient = model
+    ? controller.createClient({ ...project.settings, model, seed: 43 } as never)
     : null;
   const results: Array<{
     entityId: number;
@@ -133,6 +133,7 @@ try {
     passageCount: number;
     passages: SweepTarget['passages'];
     calls: number;
+    errors?: string[];
     modelTexts?: string[];
     proposals: Array<{ tie: SweepTie; toId: number; bothInQuote: boolean }>;
     rejections: Array<{ tie: SweepTie; reason: string }>;
@@ -141,6 +142,7 @@ try {
 
   for (const target of targets) {
     let calls = 0;
+    const errors: string[] = [];
     let modelTexts: string[] = [];
     let ties: SweepTie[] = [];
     let proposals: Array<{ tie: SweepTie; toId: number; bothInQuote: boolean }> = [];
@@ -151,28 +153,40 @@ try {
       const known = knownCharacters(db, project.id);
       const existing = existingRelations(db, project.id);
       const batches = batchSweepPassages(target.passages, batchSize);
-      calls = batches.length;
       let offset = 0;
       for (const batch of batches) {
-        const response = await client.chat({
-          system: SYSTEM_PROMPT,
-          messages: [{ role: 'user', content: promptFor(target, people, batch) }],
-          temperature: 0,
-          maxTokens: 2000,
-          format: 'json',
-        });
-        modelTexts.push(response.text);
-        const batchTies = parseSweepAnswer(response.text).map((tie) => ({
+        const system = `${relationsSystemPrompt()}\n\n${formatKnownEntities(batchNames(allEntities, target, batch), allEntities)}`;
+        let responseText: string | null = null;
+        for (const attempt of [client, retryClient]) {
+          if (!attempt) continue;
+          calls++;
+          try {
+            const response = await attempt.chat({
+              system,
+              messages: [{ role: 'user', content: passageBlockFor(batch) }],
+              temperature: 0,
+              maxTokens: 2000,
+              format: 'json',
+            });
+            responseText = response.text;
+            break;
+          } catch (error) {
+            errors.push(error instanceof Error ? error.message : String(error));
+          }
+        }
+        if (responseText === null) continue;
+        modelTexts.push(responseText);
+        const batchTies = parseRelationSweepAnswer(responseText, target, known).map((tie) => ({
           ...tie,
           chunkIndex: offset + tie.chunkIndex,
         }));
         ties.push(...batchTies);
-        const validation = validateSweepTies(batchTies, target, known, existing);
+        const validation = validateSweepTies(batchTies, target, known, existing, EXTRACTOR_KINDS);
         proposals.push(...validation.proposals);
         rejections.push(...validation.rejections);
         offset += batch.length;
       }
-      counts = applySweep(db, project.id, target, ties, { dryRun: !write });
+      counts = applySweep(db, project.id, target, ties, { dryRun: !write, allowedKinds: EXTRACTOR_KINDS });
     }
 
     results.push({
@@ -182,6 +196,7 @@ try {
       passageCount: target.passages.length,
       passages: target.passages,
       calls,
+      ...(errors.length ? { errors } : {}),
       ...(modelTexts.length ? { modelTexts } : {}),
       proposals,
       rejections,

@@ -8,6 +8,8 @@ import { Db, fromJson } from '../core/db.ts';
 import { extractJson } from '../core/json.ts';
 import { STOPWORDS } from '../core/vocab.ts';
 import { insertRelation } from '../lorebook.ts';
+import { recordRuling } from '../court/ruling.ts';
+import { citationNamesBothEndpoints } from '../gates/gates.ts';
 import {
   chapterCharacters,
   characterChapters,
@@ -19,6 +21,8 @@ export interface SweepPassage {
   locator: string;
   seq: number;
   text: string;
+  /** Source title when the plan loaded it; used by the extractor passage format. */
+  sourceTitle?: string;
 }
 
 export interface SweepTarget {
@@ -35,6 +39,7 @@ export interface SweepTie {
   quote: string;
   chunkIndex: number;
   reason?: string;
+  anchor?: string;
 }
 
 export type SweepRejection =
@@ -117,6 +122,15 @@ export function namedCharacterIds(text: string, known: Map<string, number>): Set
   return ids;
 }
 
+function knownFormsForId(known: Map<string, number>, id: number): string[] {
+  const forms = new Set<string>();
+  for (const [name, candidate] of known) {
+    if (candidate !== id) continue;
+    for (const form of nameForms(name, [])) forms.add(form);
+  }
+  return [...forms];
+}
+
 function quoteMentions(quote: string, forms: string[]): boolean {
   const text = collapseWhitespace(quote);
   return forms.some((form) => {
@@ -174,12 +188,19 @@ export function planSweep(
   );
   if (!rows.length) return [];
 
-  const chunkTexts = new Map<number, string>();
-  const chunks = db.all<{ id: number; text: string }>(
-    'SELECT id, text FROM canon_chunk WHERE project_id = ?',
+  const chunkTexts = new Map<number, { text: string; sourceTitle: string }>();
+  const chunks = db.all<{ id: number; text: string; source_title: string }>(
+    `SELECT c.id, c.text, s.title AS source_title
+       FROM canon_chunk c JOIN canon_source s ON s.id = c.source_id
+      WHERE c.project_id = ?`,
     projectId,
   );
-  for (const chunk of chunks) chunkTexts.set(Number(chunk.id), String(chunk.text ?? ''));
+  for (const chunk of chunks) {
+    chunkTexts.set(Number(chunk.id), {
+      text: String(chunk.text ?? ''),
+      sourceTitle: String(chunk.source_title ?? ''),
+    });
+  }
 
   const characterCache = new Map<number, Array<{ entityId: number }>>();
   const charactersIn = (chunkId: number): Array<{ entityId: number }> => {
@@ -212,7 +233,8 @@ export function planSweep(
     if (!cast.length && appearances.length < minAppearances) continue;
 
     const candidates = appearances.map((appearance) => {
-      const text = chunkTexts.get(appearance.chunkId) ?? appearance.quote;
+      const chunk = chunkTexts.get(appearance.chunkId);
+      const text = chunk?.text ?? appearance.quote;
       const coMentions = charactersIn(appearance.chunkId)
         .filter((face) => face.entityId !== row.id).length;
       return {
@@ -221,6 +243,7 @@ export function planSweep(
           locator: appearance.locator,
           seq: appearance.seq,
           text: text.slice(0, 1800),
+          sourceTitle: chunk?.sourceTitle ?? '',
         } satisfies SweepPassage,
         coMentions,
         chapter: chapterKey(appearance),
@@ -300,6 +323,77 @@ export function parseSweepAnswer(text: string): SweepTie[] {
   return ties;
 }
 
+function resolveKnownId(name: string, known: Map<string, number>): number | undefined {
+  const key = normalizeName(name);
+  let id = known.get(key);
+  if (id !== undefined) return id;
+  for (const [candidate, candidateId] of known) {
+    if (normalizeName(candidate) === key) return candidateId;
+  }
+  return undefined;
+}
+
+/**
+ * Parse the extractor's relations JSON for one sweep target.
+ *
+ * The extractor shape is { relations: [{ from, to, kind, evidence,
+ * chunk_index, anchor, description, why }] }. Only entries naming the target on
+ * one side become sweep ties; the other endpoint is kept by name even when it
+ * does not resolve, so validation can report unknown-other.
+ */
+export function parseRelationSweepAnswer(
+  text: string,
+  target: SweepTarget,
+  known: Map<string, number>,
+): SweepTie[] {
+  const parsed = extractJson<unknown>(text);
+  let entries: unknown[] = [];
+  if (Array.isArray(parsed)) entries = parsed;
+  else if (parsed && typeof parsed === 'object' && Array.isArray((parsed as { relations?: unknown }).relations)) {
+    entries = (parsed as { relations: unknown[] }).relations;
+  }
+
+  const ties: SweepTie[] = [];
+  for (const raw of entries) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const entry = raw as Record<string, unknown>;
+    if (typeof entry.from !== 'string' || typeof entry.to !== 'string') continue;
+    if (typeof entry.kind !== 'string' || !entry.kind.trim()) continue;
+    if (typeof entry.evidence !== 'string') continue;
+    const chunkIndex = Number(entry.chunk_index ?? entry.chunkIndex);
+    if (!Number.isInteger(chunkIndex) || chunkIndex < 0) continue;
+
+    const fromId = resolveKnownId(entry.from, known);
+    const toId = resolveKnownId(entry.to, known);
+    let other: string;
+    let direction: 'out' | 'in';
+    if (fromId === target.entityId) {
+      other = entry.to;
+      direction = 'out';
+    } else if (toId === target.entityId) {
+      other = entry.from;
+      direction = 'in';
+    } else {
+      continue;
+    }
+
+    const anchorRaw = entry.anchor ?? entry.anchor_evidence;
+    const reasonRaw = entry.description ?? entry.why;
+    const anchor = typeof anchorRaw === 'string' && anchorRaw.trim() ? anchorRaw : undefined;
+    const reason = typeof reasonRaw === 'string' && reasonRaw.trim() ? reasonRaw : undefined;
+    ties.push({
+      other: other.trim(),
+      kind: entry.kind.trim(),
+      direction,
+      quote: entry.evidence,
+      chunkIndex,
+      ...(reason === undefined ? {} : { reason }),
+      ...(anchor === undefined ? {} : { anchor }),
+    });
+  }
+  return ties;
+}
+
 function quotePassage(tie: SweepTie, passages: SweepPassage[]): SweepPassage | null {
   const quote = collapseWhitespace(tie.quote);
   if (!quote) return null;
@@ -342,11 +436,12 @@ export function validateSweepTies(
   target: SweepTarget,
   known: Map<string, number>,
   existing: Set<string>,
+  allowedKinds: Set<string> = SWEEP_KINDS,
 ): SweepTieValidation {
   const proposals: SweepTieProposal[] = [];
   const rejections: SweepTieRejection[] = [];
   for (const tie of ties) {
-    const verdict = validateSweepTie(tie, target, target.passages, known, SWEEP_KINDS, existing);
+    const verdict = validateSweepTie(tie, target, target.passages, known, allowedKinds, existing);
     if (!verdict.ok) {
       rejections.push({ tie, reason: verdict.reason });
       continue;
@@ -403,10 +498,19 @@ export function validateSweepTie(
   if (!quote) return { ok: false, reason: 'quote-absent' };
   if (!quotePassage(tie, passages)) return { ok: false, reason: 'quote-not-found' };
 
-  const quoteIds = namedCharacterIds(quote, known);
-  if (!quoteIds.has(target.entityId) || !quoteIds.has(otherId)) {
-    return { ok: false, reason: 'names-not-both' };
-  }
+  const targetForms = nameForms(target.name, target.aliases);
+  const citedBoth = citationNamesBothEndpoints({
+    fromId: target.entityId,
+    toId: otherId,
+    fromName: targetForms[0] ?? target.name,
+    toName: tie.other,
+    fromAliases: targetForms.slice(1),
+    toAliases: knownFormsForId(known, otherId),
+    kind,
+    evidence: tie.quote,
+    anchorEvidence: tie.anchor ?? '',
+  });
+  if (!citedBoth) return { ok: false, reason: 'names-not-both' };
   if (!allowedKinds.has(kind)) return { ok: false, reason: 'kind-not-allowed' };
 
   const fromId = tie.direction === 'out' ? target.entityId : otherId;
@@ -451,15 +555,16 @@ export function applySweep(
   projectId: number,
   target: SweepTarget,
   ties: SweepTie[],
-  opts: { dryRun: boolean },
+  opts: { dryRun: boolean; allowedKinds?: Set<string> },
 ): { added: number; duplicates: number; rejected: number; byReason: Record<string, number> } {
+  const allowedKinds = opts.allowedKinds ?? SWEEP_KINDS;
   const run = (): { added: number; duplicates: number; rejected: number; byReason: Record<string, number> } => {
     const counts = { added: 0, duplicates: 0, rejected: 0, byReason: {} as Record<string, number> };
     const known = knownCharacters(db, projectId);
     const existing = existingRelations(db, projectId);
 
     for (const tie of ties) {
-      const verdict = validateSweepTie(tie, target, target.passages, known, SWEEP_KINDS, existing);
+      const verdict = validateSweepTie(tie, target, target.passages, known, allowedKinds, existing);
       if (!verdict.ok) {
         counts.byReason[verdict.reason] = (counts.byReason[verdict.reason] ?? 0) + 1;
         if (verdict.reason === 'duplicate') counts.duplicates++;
@@ -488,15 +593,25 @@ export function applySweep(
 
       // The one relation insert, so the architecture rule holds: the sweep
       // proposes candidates, the owner writes them with a charge ruling.
-      insertRelation(db, projectId, {
+      const relationId = insertRelation(db, projectId, {
         fromEntity: fromId,
         toEntity: toId,
         kind,
         description: tie.reason ?? '',
         evidence: tie.quote,
         sourceRefs: JSON.stringify([{ locator: passage.locator, chunk: passage.chunkId }]),
+        anchorEvidence: tie.anchor ?? '',
         reviewStatus: 'needs_review',
         confidence: 1.0,
+      });
+      recordRuling(db, projectId, {
+        relationId,
+        role: 'clue',
+        actor: 'character-sweep' as never,
+        standard: 'sweep',
+        toStatus: 'needs_review',
+        basis: `sweep: ${target.name}`,
+        quote: tie.quote,
       });
     }
     return counts;
