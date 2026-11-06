@@ -161,6 +161,7 @@ import {
   EXTRACT_EVENTS_SYSTEM,
   EXTRACT_RELATIONS_SYSTEM,
   formatKnownEntities,
+  ENTITIES_FACTS_SCHEMA,
 } from './extract/extract-prompts.ts';
 
 /* ------------------------------------------------------------------ models */
@@ -7474,6 +7475,7 @@ async function extractWindowLegacy(
       messages: [{ role: 'user', content: passageBlock(window) }],
       temperature: 0.1,
       maxTokens,
+      format: 'json',
     });
     responseText = res.text;
     finishReason = res.finishReason;
@@ -7624,6 +7626,7 @@ async function extractWindowSplit(
     system: string,
     maxTok: number,
     temp = 0,
+    schema?: Record<string, unknown>,
   ): Promise<string | null> => {
     try {
       const res = await llm.chat({
@@ -7631,6 +7634,7 @@ async function extractWindowSplit(
         messages: [{ role: 'user', content: passages }],
         temperature: temp,
         maxTokens: maxTok,
+        format: schema ?? 'json',
       });
       answers.push(res.text);
       finishReasons.set(section, res.finishReason);
@@ -7645,7 +7649,11 @@ async function extractWindowSplit(
   };
 
   // (a) The things the passages establish, and the facts they state.
-  const first = await ask('entities-facts', EXTRACT_ENTITIES_SYSTEM, maxTokens);
+  // Entities+facts is the greedy section: a dense window can legitimately name
+  // dozens of people, and a cut array costs the facts section too. Give it up
+  // to twice the run budget (capped at 16k, which still fits the 32k context
+  // beside a ~4k prompt) before accepting a truncation.
+  const first = await ask('entities-facts', EXTRACT_ENTITIES_SYSTEM, Math.min(maxTokens * 2, 16384), 0, ENTITIES_FACTS_SCHEMA);
   if (first !== null) {
     let entitiesObservation: ExtractionParseObservation | undefined;
     let factsObservation: ExtractionParseObservation | undefined;
@@ -8369,6 +8377,7 @@ async function extractWindowWithRecovery(
       messages: [{ role: 'user', content: passages }],
       temperature,
       maxTokens: maxTok,
+      format: 'json',
     });
     if (heartbeat.lost()) throw new Error('stale-lease');
     return { text: response.text, finishReason: response.finishReason };

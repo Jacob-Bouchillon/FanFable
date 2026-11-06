@@ -75,7 +75,7 @@ export interface ChatRequest {
   stop?: string[];
   /** Ask Ollama for constrained JSON output. Off by default; extraction
    *  calls opt in. Only shapes the output, never the content. */
-  format?: 'json';
+  format?: 'json' | Record<string, unknown>;
 }
 
 /**

@@ -192,3 +192,54 @@ export function formatKnownEntities(
     return `- ${name}${aliases.length ? ` (also known as: ${aliases.join(', ')})` : ''}`;
   }).join('\n')}`;
 }
+
+
+/**
+ * Schema for the entities+facts call.
+ *
+ * The model treats "at most 20 entities" as advice; a dense window produced 151
+ * entries and cut the JSON before the facts section. The schema makes the limit
+ * structural: thirty entities and twelve facts fit the output budget, so the
+ * answer closes and the facts survive.
+ */
+export const ENTITIES_FACTS_SCHEMA = {
+  type: 'object',
+  properties: {
+    entities: {
+      type: 'array',
+      maxItems: 30,
+      items: {
+        type: 'object',
+        properties: {
+          kind: { type: 'string' },
+          name: { type: 'string' },
+          aliases: { type: 'array', items: { type: 'string' } },
+          summary: { type: 'string' },
+          role: { type: 'string' },
+          status: { type: 'string' },
+          chunk_index: { type: 'integer' },
+          evidence: { type: 'string' },
+        },
+        required: ['kind', 'name', 'chunk_index', 'evidence'],
+      },
+    },
+    facts: {
+      type: 'array',
+      maxItems: 12,
+      items: {
+        type: 'object',
+        properties: {
+          topic: { type: 'string' },
+          statement: { type: 'string' },
+          kind: { type: 'string' },
+          certainty: { type: 'string' },
+          subject: { type: 'string' },
+          chunk_index: { type: 'integer' },
+          evidence: { type: 'string' },
+        },
+        required: ['statement', 'chunk_index', 'evidence'],
+      },
+    },
+  },
+  required: ['entities', 'facts'],
+} as const;
