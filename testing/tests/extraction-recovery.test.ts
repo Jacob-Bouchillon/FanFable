@@ -5137,9 +5137,11 @@ test('a subprocess crash resumes the same stage-only recovery child', () => {
 
   const scriptDir = mkdtempSync(join(tmpdir(), 'fanfable-recovery-child-'));
   const childPath = join(scriptDir, 'child.mjs');
-  const dbModule = resolve(import.meta.dirname, '../../fanfable/src/core/db.ts');
-  const lorebookModule = resolve(import.meta.dirname, '../../fanfable/src/lorebook.ts');
-  const llmModule = resolve(import.meta.dirname, '../../fanfable/src/core/llm.ts');
+  // file:// URLs, not filesystem paths: on Windows a bare D:\... specifier
+  // fails with ERR_UNSUPPORTED_ESM_URL_SCHEME in the child process.
+  const dbModule = new URL('../../fanfable/src/core/db.ts', import.meta.url).href;
+  const lorebookModule = new URL('../../fanfable/src/lorebook.ts', import.meta.url).href;
+  const llmModule = new URL('../../fanfable/src/core/llm.ts', import.meta.url).href;
   const childScript = `
 import { writeSync } from 'node:fs';
 const { Db } = await import(${JSON.stringify(dbModule)});
