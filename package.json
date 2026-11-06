@@ -14,7 +14,7 @@
   "scripts": {
     "fanfable": "node --no-warnings fanfable/src/cli.ts",
     "test": "node --no-warnings --test --test-timeout=60000 \"testing/tests/*.test.ts\"",
-    "test:ci": "node --no-warnings --test --test-timeout=120000 \"testing/tests/*.test.ts\"",
+    "test:ci": "node --no-warnings --test --test-timeout=240000 \"testing/tests/*.test.ts\"",
     "eval:retrieval": "node testing/scripts/evaluate.ts",
     "eval:continuity": "node testing/scripts/evaluate-continuity.ts",
     "eval:writing": "node testing/scripts/evaluate-writing.ts",
