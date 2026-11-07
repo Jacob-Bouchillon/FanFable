@@ -43,6 +43,7 @@ import * as meetingWeb from './web/meetings.ts';
 import * as noteIngest from './web/note-ingest.ts';
 import * as briefWeb from './plan/brief.ts';
 import * as identityCheck from './identity/identity-check.ts';
+import { characterDossier } from './answer/dossier.ts';
 import type { PassageTrail } from './support/graph.ts';
 import { truncate } from './core/text.ts';
 import { buildTrailsHtml, trailText } from './product/trail-html.ts';
@@ -191,6 +192,7 @@ ${C.bold('SOURCE MATERIAL')}
                            What two people are to each other now, and before
   lore merge                       Merge entries that are the same under two names
   lore judge-aliases [--max n]     Rule on quarantined nickname pairs (one model call)
+  lore dossier <name> [--json]      Show a character dossier (relations, events, chapters)
   lore diagnose                    Report what the index is probably missing
   lore enrich <name> [--handoff f] Re-read the passages about one character
   lore notes [--prioritise] [--max n]  Rank parked ties for human review (no writes)
@@ -2097,6 +2099,48 @@ async function cmdLore(args: Args): Promise<void> {
     }
     const merged = rulings.filter((r) => r.verdict === 'merged').length;
     console.log(C.dim(`${checked} pair(s) judged, ${merged} merged.`));
+    return;
+  }
+
+  if (sub === 'dossier') {
+    const name = args._.slice(2).join(' ').trim() || flagString(args, 'name') || '';
+    if (!name) throw new Error('usage: lore dossier <name> [--json]');
+    const entity = lorebook.findEntity(db, project.id, name);
+    if (!entity) throw new Error(`no one called "${name}"`);
+    const dossier = characterDossier(db, project.id, entity.id);
+    if (!dossier) throw new Error(`no dossier for "${name}"`);
+    if (args.flags.json === true) {
+      console.log(JSON.stringify(dossier, null, 2));
+      return;
+    }
+    heading(`${dossier.name} — ${dossier.kind}`);
+    const span = dossier.firstChapter
+      ? (dossier.lastChapter && dossier.lastChapter !== dossier.firstChapter
+        ? `chapters ${dossier.firstChapter}-${dossier.lastChapter}`
+        : `chapter ${dossier.firstChapter}`)
+      : 'no chapter';
+    console.log(C.dim(`${dossier.status} · ${span} · ${dossier.counts.relations} ties · ${dossier.counts.events} scenes`));
+    if (dossier.aliases.length) console.log(C.dim(`also called: ${dossier.aliases.join(', ')}`));
+    if (dossier.attributes && Object.keys(dossier.attributes).length) {
+      console.log(C.dim(`facts: ${Object.entries(dossier.attributes).map(([k, v]) => `${k}=${String(v)}`).join(', ')}`));
+    }
+    if (dossier.relations.length) {
+      console.log(`
+${C.bold('Relations')}`);
+      for (const relation of dossier.relations) {
+        const arrow = relation.direction === 'out' ? '->' : '<-';
+        console.log(`  ${relation.kind} ${arrow} ${relation.other.name} [${relation.status}]${relation.locator ? ` ${C.dim(relation.locator)}` : ''}`);
+        if (relation.quote) console.log(`    "${truncate(relation.quote, 160)}"`);
+      }
+    }
+    if (dossier.events.length) {
+      console.log(`
+${C.bold('Scenes')}`);
+      for (const event of dossier.events) {
+        console.log(`  ${event.title}${event.locator ? ` ${C.dim(event.locator)}` : ''}`);
+        if (event.summary) console.log(`    ${C.dim(truncate(event.summary, 160))}`);
+      }
+    }
     return;
   }
 

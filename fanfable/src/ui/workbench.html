@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FanFable workbench</title>
+<link rel="icon" href="/ui/fanfable.png" type="image/png" />
+<style>
+  :root {
+    --bg: #0d0f13;
+    --bar: #14171d;
+    --line: #242833;
+    --text: #d7dbe2;
+    --muted: #8b93a3;
+    --accent: #4f9df7;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  header {
+    display: flex; align-items: center; gap: 14px;
+    height: 44px; padding: 0 12px;
+    background: var(--bar); border-bottom: 1px solid var(--line);
+    flex: 0 0 auto;
+  }
+  .brand { font-weight: 600; letter-spacing: .2px; white-space: nowrap; }
+  .brand span { color: var(--muted); font-weight: 400; margin-left: 6px; }
+  nav { display: flex; gap: 2px; overflow-x: auto; }
+  button.tab {
+    appearance: none; border: 1px solid transparent; background: transparent;
+    color: var(--muted); padding: 6px 12px; border-radius: 7px;
+    font: inherit; cursor: pointer; white-space: nowrap;
+  }
+  button.tab:hover { color: var(--text); background: #1b1f27; }
+  button.tab[aria-selected="true"] {
+    color: var(--text); background: #1d222c; border-color: var(--line);
+  }
+  .hint { margin-left: auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
+  main { position: relative; flex: 1 1 auto; min-height: 0; }
+  iframe {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    border: 0; background: var(--bg);
+  }
+  iframe:not([data-loaded]) { visibility: hidden; }
+  /* BookNLP's generated HTML carries no background of its own. */
+  iframe[data-view="book"] { background: #fff; }
+  .empty {
+    position: absolute; inset: 0; display: none; place-items: center;
+    color: var(--muted); text-align: center; padding: 40px;
+  }
+  .empty.show { display: grid; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">FanFable<span>workbench</span></div>
+  <nav id="tabs">
+    <button class="tab" data-view="book" aria-selected="true">Book</button>
+    <button class="tab" data-view="map" aria-selected="false">Map</button>
+    <button class="tab" data-view="evidence" aria-selected="false">Evidence</button>
+    <button class="tab" data-view="dev" aria-selected="false">Dev</button>
+    <button class="tab" data-view="app" aria-selected="false">App</button>
+  </nav>
+  <div class="hint">one page · every view</div>
+</header>
+<main id="views">
+  <iframe data-view="book" data-src="/booknlp-inspector" title="Book with mention highlights"></iframe>
+  <iframe data-view="map" data-src="/web3d" title="Relationship map"></iframe>
+  <iframe data-view="evidence" data-src="/web3d/evidence" title="Evidence web"></iframe>
+  <iframe data-view="dev" data-src="/dev-viz" title="Dev visualizer"></iframe>
+  <iframe data-view="app" data-src="/" title="FanFable app"></iframe>
+  <div class="empty" id="missing">
+    <div>
+      <p><strong>This view is not available.</strong></p>
+      <p class="hint">Dev and Book need the server started with <code>--dev</code> and a BookNLP run.</p>
+    </div>
+  </div>
+</main>
+<script>
+  const tabs = [...document.querySelectorAll('button.tab')];
+  const frames = [...document.querySelectorAll('iframe')];
+
+  function show(view) {
+    for (const tab of tabs) tab.setAttribute('aria-selected', String(tab.dataset.view === view));
+    for (const frame of frames) {
+      const on = frame.dataset.view === view;
+      frame.hidden = !on;
+      if (on && !frame.dataset.loaded) {
+        frame.src = frame.dataset.src;
+        frame.dataset.loaded = '1';
+      }
+    }
+    if (location.hash.slice(1) !== view) history.replaceState(null, '', '#' + view);
+  }
+
+  for (const tab of tabs) tab.addEventListener('click', () => show(tab.dataset.view));
+  window.addEventListener('hashchange', () => {
+    const view = location.hash.slice(1);
+    if (tabs.some((tab) => tab.dataset.view === view)) show(view);
+  });
+
+  const initial = location.hash.slice(1);
+  show(tabs.some((tab) => tab.dataset.view === initial) ? initial : 'book');
+</script>
+</body>
+</html>

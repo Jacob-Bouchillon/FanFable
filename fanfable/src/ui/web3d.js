@@ -450,6 +450,34 @@
         }
       }
       if (!data.groups.length) nodes.push(el('p', 'w3d-muted', 'no banked relationships yet'));
+      const extra = data.extra;
+      if (extra) {
+        const span = extra.firstChapter
+          ? (extra.lastChapter && extra.lastChapter !== extra.firstChapter
+            ? `chapters ${extra.firstChapter}–${extra.lastChapter}`
+            : `chapter ${extra.firstChapter}`)
+          : 'no chapter';
+        nodes.push(el('div', 'w3d-muted', `${extra.status} · ${span} · ${extra.events.length} scenes`));
+        if (extra.attributes && (extra.attributes.sentient != null || extra.attributes.speaks != null)) {
+          const flags = [];
+          if (extra.attributes.sentient != null) flags.push(`sentient: ${extra.attributes.sentient}`);
+          if (extra.attributes.speaks != null) flags.push(`speaks: ${extra.attributes.speaks}`);
+          nodes.push(el('div', 'w3d-muted', flags.join(' · ')));
+        }
+        if (extra.events.length) {
+          nodes.push(el('h3', 'w3d-family', 'Scenes'));
+          for (const event of extra.events) {
+            const card = el('div', 'w3d-note w3d-tie');
+            const head = el('div', 'w3d-evidence-head');
+            head.append(el('span', 'w3d-tie-direction', event.title));
+            nodes.push(card);
+            card.append(head);
+            if (event.locator) card.append(el('div', 'w3d-muted', event.locator));
+            if (event.summary) card.append(el('div', 'w3d-muted', event.summary));
+            if (event.quote) card.append(el('q', 'w3d-tie-quote', event.quote));
+          }
+        }
+      }
       detailEl.replaceChildren(...nodes);
     } catch (error) {
       detailEl.replaceChildren(el('p', 'w3d-muted', 'Could not load person.'));

@@ -40,6 +40,8 @@ const RELATION_STATUS_GRANDFATHERS: Counts = {
     promoteProvisionalWithEvidence: 1,
     evaluateTies: 1,
     mergeEntityPair: 1,
+    // A rejected row keeps its evidence for audit; the write records a ruling.
+    rejectRelation: 1,
     replayRulings: 3,
   },
 };

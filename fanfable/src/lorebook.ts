@@ -11488,6 +11488,311 @@ export function insertRelation(
   });
 }
 
+export interface EntityCandidateInsert {
+  kind: EntityKind;
+  name: string;
+  evidence: string;
+  firstChunk: number | null;
+  sourceRefs: string;
+  /** Derived from the text; null means the text does not say. */
+  attributes?: { sentient?: boolean | null; speaks?: boolean | null };
+}
+
+/**
+ * The owner-side insert for name-harvest candidates.
+ *
+ * INSERT OR IGNORE keeps a repeat harmless; a real insert gets one
+ * name-harvest option ruling. The harvest module never writes canon_entity
+ * itself.
+ */
+export function insertEntityCandidate(
+  db: Db,
+  projectId: number,
+  row: EntityCandidateInsert,
+): number | null {
+  const name = String(row.name ?? '').trim();
+  if (!name) return null;
+  return db.transaction(() => {
+    const result = db.run(
+      `INSERT OR IGNORE INTO canon_entity
+         (project_id, claim_uid, kind, name, aliases, attributes, first_chunk, evidence, source_refs,
+          mentions, review_status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, '[]', ?, ?, ?, ?, 1, 'needs_review', ?, ?)`,
+      projectId,
+      newClaimUid('entity'),
+      row.kind,
+      name,
+      toJson({
+        sentient: row.attributes?.sentient ?? null,
+        speaks: row.attributes?.speaks ?? null,
+      }),
+      row.firstChunk,
+      row.evidence,
+      row.sourceRefs,
+      nowIso(),
+      nowIso(),
+    );
+    if (result.changes === 0) return null;
+    const inserted = db.get<{ id: number }>(
+      'SELECT id FROM canon_entity WHERE project_id = ? AND kind = ? AND lower(name) = lower(?)',
+      projectId,
+      row.kind,
+      name,
+    );
+    if (!inserted) return null;
+    recordRuling(db, projectId, {
+      subject: entitySubject(inserted.id),
+      role: 'charge',
+      actor: 'name-harvest' as never,
+      standard: 'harvest',
+      toStatus: 'needs_review',
+      basis: `harvested ${row.kind}`,
+      quote: row.evidence,
+    });
+    return inserted.id;
+  });
+}
+
+/**
+ * Record that a person owns a harvested creature. A second harvest run finds
+ * the same relation by its quote and adds nothing.
+ */
+export function insertOwnedCreatureRelation(
+  db: Db,
+  projectId: number,
+  ownerId: number,
+  creatureId: number,
+  quote: string,
+  sourceRefs: string,
+): number {
+  const existing = db.get<{ id: number }>(
+    `SELECT id FROM canon_relation
+      WHERE project_id = ? AND from_entity = ? AND to_entity = ? AND kind = 'owner of' AND evidence = ?
+      LIMIT 1`,
+    projectId,
+    ownerId,
+    creatureId,
+    quote,
+  );
+  if (existing) return existing.id;
+  return insertRelation(db, projectId, {
+    fromEntity: ownerId,
+    toEntity: creatureId,
+    kind: 'owner of',
+    description: 'owned creature',
+    evidence: quote,
+    sourceRefs,
+    reviewStatus: 'needs_review',
+  });
+}
+
+/** Park an entity for review without deleting its evidence or aliases. */
+/**
+ * Put a quarantined entity back into review. Quarantine is a holding pen, not a
+ * deletion: a rule can be wrong (a real person whose name is also a common
+ * word), and the correction has to be possible without touching the table.
+ */
+export function restoreEntity(
+  db: Db,
+  projectId: number,
+  entityId: number,
+  basis: string,
+  quote = '',
+): boolean {
+  const row = db.get<{ review_status: string }>(
+    'SELECT review_status FROM canon_entity WHERE id = ? AND project_id = ?',
+    entityId,
+    projectId,
+  );
+  if (!row || row.review_status !== 'quarantined') return false;
+  return db.transaction(() => {
+    db.run(
+      "UPDATE canon_entity SET review_status = 'needs_review', quarantine_reason = '' WHERE id = ? AND project_id = ?",
+      entityId,
+      projectId,
+    );
+    recordRuling(db, projectId, {
+      subject: entitySubject(entityId),
+      role: 'verdict',
+      actor: 'human',
+      standard: 'cleanup',
+      fromStatus: 'quarantined',
+      toStatus: 'needs_review',
+      basis,
+      quote,
+    });
+    return true;
+  });
+}
+
+export function quarantineEntity(
+  db: Db,
+  projectId: number,
+  entityId: number,
+  reason: string,
+  basis: string,
+  quote = '',
+): boolean {
+  const entity = db.get<{ name: string; review_status: string }>(
+    'SELECT name, review_status FROM canon_entity WHERE id = ? AND project_id = ?',
+    entityId,
+    projectId,
+  );
+  if (!entity) return false;
+  return db.transaction(() => {
+    db.run(
+      "UPDATE canon_entity SET review_status = 'quarantined', quarantine_reason = ?, updated_at = ? WHERE id = ? AND project_id = ?",
+      reason,
+      nowIso(),
+      entityId,
+      projectId,
+    );
+    recordRuling(db, projectId, {
+      subject: entitySubject(entityId),
+      role: 'verdict',
+      actor: 'human',
+      standard: 'cleanup',
+      fromStatus: entity.review_status,
+      toStatus: 'quarantined',
+      basis,
+      quote,
+    });
+    return true;
+  });
+}
+
+/** Change an entity's kind through the owner and leave a ruling. */
+export function reclassifyEntityKind(
+  db: Db,
+  projectId: number,
+  entityId: number,
+  kind: EntityKind,
+  basis: string,
+  quote = '',
+): boolean {
+  const entity = db.get<{ name: string; kind: string; review_status: string }>(
+    'SELECT name, kind, review_status FROM canon_entity WHERE id = ? AND project_id = ?',
+    entityId,
+    projectId,
+  );
+  if (!entity || entity.kind === kind) return false;
+  return db.transaction(() => {
+    updateEntity(db, projectId, entityId, { kind });
+    recordRuling(db, projectId, {
+      subject: entitySubject(entityId),
+      role: 'verdict',
+      actor: 'human',
+      standard: 'cleanup',
+      fromStatus: entity.review_status,
+      toStatus: entity.review_status,
+      basis: `${entity.kind} -> ${kind}: ${basis}`,
+      quote,
+    });
+    return true;
+  });
+}
+
+/** Store the two facts that separate a person from a creature. */
+export function setEntityAttributes(
+  db: Db,
+  projectId: number,
+  entityId: number,
+  attributes: { sentient?: boolean | null; speaks?: boolean | null },
+  basis: string,
+  quote = '',
+): boolean {
+  const entity = db.get<{ review_status: string }>(
+    'SELECT review_status FROM canon_entity WHERE id = ? AND project_id = ?',
+    entityId,
+    projectId,
+  );
+  if (!entity) return false;
+  return db.transaction(() => {
+    db.run(
+      'UPDATE canon_entity SET attributes = ?, updated_at = ? WHERE id = ? AND project_id = ?',
+      toJson({
+        sentient: attributes.sentient ?? null,
+        speaks: attributes.speaks ?? null,
+      }),
+      nowIso(),
+      entityId,
+      projectId,
+    );
+    recordRuling(db, projectId, {
+      subject: entitySubject(entityId),
+      role: 'verdict',
+      actor: 'human',
+      standard: 'cleanup',
+      fromStatus: entity.review_status,
+      toStatus: entity.review_status,
+      basis,
+      quote,
+    });
+    return true;
+  });
+}
+
+/** Merge one entity into another and leave the credited alias ruling. */
+export function mergeEntitiesWithRuling(
+  db: Db,
+  projectId: number,
+  keepId: number,
+  dropId: number,
+  basis: string,
+  quote = '',
+): boolean {
+  if (keepId === dropId) return false;
+  const entities = listEntities(db, projectId);
+  const keep = entities.find((entity) => entity.id === keepId);
+  const drop = entities.find((entity) => entity.id === dropId);
+  if (!keep || !drop) return false;
+  mergeEntityPair(db, projectId, keep, drop);
+  recordRuling(db, projectId, {
+    subject: entitySubject(keepId),
+    role: 'verdict',
+    actor: 'human',
+    standard: 'alias-merge',
+    toStatus: 'merged',
+    basis,
+    quote,
+  });
+  return true;
+}
+
+/** Reject a relation while keeping the row for audit. */
+export function rejectRelation(
+  db: Db,
+  projectId: number,
+  relationId: number,
+  basis: string,
+  quote = '',
+): boolean {
+  const row = db.get<{ review_status: string; evidence: string }>(
+    'SELECT review_status, evidence FROM canon_relation WHERE id = ? AND project_id = ?',
+    relationId,
+    projectId,
+  );
+  if (!row) return false;
+  return db.transaction(() => {
+    db.run(
+      "UPDATE canon_relation SET review_status = 'rejected' WHERE id = ? AND project_id = ?",
+      relationId,
+      projectId,
+    );
+    recordRuling(db, projectId, {
+      relationId,
+      role: 'verdict',
+      actor: 'human',
+      standard: 'cleanup',
+      fromStatus: row.review_status,
+      toStatus: 'rejected',
+      basis,
+      quote: quote || row.evidence,
+    });
+    return true;
+  });
+}
+
 /** Read-only audit: relations whose refs name a source/locator but no chunk. */
 export function findLocatorOnlyRefs(db: Db, projectId: number): number[] {
   const rows = db.all<{ id: number; source_refs: string }>(
@@ -16303,6 +16608,15 @@ export function findEntity(db: Db, projectId: number, name: string): CanonEntity
   if (exact) return exact;
   const alias = all.find((e) => e.aliases.some((a) => a.toLowerCase() === clean));
   if (alias) return alias;
+  // A stored honorific does not change identity: "Ollivander" -> "Mr. Ollivander".
+  const HONORIFIC = new Set(['mr', 'mrs', 'ms', 'miss', 'madam', 'professor', 'dr', 'uncle', 'aunt', 'lord', 'lady', 'sir']);
+  const core = (value: string) =>
+    value.toLowerCase().split(/[^a-z0-9]+/).filter((token) => token && !HONORIFIC.has(token)).join(' ');
+  const wanted = core(clean);
+  if (wanted) {
+    const bare = all.filter((e) => core(e.name) === wanted);
+    if (bare.length === 1) return bare[0];
+  }
   // A fuller name that starts with what was asked for: "Harry" -> "Harry Potter".
   return all.find((e) => e.name.toLowerCase().startsWith(clean + ' '));
 }

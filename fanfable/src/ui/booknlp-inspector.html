@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>BookNLP inspector — HP1</title>
+<link rel="icon" href="/ui/fanfable.png" type="image/png" />
+<style>
+  :root {
+    --bg: #0c0e12;
+    --panel: #12151b;
+    --line: #222733;
+    --text: #d6dae2;
+    --muted: #8a92a2;
+    --accent: #ffd166;
+    --quote: #9ad0ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 13px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; flex: 0 0 auto;
+    padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  .title { font-weight: 600; }
+  .title span { color: var(--muted); font-weight: 400; margin-left: 6px; }
+  .stats { color: var(--muted); font-size: 12px; }
+  .grow { flex: 1 1 auto; }
+  input[type="search"] {
+    background: #0e1117; color: var(--text); border: 1px solid var(--line);
+    border-radius: 7px; padding: 6px 10px; font: inherit; width: 240px;
+  }
+  label.toggle { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+  main { flex: 1 1 auto; min-height: 0; display: grid; grid-template-columns: 260px minmax(0, 1fr) 320px; }
+  .pane { min-height: 0; overflow: auto; }
+  .pane + .pane { border-left: 1px solid var(--line); }
+  #clusters { background: var(--panel); }
+  .cluster {
+    display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+    border-bottom: 1px solid #191d25; cursor: pointer;
+  }
+  .cluster:hover { background: #171b23; }
+  .cluster[aria-selected="true"] { background: #1d2430; }
+  .cluster .name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cluster .count { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; }
+  .cluster .dot { width: 8px; height: 8px; border-radius: 50%; background: #3a4150; flex: 0 0 auto; }
+  .cluster[aria-selected="true"] .dot { background: var(--accent); }
+  #book { position: relative; padding: 18px 26px 60px; font-size: 15px; line-height: 1.7; }
+  #book p { margin: 0 0 14px; }
+  #book .mk { background: transparent; color: inherit; border-bottom: 1px solid #3a4150; border-radius: 2px; }
+  #book .mk.sel { background: rgba(255, 209, 102, .28); border-bottom-color: var(--accent); }
+  #book .mk.qt { font-style: italic; color: var(--quote); border-bottom-color: var(--quote); }
+  #book .mk.qt.sel { background: rgba(154, 208, 255, .22); }
+  #detail { background: var(--panel); padding: 14px; }
+  #detail h2 { font-size: 15px; margin: 0 0 4px; }
+  #detail .muted { color: var(--muted); }
+  #detail .row { display: flex; justify-content: space-between; gap: 10px; padding: 3px 0; }
+  #detail h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 16px 0 6px; }
+  #detail .form { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; font-size: 12px; }
+  #detail .quote {
+    border-left: 2px solid #2c3442; padding: 4px 8px; margin: 6px 0;
+    font-size: 12px; color: #b9c2d0; cursor: pointer;
+  }
+  #detail .quote:hover { border-left-color: var(--quote); color: var(--text); }
+  .empty { color: var(--muted); padding: 16px; }
+  .filter-note { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="title">Inspector<span>bank + BookNLP</span></div>
+  <div class="stats" id="stats"></div>
+  <div class="grow"></div>
+  <input type="search" id="search" placeholder="search a name or surface form" />
+  <label class="toggle"><input type="checkbox" id="unbanked" checked /> BookNLP-only clusters</label>
+  <label class="toggle"><input type="checkbox" id="whole" /> whole book</label>
+</header>
+<main>
+  <div class="pane" id="clusters"></div>
+  <div class="pane" id="book"></div>
+  <div class="pane" id="detail"><div class="empty">Pick a cluster.</div></div>
+</main>
+<script src="/ui/booknlp-inspector.js?v=10"></script>
+</body>
+</html>

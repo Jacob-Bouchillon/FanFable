@@ -11,6 +11,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { join, extname, basename, normalize, resolve, sep } from 'node:path';
+import { homedir } from 'node:os';
 import { Db } from '../core/db.ts';
 import * as controller from '../plan/controller.ts';
 import * as lore from '../answer/lore.ts';
@@ -26,6 +27,7 @@ import { DEFAULT_LLM_SETTINGS, clientFrom, loadGlobalConfig, saveGlobalConfig } 
 import { DEFAULT_CONTINUITY_SETTINGS, continuitySettings } from './continuity-settings.ts';
 import { devGraphSummary } from './dev-summary.ts';
 import { buildWebGraph, buildWebMap, webPersonDossier, webThreadDetail } from './web3d.ts';
+import { loadBookNlp } from './booknlp.ts';
 
 /** Settings returned to the UI never carry the whole API key. */
 export function maskSettingsForOutput<T extends Record<string, unknown>>(settings: T): T {
@@ -301,6 +303,65 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
       }
       if (method === 'GET' && (path === '/web3d' || path === '/web3d/')) {
         serveStatic(res, join(UI_DIR, 'web3d-map.html'));
+        return;
+      }
+      if (method === 'GET' && (path === '/workbench' || path === '/workbench/')) {
+        serveStatic(res, join(UI_DIR, 'workbench.html'));
+        return;
+      }
+      // The BookNLP HTML is generated outside the repo. Point at it with
+      // FANFABLE_BOOKNLP when it lives somewhere else.
+      if (method === 'GET' && (path === '/booknlp-inspector' || path === '/booknlp-inspector/')) {
+        serveStatic(res, join(UI_DIR, 'booknlp-inspector.html'));
+        return;
+      }
+      if (method === 'GET' && (path === '/api/booknlp/entities' || path === '/api/booknlp/entities/')) {
+        if (activeId() === null) {
+          json(res, 404, { error: 'not found' });
+          return;
+        }
+        const current = project();
+        const rows = db.all<{ id: number; name: string; aliases: string; kind: string; review_status: string }>(
+          `SELECT id, name, aliases, kind, review_status FROM canon_entity
+            WHERE project_id = ? AND review_status <> 'quarantined' ORDER BY name`,
+          current.id,
+        );
+        json(res, 200, rows.map((row) => ({
+          id: Number(row.id),
+          name: String(row.name ?? ''),
+          aliases: (() => { try { const v = JSON.parse(row.aliases || '[]'); return Array.isArray(v) ? v.map(String) : []; } catch { return []; } })(),
+          kind: String(row.kind ?? ''),
+          status: String(row.review_status ?? ''),
+        })));
+        return;
+      }
+      if (method === 'GET' && (path === '/api/booknlp' || path === '/api/booknlp/')) {
+        const dir = process.env.FANFABLE_BOOKNLP_DIR
+          || join(homedir(), 'fanfable-work', 'booknlp-hp1');
+        const payload = loadBookNlp(dir);
+        if (!payload) {
+          json(res, 404, { error: 'no BookNLP output; run the pipeline first' });
+          return;
+        }
+        json(res, 200, payload);
+        return;
+      }
+      if (method === 'GET' && (path === '/booknlp' || path === '/booknlp/')) {
+        const file = process.env.FANFABLE_BOOKNLP
+          || join(homedir(), 'fanfable-work', 'booknlp-hp1', 'hp1.book.html');
+        if (!existsSync(file)) {
+          json(res, 404, { error: 'no BookNLP output; run the BookNLP pipeline first' });
+          return;
+        }
+        // The generated page has no styling and no anchor for the text. Give it
+        // a readable default and an id the workbench can jump to.
+        const style = '<style>body{background:#fff;color:#111;font:14px/1.5 system-ui,sans-serif;margin:18px 22px}'
+          + 'h2{margin:26px 0 10px;font-size:16px}sub{font-size:9px}</style>';
+        const html = readFileSync(file, 'utf8')
+          .replace('<meta charset="UTF-8">', '<meta charset="UTF-8">' + style)
+          .replace('<h2>Text</h2>', '<h2 id="text">Text</h2>');
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        res.end(html);
         return;
       }
       if (method === 'GET' && (path === '/dev-viz' || path === '/dev-viz/')) {

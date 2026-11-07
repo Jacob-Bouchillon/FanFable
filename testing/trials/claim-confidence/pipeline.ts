@@ -102,7 +102,7 @@ async function main(): Promise<void> {
     db
       .prepare(
         `SELECT r.id, r.kind, r.evidence, r.source_refs, r.review_status,
-                r.from_entity, r.to_entity, a.name AS a, b.name AS b
+                r.from_entity, r.to_entity, r.confidence, a.name AS a, b.name AS b
            FROM canon_relation r
            JOIN canon_entity a ON a.id = r.from_entity
            JOIN canon_entity b ON b.id = r.to_entity
@@ -115,6 +115,7 @@ async function main(): Promise<void> {
       evidence: string;
       source_refs: string;
       review_status: string;
+      confidence: number;
       from_entity: number;
       to_entity: number;
       a: string;
@@ -197,6 +198,96 @@ async function main(): Promise<void> {
   ]);
   const mechanical = new Map<number, string>();
   if (filters) {
+    // Subsumption: `acquaintance` is a co-presence fallback and never stands
+    // beside a stronger tie for the same pair. An inverse teaching pair
+    // (student of A->B and mentor/teacher of B->A) is one relation stored twice.
+    const pairKey = (row: { from_entity: number; to_entity: number }) =>
+      `${Math.min(row.from_entity, row.to_entity)}-${Math.max(row.from_entity, row.to_entity)}`;
+    // `acquaintance` is allowed, but only as a meeting: the quote must show an
+    // introduction, greeting, handshake or direct address. Mere co-presence is
+    // what made the model default to it, so that is what the cue filter removes.
+    const ACQUAINTANCE_CUE = /\b(meet|meets|met|meeting|introduced|introduce|introduces|greet|greeted|greets|greeting|welcome|welcomed|welcomes|this is|shook (his|her|their) hand|shook hands|shake hands|said hello|say hello|how do you do|nice to meet|pleased to meet|know each other|recognised|recognized|recognise|recognize|remember me)\b/i;
+    const STOP_NAME = new Set(['mr', 'mrs', 'miss', 'professor', 'uncle', 'aunt', 'the', 'and', 'lord', 'madam', 'dr']);
+    const nameTokens = (value: unknown) =>
+      String(value ?? '').toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length > 2 && !STOP_NAME.has(t));
+    for (const v of verdicts) {
+      if (!v.pass || v.row.kind.toLowerCase().trim() !== 'acquaintance') continue;
+      const quote = String(v.row.evidence ?? '');
+      const words = new Set(quote.toLowerCase().split(/[^a-z0-9]+/));
+      const namesBoth =
+        nameTokens(v.row.a).some((t) => words.has(t)) &&
+        nameTokens(v.row.b).some((t) => words.has(t));
+      if (!ACQUAINTANCE_CUE.test(quote) || !namesBoth) {
+        v.pass = false;
+        mechanical.set(v.row.id, !ACQUAINTANCE_CUE.test(quote) ? 'acquaintance-no-interaction' : 'acquaintance-names-not-both');
+      }
+    }
+    // A vague tie never stands beside a specific one for the same pair. The
+    // stronger tie may already be in the bank from an earlier run (a filtered
+    // run only carries the ids it was given), so the bank is consulted too.
+    const bankedStrong = new Set<string>(
+      (
+        db
+          .prepare(
+            `SELECT from_entity AS f, to_entity AS t FROM canon_relation
+              WHERE project_id = ? AND review_status = 'accepted'
+                AND lower(trim(kind)) <> 'acquaintance'`,
+          )
+          .all(project.id) as { f: number; t: number }[]
+      ).map((r) => `${Math.min(r.f, r.t)}-${Math.max(r.f, r.t)}`),
+    );
+    const acqPairs = new Map<string, number[]>();
+    for (const v of verdicts) {
+      if (!v.pass) continue;
+      if (v.row.kind.toLowerCase().trim() !== 'acquaintance') continue;
+      const k = `${Math.min(v.row.from_entity, v.row.to_entity)}-${Math.max(v.row.from_entity, v.row.to_entity)}`;
+      acqPairs.set(k, [...(acqPairs.get(k) ?? []), v.row.id]);
+    }
+    for (const v of verdicts) {
+      if (!v.pass) continue;
+      const kind = v.row.kind.toLowerCase().trim();
+      if (kind === 'acquaintance') continue;
+      const k = `${Math.min(v.row.from_entity, v.row.to_entity)}-${Math.max(v.row.from_entity, v.row.to_entity)}`;
+      for (const id of acqPairs.get(k) ?? []) {
+        const acq = verdicts.find((x) => x.row.id === id);
+        if (!acq || !acq.pass) continue;
+        acq.pass = false;
+        mechanical.set(id, `subsumed-by-${kind}`);
+      }
+    }
+    for (const v of verdicts) {
+      if (!v.pass || v.row.kind.toLowerCase().trim() !== 'acquaintance') continue;
+      const k = `${Math.min(v.row.from_entity, v.row.to_entity)}-${Math.max(v.row.from_entity, v.row.to_entity)}`;
+      if (!bankedStrong.has(k)) continue;
+      v.pass = false;
+      mechanical.set(v.row.id, 'subsumed-by-banked-kind');
+    }
+    // The extractor rates its own claim, and zero means it found no support in
+    // the passage. Such a row may sit in the bank for review, never as accepted
+    // canon: it is how one sentence becomes four labels at once.
+    for (const v of verdicts) {
+      if (!v.pass) continue;
+      if (Number(v.row.confidence ?? 0) > 0) continue;
+      v.pass = false;
+      mechanical.set(v.row.id, 'zero-confidence');
+    }
+    const passing = verdicts.filter((v) => v.pass);
+    const byPair = new Map<string, typeof passing>();
+    for (const v of passing) {
+      const k = pairKey(v.row);
+      byPair.set(k, [...(byPair.get(k) ?? []), v]);
+    }
+    for (const list of byPair.values()) {
+      if (list.length < 2) continue;
+      const kindOf = (v: (typeof list)[number]) => v.row.kind.toLowerCase().trim();
+      const student = list.find((v) => kindOf(v) === 'student of');
+      const teacher = list.find((v) => kindOf(v) === 'mentor of' || kindOf(v) === 'teacher of');
+      if (student && teacher && student.row.from_entity !== teacher.row.from_entity) {
+        student.pass = false;
+        mechanical.set(student.row.id, `inverse-of-${teacher.row.kind}`);
+      }
+    }
+
     const orderedSeen = new Map<string, number>();
     const unorderedSeen = new Map<string, number>();
     for (const verdict of verdicts) {

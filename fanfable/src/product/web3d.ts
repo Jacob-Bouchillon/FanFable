@@ -6,6 +6,7 @@
  */
 import { createHash } from 'node:crypto';
 import { Db, fromJson } from '../core/db.ts';
+import { characterDossier, type DossierEvent } from '../answer/dossier.ts';
 
 export type WebNodeKind = 'person' | 'pair' | 'born';
 
@@ -413,6 +414,15 @@ export interface WebPersonDossier {
   counts: { total: number; accepted: number; needsReview: number };
   groups: Array<{ family: string; ties: WebPersonTie[] }>;
   duplicates: Array<{ id: number; name: string; reason: string }>;
+  /** Derived from the bank on read: scene participation, chapters and beats. */
+  extra: {
+    status: 'appears' | 'mentioned';
+    attributes: Record<string, unknown> | null;
+    events: DossierEvent[];
+    firstChapter: number | null;
+    lastChapter: number | null;
+    chapters: number;
+  };
 }
 
 const FAMILY_ORDER = ['kin', 'friend', 'hostile', 'teach', 'trust', 'ally', 'colleague', 'other'];
@@ -647,6 +657,8 @@ export function webPersonDossier(db: Db, projectId: number, entityId: number): W
     }
   }
 
+  const derived = characterDossier(db, projectId, entityId);
+
   return {
     person: { id: Number(person.id), name: String(person.name ?? ''), aliases, kind: String(person.kind ?? '') },
     counts: {
@@ -656,6 +668,14 @@ export function webPersonDossier(db: Db, projectId: number, entityId: number): W
     },
     groups,
     duplicates,
+    extra: {
+      status: derived?.status ?? 'mentioned',
+      attributes: derived?.attributes ?? null,
+      events: derived?.events ?? [],
+      firstChapter: derived?.firstChapter ?? null,
+      lastChapter: derived?.lastChapter ?? null,
+      chapters: derived?.counts.chapters ?? 0,
+    },
   };
 }
 
