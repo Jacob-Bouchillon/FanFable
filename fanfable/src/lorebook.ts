@@ -11589,6 +11589,48 @@ export function insertOwnedCreatureRelation(
 }
 
 /** Park an entity for review without deleting its evidence or aliases. */
+/** Attach every mention of a cluster to one entity (local resolution). */
+export function linkMentions(db: Db, projectId: number, clusterId: number, entityId: number): number {
+  const result = db.run(
+    'UPDATE canon_mention SET entity_id = ? WHERE project_id = ? AND cluster_id = ? AND entity_id IS NULL',
+    entityId,
+    projectId,
+    clusterId,
+  );
+  return Number(result.changes ?? 0);
+}
+
+/** One mention of an entity in a chunk, for the evidence index. */
+export interface MentionInput {
+  entityId: number | null;
+  clusterId: number | null;
+  chunkId: number;
+  start: number;
+  end: number;
+  surface: string;
+  kind?: string;
+  method?: string;
+}
+
+export function insertMention(db: Db, projectId: number, mention: MentionInput): number {
+  const result = db.run(
+    `INSERT INTO canon_mention
+       (project_id, entity_id, cluster_id, chunk_id, start, end, surface, kind, method, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    projectId,
+    mention.entityId,
+    mention.clusterId,
+    mention.chunkId,
+    mention.start,
+    mention.end,
+    mention.surface,
+    mention.kind ?? 'PROP',
+    mention.method ?? 'booknlp',
+    new Date().toISOString(),
+  );
+  return Number(result.lastInsertRowid);
+}
+
 /**
  * Put a quarantined entity back into review. Quarantine is a holding pen, not a
  * deletion: a rule can be wrong (a real person whose name is also a common

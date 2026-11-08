@@ -1154,14 +1154,30 @@ export const MIGRATIONS: Migration[] = [
         ON trace_event(created_at);
     `,
   },
+  {
+    version: 33,
+    name: 'evidence mention index',
+    sql: `
+      CREATE TABLE IF NOT EXISTS canon_mention (
+        id          INTEGER PRIMARY KEY,
+        project_id  INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+        entity_id   INTEGER REFERENCES canon_entity(id) ON DELETE SET NULL,
+        cluster_id  INTEGER,
+        chunk_id    INTEGER NOT NULL REFERENCES canon_chunk(id) ON DELETE CASCADE,
+        start       INTEGER NOT NULL,
+        end         INTEGER NOT NULL,
+        surface     TEXT NOT NULL,
+        kind        TEXT NOT NULL DEFAULT 'PROP',
+        method      TEXT NOT NULL DEFAULT 'booknlp',
+        created_at  TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS canon_mention_chunk ON canon_mention(project_id, chunk_id);
+      CREATE INDEX IF NOT EXISTS canon_mention_entity ON canon_mention(project_id, entity_id);
+      CREATE INDEX IF NOT EXISTS canon_mention_cluster ON canon_mention(project_id, cluster_id);
+    `,
+  },
 ];
 
-/**
- * Bring a database up to the latest schema.
- *
- * Databases created before versioning existed carry `schema_meta.version = 1`
- * and `user_version = 0`; they are treated as version 1 and moved forward.
- */
 export function runMigrations(db: DatabaseSync): number {
   const version = Number(db.prepare('PRAGMA user_version').get()?.user_version ?? 0);
 

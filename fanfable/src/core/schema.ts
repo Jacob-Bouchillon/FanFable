@@ -195,6 +195,26 @@ CREATE TABLE IF NOT EXISTS canon_timeline (
 );
 CREATE INDEX IF NOT EXISTS canon_timeline_project ON canon_timeline(project_id, seq);
 
+-- ============================================================= EVIDENCE INDEX
+-- One row per mention of an entity in a chunk. Every claim can point at a
+-- mention, and every mention points at a chunk and an entity (when resolved).
+CREATE TABLE IF NOT EXISTS canon_mention (
+  id          INTEGER PRIMARY KEY,
+  project_id  INTEGER NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+  entity_id   INTEGER REFERENCES canon_entity(id) ON DELETE SET NULL,
+  cluster_id  INTEGER,
+  chunk_id    INTEGER NOT NULL REFERENCES canon_chunk(id) ON DELETE CASCADE,
+  start       INTEGER NOT NULL,
+  end         INTEGER NOT NULL,
+  surface     TEXT NOT NULL,
+  kind        TEXT NOT NULL DEFAULT 'PROP',
+  method      TEXT NOT NULL DEFAULT 'booknlp',
+  created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS canon_mention_chunk ON canon_mention(project_id, chunk_id);
+CREATE INDEX IF NOT EXISTS canon_mention_entity ON canon_mention(project_id, entity_id);
+CREATE INDEX IF NOT EXISTS canon_mention_cluster ON canon_mention(project_id, cluster_id);
+
 -- ==================================================================== STORY
 CREATE TABLE IF NOT EXISTS outline (
   id              INTEGER PRIMARY KEY,
