@@ -422,6 +422,7 @@ export interface WebPersonDossier {
     firstChapter: number | null;
     lastChapter: number | null;
     chapters: number;
+    facts: Array<{ statement: string; evidence: string; status: string }>;
   };
 }
 
@@ -573,6 +574,7 @@ export function webPersonDossier(db: Db, projectId: number, entityId: number): W
        JOIN canon_entity fa ON fa.id = r.from_entity
        JOIN canon_entity fb ON fb.id = r.to_entity
       WHERE r.project_id = ? AND (r.from_entity = ? OR r.to_entity = ?)
+        AND r.review_status <> 'rejected'
       ORDER BY r.id`,
     projectId,
     entityId,
@@ -658,6 +660,13 @@ export function webPersonDossier(db: Db, projectId: number, entityId: number): W
   }
 
   const derived = characterDossier(db, projectId, entityId);
+  const factRows = db.all<{ statement: string; evidence: string; review_status: string }>(
+    `SELECT statement, evidence, review_status FROM canon_fact
+      WHERE project_id = ? AND subject_entity_id = ? AND review_status <> 'rejected'
+      ORDER BY id LIMIT 40`,
+    projectId,
+    entityId,
+  );
 
   return {
     person: { id: Number(person.id), name: String(person.name ?? ''), aliases, kind: String(person.kind ?? '') },
@@ -675,6 +684,11 @@ export function webPersonDossier(db: Db, projectId: number, entityId: number): W
       firstChapter: derived?.firstChapter ?? null,
       lastChapter: derived?.lastChapter ?? null,
       chapters: derived?.counts.chapters ?? 0,
+      facts: factRows.map((row) => ({
+        statement: String(row.statement ?? ''),
+        evidence: String(row.evidence ?? ''),
+        status: String(row.review_status ?? ''),
+      })),
     },
   };
 }

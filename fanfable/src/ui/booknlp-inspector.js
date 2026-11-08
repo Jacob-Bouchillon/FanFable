@@ -14,6 +14,8 @@
     focusQuote: null,
     query: '',
     showUnbanked: true,
+    showEmpty: false,
+    castOnly: true,
     wholeBook: false,
   };
 
@@ -71,6 +73,10 @@
         status: entity.status,
         aliases: entity.aliases,
         bankId: entity.id,
+        hasSummary: entity.hasSummary === true,
+        ties: Number(entity.ties ?? 0),
+        facts: Number(entity.facts ?? 0),
+        mentions: Number(entity.mentions ?? 0),
         clusterId: cluster?.id ?? null,
         mentions: cluster?.mentions ?? null,
       });
@@ -102,6 +108,9 @@
     const query = state.query.toLowerCase();
     return state.entries.filter((entry) => {
       if (!state.showUnbanked && entry.kind === 'booknlp') return false;
+      if (!state.showEmpty && entry.bankId != null && entry.ties === 0 && entry.facts === 0 && !entry.hasSummary) return false;
+      // The cast is the people with relationships; the rest are minor names.
+      if (state.castOnly && entry.kind === 'character' && entry.ties === 0 && entry.mentions < 5) return false;
       if (!query) return true;
       return entry.name.toLowerCase().includes(query)
         || entry.aliases.some((alias) => alias.toLowerCase().includes(query));
@@ -110,14 +119,32 @@
 
   function renderList() {
     const entries = visibleEntries();
-    $('#clusters').innerHTML = entries.length
-      ? entries.map((entry) => `
+    if (!entries.length) {
+      $('#clusters').innerHTML = '<div class="empty">Nothing matches.</div>';
+      return;
+    }
+    const counts = new Map();
+    for (const entry of entries) counts.set(entry.kind, (counts.get(entry.kind) ?? 0) + 1);
+    const order = ['character', 'creature', 'species', 'faction', 'location', 'item', 'rule', 'booknlp'];
+    const label = (kind) => kind === 'booknlp' ? 'BookNLP only' : kind[0].toUpperCase() + kind.slice(1) + 's';
+    let html = '';
+    let current = '';
+    for (const kind of order) {
+      if (!counts.has(kind)) continue;
+      if (kind !== current) {
+        html += `<div class="group">${esc(label(kind))} <span>${counts.get(kind)}</span></div>`;
+        current = kind;
+      }
+      for (const entry of entries.filter((item) => item.kind === kind)) {
+        html += `
         <div class="cluster" data-key="${entry.key}" role="button" aria-selected="${entry.key === state.selected?.key}">
           <span class="dot"></span>
           <span class="name">${esc(entry.name)}</span>
-          <span class="count">${entry.kind === 'booknlp' ? entry.mentions : esc(entry.kind)}</span>
-        </div>`).join('')
-      : '<div class="empty">Nothing matches.</div>';
+          <span class="count">${entry.kind === 'booknlp' ? entry.mentions : ''}</span>
+        </div>`;
+      }
+    }
+    $('#clusters').innerHTML = html;
   }
 
   function clusterSpans(id) {
@@ -233,6 +260,13 @@
           if (Object.keys(attrs).length) {
             parts.push(`<div class="row"><span>facts</span><span>${Object.entries(attrs).map(([k, v]) => `${esc(k)}=${esc(v)}`).join(', ')}</span></div>`);
           }
+          const facts = extra.facts ?? [];
+          if (facts.length) {
+            parts.push(`<h3>Facts (${facts.length})</h3>`);
+            for (const fact of facts) {
+              parts.push(`<div class="quote">${esc(fact.statement)}</div>`);
+            }
+          }
           const ties = (person.groups ?? []).flatMap((group) => group.ties).slice(0, 20);
           if (ties.length) {
             parts.push('<h3>Bank ties</h3>');
@@ -282,6 +316,14 @@
   });
   $('#unbanked').addEventListener('change', (event) => {
     state.showUnbanked = event.target.checked;
+    renderList();
+  });
+  $('#cast').addEventListener('change', (event) => {
+    state.castOnly = event.target.checked;
+    renderList();
+  });
+  $('#empty').addEventListener('change', (event) => {
+    state.showEmpty = event.target.checked;
     renderList();
   });
   $('#whole').addEventListener('change', (event) => {

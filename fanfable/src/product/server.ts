@@ -321,9 +321,19 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
           return;
         }
         const current = project();
-        const rows = db.all<{ id: number; name: string; aliases: string; kind: string; review_status: string }>(
-          `SELECT id, name, aliases, kind, review_status FROM canon_entity
-            WHERE project_id = ? AND review_status <> 'quarantined' ORDER BY name`,
+        const rows = db.all<{
+          id: number; name: string; aliases: string; kind: string;
+          review_status: string; summary: string; ties: number; facts: number; mentions: number;
+        }>(
+          `SELECT e.id, e.name, e.aliases, e.kind, e.review_status, e.summary, e.mentions,
+                  (SELECT COUNT(*) FROM canon_relation r
+                    WHERE r.project_id = e.project_id
+                      AND (r.from_entity = e.id OR r.to_entity = e.id)
+                      AND r.review_status <> 'rejected') AS ties,
+                  (SELECT COUNT(*) FROM canon_fact f
+                    WHERE f.subject_entity_id = e.id AND f.review_status <> 'rejected') AS facts
+             FROM canon_entity e
+            WHERE e.project_id = ? AND e.review_status <> 'quarantined' ORDER BY e.name`,
           current.id,
         );
         json(res, 200, rows.map((row) => ({
@@ -332,6 +342,10 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
           aliases: (() => { try { const v = JSON.parse(row.aliases || '[]'); return Array.isArray(v) ? v.map(String) : []; } catch { return []; } })(),
           kind: String(row.kind ?? ''),
           status: String(row.review_status ?? ''),
+          hasSummary: String(row.summary ?? '').trim().length > 0,
+          ties: Number(row.ties ?? 0),
+          facts: Number(row.facts ?? 0),
+          mentions: Number(row.mentions ?? 0),
         })));
         return;
       }

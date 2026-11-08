@@ -222,6 +222,8 @@ export interface CanonFact {
   sourceRefs: { source: string; locator: string; chunk?: number }[];
   modality: string;
   conflictStatus: string;
+  /** Fact review state; only accepted facts reach the writer brief. */
+  reviewStatus?: string;
 }
 
 export interface CanonTimelineEntry {
@@ -16358,6 +16360,49 @@ export function directedPairStatus(
   return { forward: one(aId, bId), reverse: one(bId, aId) };
 }
 
+/**
+ * Set a fact's provenance and review state. Used by the provenance gate: a
+ * verified quote promotes the fact, an ungrounded one is rejected.
+ */
+export function setFactProvenance(
+  db: Db,
+  projectId: number,
+  factId: number,
+  sourceRefs: string,
+  status: 'accepted' | 'rejected',
+  basis: string,
+  quote = '',
+): boolean {
+  const row = db.get<{ review_status: string; subject_entity_id: number | null }>(
+    'SELECT review_status, subject_entity_id FROM canon_fact WHERE id = ? AND project_id = ?',
+    factId,
+    projectId,
+  );
+  if (!row) return false;
+  return db.transaction(() => {
+    db.run(
+      'UPDATE canon_fact SET source_refs = ?, review_status = ? WHERE id = ? AND project_id = ?',
+      sourceRefs,
+      status,
+      factId,
+      projectId,
+    );
+    if (row.subject_entity_id) {
+      recordRuling(db, projectId, {
+        subject: entitySubject(Number(row.subject_entity_id)),
+        role: 'verdict',
+        actor: 'human',
+        standard: 'provenance',
+        fromStatus: row.review_status,
+        toStatus: status,
+        basis,
+        quote,
+      });
+    }
+    return true;
+  });
+}
+
 export function listFacts(db: Db, projectId: number, topic?: string): CanonFact[] {
   const params: unknown[] = [projectId];
   let sql = 'SELECT * FROM canon_fact WHERE project_id = ?';
@@ -16377,6 +16422,7 @@ export function listFacts(db: Db, projectId: number, topic?: string): CanonFact[
     source_refs: string;
     modality: string | null;
     conflict_status: string | null;
+    review_status: string | null;
   }>(sql, ...params);
   return rows.map((r) => ({
     id: r.id,
@@ -16389,6 +16435,7 @@ export function listFacts(db: Db, projectId: number, topic?: string): CanonFact[
     sourceRefs: JSON.parse(r.source_refs || '[]') as { source: string; locator: string }[],
     modality: r.modality ?? 'asserted',
     conflictStatus: r.conflict_status ?? 'none',
+    reviewStatus: r.review_status ?? 'needs_review',
   }));
 }
 
@@ -16530,7 +16577,12 @@ export function buildLoreBrief(
   const relations = listRelations(db, projectId, ['accepted', 'user_confirmed']).filter(
     (r) => !names.length || chosen.some((e) => e.id === r.fromId || e.id === r.toId),
   );
-  const facts = opts.includeFacts === false ? [] : listFacts(db, projectId);
+  const facts = opts.includeFacts === false
+    ? []
+    // Facts are advisory by design: accepted and needs_review both reach the
+    // brief under a "verify before asserting" heading. Only a fact shown to be
+    // ungrounded is withheld.
+    : listFacts(db, projectId).filter((fact) => fact.reviewStatus !== 'rejected');
   return renderBrief(chosen, relations, facts, names);
 }
 

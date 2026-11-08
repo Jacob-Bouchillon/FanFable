@@ -68,6 +68,8 @@
   #detail .quote:hover { border-left-color: var(--quote); color: var(--text); }
   .empty { color: var(--muted); padding: 16px; }
   .filter-note { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+  .group { padding: 10px 10px 4px; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); border-top: 1px solid #1b2029; }
+  .group span { float: right; }
 </style>
 </head>
 <body>
@@ -77,6 +79,8 @@
   <div class="grow"></div>
   <input type="search" id="search" placeholder="search a name or surface form" />
   <label class="toggle"><input type="checkbox" id="unbanked" checked /> BookNLP-only clusters</label>
+  <label class="toggle"><input type="checkbox" id="cast" checked /> cast only</label>
+  <label class="toggle"><input type="checkbox" id="empty" /> show empty</label>
   <label class="toggle"><input type="checkbox" id="whole" /> whole book</label>
 </header>
 <main>
@@ -84,6 +88,6 @@
   <div class="pane" id="book"></div>
   <div class="pane" id="detail"><div class="empty">Pick a cluster.</div></div>
 </main>
-<script src="/ui/booknlp-inspector.js?v=10"></script>
+<script src="/ui/booknlp-inspector.js?v=13"></script>
 </body>
 </html>
