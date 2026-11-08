@@ -95,7 +95,7 @@ test('migration 28 creates the provenance tables, columns and indexes', () => {
   for (const name of ['extraction_run_project', 'extraction_window_run_run', 'extraction_window_run_window']) {
     assert.ok(indexes.includes(name), name);
   }
-  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')?.user_version, 32);
+  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')?.user_version, 33);
   assert.equal(db.get<{ value: string }>("SELECT value FROM schema_meta WHERE key = 'version'")?.value, '1');
   db.close();
 });
@@ -442,7 +442,7 @@ test('migration 28 leaves a pre-28 database canon and status content unchanged',
   db.close();
 
   const reopened = new Db(path);
-  assert.equal(reopened.get<{ user_version: number }>('PRAGMA user_version')?.user_version, 32);
+  assert.equal(reopened.get<{ user_version: number }>('PRAGMA user_version')?.user_version, 33);
   for (const table of ['extraction_run', 'extraction_window_run']) {
     assert.ok(
       reopened.get("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", table),

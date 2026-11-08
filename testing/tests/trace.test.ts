@@ -193,7 +193,7 @@ function rulingCount(db: Db, projectId: number): number {
 
 test('migration 30 adds the trace ledger and indexes', () => {
   const { db } = tempDb();
-  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')?.user_version, 32);
+  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')?.user_version, 33);
   const tables = db.all<{ name: string }>(
     "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('trace','trace_event')",
   ).map((row) => row.name);

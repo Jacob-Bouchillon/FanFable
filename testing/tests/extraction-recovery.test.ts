@@ -280,7 +280,7 @@ test('migration 31 is additive, creates the recovery ledger and preserves legacy
   ]) {
     assert.ok(tableExists(db.raw, table), `${table} exists`);
   }
-  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')?.user_version, 32);
+  assert.equal(db.get<{ user_version: number }>('PRAGMA user_version')?.user_version, 33);
   const attemptColumns = db.all<{ name: string }>('PRAGMA table_info(extraction_attempt)').map((row) => row.name);
   assert.ok(attemptColumns.includes('fingerprint'), 'attempts carry their stage fingerprint');
   const attemptIndex = db.get<{ sql: string }>(
@@ -303,7 +303,7 @@ test('migration 31 is additive, creates the recovery ledger and preserves legacy
   db.close();
 
   const reopened = new Db(path);
-  assert.equal(reopened.get<{ user_version: number }>('PRAGMA user_version')?.user_version, 32);
+  assert.equal(reopened.get<{ user_version: number }>('PRAGMA user_version')?.user_version, 33);
   assert.ok(tableExists(reopened.raw, 'extraction_recovery_parent'));
   assert.equal(totalChunks(reopened, project.id), before.chunks);
   assert.equal(minedCount(reopened, project.id), before.mined);
@@ -383,7 +383,7 @@ test('an old experimental v31 database upgrades to the revised recovery schema w
   db.close();
 
   const reopened = new Db(path);
-  assert.equal(reopened.get<{ user_version: number }>('PRAGMA user_version')?.user_version, 32);
+  assert.equal(reopened.get<{ user_version: number }>('PRAGMA user_version')?.user_version, 33);
   for (const table of ['extraction_recovery_run_child', 'extraction_recovery_chunk_work']) {
     assert.ok(tableExists(reopened.raw, table), `${table} added by migration 32`);
   }
