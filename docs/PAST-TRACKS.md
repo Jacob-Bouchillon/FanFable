@@ -17,6 +17,13 @@ House rules (agreed before any redesign; the map, not the territory):
 Live tracks first (ran this month or wired into current flows), then one
 block per resting track, then strays, then the delete list.
 
+> **Status note (2026-11-13).** This document is the record as written; it is
+> not a live inventory. Five folders it lists as resting have since been
+> deleted from disk — `gatecheck/`, `product-loop/`, `reader-ab/`,
+> `reader-strict/`, and `tiers-probe/` — and `sheets/` is gone too. For what
+> is actually on disk, read `testing/trials/README.md`, which maps all 43
+> current folders. Nothing in this file was rewritten to match.
+
 ## Live (9)
 
 - `adjudication/` — blind-adjudication harness (gold sheets, three-way
@@ -28,7 +35,7 @@ block per resting track, then strays, then the delete list.
   probes cited in BENCHMARK §9. The `.json` outputs are gitignored run
   data, not the harness.
 - `claim-confidence/` — blind-gold runs + `judge-variants.ts` (the pattern
-  the third judge reused). Evidence: SESSION-REPORT model study, Oct 30.
+  the third judge reused). Evidence: the 2026-10-30 report's model study, in `REPORTS.md`.
 - `discovery/` — `sample-unproposed.ts` / `score-unproposed.ts`; feeds the
   WEBS-AND-THREADS discovery section. Touched `3208732`.
 - `grade-claims/` — export/score harness (`734a942`) + Oct 31 third-judge
@@ -43,16 +50,16 @@ block per resting track, then strays, then the delete list.
 ## Resting (24) — one block each
 
 - `audit/` — Asked whether the bank survives a strict-verbatim audit.
-  Decided: demote-with-reason + integrity exit codes (SESSION-REPORT:
+  Decided: demote-with-reason + integrity exit codes (the 2026-10-30 report in `REPORTS.md`:
   4 violations found, 4 demoted, exit 0 after). Died when the reports
-  were merged into SESSION-REPORT-2026-10-30 (`734a942`); the audit
+  were merged into the 2026-10-30 report, now in `REPORTS.md` (`734a942`); the audit
   command lives in src. Recover: `git log -- testing/trials/audit/`.
 - `bucketing/` — Asked whether bucketed sampling finds ties. Ran a
   40-row blind packet (42-line CSV incl. header) + 43-line judge verdicts
   under a rejected A/A'/D/I scheme. Superseded by the 80-row stratified
   design (DESIGNED BUT UNRUN). Last touch `61a9841`. Recover: same path.
 - `chain/` — Asked how walks read the book (book-coord runners + the
-  thin-first ordering reader). Folded into `fanfable/src/chain-handoff.ts`
+  thin-first ordering reader). Folded into `fanfable/src/answer/thin-ranked.ts`
   + the diagnostics re-read. Died at the `ab74bb0` reorg (scripts kept).
 - `discovery-cmp/` — Asked whether a liberal relations prompt beats the
   current one: the three prompt conditions over the same 10 windows (triageable 16 / 2 / 1
@@ -78,7 +85,7 @@ block per resting track, then strays, then the delete list.
 - `kind-labels/` — `evaluate.ts`; the kinds it evaluated shipped
   (`841b007`). Died with the kinds commit.
 - `model-ab/` (leftovers) — The comparison banks except the `hp3.db` smoke
-  fixture + `compare-banks.ts`. Verdicts recorded in SESSION-REPORT §5.
+  fixture + `compare-banks.ts`. Verdicts recorded in the 2026-10-30 report §5, in `REPORTS.md`.
   The rest is residue (see list).
 - `name-probe/` — One-off `probe.ts`. No refs. Died `61a9841`.
 - `name-variants/` — Differentials, failure census, `FREEZE.txt`,
@@ -131,7 +138,7 @@ not a verdict.
   `config.before.json` — comparison leftovers incl. audit-backup + pre-replay
   snapshots.
 - `testing/trials/nuextract-duel/` except `manifest.json` — comparison
-  residue; verdict lives in SESSION-REPORT §5.
+  residue; verdict lives in the 2026-10-30 report §5, in `REPORTS.md`.
 - `testing/trials/product-loop/` outputs (`*.db`, `*.log`, chapter
   drafts) — pipeline moved to src; keep nothing.
 - `testing/trials/sheets/` + `testing/trials/sheet-rerun/` except

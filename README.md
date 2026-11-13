@@ -33,6 +33,18 @@ npm run fanfable -- serve        # http://127.0.0.1:8123
 
 On Windows, PowerShell blocks `npm.ps1` by default; use `npm.cmd` or set the execution policy once. `npm run typecheck` and `npm test` check the build and run the offline test suite.
 
+## Documentation
+
+Everything written down lives in [`docs/`](docs/), which opens with a map of what is there:
+
+- [`docs/README.md`](docs/README.md) — the whole picture: current state, what's next, and an index of every document.
+- [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md) — the standing design, and the rules future work must obey.
+- [`docs/CODE-MAP.md`](docs/CODE-MAP.md) — where to look for what in the source.
+- [`docs/WHATS-NEXT.md`](docs/WHATS-NEXT.md) — ranked next steps, commands, and the traps that cost real time.
+- [`GLOSSARY.md`](GLOSSARY.md) — the locked vocabulary, where plain words win over code words.
+
+Measurement reports under `docs/REPORT-*.md` are dated and never rewritten; a new number gets a new file.
+
 ## Research
 
 I'm exploring ways to improve how AI retrieves and understands information from books, especially across long stories.
