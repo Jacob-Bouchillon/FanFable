@@ -37,13 +37,24 @@ describes behaviour, run it. Probes were run against throwaway databases under
 | D2 sweep crashes on resolved note | duplicate check covers every status, not just `pending`. Code read. |
 | D5 sweep bypasses the court | `recordRuling` is called on the proposal path. Code read. |
 
-## Verified LIVE
+## Verified LIVE, then fixed
+
+A3, A6, C8, C9, D12 and A9 were all confirmed live and have since been fixed, each
+with a regression test that fails against the previous code. See the commit
+"Fix five audit findings confirmed live" and its follow-up for A9.
+
+A9 was worse in effect than the audit said. Adding the instruction sentence to the
+focus set does not merely pollute retrieval: `buildContextSlice` keeps only rows
+whose text contains a focus term, so a note naming nobody flipped `focus.length`
+from 0 to 1 and returned an **empty** context slice. Notes now contribute only the
+story and canon names they actually mention.
+
+
 
 | id | what is still wrong | evidence |
 |---|---|---|
 | **A3** | embedding timeout cleared when headers arrive, so a stalled body hangs forever | `embeddings.ts`: `clearTimeout(timer)` in `finally` around `fetch`, `res.json()` outside it |
 | **A6** | knowledge-continuity matches generic words | `graph-checks.ts`: the caller lowercases the claim, so `distinctiveTerms`' capitalisation filter can never exclude anything |
-| **A9** | user instructions injected into the retrieval focus set verbatim | `controller.ts`: `for (const m of toStringArray(opts.userInstructions)) focus.add(m)` |
 | **C8** | `contextTokens` stored as whatever the client sent | `server.ts`: `temperature` is coerced with `Number()`, `contextTokens` is not; the client types it as a number |
 | **C9** | "masking" exposes short keys in full | `server.ts`: `${apiKey.slice(0, 6)}…${apiKey.slice(-4)}` — a key of 10 characters or fewer is shown whole |
 | **D12** | sweep skips non-ASCII names | `sweep.ts`: `/^[A-Z]/.test(form)` drops any name not starting with an ASCII capital |

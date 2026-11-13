@@ -236,6 +236,31 @@ export interface ContextBundle {
 }
 
 /**
+ * Add to `focus` only the story and canon names a note actually mentions.
+ *
+ * The author's instructions steer the prose ("make this tenser", "Mara should
+ * not trust him yet"). Those words are not names, and the context slice filters
+ * on names. Recognising the known ones keeps the useful part — a note that
+ * names someone pulls them into context — and drops the rest.
+ */
+function focusAddNotesFrom(db: Db, projectId: number, focus: Set<string>, notes: unknown): void {
+  const text = toStringArray(notes).join(' ');
+  if (!text.trim()) return;
+  const haystack = ` ${text.toLowerCase().replace(/[^a-z0-9'’-]+/g, ' ')} `;
+  const seen = new Set<string>();
+  const add = (name: string): void => {
+    const clean = name.trim();
+    if (!clean || seen.has(clean.toLowerCase())) return;
+    const needle = ` ${clean.toLowerCase()} `;
+    if (!haystack.includes(needle)) return;
+    seen.add(clean.toLowerCase());
+    focus.add(clean);
+  };
+  for (const character of memory.listCharacters(db, projectId)) add(character.name);
+  for (const entity of lorebook.listEntities(db, projectId)) add(entity.name);
+}
+
+/**
  * Assemble the context for a chapter: story memory, canon evidence and the
  * tail of the previous chapter.
  */
@@ -268,7 +293,11 @@ export async function assembleContext(
     }
     for (const id of opts.chapter.canonEventIds) focus.add(`canon:${id}`);
   }
-  for (const m of toStringArray(opts.userInstructions)) focus.add(m);
+  // A note is prose, not a name. Adding the whole sentence to the focus set is
+  // worse than useless: `buildContextSlice` keeps only rows whose text contains
+  // a focus term, so a sentence that names nobody empties the slice instead of
+  // widening it. Read the names actually mentioned in the note instead.
+  focusAddNotesFrom(db, projectId, focus, opts.userInstructions);
 
   // The scene's names: who and what it is about.
   const loreNames = [

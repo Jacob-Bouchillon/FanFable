@@ -147,3 +147,64 @@ test('A6: a shared verb alone does not prove a character knew a fact', () => {
   assert.equal(real.filter((i) => i.category === 'knowledge').length, 1);
   db.close();
 });
+
+test('A9: a note naming nobody does not empty the context', async () => {
+  const { db } = tempDb();
+  const project = createProject(db, 'a9');
+  addChunk(db, project.id, 'Mara waited at the ford.');
+  const character = Number(db.run(
+    `INSERT INTO character (project_id, name, created_at, updated_at) VALUES (?, ?, ?, ?)`,
+    project.id, 'Mara', AT, AT,
+  ).lastInsertRowid);
+  db.run(
+    `INSERT INTO character_knowledge (project_id, character_id, fact, topic, certainty, source, created_at)
+     VALUES (?, ?, 'Mara distrusts Corin', 'Corin', 'knows', 'au', ?)`,
+    project.id, character, AT,
+  );
+
+  const plain = await (await import('../../fanfable/src/plan/controller.ts')).assembleContext(
+    db,
+    mockProvider(() => '{}'),
+    project.id,
+    { chapterNumber: 1, trace: false },
+  );
+  const withNote = await (await import('../../fanfable/src/plan/controller.ts')).assembleContext(
+    db,
+    mockProvider(() => '{}'),
+    project.id,
+    { chapterNumber: 1, trace: false, userInstructions: 'make the scene more tense and shorter' },
+  );
+
+  // Before the fix the whole sentence entered the focus set, and because no row
+  // contains it, the slice came back empty.
+  assert.ok(
+    withNote.memoryText.length > 0,
+    'an instruction that names nobody must not empty the context',
+  );
+  assert.equal(withNote.memoryText.length, plain.memoryText.length);
+  db.close();
+});
+
+test('A9: a note naming a character still pulls that character in', async () => {
+  const { db } = tempDb();
+  const project = createProject(db, 'a9-named');
+  addChunk(db, project.id, 'Mara waited at the ford.');
+  const character = Number(db.run(
+    `INSERT INTO character (project_id, name, created_at, updated_at) VALUES (?, ?, ?, ?)`,
+    project.id, 'Mara', AT, AT,
+  ).lastInsertRowid);
+  db.run(
+    `INSERT INTO character_knowledge (project_id, character_id, fact, topic, certainty, source, created_at)
+     VALUES (?, ?, 'Mara distrusts Corin', 'Corin', 'knows', 'au', ?)`,
+    project.id, character, AT,
+  );
+
+  const controller = await import('../../fanfable/src/plan/controller.ts');
+  const named = await controller.assembleContext(db, mockProvider(() => '{}'), project.id, {
+    chapterNumber: 1,
+    trace: false,
+    userInstructions: 'keep Mara quiet in this scene',
+  });
+  assert.ok(named.memoryText.includes('Mara'), 'the named character reaches the context');
+  db.close();
+});
