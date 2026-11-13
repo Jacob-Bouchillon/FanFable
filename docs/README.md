@@ -29,6 +29,7 @@
 | `PIPELINE-PLAN.md` | who owns which pipeline stage, and the bar a new part must clear before it is allowed in |
 | `WEBS-AND-THREADS.md` | the proposed thread/web visual system, and what of it actually shipped |
 | `PAST-TRACKS.md` | what each trial asked and decided — a dated record, not a live inventory |
+| `ORGANIZATION-2026-11-13.md` | what the 2026-11-13 organization pass changed, and what it deliberately left alone |
 | `ASSESSOR-BENCH.md` | what the judge bench measured, and what it did not |
 | `GLINER-ARCHITECTURES.md` | architecture notes on GLiNER for entity finding |
 | `RESOURCE-SHELF.md` | models, datasets and recipes kept for reference |
