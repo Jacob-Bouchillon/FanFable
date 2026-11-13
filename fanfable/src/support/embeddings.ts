@@ -77,6 +77,7 @@ export async function embedTexts(texts: string[], opts: EmbedConfig): Promise<nu
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 60_000);
       let res: Response;
+      let data: { embeddings?: unknown } | undefined;
       try {
         res = await fetch(`${base}/api/embed`, {
           method: 'POST',
@@ -84,11 +85,16 @@ export async function embedTexts(texts: string[], opts: EmbedConfig): Promise<nu
           body: JSON.stringify({ model, input: chunk }),
           signal: controller.signal,
         });
+        if (!res.ok) return undefined;
+        // The body read stays inside the abort window. Clearing the timer when
+        // the headers arrive lets a server that stalls after sending them hang
+        // this call forever, ignoring timeoutMs.
+        data = (await res.json().catch(() => undefined)) as { embeddings?: unknown } | undefined;
+      } catch {
+        return undefined;
       } finally {
         clearTimeout(timer);
       }
-      if (!res.ok) return undefined;
-      const data = (await res.json().catch(() => undefined)) as { embeddings?: unknown } | undefined;
       const vecs = cleanVecs(data?.embeddings);
       if (!vecs || vecs.length !== chunk.length) return undefined;
       out.push(...vecs);

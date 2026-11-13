@@ -29,11 +29,21 @@ import { devGraphSummary } from './dev-summary.ts';
 import { buildWebGraph, buildWebMap, webPersonDossier, webThreadDetail } from './web3d.ts';
 import { loadBookNlp } from './booknlp.ts';
 
-/** Settings returned to the UI never carry the whole API key. */
+/**
+ * Settings returned to the UI never carry the whole API key.
+ *
+ * The prefix/suffix shape is only safe while it leaves characters hidden. At
+ * 6+4 revealed, any key of 10 or fewer characters was printed in full by the
+ * old code (`abc…ghij` is the entire key). Real keys are far longer than that,
+ * so the shape is kept for anything 16 characters or more and shorter values
+ * are masked completely.
+ */
 export function maskSettingsForOutput<T extends Record<string, unknown>>(settings: T): T {
   const copy = { ...settings } as Record<string, unknown>;
   if (typeof copy.apiKey === 'string' && copy.apiKey) {
-    copy.apiKey = `${copy.apiKey.slice(0, 6)}…${copy.apiKey.slice(-4)}`;
+    copy.apiKey = copy.apiKey.length >= 16
+      ? `${copy.apiKey.slice(0, 6)}…${copy.apiKey.slice(-4)}`
+      : '••••••••';
   }
   return copy as T;
 }
@@ -1263,10 +1273,13 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
       if (path === '/api/settings' && method === 'POST') {
         const body = await readJson(req);
         const patch: Record<string, unknown> = {};
-        for (const key of ['provider', 'baseUrl', 'model', 'temperature', 'maxTokens', 'contextTokens']) {
-          if (body[key] !== undefined && body[key] !== '') patch[key] = body[key];
+        // Numeric settings are coerced here. Storing "32768" as a string makes
+        // `num_ctx` a string downstream, which Ollama rejects or ignores.
+        const NUMERIC = new Set(['temperature', 'maxTokens', 'contextTokens', 'timeoutMs', 'seed']);
+        for (const key of ['provider', 'baseUrl', 'model', 'temperature', 'maxTokens', 'contextTokens', 'timeoutMs', 'seed']) {
+          if (body[key] === undefined || body[key] === '') continue;
+          patch[key] = NUMERIC.has(key) ? Number(body[key]) : body[key];
         }
-        if (patch.temperature !== undefined) patch.temperature = Number(patch.temperature);
         if (body.continuity !== undefined) {
           patch.continuity = body.continuity;
         }

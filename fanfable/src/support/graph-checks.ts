@@ -29,8 +29,17 @@ function distinctiveTerms(text: string): string[] {
     .split(/[^A-Za-z0-9'’-]+/)
     .map((w) => w.trim())
     .filter((w) => w.length > 3)
-    .filter((w) => /[A-Z]/.test(w.slice(1)) || w.toLowerCase() === w)
+    // A proper noun carries a capital after its first letter ("McDonald") or is
+    // simply capitalised ("Serena"). Ordinary words are dropped: matching on
+    // "visited" alone flags a character for referring to a fact they never
+    // mentioned, because the verb is shared by every sentence about anything.
+    .filter((w) => /[A-Z]/.test(w))
     .map((w) => w.toLowerCase());
+}
+
+/** Whole-word test, so "serena" does not match "serenaded". */
+function mentionsTerm(haystack: string, term: string): boolean {
+  return new RegExp(`(?<![a-z0-9])${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![a-z0-9])`).test(haystack);
 }
 
 /**
@@ -67,10 +76,18 @@ function checkKnowledgeBeforeLearning(db: Db, projectId: number, input: GraphChe
     if (row.event_order <= input.storyOrder) continue; // learned before this chapter
 
     // The claim has to be *about* something the chapter mentions, and the
-    // character has to be in the chapter.
-    const claim = `${row.fact} ${row.topic}`.toLowerCase();
-    const distinctive = distinctiveTerms(claim);
-    const shared = distinctive.filter((t) => body.includes(t));
+    // character has to be in the chapter. Distinctiveness is judged on the raw
+    // claim text, because lowercasing first destroys the capitalisation that
+    // tells a proper noun from an ordinary word.
+    //
+    // The character's own name is not evidence of what they know: the check
+    // below already requires them to appear. Leaving it in makes "Serena
+    // visited Voldemort" fire on any chapter that merely says "Serena".
+    const ownName = new Set(
+      row.character_name.toLowerCase().split(/[^a-z0-9'’-]+/).filter((w) => w.length > 1),
+    );
+    const distinctive = distinctiveTerms(`${row.fact} ${row.topic}`).filter((t) => !ownName.has(t));
+    const shared = distinctive.filter((t) => mentionsTerm(body, t));
     if (!shared.length) continue;
     // The character has to be in the chapter. A first name is enough: prose
     // rarely repeats surnames.

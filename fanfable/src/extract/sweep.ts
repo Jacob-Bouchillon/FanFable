@@ -281,11 +281,20 @@ export async function runNameSweep(
         variants
           .flatMap((variant) => [variant, ...variant.split(/\s+/)])
           .map((form) => form.trim())
-          .filter((form) => form.length >= 3 && /^[A-Z]/.test(form)),
+          // A capitalised ASCII name, or any name carrying a letter outside
+          // ASCII. The old `/^[A-Z]/` test silently dropped every "Éowyn",
+          // "Ñandú" and wholly non-Latin name, so those characters were never
+          // swept at all.
+          .filter((form) => form.length >= 3 && (/^\p{Lu}/u.test(form) || /[^\x00-\x7F]/.test(form))),
       ),
     ];
     if (!forms.length) continue;
-    const formRe = new RegExp(`\\b(${forms.map((form) => form.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\b`);
+    // Unicode-aware boundaries: `\b` treats every non-ASCII letter as a
+    // boundary character, so "éowyn" inside "théowyn" would match.
+    const formRe = new RegExp(
+      `(?<!\\p{L})(${forms.map((form) => form.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})(?!\\p{L})`,
+      'u',
+    );
     const ledger: LedgerLine[] = [];
     for (const chunk of chunks) {
       for (const sentence of chunk.text.split(/(?<=[.!?])\s+/)) {
