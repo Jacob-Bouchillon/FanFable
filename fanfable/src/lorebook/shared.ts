@@ -6,9 +6,10 @@
  * at least two modules; anything used by one belongs in that module.
  */
 import { Db, strList } from '../core/db.ts';
+import { normalise } from '../core/text.ts';
 import type { EndpointResolutionMethod, TracedEndpointResolution } from '../trace/extraction-trace.ts';
 import { canonicalName } from '../identity/names.ts';
-import type { EntityKind } from '../lorebook.ts';
+import type { ChunkRow, EntityKind } from '../lorebook.ts';
 
 /**
  * The first chunk id named by a row's `source_refs` JSON.
@@ -168,3 +169,83 @@ export function resolveEntity(
 ): number | undefined {
   return resolveEntityDetailed(db, projectId, name).id;
 }
+
+// --------------------------------------------------------------- passages
+
+export function chunkAt(window: ChunkRow[], idx: unknown): ChunkRow | undefined {
+  const i = Number(idx);
+  return Number.isFinite(i) ? window[i] : undefined;
+}
+
+export function refsFor(
+  chunk: ChunkRow | undefined,
+): { source: string; locator: string; chunk?: number; chunk_start?: number; chunk_end?: number }[] {
+  if (!chunk) return [];
+  return [{
+    source: chunk.source_title,
+    locator: chunk.locator,
+    chunk: chunk.id,
+    ...(chunk.chunk_start === undefined ? {} : { chunk_start: chunk.chunk_start }),
+    ...(chunk.chunk_end === undefined ? {} : { chunk_end: chunk.chunk_end }),
+  }];
+}
+
+// ------------------------------------------------------------ quotations
+
+/**
+ * Keep an evidence quote only if it really appears in the source.
+ *
+ * Models paraphrase when they are asked for a quote, and they often quote a
+ * neighbouring passage while citing the current one. Both are recoverable:
+ * a quote that is not in the cited passage is looked for in the passages
+ * around it, and the reference is corrected to where it actually is.
+ *
+ * A quote that appears nowhere is dropped: a fabricated citation is worse
+ * than no citation.
+ */
+export function verifyQuote(
+  raw: unknown,
+  chunk: ChunkRow | undefined,
+  neighbours: ChunkRow[] = [],
+): { quote: string; chunkId: number | null; source: string; locator: string } {
+  const text = String(raw ?? '').trim();
+  const empty = { quote: '', chunkId: chunk?.id ?? null, source: chunk?.source_title ?? '', locator: chunk?.locator ?? '' };
+  if (!text || !chunk) return empty;
+
+  const needle = normalise(text);
+  if (!needle) return empty;
+
+  const search = (target: ChunkRow | undefined): boolean => {
+    if (!target) return false;
+    return normalise(target.text).includes(needle);
+  };
+
+  if (search(chunk)) {
+    return { quote: text, chunkId: chunk.id, source: chunk.source_title, locator: chunk.locator };
+  }
+  // The model may have added a prefix or a trailing full stop.
+  const words = needle.split(' ').slice(0, 6).join(' ');
+  if (words.length > 8) {
+    const partial = (target: ChunkRow | undefined): boolean => {
+      if (!target) return false;
+      return normalise(target.text).includes(words);
+    };
+    if (partial(chunk)) {
+      return { quote: text, chunkId: chunk.id, source: chunk.source_title, locator: chunk.locator };
+    }
+    // Look in the passages around the cited one.
+    for (const candidate of neighbours) {
+      if (candidate.id === chunk.id) continue;
+      if (partial(candidate)) {
+        return {
+          quote: text,
+          chunkId: candidate.id,
+          source: candidate.source_title,
+          locator: candidate.locator,
+        };
+      }
+    }
+  }
+  return empty;
+}
+
