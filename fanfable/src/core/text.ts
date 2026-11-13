@@ -2,6 +2,17 @@
 import { STOPWORDS } from './vocab.ts';
 
 /**
+ * Deterministic lexicographic comparator.
+ *
+ * Sorts on code units rather than locale, so ordering is identical on every
+ * machine and in every run. Use this wherever a stable order is part of the
+ * output (exports, replays, tie-breaks), never `localeCompare`.
+ */
+export function compareText(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
  * Convert a SQLite FTS5 bm25 rank into a 0..1 lexical score where higher is
  * a stronger match. FTS5 ranks are lower (more negative) for better matches;
  * the old `1 / (1 + rank)` inverted that below -1. This keeps the order

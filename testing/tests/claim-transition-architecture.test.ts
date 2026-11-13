@@ -42,13 +42,17 @@ const RELATION_STATUS_GRANDFATHERS: Counts = {
     mergeEntityPair: 1,
     // A rejected row keeps its evidence for audit; the write records a ruling.
     rejectRelation: 1,
+  },
+  // Rulings export/replay was split out of lorebook.ts on 2026-11-13, logic
+  // unchanged. The same three writes now live here; the count is still exact.
+  'lorebook/rulings.ts': {
     replayRulings: 3,
   },
 };
 
 /** Existing direct confirmed_by_user writers. */
 const AUTH_GRANDFATHERS: Counts = {
-  'lorebook.ts': {
+  'lorebook/rulings.ts': {
     replayRulings: 3,
   },
   'answer/lore-diagnostics.ts': {
