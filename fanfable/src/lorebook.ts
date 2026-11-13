@@ -4685,7 +4685,7 @@ export {
   type BankRankCandidate,
 } from './lorebook/ranking.ts';
 
-
+/* ----------------------------------------- bank-answer cue and inverse rules */
 
 /**
  * The bank's own answer line for an asked relation.
