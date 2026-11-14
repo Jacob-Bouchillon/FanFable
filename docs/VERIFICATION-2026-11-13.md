@@ -59,23 +59,32 @@ story and canon names they actually mention.
 | **C9** | "masking" exposes short keys in full | `server.ts`: `${apiKey.slice(0, 6)}…${apiKey.slice(-4)}` — a key of 10 characters or fewer is shown whole |
 | **D12** | sweep skips non-ASCII names | `sweep.ts`: `/^[A-Z]/.test(form)` drops any name not starting with an ASCII capital |
 
-## Not verified
+## Second pass — 13 more checked
 
-26 findings were not re-checked: A4, A7, A11, A12, B4 (report says fixed and tested), B6, B7,
-B8, B9, B12, C5, C6, C7, C10, C11, C12, D3, D4, D6, D7, D8, D9, D10, D11, plus the
-three clean-report subsections.
+| id | verdict | evidence |
+|---|---|---|
+| A4 | **LIVE** | `planner.ts`: the merge replaces an existing chapter whenever the model returns its number, so a revision of chapter 2 that also returns chapter 1 does replace it. `canonEventIds` is still `(…).map(Number)` with no lookup against the canon table. |
+| A7 | **LIVE** | `lore-diagnostics.ts`: facts store `String(fact.quote)` unverified, and `source_refs` is hardcoded to `window[0]` even when the quote came from a later passage. `knowledge` is still returned as 0. |
+| A11 | fixed | `lore.ts`: an existing `(project, source, chunk, title)` row is counted as `duplicates` and skipped before insert. |
+| B6 | not a defect | the two normalisers still differ, but `gates.ts` now states why: `proofNormalise` feeds promotion and keeps punctuation, `core/text.normalise` feeds fingerprints. The deliberate separation is documented at the definition. |
+| B7 | fixed | `identity/names.ts`: `TITLE_TOKENS` is now the single owner, merged from the four lists that used to disagree, with a comment saying so. |
+| B9 / C12 | **LIVE** | ten modules still have zero importers in `fanfable/src` (`veto-bridge`, `character-sweep`, `name-harvest`, `thread-worker`, `combine`, and five identity modules). Whether that is deliberate is still a question for the author. |
+| B12 | fixed | `core/json.ts`: `salvageJsonArray` only starts a candidate at depth 0, so a nested object inside a truncated root can no longer be returned as a whole object. |
+| C7 | **LIVE** | no `realpath`/`lstat` anywhere in `server.ts` or `controller.ts`. The only `realpathSync` in the tree is in `web/meetings.ts` for an unrelated purpose. |
+| D3 | fixed | `sweep.ts` uses `KEEPER_STATUS_SQL` and adds `conflict_status != 'contested'`, with a comment explaining why the check is pair-wide but the pending-note check is kind-specific. |
+| D4 | fixed | no `modality` in `extract/extract-prompts.ts`; the request is gone from the prompt. |
+| D8 | fixed | `recovery.ts`: `deferStage` now requires `owner` — "a deferral expires leases and must prove ownership" — and rejects on stale fencing or non-running status. |
+| D9 | fixed | `court/claim-proof.ts`: `importClaimProofs` skips rows whose outcome is not in `STORED_OUTCOMES` and whose standard does not belong to the claim type. |
+| C11 | partly | the Continuity UI renders the `minSeverity` selector with an "errors only" option, but `filterBySeverity` is imported only by `cli.ts` in this tree. Whether the browser filters on it was not established. |
 
-They are not presumed fixed. Each needs the same treatment: read the current code
-at the cited location, and where the finding describes behaviour, run it.
+## Still unverified — 9 findings
 
-Two are worth flagging as probably-still-live from the code shape alone:
+A12, C5, C6, C10, D6, D7, D10, D11. Not presumed fixed and not presumed broken.
 
-- **B9 / C12** (dead modules presented as production): `gates/veto-bridge.ts`,
-  `web/character-sweep.ts`, `identity/name-harvest.ts` and `core/combine.ts` still
-  have zero importers in `fanfable/src`. Whether that is deliberate is a question
-  for the author, not something to infer from imports.
-- **C7** (temp-copy write guard): no `realpath`/`lstat` check appears anywhere in
-  `server.ts` or `controller.ts`, which is what the finding prescribed.
+Two notes from the code seen while checking others:
+
+- **D6 looks fixed in shape**: `transitionClaim` is imported and called by `lorebook.ts` and defined in `court/claim-transition.ts`; nothing else adopts it. The audit's complaint was that the owner was dead while the architecture test grandfathered legacy writers, so the test's grandfather list is what needs reading, not the imports.
+- **D11 partly addressed**: `snapshotRoster` is now called for its fingerprint on two paths rather than computed and discarded, but whether the two incompatible stored formats remain was not checked.
 
 ---
 
@@ -91,5 +100,11 @@ timeout that can hang an embedding call, a continuity check that over-reports, a
 number stored as a string, a mask that is not a mask. None of them call for a
 rewrite. All of them are cheap to fix where they are.
 
+Second pass: 13 more checked — 9 fixed or documented, 4 still live (A4, A7, B9/C12,
+C7), 9 unverified.
+
 The honest summary: **the codebase is in materially better shape than its own audit
-says.** That is worth correcting before it drives another architectural decision.
+says, but the audit is not finished being checked.** Of 39 findings examined so far,
+27 are fixed, 1 is documented as deliberate, and 10 remain live — all MEDIUM or
+below. The 11 HIGH findings are done: 10 fixed and verified, and the eleventh
+(D2) fixed too. Nothing found so far would justify a rewrite.
