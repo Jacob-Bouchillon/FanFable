@@ -47,80 +47,29 @@ import { characterDossier } from './answer/dossier.ts';
 import type { PassageTrail } from './support/graph.ts';
 import { truncate } from './core/text.ts';
 import { buildTrailsHtml, trailText } from './product/trail-html.ts';
+import {
+  ageLabel,
+  app,
+  budgetFlag,
+  C,
+  defaultDbPath,
+  flagNumber,
+  flagString,
+  globalState,
+  heading,
+  parseArgs,
+  prompt,
+  requireProject,
+  setGlobalState,
+  type Args,
+} from './cli/shared.ts';
+import { cmdState } from './cli/commands/state.ts';
+import { cmdTrace } from './cli/commands/trace.ts';
+import { cmdCheck, cmdContinuity, cmdIssues, printIssues } from './cli/commands/checks.ts';
+import { cmdConflicts, cmdGraph } from './cli/commands/graph.ts';
+import { cmdLlm, maskApiKey } from './cli/commands/llm.ts';
 
 /* ------------------------------------------------------------------- args */
-
-interface Args {
-  _: string[];
-  flags: Record<string, string | boolean>;
-}
-
-function parseArgs(argv: string[]): Args {
-  const args: Args = { _: [], flags: {} };
-  for (let i = 0; i < argv.length; i++) {
-    const token = argv[i];
-    if (token.startsWith('--')) {
-      const name = token.slice(2);
-      const next = argv[i + 1];
-      if (next && !next.startsWith('--')) {
-        args.flags[name] = next;
-        i++;
-      } else {
-        args.flags[name] = true;
-      }
-    } else if (token.startsWith('-') && token.length > 1) {
-      const name = token.slice(1);
-      const next = argv[i + 1];
-      if (next && !next.startsWith('-')) {
-        args.flags[name] = next;
-        i++;
-      } else {
-        args.flags[name] = true;
-      }
-    } else {
-      args._.push(token);
-    }
-  }
-  return args;
-}
-
-const C = {
-  bold: (s: string) => `\u001b[1m${s}\u001b[0m`,
-  dim: (s: string) => `\u001b[2m${s}\u001b[0m`,
-  red: (s: string) => `\u001b[31m${s}\u001b[0m`,
-  yellow: (s: string) => `\u001b[33m${s}\u001b[0m`,
-  green: (s: string) => `\u001b[32m${s}\u001b[0m`,
-  cyan: (s: string) => `\u001b[36m${s}\u001b[0m`,
-};
-
-function heading(text: string): void {
-  console.log(`\n${C.bold(text)}\n${C.dim('-'.repeat(Math.min(text.length, 70)))}`);
-}
-
-/* ------------------------------------------------------------------ paths */
-
-function defaultDbPath(): string {
-  if (process.env.FANFABLE_DB) return process.env.FANFABLE_DB;
-  const base =
-    process.env.FANFABLE_DATA_DIR || join(homedir(), '.local', 'share', 'fanfable');
-  return join(base, 'fanfable.db');
-}
-
-function globalState(): Record<string, unknown> {
-  const p = configPath();
-  if (!existsSync(p)) return {};
-  try {
-    return JSON.parse(readFileSync(p, 'utf8')) as Record<string, unknown>;
-  } catch {
-    return {};
-  }
-}
-
-function setGlobalState(patch: Record<string, unknown>): void {
-  // Every config write goes through saveGlobalConfig so permissions and merge
-  // semantics stay in one place.
-  saveGlobalConfig(patch as Partial<LlmSettings>);
-}
 
 /* ------------------------------------------------------------------- help */
 
@@ -270,51 +219,6 @@ ${C.bold('UI')}
 
 /* -------------------------------------------------------------- utilities */
 
-function requireProject(args: Args): controller.Project {
-  const name = (args.flags.project as string) ?? (globalState().lastProject as string);
-  if (!name) {
-    throw new Error(
-      'No project selected. Use --project <name>, or run "fanfable project use <name>".',
-    );
-  }
-  const project = controller.getProjectByName(db, name);
-  if (!project) throw new Error(`no project named "${name}"`);
-  return project;
-}
-
-function app(args: Args): controller.App {
-  const project = requireProject(args);
-  // A --model flag wins everywhere, same as the extract command's override.
-  // Without it the project (then global, then built-in) default applies.
-  const m = flagString(args, 'model');
-  const settings = m ? { ...(project.settings as object), model: m } : project.settings;
-  return new controller.App(db, project.id, clientFrom(settings));
-}
-
-function flagString(args: Args, name: string, fallback = ''): string {
-  const v = args.flags[name];
-  return typeof v === 'string' ? v : fallback;
-}
-
-function flagNumber(args: Args, name: string, fallback: number): number {
-  const v = args.flags[name];
-  const n = typeof v === 'string' ? Number(v) : NaN;
-  return Number.isFinite(n) ? n : fallback;
-}
-
-/** An optional numeric flag: absent (or unparsable) means "no budget". */
-function budgetFlag(args: Args, name: string): number | undefined {
-  const n = flagNumber(args, name, NaN);
-  return Number.isFinite(n) ? n : undefined;
-}
-
-/** Whole days since an ISO timestamp, for thread listings. */
-function ageLabel(iso: string): string {
-  const at = Date.parse(iso);
-  if (!Number.isFinite(at)) return '?';
-  return `${Math.max(0, Math.floor((Date.now() - at) / 86400000))}d`;
-}
-
 /* ------------------------------------------------------------- commands */
 
 async function cmdProject(args: Args): Promise<void> {
@@ -367,7 +271,7 @@ async function cmdProject(args: Args): Promise<void> {
       return;
     }
     case 'settings': {
-      const p = requireProject(args);
+      const p = requireProject(db, args);
       const patch: Record<string, unknown> = {};
       for (const key of ['provider', 'baseUrl', 'model'] as const) {
         const v = flagString(args, key);
@@ -406,7 +310,7 @@ async function cmdProject(args: Args): Promise<void> {
 }
 
 async function cmdImport(args: Args): Promise<void> {
-  const project = requireProject(args);
+  const project = requireProject(db, args);
   const files = args._.slice(1).filter((f) => !f.startsWith('--'));
   if (!files.length) throw new Error('no files given');
   heading('Importing sources');
@@ -432,7 +336,7 @@ async function cmdImport(args: Args): Promise<void> {
 }
 
 async function cmdSources(args: Args): Promise<void> {
-  const project = requireProject(args);
+  const project = requireProject(db, args);
   const sources = lore.listSources(db, project.id);
   heading('Sources');
   if (!sources.length) {
@@ -456,9 +360,9 @@ async function cmdLore(args: Args): Promise<void> {
         '--legacy publishes through the canon path, so use it only on a disposable database.',
     );
   }
-  const project = requireProject(args);
+  const project = requireProject(db, args);
   const sub = args._[1] ?? '';
-  const a = app(args);
+  const a = app(db, args);
 
   if (sub === 'search') {
     const query = args._.slice(2).join(' ');
@@ -2289,8 +2193,8 @@ ${C.bold('Scenes')}`);
 }
 
 async function cmdPlan(args: Args): Promise<void> {
-  const project = requireProject(args);
-  const a = app(args);
+  const project = requireProject(db, args);
+  const a = app(db, args);
   const sub = args._[1] ?? '';
 
   if (sub === 'discuss') {
@@ -2427,8 +2331,8 @@ function printOutline(outline: planner.Outline, brief = false): void {
 }
 
 async function cmdWrite(args: Args): Promise<void> {
-  const project = requireProject(args);
-  const a = app(args);
+  const project = requireProject(db, args);
+  const a = app(db, args);
   const sub = args._[1] ?? '';
 
   if (sub === 'next' || sub === 'chapter') {
@@ -2544,859 +2448,15 @@ function printWriteResult(result: controller.WriteChapterResult): void {
   );
 }
 
-function printIssues(issues: continuity.ContinuityIssue[]): void {
-  if (!issues.length) {
-    console.log(`${C.green('No continuity issues found.')}`);
-    return;
-  }
-  for (const i of issues) {
-    const color = i.severity === 'error' ? C.red : i.severity === 'warning' ? C.yellow : C.dim;
-    console.log(`  ${color(`[${i.severity}]`)} ${C.bold(i.category)}: ${i.message}`);
-    if (i.evidence) console.log(`      ${C.dim('evidence: ' + truncate(i.evidence, 220))}`);
-    if (i.suggestion) console.log(`      ${C.dim('suggestion: ' + truncate(i.suggestion, 220))}`);
-  }
-}
 
-async function cmdCheck(args: Args): Promise<void> {
-  const project = requireProject(args);
-  const a = app(args);
-  const n = Number(args._[1]);
-  if (!Number.isFinite(n)) throw new Error('chapter number required');
-  const chapter = controller.getChapter(db, project.id, n);
-  if (!chapter) throw new Error(`chapter ${n} not found`);
-  heading(`Continuity check — chapter ${n}`);
-  const outline = planner.approvedOutline(db, project.id);
-  let contextTraceId: string | undefined;
-  const bundle = await controller.assembleContext(db, a.llm, project.id, {
-    chapter: outline?.chapters.find((c) => c.number === n),
-    chapterNumber: n,
-    onTraceId: (id) => {
-      contextTraceId = id;
-    },
-  });
-  const report = { droppedModelIssues: 0 };
-  const issues = await controller.runContinuityCheck(db, a.llm, project.id, chapter, outline, bundle, report);
-  printIssues(issues);
-  console.log(C.dim(`dropped model issues: ${report.droppedModelIssues}`));
-  if (contextTraceId) console.log(`${C.dim(`trace ${contextTraceId}`)}`);
-}
 
-async function cmdIssues(args: Args): Promise<void> {
-  const project = requireProject(args);
-  const sub = args._[1];
-  if (sub === 'resolve') {
-    const id = Number(args._[2]);
-    if (!Number.isFinite(id)) throw new Error('issue id required');
-    const resolution = args.flags.fix ? 'fixed' : args.flags.accept ? 'accepted' : 'open';
-    continuity.setIssueResolution(db, project.id, id, resolution);
-    console.log(`issue ${id} marked ${resolution}`);
-    return;
-  }
-  const all = args.flags.all === true;
-  const settings = continuitySettings(project);
-  let issues = continuity.listIssues(db, project.id, { openOnly: !all, minSeverity: all ? 'note' : settings.minSeverity });
-  issues = filterBySeverity(issues, all ? { ...settings, minSeverity: 'note' } : settings);
-  heading('Continuity issues');
-  if (!issues.length) {
-    console.log('(none)');
-    return;
-  }
-  for (const i of issues) {
-    const color = i.severity === 'error' ? C.red : i.severity === 'warning' ? C.yellow : C.dim;
-    console.log(
-      `  ${C.bold(`#${i.id}`)} ${color(`[${i.severity}]`)} ${C.bold(i.category)} ${
-        i.chapterNumber ? C.dim(`(ch${i.chapterNumber})`) : ''
-      } ${C.dim(`[${i.resolution}]`)}`,
-    );
-    console.log(`      ${i.message}`);
-    if (i.evidence) console.log(`      ${C.dim('evidence: ' + truncate(i.evidence, 200))}`);
-  }
-}
 
-async function cmdContinuity(args: Args): Promise<void> {
-  const project = requireProject(args);
-  const current = continuitySettings(project);
 
-  const hasFlags =
-    args.flags.on !== undefined ||
-    args.flags.off !== undefined ||
-    args.flags.model !== undefined ||
-    args.flags.severity !== undefined ||
-    args.flags.drafts !== undefined;
 
-  if (!hasFlags) {
-    heading('Continuity checking');
-    console.log(`enabled:        ${current.enabled ? C.green('yes') : C.yellow('no')}`);
-    console.log(`model checks:   ${current.modelChecks ? 'yes' : 'no'}`);
-    console.log(`check drafts:   ${current.onDraft ? 'yes' : 'no'}`);
-    console.log(`report:         ${current.minSeverity} and above`);
-    console.log(`\n${C.dim('change it with: fanfable continuity --off | --on | --model on|off | --drafts on|off | --severity error|warning|note')}`);
-    return;
-  }
 
-  const next = { ...current };
-  if (args.flags.on) next.enabled = true;
-  if (args.flags.off) next.enabled = false;
-  if (args.flags.model !== undefined) next.modelChecks = args.flags.model !== 'off' && args.flags.model !== 'false';
-  if (args.flags.drafts !== undefined) next.onDraft = args.flags.drafts !== 'off' && args.flags.drafts !== 'false';
-  if (args.flags.severity) {
-    const sev = String(args.flags.severity);
-    if (sev === 'error' || sev === 'warning' || sev === 'note') next.minSeverity = sev;
-  }
-  controller.updateProjectSettings(db, project.id, { continuity: next });
-  heading('Continuity checking updated');
-  console.log(`enabled:        ${next.enabled ? 'yes' : 'no'}`);
-  console.log(`model checks:   ${next.modelChecks ? 'yes' : 'no'}`);
-  console.log(`check drafts:   ${next.onDraft ? 'yes' : 'no'}`);
-  console.log(`report:         ${next.minSeverity} and above`);
-}
 
-async function cmdGraph(args: Args): Promise<void> {
-  const project = requireProject(args);
-  const sub = args._[1] ?? 'stats';
-
-  if (sub === 'stats') {
-    const g = graph.loadGraph(db, project.id);
-    const kinds = new Map<string, number>();
-    for (const node of g.nodes.values()) kinds.set(node.kind, (kinds.get(node.kind) ?? 0) + 1);
-    heading('Knowledge graph');
-    console.log(`${g.nodes.size} nodes, ${g.edges.length} connections`);
-    for (const [kind, n] of [...kinds].sort((a, b) => b[1] - a[1])) {
-      console.log(`  ${kind.padEnd(16)} ${n}`);
-    }
-    const typeCounts = new Map<string, number>();
-    for (const e of g.edges) typeCounts.set(e.type, (typeCounts.get(e.type) ?? 0) + 1);
-    if (typeCounts.size) {
-      console.log(`\n${C.dim('connection types')}`);
-      for (const [type, n] of [...typeCounts].sort((a, b) => b[1] - a[1]).slice(0, 12)) {
-        console.log(`  ${type.padEnd(20)} ${n}`);
-      }
-    }
-    return;
-  }
-
-  const name = flagString(args, 'name') || (sub === 'stats' ? '' : sub);
-  if (!name) throw new Error('a name is required: fanfable graph <name>');
-  const hops = flagNumber(args, 'hops', 1);
-  const g = graph.loadGraph(db, project.id);
-  const roots = graph.resolveRoots(g, [name]);
-  if (!roots.length) {
-    console.log(C.yellow(`nothing in the graph is called "${name}"`));
-    return;
-  }
-  const result = graph.traverse(g, {
-    roots: roots.map((r) => r.node.id),
-    hops,
-    maxNodes: flagNumber(args, 'limit', 40),
-  });
-  heading(`Connections for "${name}"`);
-  console.log(C.dim(`${result.nodes.size} nodes, ${result.edges.length} connections, ${hops} hop(s)`));
-  const nameOf = (id: string) => g.nodes.get(id)?.name ?? id;
-  for (const edge of result.edges) {
-    const from = result.depth.get(edge.from) ?? 0;
-    const to = result.depth.get(edge.to) ?? 0;
-    const unsure = edge.confidence < 0.6 ? C.yellow(' [uncertain]') : '';
-    console.log(
-      `  ${'  '.repeat(Math.max(0, Math.min(from, to)))}${nameOf(edge.from)} ${C.cyan(`--${edge.type}-->`)} ${nameOf(edge.to)}${unsure}` +
-        (edge.description ? C.dim(`  ${truncate(edge.description, 90)}`) : ''),
-    );
-  }
-}
-
-async function cmdConflicts(args: Args): Promise<void> {
-  const project = requireProject(args);
-  const sub = args._[1] ?? 'list';
-
-  if (sub === 'resolve') {
-    const id = Number(args._[2]);
-    if (!Number.isFinite(id)) throw new Error('a conflict id is required');
-    const status = (flagString(args, 'status') || 'accepted') as 'open' | 'accepted' | 'resolved';
-    resolveConflict(db, project.id, id, status);
-    console.log(`Conflict ${id} marked ${status}.`);
-    return;
-  }
-
-  heading('Conflicts with established story state');
-  const conflicts = listConflicts(db, project.id, { openOnly: args.flags.all !== true });
-  if (!conflicts.length) {
-    console.log(C.green('No conflicts: every approved chapter agrees with the story so far.'));
-    return;
-  }
-  for (const c of conflicts) {
-    console.log(
-      `\n${C.yellow(`[${c.kind}]`)} ${C.bold(c.subject)} — ${c.message}` +
-        `\n   ${C.dim('established: ' + c.existingRef + ' · this chapter: ' + c.incomingRef)}` +
-        (c.evidence ? `\n   ${C.dim(c.evidence)}` : '') +
-        `\n   ${C.dim('resolve with: fanfable conflicts resolve ' + c.id + ' --status accepted|resolved')}`,
-    );
-  }
-}
-
-async function cmdState(args: Args): Promise<void> {
-  const project = requireProject(args);
-  const sub = args._[1] ?? '';
-
-  if (sub === 'characters') {
-    const chars = memory.listCharacters(db, project.id);
-    heading('Characters');
-    if (!chars.length) {
-      console.log('(none recorded yet — approve a chapter to extract state)');
-      return;
-    }
-    const states = memory.currentStates(db, project.id);
-    const knowledge = memory.listKnowledge(db, project.id);
-    for (const c of chars) {
-      console.log(`\n${C.bold(c.name)}${c.aliases.length ? C.dim(` (${c.aliases.join(', ')})`) : ''}`);
-      if (c.profile) console.log(`  profile: ${truncate(c.profile, 300)}`);
-      if (c.traits.length) console.log(`  traits: ${c.traits.join(', ')}`);
-      const s = states.find((x) => x.characterId === c.id);
-      if (s) {
-        console.log(
-          `  state: ${s.location || '?'} | ${s.condition || '?'} | ${s.emotional || '?'} | ${s.situation || '?'} ${C.dim(
-            `(${s.source})`,
-          )}`,
-        );
-      }
-      const k = knowledge.filter((x) => x.characterId === c.id);
-      if (k.length) {
-        console.log('  knows:');
-        for (const entry of k) console.log(`    - [${entry.certainty}] ${entry.fact}`);
-      }
-    }
-    return;
-  }
-
-  if (sub === 'timeline') {
-    const events = memory.listAuEvents(db, project.id);
-    heading('AU timeline');
-    if (!events.length) {
-      console.log('(no events recorded yet)');
-      return;
-    }
-    for (const e of events) {
-      const link = e.adaptsCanonEventId ? C.cyan(` [adapts canon #${e.adaptsCanonEventId}]`) : '';
-      const kind = e.kind !== 'event' ? C.yellow(` [${e.kind}]`) : '';
-      console.log(
-        `\n${C.bold(e.title)}${link}${kind} ${C.dim(`[${e.storyTime || `order ${e.storyOrder}`}]` +
-          `${e.chapterNumber ? ` ch${e.chapterNumber}` : ''}`)}`,
-      );
-      if (e.summary) console.log(`  ${truncate(e.summary, 300)}`);
-      if (e.participants.length) console.log(`  ${C.dim('who: ' + e.participants.join(', '))}`);
-      if (e.location) console.log(`  ${C.dim('where: ' + e.location)}`);
-      if (e.divergenceNote) console.log(`  ${C.yellow('changed from canon: ' + e.divergenceNote)}`);
-    }
-    return;
-  }
-
-  if (sub === 'threads') {
-    const threads = memory.listThreads(db, project.id);
-    heading('Plot threads');
-    if (!threads.length) {
-      console.log('(none)');
-      return;
-    }
-    for (const t of threads) {
-      console.log(`  ${C.bold(t.title)} [${t.status}]`);
-      if (t.description) console.log(`    ${truncate(t.description, 220)}`);
-      if (t.events.length) console.log(`    ${C.dim('events: ' + t.events.join(' | '))}`);
-    }
-    return;
-  }
-
-  if (sub === 'facts') {
-    const facts = memory.listFacts(db, project.id);
-    heading('Established facts and decisions');
-    if (!facts.length) {
-      console.log('(none)');
-      return;
-    }
-    for (const f of facts) {
-      console.log(`  ${C.bold(`[${f.kind}]`)} ${f.subject ? `${f.subject}: ` : ''}${f.content} ${C.dim(`(${f.certainty})`)}`);
-    }
-    return;
-  }
-
-  if (sub === 'requests') {
-    const rows = db.all<{
-      id: number;
-      kind: string;
-      query: string;
-      result_count: number;
-      status: string;
-      created_at: string;
-    }>(
-      'SELECT id, kind, query, result_count, status, created_at FROM context_request WHERE project_id = ? ORDER BY id DESC LIMIT 100',
-      project.id,
-    );
-    heading('Context requests');
-    if (!rows.length) {
-      console.log('(none)');
-      return;
-    }
-    for (const r of rows) {
-      console.log(
-        `  ${C.bold(`#${r.id}`)} ${C.cyan(r.kind.padEnd(9))} ${r.status.padEnd(9)} ${r.result_count} results  ${r.query}`,
-      );
-    }
-    return;
-  }
-
-  if (sub === 'set-character') {
-    const name = args._[2];
-    if (!name) throw new Error('character name required');
-    const char = memory.resolveCharacter(db, project.id, name);
-    if (!char) throw new Error('character not found');
-    const location = flagString(args, 'location');
-    const condition = flagString(args, 'condition');
-    const emotional = flagString(args, 'emotional');
-    const situation = flagString(args, 'situation');
-    memory.addCharacterState(db, project.id, char.id, {
-      location,
-      condition,
-      emotional,
-      situation,
-      source: 'user',
-    });
-    console.log(`Updated state for ${C.bold(char.name)}`);
-    const impacted = controller.impactedMaterial(db, project.id, char.name);
-    if (impacted.length) {
-      console.log(C.dim(`  chapters mentioning ${char.name}: ${impacted.map((i) => i.chapter.number).join(', ')}`));
-    }
-    return;
-  }
-
-  if (sub === 'add-fact') {
-    const content = flagString(args, 'content');
-    if (!content) throw new Error('--content required');
-    memory.addFact(db, project.id, {
-      kind: flagString(args, 'kind', 'fact'),
-      subject: flagString(args, 'subject'),
-      content,
-      certainty: 'established',
-    });
-    console.log('Fact recorded.');
-    return;
-  }
-
-  if (sub === 'set-event') {
-    const id = Number(args._[2]);
-    if (!Number.isFinite(id)) throw new Error('event id required');
-    const order = args.flags.order !== undefined ? flagNumber(args, 'order', NaN) : null;
-    const kind = flagString(args, 'kind');
-    const note = flagString(args, 'note');
-    const existing = db.get<{ id: number; title: string; story_order: number; kind: string; divergence_note: string }>(
-      'SELECT id, title, story_order, kind, divergence_note FROM au_event WHERE id = ? AND project_id = ?',
-      id,
-      project.id,
-    );
-    if (!existing) throw new Error(`event ${id} not found`);
-    db.run(
-      'UPDATE au_event SET story_order = ?, kind = ?, divergence_note = ? WHERE id = ? AND project_id = ?',
-      order !== null && Number.isFinite(order) ? order : existing.story_order,
-      kind || existing.kind,
-      note || existing.divergence_note,
-      id,
-      project.id,
-    );
-    console.log(`Updated AU event ${id} "${existing.title}".`);
-    const impacts = controller.impactedMaterial(db, project.id, existing.title);
-    if (impacts.length) {
-      console.log(
-        C.dim(`  chapters mentioning "${existing.title}": ${impacts.map((i) => i.chapter.number).join(', ')}`),
-      );
-    }
-    return;
-  }
-
-  // overview
-  heading(`Story state — ${project.name}`);
-  const outline = planner.approvedOutline(db, project.id);
-  console.log(`outline: ${outline ? C.green(`v${outline.version} approved`) : C.yellow('none approved')}`);
-  if (outline) console.log(`premise: ${truncate(outline.premise, 300)}`);
-  const chapters = controller.listChapters(db, project.id);
-  console.log(`chapters: ${chapters.length} (${chapters.filter((c) => c.status === 'approved').length} approved)`);
-  console.log(`characters: ${memory.listCharacters(db, project.id).length}`);
-  console.log(`timeline events: ${memory.listAuEvents(db, project.id).length}`);
-  console.log(`open threads: ${memory.listThreads(db, project.id).filter((t) => t.status === 'open').length}`);
-  const issues = continuity.listIssues(db, project.id, { openOnly: true });
-  console.log(
-    `continuity issues: ${issues.length} ${C.dim(
-      `(${issues.filter((i) => i.severity === 'error').length} errors)`,
-    )}`,
-  );
-}
-
-/** Printed settings never carry the whole key: prefix…suffix only. */
-function maskApiKey<T extends { apiKey?: string }>(settings: T): T {
-  if (typeof settings.apiKey === 'string' && settings.apiKey) {
-    settings.apiKey = `${settings.apiKey.slice(0, 6)}…${settings.apiKey.slice(-4)}`;
-  }
-  return settings;
-}
-
-async function cmdLlm(args: Args): Promise<void> {
-  const sub = args._[1] ?? '';
-  if (sub === 'config') {
-    const patch: Partial<LlmSettings> = {};
-    const provider = flagString(args, 'provider');
-    const model = flagString(args, 'model');
-    const baseUrl = flagString(args, 'base-url');
-    const apiKey = flagString(args, 'api-key');
-    const embeddingBaseUrl = flagString(args, 'embedding-base-url');
-    const temperature = flagNumber(args, 'temperature', NaN);
-    if (provider) patch.provider = provider as LlmSettings['provider'];
-    if (model) patch.model = model;
-    if (baseUrl) patch.baseUrl = baseUrl;
-    if (apiKey) patch.apiKey = apiKey;
-    if (embeddingBaseUrl) patch.embeddingBaseUrl = embeddingBaseUrl;
-    if (Number.isFinite(temperature)) patch.temperature = temperature;
-    saveGlobalConfig(patch);
-    console.log(JSON.stringify(maskApiKey({ ...DEFAULT_LLM_SETTINGS, ...loadGlobalConfig() }), null, 2));
-    return;
-  }
-
-  if (sub === 'status' || sub === '') {
-    const settings = resolveSettings();
-    heading('Model status');
-    console.log(`provider: ${settings.provider}`);
-    console.log(`base url: ${settings.baseUrl}`);
-    console.log(`model: ${settings.model}`);
-    console.log(`api key: ${settings.apiKey ? C.green('set') : C.dim('not set')}`);
-    if (settings.embeddingBaseUrl) console.log(`embedding base url: ${settings.embeddingBaseUrl}`);
-    const client = controller.createClient(settings);
-    const ok = await client.available();
-    console.log(ok ? C.green('server reachable') : C.red('server not reachable'));
-    if (!ok) {
-      console.log(
-        C.dim(
-          'Start a local server, e.g. "ollama serve" (Ollama) or "llama-server -m model.gguf" (llama.cpp), ' +
-            'or set apiKey for a cloud gateway.',
-        ),
-      );
-    }
-    return;
-  }
-
-  throw new Error(`unknown llm subcommand "${sub}"`);
-}
-
-/* ------------------------------------------------------------------ trace */
-
-async function cmdTrace(args: Args, dbPath: string): Promise<void> {
-  const sub = args._[1];
-  const traceId = args._[2];
-  if (!sub || !traceId || (sub !== 'show' && sub !== 'audit')) {
-    throw new Error('usage: fanfable trace show|audit <trace-id> [--json]');
-  }
-  const asJson = args.flags.json === true;
-  const reader = openTraceReadConnection(dbPath);
-
-  try {
-    if (sub === 'show') {
-      const view = traceLog.showTrace(reader, traceId);
-      if (!view) throw new Error(`no trace "${traceId}"`);
-      if (asJson) {
-        console.log(JSON.stringify(view, null, 2));
-        return;
-      }
-      console.log(`\n${C.bold('Trace')} ${view.trace.id}`);
-      console.log(
-        `completeness: ${view.trace.completeness}` +
-          `   dropped_events: ${view.trace.droppedEvents}` +
-          `   sampled_rate: ${view.trace.sampledRate}`,
-      );
-      console.log(`started: ${view.trace.startedAt}   finished: ${view.trace.finishedAt ?? '(unfinished)'}`);
-      console.log(`project: ${view.trace.projectId}   events: ${view.events.length}`);
-      if (Object.keys(view.trace.metadata).length) {
-        console.log(`metadata: ${JSON.stringify(view.trace.metadata)}`);
-      }
-      const retrievalEvents = view.events.filter((event) => event.stage === 'retrieval');
-      if (retrievalEvents.length) {
-        const completed = retrievalEvents.find((event) => event.event === 'retrieval.completed');
-        const searches = retrievalEvents.filter((event) => event.event === 'retrieval.search.completed');
-        const summaries = retrievalEvents.filter((event) => event.event === 'retrieval.summary');
-        const selected = retrievalEvents.filter(
-          (event) => event.event === 'retrieval.candidate.disposition' && event.decision === 'selected',
-        );
-        const selectedChunks = selected.filter((event) => event.subject.startsWith('chunk:')).length;
-        const selectedIndex = selected.length - selectedChunks;
-        console.log(`\n${C.bold('Retrieval handoff')}`);
-        if (completed) {
-          console.log(
-            `  outcome=${completed.reasonCode || '-'} selected=${completed.refs.count ?? selectedChunks}` +
-              (selectedIndex ? ` index=${selectedIndex}` : ''),
-          );
-        }
-        for (const event of searches) {
-          console.log(
-            `  ${event.subject}: ${event.reasonCode || '-'}` +
-              (event.refs.count !== undefined ? ` count=${event.refs.count}` : ''),
-          );
-        }
-        for (const event of summaries) {
-          console.log(
-            `  ${event.subject}: raw=${event.refs.raw_count ?? '-'}` +
-              ` dedup=${event.refs.dedup_count ?? '-'}` +
-              ` ranked=${event.refs.ranked_count ?? '-'}` +
-              ` selected=${event.refs.selected_count ?? '-'}` +
-              ` budgeted=${event.refs.budgeted_count ?? '-'}` +
-              ` excluded=${event.refs.excluded_count ?? '-'}`,
-          );
-        }
-        if (selected.length) {
-          console.log(`  selected evidence: ${selected.map((event) => event.subject).join(', ')}`);
-        }
-      }
-      const contextEvents = view.events.filter((event) => event.stage === 'context');
-      if (contextEvents.length) {
-        const contextual = view.events.filter(
-          (event) => event.stage === 'context' || event.spanId.startsWith('sp-context'),
-        );
-        const spans = new Map<string, { id: string; parent: string | null; children: string[]; events: typeof view.events }>();
-        for (const event of contextual) {
-          let span = spans.get(event.spanId);
-          if (!span) {
-            span = { id: event.spanId, parent: event.parentSpanId, children: [], events: [] };
-            spans.set(event.spanId, span);
-          }
-          span.events.push(event);
-          if (span.parent === null && event.parentSpanId) span.parent = event.parentSpanId;
-        }
-        for (const span of spans.values()) {
-          if (span.parent && spans.has(span.parent) && !spans.get(span.parent)!.children.includes(span.id)) {
-            spans.get(span.parent)!.children.push(span.id);
-          }
-        }
-        const completionFor = (id: string) =>
-          spans.get(id)?.events.find((event) => event.event === 'context.child.completed');
-        const printed = new Set<string>();
-        const printSpan = (id: string, depth: number): void => {
-          if (printed.has(id)) return;
-          printed.add(id);
-          const span = spans.get(id);
-          if (!span) return;
-          const completion = completionFor(id);
-          const label = completion
-            ? completion.subject.replace(/^child:/, '')
-            : id === 'sp-context'
-              ? 'context'
-              : id;
-          const kind = completion?.refs.stage ? ` [${completion.refs.stage}]` : '';
-          const status = completion?.reasonCode ? ` ${completion.reasonCode}` : '';
-          const selected = completion?.refs.selected_count ?? completion?.refs.count;
-          console.log(
-            `  ${'  '.repeat(depth)}${label}${kind}${status}` +
-              (selected !== undefined ? ` selected=${selected}` : ''),
-          );
-          for (const child of span.children) printSpan(child, depth + 1);
-        };
-        console.log(`\n${C.bold('Context assembly tree')}`);
-        if (spans.has('sp-context')) printSpan('sp-context', 0);
-        else {
-          for (const span of spans.values()) {
-            if (!span.parent || !spans.has(span.parent)) printSpan(span.id, 0);
-          }
-        }
-
-        const finalSummary = contextEvents.find(
-          (event) => event.event === 'context.summary' && event.subject === 'context:final',
-        );
-        const dispositions = contextEvents.filter((event) => event.event === 'context.item.disposition');
-        const included = dispositions.filter(
-          (event) => event.decision === 'included' || event.decision === 'truncated',
-        );
-        const excluded = dispositions.filter(
-          (event) => event.decision === 'budgeted' || event.decision === 'excluded' || event.decision === 'failed',
-        );
-        const coverage = contextEvents.find((event) => event.event === 'context.coverage');
-        const locatorFor = (event: (typeof contextEvents)[number]): string => {
-          const chunkId = Number(event.refs.chunk_id ?? 0);
-          if (!Number.isInteger(chunkId) || chunkId <= 0) return '';
-          const row = reader.get<{ locator: string }>(
-            'SELECT locator FROM canon_chunk WHERE id = ? AND project_id = ?',
-            chunkId,
-            view.trace.projectId,
-          );
-          return row?.locator ? ` <${row.locator}>` : '';
-        };
-        console.log(`\n${C.bold('Context handoff')}`);
-        if (finalSummary) {
-          console.log(
-            `  raw=${finalSummary.refs.raw_count ?? '-'}` +
-              ` dedup=${finalSummary.refs.dedup_count ?? '-'}` +
-              ` selected=${finalSummary.refs.selected_count ?? '-'}` +
-              ` budgeted=${finalSummary.refs.budgeted_count ?? '-'}` +
-              ` excluded=${finalSummary.refs.excluded_count ?? '-'}` +
-              ` truncated=${finalSummary.refs.truncated_count ?? '-'}`,
-          );
-        }
-        if (included.length) {
-          console.log(
-            `  final context: ${included
-              .map((event) => `${event.subject}${locatorFor(event)}`)
-              .join(', ')}`,
-          );
-        }
-        if (excluded.length) {
-          console.log(
-            `  excluded: ${excluded
-              .map((event) => `${event.subject} (${event.reasonCode || event.decision})`)
-              .join(', ')}`,
-          );
-        }
-        if (coverage) {
-          console.log(
-            `  coverage: ${coverage.reasonCode}` +
-              ` required=${coverage.refs.required_count ?? '-'}` +
-              ` contributing=${coverage.refs.contributing_count ?? '-'}` +
-              ` optional=${coverage.refs.optional_count ?? '-'}` +
-              ` incomplete=${coverage.refs.incomplete_count ?? '-'}`,
-          );
-        }
-      }
-      const writeEvents = view.events.filter((event) => event.stage === 'write');
-      if (writeEvents.length) {
-        const contextual = view.events.filter(
-          (event) => event.stage === 'write' || event.spanId.startsWith('sp-write'),
-        );
-        const spans = new Map<string, { id: string; parent: string | null; children: string[]; events: typeof view.events }>();
-        for (const event of contextual) {
-          let span = spans.get(event.spanId);
-          if (!span) {
-            span = { id: event.spanId, parent: event.parentSpanId, children: [], events: [] };
-            spans.set(event.spanId, span);
-          }
-          span.events.push(event);
-          if (span.parent === null && event.parentSpanId) span.parent = event.parentSpanId;
-        }
-        for (const span of spans.values()) {
-          if (span.parent && spans.has(span.parent) && !spans.get(span.parent)!.children.includes(span.id)) {
-            spans.get(span.parent)!.children.push(span.id);
-          }
-        }
-        const terminalFor = (id: string) =>
-          spans.get(id)?.events.find((event) =>
-            event.event === 'write.model.completed' ||
-            event.event === 'write.model.failed' ||
-            event.event === 'write.part.completed' ||
-            event.event === 'write.part.skipped' ||
-            event.event === 'write.completed' ||
-            event.event === 'write.failed' ||
-            event.event === 'write.stored' ||
-            (event.event.startsWith('write.request.') && event.event !== 'write.request.parsed'),
-          );
-        const printed = new Set<string>();
-        const printSpan = (id: string, depth: number): void => {
-          if (printed.has(id)) return;
-          printed.add(id);
-          const span = spans.get(id);
-          if (!span) return;
-          const started = span.events.find((event) => event.event === 'write.model.started');
-          const terminal = terminalFor(id);
-          const label = id === 'sp-write'
-            ? 'write'
-            : started
-              ? `${started.reasonCode || 'model'} ${started.subject}`
-              : id.replace(/^sp-write-/, '');
-          const status = terminal ? `${terminal.event.replace(/^write\./, '')} ${terminal.reasonCode || ''}`.trim() : '';
-          console.log(`  ${'  '.repeat(depth)}${label}${status ? ` — ${status}` : ''}`);
-          for (const child of span.children) printSpan(child, depth + 1);
-        };
-        console.log(`\n${C.bold('Write execution tree')}`);
-        if (spans.has('sp-write')) printSpan('sp-write', 0);
-        else {
-          for (const span of spans.values()) {
-            if (!span.parent || !spans.has(span.parent)) printSpan(span.id, 0);
-          }
-        }
-
-        const sections = writeEvents
-          .filter((event) => event.event === 'write.prompt.section')
-          .sort((a, b) => Number(a.refs.rank ?? 0) - Number(b.refs.rank ?? 0));
-        if (sections.length) {
-          console.log(`\n${C.bold('Prompt sections')}`);
-          for (const event of sections) {
-            console.log(
-              `  ${event.subject.replace(/^section:/, '')}: chars=${event.refs.section_chars ?? '-'}` +
-                ` words=${event.refs.section_words ?? '-'} hash=${String(event.refs.content_hash ?? '').slice(0, 12)}`,
-            );
-          }
-        }
-
-        const calls = writeEvents.filter((event) => event.event === 'write.model.started');
-        if (calls.length) {
-          console.log(`\n${C.bold('Model calls')}`);
-          for (const call of calls) {
-            const completed = writeEvents.find(
-              (event) =>
-                (event.event === 'write.model.completed' || event.event === 'write.model.failed') &&
-                event.subject === call.subject,
-            );
-            console.log(
-              `  ${call.subject} ${call.reasonCode} model=${call.model || '-'}` +
-                ` part=${call.refs.part ?? '-'} round=${call.refs.round ?? '-'}` +
-                ` messages=${call.refs.message_count ?? '-'}` +
-                ` prompt=${call.refs.prompt_chars ?? '-'} chars` +
-                ` response=${completed?.refs.response_chars ?? '-'} chars` +
-                ` ${completed?.event.replace(/^write\./, '') ?? 'unfinished'}`,
-            );
-          }
-        }
-
-        const requests = writeEvents.filter((event) => event.event === 'write.request.parsed');
-        if (requests.length) {
-          console.log(`\n${C.bold('Context requests')}`);
-          for (const request of requests) {
-            const terminal = writeEvents.find(
-              (event) =>
-                event.subject === request.subject &&
-                event.refs.seq === request.refs.seq &&
-                event.event.startsWith('write.request.') &&
-                event.event !== 'write.request.parsed',
-            );
-            const consumed = writeEvents.some(
-              (event) =>
-                event.event === 'write.answer.consumed' &&
-                event.subject === request.subject &&
-                event.refs.seq === request.refs.seq,
-            );
-            const notIncluded = writeEvents.some(
-              (event) =>
-                event.event === 'write.answer.not-included' &&
-                event.subject === request.subject &&
-                event.refs.seq === request.refs.seq,
-            );
-            console.log(
-              `  ${request.subject} kind=${request.refs.request_kind ?? '-'}` +
-                ` status=${terminal?.event.replace(/^write\.request\./, '') ?? 'unfinished'}` +
-                ` answer=${consumed ? 'consumed' : notIncluded ? 'not-included' : '-'}`,
-            );
-          }
-        }
-
-        const finalOutput = writeEvents.find((event) => event.event === 'write.output.final');
-        const stored = writeEvents.find((event) => event.event === 'write.stored');
-        const linked = writeEvents.find((event) => event.event === 'write.context.linked');
-        const supplied = writeEvents.find((event) => event.event === 'write.context.supplied');
-        console.log(`\n${C.bold('Write handoff')}`);
-        if (linked) console.log(`  context trace: ${linked.refs.context_trace_id ?? '-'}`);
-        else if (supplied) console.log('  context source: supplied-bundle');
-        if (finalOutput) {
-          console.log(
-            `  output: chars=${finalOutput.refs.body_chars ?? '-'}` +
-              ` words=${finalOutput.refs.body_words ?? '-'}` +
-              ` hash=${String(finalOutput.refs.body_hash ?? '').slice(0, 12)}`,
-          );
-        }
-        if (stored) {
-          console.log(
-            `  stored chapter: ${stored.refs.chapter_number ?? '-'}` +
-              ` id=${stored.refs.chapter_id ?? '-'}` +
-              ` chars=${stored.refs.body_chars ?? '-'}` +
-              ` words=${stored.refs.body_words ?? '-'}`,
-          );
-        }
-      }
-      for (const event of view.events) {
-        const parent = event.parentSpanId ? ` parent=${event.parentSpanId}` : '';
-        console.log(
-          `\n#${event.id} span=${event.spanId}${parent} ${event.stage} ${event.event}` +
-            ` [${event.eventClass}]`,
-        );
-        console.log(
-          `  decision=${event.decision || '-'} reason=${event.reasonCode || '-'}` +
-            ` committed=${event.committed ? 'yes' : 'no'}`,
-        );
-        if (event.subject) console.log(`  subject=${event.subject}`);
-        const refs = Object.entries(event.refs).map(([key, value]) => `${key}=${String(value)}`);
-        if (refs.length) console.log(`  refs: ${refs.join(' ')}`);
-        if (event.model || event.promptHash) {
-          console.log(`  model=${event.model || '-'} prompt_hash=${event.promptHash || '-'}`);
-        }
-        if (event.durationMs !== null) console.log(`  duration_ms=${event.durationMs}`);
-        if (event.error) console.log(`  error: ${event.error}`);
-      }
-      return;
-    }
-
-    const audit = traceLog.auditTrace(reader, traceId);
-    if (!audit) throw new Error(`no trace "${traceId}"`);
-    if (asJson) {
-      console.log(JSON.stringify(audit, null, 2));
-      return;
-    }
-    console.log(`\n${C.bold('Trace audit')} ${audit.traceId}`);
-    console.log(
-      `completeness: ${audit.completeness}` +
-        `   exhaustive: ${audit.exhaustive ? 'yes' : 'no'}` +
-        `   dropped_events: ${audit.droppedEvents}` +
-        `   sampled_rate: ${audit.sampledRate}`,
-    );
-    console.log(
-      audit.exhaustive
-        ? C.green('This trace is an exhaustive account of the events it contains.')
-        : C.yellow('This trace is NOT an exhaustive account; events were sampled, dropped or interrupted.'),
-    );
-    if (audit.noteAccounting) {
-      const accounting = audit.noteAccounting;
-      console.log(
-        `note accounting: generated ${accounting.generated} = ` +
-          `admitted ${accounting.admitted} + deduplicated ${accounting.deduplicated} + ` +
-          `rejected ${accounting.rejected} + parked ${accounting.parked} ` +
-          `(${accounting.verified ? 'verified' : 'not verified'})`,
-      );
-    }
-    if (audit.extractionAccounting) {
-      const accounting = audit.extractionAccounting;
-      const outcomes = accounting.candidateOutcomes;
-      const claims = accounting.claimEvents
-        ? `claim events inserted ${accounting.claimEvents.inserted}, merged ${accounting.claimEvents.merged}, ` +
-          `hinted ${accounting.claimEvents.hinted}, noted ${accounting.claimEvents.noted}, ` +
-          `dropped ${accounting.claimEvents.dropped}`
-        : 'claim events unavailable';
-      console.log(
-        `extraction accounting: parsed ${accounting.parsedCandidates}, terminal ${accounting.terminalDispositions} ` +
-          `candidate outcomes (inserted ${outcomes.inserted}, merged ${outcomes.merged}, hinted ${outcomes.hinted}, ` +
-          `noted ${outcomes.noted}, dropped ${outcomes.dropped}, mixed ${outcomes.mixed}, ` +
-          `errors ${outcomes.errors}); ${claims}; sections failed ${accounting.failedSections}, ` +
-          `missing ${accounting.missingSections}, partial ${accounting.partialSections}, ` +
-          `unparsed ${accounting.unparsedSections}, skipped ${accounting.skippedSections}; ` +
-          `aborted candidates ${accounting.abortedCandidates}; unique hints ${accounting.uniqueHints ?? 'unavailable'}; ` +
-          `pipeline ${accounting.pipelineScope}/${accounting.pipelineLineage}; run ${accounting.runStatus} ` +
-          `(${accounting.candidateAccountingVerified ? 'candidate accounting verified' : 'candidate accounting not verified'})`,
-      );
-    }
-    console.log(`\n${C.bold('Provable violations')}: ${audit.violations.length}`);
-    for (const item of audit.violations) {
-      const event = item.eventId === undefined ? '' : ` event #${item.eventId}`;
-      const claim = item.claimUid ? ` claim ${item.claimUid}` : '';
-      console.log(`  ${C.red(item.code)}${event}${claim}: ${item.detail}`);
-    }
-    console.log(`\n${C.bold('Suspicious patterns')}: ${audit.suspicious.length}`);
-    for (const item of audit.suspicious) {
-      const event = item.eventId === undefined ? '' : ` event #${item.eventId}`;
-      console.log(`  ${C.yellow(item.code)}${event}: ${item.detail}`);
-    }
-    console.log(`\n${C.bold('Checks')}`);
-    for (const check of audit.checks) console.log(`  - ${check}`);
-    console.log(`\n${C.bold('Limitations')}`);
-    for (const limitation of audit.limitations) console.log(`  - ${limitation}`);
-  } finally {
-    reader.close();
-  }
-}
-
-/* ------------------------------------------------------------------- main */
 
 let db: Db;
-
-async function prompt(label: string): Promise<string> {
-  const { createInterface } = await import('node:readline/promises');
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const answer = await rl.question(label);
-  rl.close();
-  return answer;
-}
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
@@ -3414,7 +2474,7 @@ async function main(): Promise<void> {
   // normalises rows and writes schema_meta. Open a genuinely read-only
   // connection and never fall back to the writable path.
   if (command === 'trace') {
-    await cmdTrace(args, dbPath);
+    await cmdTrace(db, args, dbPath);
     return;
   }
 
@@ -3441,25 +2501,25 @@ async function main(): Promise<void> {
         await cmdWrite(args);
         break;
       case 'check':
-        await cmdCheck(args);
+        await cmdCheck(db, args);
         break;
       case 'issues':
-        await cmdIssues(args);
+        await cmdIssues(db, args);
         break;
       case 'state':
-        await cmdState(args);
+        await cmdState(db, args);
         break;
       case 'continuity':
-        await cmdContinuity(args);
+        await cmdContinuity(db, args);
         break;
       case 'graph':
-        await cmdGraph(args);
+        await cmdGraph(db, args);
         break;
       case 'conflicts':
-        await cmdConflicts(args);
+        await cmdConflicts(db, args);
         break;
       case 'llm':
-        await cmdLlm(args);
+        await cmdLlm(db, args);
         break;
       case 'serve': {
         // An explicit --project must win, including when the database has other
