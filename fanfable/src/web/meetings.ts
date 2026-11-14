@@ -1451,13 +1451,24 @@ export function isTempDatabasePath(path: string): boolean {
   } catch {
     return false;
   }
-  const candidates = [resolve(path)];
-  try {
-    if (existsSync(path)) candidates.push(realpathSync(path));
-  } catch {
-    /* resolve form only */
+  const under = (candidate: string): boolean =>
+    norm(expand(candidate)).startsWith(root + norm(sep));
+
+  const resolved = resolve(path);
+  if (existsSync(resolved)) {
+    // The path exists, so its real form is the only one that matters. Accepting
+    // the resolved spelling as well let a symlink under /tmp pointing at a
+    // production database pass the guard: the link name is under temp, the file
+    // it reaches is not.
+    try {
+      return under(realpathSync(resolved));
+    } catch {
+      // Unresolvable but present: refuse rather than guess.
+      return false;
+    }
   }
-  return candidates.some((candidate) => norm(expand(candidate)).startsWith(root + norm(sep)));
+  // Nothing there yet, so there is no link to follow: judge the intended path.
+  return under(resolved);
 }
 
 /**

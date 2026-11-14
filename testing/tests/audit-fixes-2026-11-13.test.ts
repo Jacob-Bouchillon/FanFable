@@ -332,3 +332,61 @@ test('C10: a sentence-initial common word is not reported as a character', async
   assert.ok(real.some((w) => w.kind === 'unknown-character' && /Wilhelmina/.test(w.message)));
   db.close();
 });
+
+test('C7: a symlink under temp does not make a production database writable', async () => {
+  const { mkdtempSync, mkdirSync, rmSync, symlinkSync, existsSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { isTempDatabasePath } = await import('../../fanfable/src/web/meetings.ts');
+
+  // A target outside the temp directory. /var/tmp is on a different root than
+  // /tmp on Linux; skip where it is not usable.
+  const outside = '/var/tmp/fanfable-c7-probe';
+  if (!existsSync('/var/tmp')) return;
+  mkdirSync(outside, { recursive: true });
+  const target = join(outside, 'prod.db');
+  const { Db: DbClass } = await import('../../fanfable/src/core/db.ts');
+  new DbClass(target).close();
+
+  const linkDir = mkdtempSync(join(tmpdir(), 'ff-c7-link-'));
+  const link = join(linkDir, 'link.db');
+  try {
+    symlinkSync(target, link);
+  } catch {
+    rmSync(outside, { recursive: true, force: true });
+    rmSync(linkDir, { recursive: true, force: true });
+    return; // no symlink support here
+  }
+
+  assert.equal(isTempDatabasePath(target), false, 'the real file is outside temp');
+  assert.equal(
+    isTempDatabasePath(link),
+    false,
+    'a link whose name is under temp but whose target is not must be refused',
+  );
+  rmSync(outside, { recursive: true, force: true });
+  rmSync(linkDir, { recursive: true, force: true });
+});
+
+test('A12: the graph path does not claim the trails command\'s final accounting', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { resolve } = await import('node:path');
+
+  // `budget:trails` is the trails command's final accounting and the audit
+  // requires a matching `trails:final` summary for it. The PPR graph path has
+  // no such summary — its accounting is the `passages:graph` summary — so it
+  // must use its own subject. Fixtures never have enough graph passages to
+  // exercise the path, so the invariant is pinned here instead.
+  const graph = readFileSync(resolve(import.meta.dirname, '../../fanfable/src/support/graph.ts'), 'utf8');
+  assert.equal(
+    /subject:\s*'budget:trails'/.test(graph),
+    false,
+    'graph.ts emits budget:trails without a trails:final summary',
+  );
+  assert.match(graph, /subject:\s*'budget:graph-trails'/);
+
+  // The trails command does emit both, and must keep doing so.
+  const cli = readFileSync(resolve(import.meta.dirname, '../../fanfable/src/cli.ts'), 'utf8');
+  assert.match(cli, /subject:\s*'budget:trails'/);
+  assert.match(cli, /subject:\s*'trails:final'/);
+});

@@ -2888,7 +2888,13 @@ export async function buildPprGraphContext(
   if (passages.length > trails.length) {
     emit({
       event: 'retrieval.budget.cutoff',
-      subject: 'budget:trails',
+      // `budget:trails` is the trails command's final accounting, and the audit
+      // requires a matching `trails:final` summary for it. This cutoff is a
+      // different budget — how many graph passages get a trail rendering — and
+      // its accounting is already carried by the `passages:graph` summary
+      // above. Reusing the trails subject made the audit report a missing
+      // summary on every run that rendered fewer trails than passages.
+      subject: 'budget:graph-trails',
       decision: 'budgeted',
       reasonCode: 'trail-cap',
       refs: { count: passages.length - trails.length, stage: 'trail' },
