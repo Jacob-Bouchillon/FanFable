@@ -2,7 +2,7 @@
 
 **The bet:** a book becomes a *bank of proven claims*, and stories are written from the bank, not the raw text. Three rules shape everything: canon is evidence (no verbatim quote, no bank); the model proposes but the system decides (no model sets a status); answers show provenance (*confirmed by you* vs *the model, 0.78*).
 
-**Current snapshot (2026-11-13, branch `experiment/evidence-scan`):** `npm run typecheck` is clean and `npm test` passes 1,555 tests. The bank on the trial book holds 164 relations; the judge scores 0.83 precision / 0.68 recall on 42 blind-labelled rows. Two systematic defects remain open measurements, not solved work: alias pairs judged as two people (Plagueis/"The Muun", Palpatine/Sidious) and family titles refused as evidence ("Aunt Petunia" — six of six establishment misses). Those numbers are the 2026-10-29 measurement and are not rewritten.
+**Current snapshot (2026-11-13, branch `experiment/evidence-scan`):** `npm run typecheck` is clean and `npm test` passes 1,564 tests. The bank on the trial book holds 164 relations; the judge scores 0.83 precision / 0.68 recall on 42 blind-labelled rows. Two systematic defects remain open measurements, not solved work: alias pairs judged as two people (Plagueis/"The Muun", Palpatine/Sidious) and family titles refused as evidence ("Aunt Petunia" — six of six establishment misses). Those numbers are the 2026-10-29 measurement and are not rewritten.
 
 **What's next:** one prompt variant fixing identity + titles, measured on the same 42 rows; then majority-of-three stability; then apply the winner to candidate pairs. Longer track: recall (classifier E0–E4), bank re-measurement at threshold, canon-aware planner, second book. Full ranked list in `WHATS-NEXT.md`.
 
