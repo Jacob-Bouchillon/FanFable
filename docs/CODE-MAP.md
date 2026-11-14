@@ -17,7 +17,9 @@ One product, one command line, one test suite:
 | `lorebook/ranking.ts` | 579 | ranking retrieved passages against the bank |
 | `lorebook/kinds.ts` | 507 | closed kind vocabulary, glosses, inverse pairs |
 | `lorebook/shared.ts` | 251 | helpers two or more modules need |
-| `fanfable/src/cli.ts` | 3,521 | the command line: 14 top-level commands, 46 `lore` subcommands |
+| `fanfable/src/cli.ts` | 2,581 | entry point, dispatch, and the 1,839-line `cmdLore` |
+| `cli/shared.ts` | 153 | argument parsing, colours, data path, flags, project lookup |
+| `cli/commands/` | 910 | `state`, `trace`, `checks`, `graph`, `llm` — eight commands |
 | `fanfable/src/**, everything else` | 42,065 | 84 modules across 13 folders |
 
 `lorebook.ts` is now 20% of the source (down from 27%) and still imported by 19
@@ -182,6 +184,15 @@ docs, or each other. They are one-off report generators; run them directly.
 
 `cli.ts` has 14 top-level commands (`project`, `import`, `sources`, `lore`, `plan`,
 `write`, `check`, `issues`, `state`, `continuity`, `graph`, `conflicts`, `llm`,
-`serve`). `cmdLore` alone handles 46 subcommands as a flat `if (sub === '...')`
-chain spanning roughly 1,800 lines. When adding a `lore` subcommand, follow that
-pattern; do not introduce a dispatch table for one command.
+`serve`). Eight of them now live in `cli/commands/`, and the shared plumbing is in
+`cli/shared.ts`. `db` is passed to each command rather than held as a module-level
+singleton — that singleton was the reason the commands could not be moved before.
+
+`cmdLore` alone still handles 46 subcommands as a flat `if (sub === '...')` chain
+spanning 1,839 lines. Measured for splitting: 46 blocks, **6 of which do not end in
+`return;`** (`pair-threads`, `births`, `trails`, `rulings`, `correct`, `remove`), so
+those need per-branch reading rather than a bulk transform. Largest blocks:
+`extract` 232 lines, `trails` 170, `ties` 104, `thread` 100.
+
+When adding a `lore` subcommand, follow the existing chain; do not introduce a
+dispatch table for one command.
