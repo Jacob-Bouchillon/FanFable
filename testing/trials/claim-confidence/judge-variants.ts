@@ -124,6 +124,7 @@ let llm: ReturnType<typeof clientFrom> | null = null;
 const out: { gold: number; label: string; predicted: boolean; why: string }[] = [];
 
 let skippedMissingDb = 0;
+let unparsed = 0;
 for (const entry of goldMap) {
   const path = `testing/trials/model-ab/${entry.db}.db`;
   // A trial bank is local-only and may have been deleted. Skipping is the only
@@ -141,7 +142,17 @@ for (const entry of goldMap) {
     if (!llm) {
       const base = JSON.parse(project?.settings || '{}');
       const seed = Number(process.env.JUDGE_SEED ?? 42);
-      llm = clientFrom({ ...base, model: process.env.JUDGE_MODEL ?? 'qwen3.5:9b', temperature: 0, seed, maxTokens: 2048 });
+      // `think` is a CLIENT setting in llm.ts, not a per-call option; passing it in
+      // the chat() call does nothing. Without it the model spends the whole
+      // output budget reasoning and returns 0 content characters.
+      llm = clientFrom({
+        ...base,
+        model: process.env.JUDGE_MODEL ?? 'qwen3.5:9b',
+        temperature: 0,
+        seed,
+        maxTokens: 2048,
+        think: false,
+      });
     }
     const chunks = new Map<number, string>();
     if (project) {
@@ -184,7 +195,16 @@ for (const entry of goldMap) {
     temperature: 0,
     maxTokens: 2048,
   });
-  const parsed = extractJson<Record<string, unknown>>(res.text) ?? {};
+  const parsed = extractJson<Record<string, unknown>>(res.text);
+  if (!parsed) {
+    // A reply the parser cannot read is not a verdict. Recording it as "not a
+    // relationship" is how an earlier run scored 1.00 precision / 0.15 recall
+    // from a model that had answered nothing: every empty response became a
+    // confident negative. Count it and leave it out.
+    unparsed++;
+    process.stderr.write(`${variant} ${out.length + unparsed}/${goldMap.length} UNPARSED (chars=${(res.text ?? '').length})\n`);
+    continue;
+  }
   out.push({ gold: entry.gold, label: labelOf.get(entry.gold) ?? 'unclear', predicted: spec.positive(parsed), why: String(parsed.why ?? '') });
   process.stderr.write(`${variant} ${out.length}/${goldMap.length}\n`);
 }
@@ -200,13 +220,21 @@ writeFileSync(outPath, JSON.stringify({
   variant,
   model: process.env.JUDGE_MODEL ?? 'qwen3.5:9b',
   seed: Number(process.env.JUDGE_SEED ?? 42),
+  think: false,
+  unparsed,
   scored: out.length,
   skippedMissingDb,
   rows: out,
 }, null, 1));
+if (unparsed) {
+  console.error(
+    `WARNING: ${unparsed} repl${unparsed === 1 ? 'y' : 'ies'} could not be parsed and ${unparsed === 1 ? 'is' : 'are'} NOT in the score. ` +
+      'Check finishReason and the thinking budget before trusting these numbers.',
+  );
+}
 console.log(
   JSON.stringify(
-    { variant, scored: out.length, skippedMissingDb, tp, fp, fn, tn, precision: Number((tp / Math.max(tp + fp, 1)).toFixed(2)), recall: Number((tp / Math.max(tp + fn, 1)).toFixed(2)), out: outPath },
+    { variant, scored: out.length, skippedMissingDb, unparsed, tp, fp, fn, tn, precision: Number((tp / Math.max(tp + fp, 1)).toFixed(2)), recall: Number((tp / Math.max(tp + fn, 1)).toFixed(2)), out: outPath },
     null,
     1,
   ),

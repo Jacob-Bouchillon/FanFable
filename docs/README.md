@@ -6,7 +6,7 @@
 
 **What's next:** one prompt variant fixing identity + titles, measured on the same 42 rows; then majority-of-three stability; then apply the winner to candidate pairs. Longer track: recall (classifier E0–E4), bank re-measurement at threshold, canon-aware planner, second book. Full ranked list in `WHATS-NEXT.md`.
 
-**The trap that cost three hours:** a reasoning model spends the output budget thinking and returns empty with `done_reason: length` — measured on `gpt-oss:20b`, retired 2026-11-13 as the judge. Check `done_reason` and the thinking length before concluding a model returned nothing. Always smoke-test one window before any full run, and `ps` after killing a run — orphaned processes compete for the GPU.
+**The trap that cost three hours, twice:** a reasoning model spends the output budget thinking and returns empty with `done_reason: length`. Measured on `gpt-oss:20b` (retired as the judge 2026-11-13) and again on `qwen3.5:9b`. `think: false` fixes it — 0 thinking tokens against 2,367 — **but it is a client setting, not a per-call option**: `clientFrom({ ..., think: false })`, never `chat({ think: false })`, which is silently ignored. A judge harness that reads empty replies as "not a relationship" will score a model that answered nothing as flawless precision. Always smoke-test one window before any full run, and `ps` after killing a run — orphaned processes compete for the GPU.
 
 ## Start here
 

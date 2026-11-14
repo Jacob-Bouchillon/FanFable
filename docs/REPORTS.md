@@ -29,6 +29,7 @@ any claim stays traceable in git history (`git log -- docs/<file>`).
 | 2026-11-05 | [Case-file judge and the integrated keeper pipeline](#report-2026-11-05-11) |
 | 2026-11-06 | [Baseline bank](#report-2026-11-06-12) |
 | 2026-11-06 | [Fixed extraction after the token-cap change](#report-2026-11-06-13) |
+| 2026-11-13 | [Judge re-baseline on qwen3.5:9b](#report-2026-11-13-14) |
 
 <a id="report-2026-10-30-1"></a>
 
@@ -1944,6 +1945,19 @@ baseline bank has not been through the judge yet.
 8. Untracked large directories (`testing/trials/valve-bench` ~23 GB, `coref-probe/data` ~116 MB)
    are deliberately excluded from the commit.
 
+### Stability on the new judge
+
+Three identical runs of the baseline (same seed, temperature 0, `think: false`):
+**0 of 21 verdicts flipped.** The retired `gpt-oss:20b` flipped 6 of 42 (14%), which
+was the reason "majority of three runs" became a rule.
+
+Read this as a floor, not a warranty. 21 rows is small, a deterministic
+temperature-0 run can still change with a different prompt or model version, and the
+old 14% was measured on a different and larger set. What it does establish is that
+the majority-of-three precaution is not currently load-bearing for `qwen3.5:9b`, and
+that a single deterministic run is a defensible way to compare *prompt variants* —
+which is what the variant table above is.
+
 ### Next
 
 1. Fix JSON validity (constrained decoding or repair pass) and re-run only the partial windows.
@@ -2056,3 +2070,66 @@ mixed-entry calls cost an unknown number of rows; that explains part of the drop
    once with a lower repeat budget or fewer relation labels.
 3. Judge this bank, apply alias groups, run the worker, then compare true ties against the 65-row
    calibration.
+
+<a id="report-2026-11-13-14"></a>
+
+## 2026-11-13 — Judge re-baseline on `qwen3.5:9b`
+
+The judge model moved from `gpt-oss:20b` to `qwen3.5:9b`, so the old 0.83 / 0.68
+figure is a number for a retired model. This is the re-baseline, and the first
+measurement of the identity/title prompt variants on the new judge.
+
+**Setup.** `judge-variants.ts`, `qwen3.5:9b`, temperature 0, seed 42, `think: false`.
+**21 rows, not 42.** `gold-map.json` draws half the set from `model-ab/n.db`, which is
+no longer on this machine; the harness skips it and reports `skippedMissingDb: 21`.
+Every number below is therefore hp3-only.
+
+| variant | tp | fp | fn | tn | precision | recall |
+|---|---|---|---|---|---|---|
+| `categories` (baseline) | 13 | 3 | 0 | 5 | **0.81** | **1.00** |
+| `fixed2` (identity + title) | 5 | 0 | 8 | 8 | **1.00** | **0.38** |
+| `fixed3` (identity + title) | 7 | 1 | 6 | 7 | **0.88** | **0.54** |
+
+### What the numbers say
+
+**The variants fail the acceptance test.** The plan required that a variant move the
+alias false positives and the title misses *with zero regressions on rows already
+correct*. Both variants remove false positives — `fixed2` takes fp from 3 to 0 — and
+both do it by giving up true positives: 8 and 6 establishment rows that the baseline
+classified correctly. On this half that is a regression, not a fix.
+
+**The failure mode here is not identity or titles.** All three baseline false
+positives are `mentions` rows the judge called a relationship — a presupposition
+over-reach, not two names for one person and not a kin title. The variants address a
+problem that is not present in these 21 rows, which explains why they cost recall and
+buy nothing.
+
+**The rows the plan targets live in the missing half.** The alias pairs
+(Plagueis / "The Muun", Palpatine / Sidious) are from the second book, and the six
+title misses are establishment misses — the baseline has zero establishment misses
+here, so those rows cannot be in this half. Until `n.db` is rebuilt, the identity and
+title defects cannot be measured at all.
+
+### A measurement that had to be thrown away
+
+The first run reported **precision 1.00 / recall 0.15** and was meaningless. Every
+call returned 0 content characters with `finishReason: length` — the model spent the
+whole 2,048-token budget thinking, the parser produced `undefined`, and the harness
+recorded that as "not a relationship". A model that answered nothing scored perfect
+precision.
+
+Two defects made that possible and both are fixed: the harness now counts unparsed
+replies and refuses to score them (it reported `unparsed: 17` on the re-run until the
+setting was right), and `think: false` is set on the **client** — `think` passed to
+`chat()` is silently ignored, which is why the first attempt at the fix changed
+nothing. The run then took 8.7 seconds instead of 5m49s.
+
+### Next
+
+1. Rebuild `model-ab/n.db` or re-label 21 rows from a book whose bank exists; without
+   42 rows neither the old baseline nor these variants can be compared to anything.
+2. Re-measure the identical-run flip rate on `qwen3.5:9b`; the 14% noise floor belongs
+   to the retired judge.
+3. Given that the baseline's errors are presupposition over-reach, a variant aimed at
+   *co-mention vs presupposition* is better supported by these rows than the
+   identity/title variant the plan specifies.

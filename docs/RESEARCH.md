@@ -128,9 +128,20 @@ Differential result (same 855 candidates, same DB copy): accepts without index 1
 > every row of the table below belong to that model, so none of them is a baseline
 > for `qwen3.5:9b`. Re-establish the baseline on the same 42 rows before treating
 > any prompt variant as an improvement, and re-measure the identical-run flip rate:
-> the 14% noise floor is a property of the retired model.
+> the 14% noise floor is a property of the retired model. Measured since: on 21
+> rows, three identical `qwen3.5:9b` runs at temperature 0 with `think: false` gave
+> **0 flips**, so the majority-of-three rule is not currently load-bearing — see the
+> 2026-11-13 section of `REPORTS.md`.
 
-Model: **`gpt-oss:20b` with `think: "low"`** *(retired as the judge 2026-11-13)* — at 2,048 and 8,192 output tokens it produced 0 content characters with `done_reason: "length"` (29,546 chars of thinking at 8k); `think: false` is silently ignored by this Ollama build; `think: "low"` works (456 thinking / 4,480 JSON). `llm.ts` accepts `think: boolean | 'low' | 'medium' | 'high'`. Trial scripts: `judge-variants.ts`, `blind-gold.ts`, `blind-gold-cite.ts`, `calibrate.ts`, `pair-evidence.ts` (concluded: not viable, evidence too thin), `reason-check.ts` (concluded: flags everything), `three-way-sheet.ts`.
+Model: **`gpt-oss:20b` with `think: "low"`** *(retired as the judge 2026-11-13)* — at 2,048 and 8,192 output tokens it produced 0 content characters with `done_reason: "length"` (29,546 chars of thinking at 8k); `think: false` was silently ignored *by that model*; `think: "low"` worked (456 thinking / 4,480 JSON). `llm.ts` accepts `think: boolean | 'low' | 'medium' | 'high'`.
+
+> **2026-11-13 — the `think: false` quirk is model-specific, not build-specific.**
+> `qwen3.5:9b` honours it: `think: false` gives 0 thinking tokens / 6 eval tokens,
+> `think: true` gives 2,367 / 596 on the same prompt. The earlier note said "silently
+> ignored by this Ollama build", which reads as universal and sent the next judge run
+> down the same path. `think` is also read from the **client** settings
+> (`clientFrom({ think: false })`), not from the `chat()` call — a `think` passed per
+> call is ignored without error. Trial scripts: `judge-variants.ts`, `blind-gold.ts`, `blind-gold-cite.ts`, `calibrate.ts`, `pair-evidence.ts` (concluded: not viable, evidence too thin), `reason-check.ts` (concluded: flags everything), `three-way-sheet.ts`.
 
 | Prompt variant (same 42 rows) | Precision | Recall |
 |---|---|---:|
