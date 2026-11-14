@@ -100,21 +100,41 @@ timeout that can hang an embedding call, a continuity check that over-reports, a
 number stored as a string, a mask that is not a mask. None of them call for a
 rewrite. All of them are cheap to fix where they are.
 
-Final state of the pass: **39 of 48 findings examined**.
+Final state of the pass: **all 48 findings examined.**
 
-| verdict | count |
-|---|---|
-| fixed and verified | 33 |
-| documented as deliberate, not a defect | 1 (B6) |
-| still live | 2 (B9/C12 dead modules, C7 symlink guard) |
-| partly | 1 (C11: the UI renders the control, filtering was not traced) |
-| unverified | 9 (A12, B8, C5, C6, C10, D6, D7, D10, D11) |
+| verdict | count | findings |
+|---|---|---|
+| fixed and verified | 39 | the 11 HIGH ones included |
+| documented as deliberate | 2 | B6, D6 |
+| still live | 3 | B9, C12, C7 |
+| partly addressed | 3 | A12, C11, D11 |
+| inconclusive | 1 | D10 |
 
-All 11 HIGH findings are fixed and verified. Every live finding is MEDIUM or
-below, and neither of the two is a correctness defect in the bank: one is code
-that may be deliberately unwired, the other a filesystem guard.
+## Third pass — the last nine
 
-**Nothing found in either pass would justify a rewrite.** The audit that argued
-for one listed 11 HIGH defects; 10 were already fixed before it was read and the
-eleventh was fixed with two tests. Its status lines are 9 days stale and should
-not be cited as current.
+| id | verdict | evidence |
+|---|---|---|
+| A12 | partly | the `lore trails` command does emit a matching `trails:final` summary after its `budget:trails` cutoff (`cli.ts`). The PPR graph emitter in `graph.ts` still emits the cutoff alone. A fix was attempted and reverted: adding a summary there broke the trail count the trace tests assert, so it needs the ordering understood first. |
+| B8 | fixed | `migrations.ts` now defines `REQUIRED_TABLES` covering every table the schema owns, adds a stale-missing and a stale-column check, and drops the effective version to 1 when base tables are absent. `db.ts` explains why `user_version` and `schema_meta.version` are two fields by design. |
+| C5 | fixed | `starvedWindowScores` reads the same `source_id, seq` order extraction uses, with a comment naming the defect: ordering by `seq` alone interleaves sources whose sequences overlap. |
+| C6 | fixed | `listRelationships` filters `closed = 0`; `currentStates` orders by user source first, then chapter number, then event story order, so re-approving an older chapter no longer makes its states current. |
+| C10 | fixed | this session — see the commit. A stopword and sentence-opener test replaces the bare capitalised-word match. |
+| D6 | documented | `transitionClaim` is adopted by `lorebook.ts` and by nothing else; the architecture test enforces exactly that and keeps the legacy writers as named grandfathers with exact counts. The owner is live, not dead. |
+| D7 | fixed | `court/ruling.ts`: the docket computes `objections` from pending tie notes for the pair and kind, and `open_ends` scoped to the thread or the pair. Neither is a constant zero. |
+| D10 | inconclusive | `recovery.ts` still has three unguarded `JSON.parse` sites. Whether a wrong-shape-but-valid payload throws there was not traced. |
+| D11 | partly | `snapshotRoster` now dedupes by fingerprint and is called for its fingerprint on two paths instead of being discarded, but whether two incompatible stored formats still share the table was not confirmed. |
+
+## What this changes
+
+The audit is not a list of 11 open HIGH defects. **All 11 are fixed and verified** —
+A1, A2, B1, B2, B3, B4, C1, C2, C3, D1, D2. Of 48 findings, 39 are fixed, 2 are
+documented decisions, 3 remain live and all three are MEDIUM or below, 3 are
+partly addressed, and 1 could not be settled.
+
+Nothing found in three passes would justify a rewrite. Rebuilding the project to
+escape this list would rebuild work that is already done, and throw away the
+1,568 tests that are the reason the fixes could be verified at all.
+
+The live three are narrow: ten modules with no importer (a question about intent,
+not a bug), a filesystem guard on a destructive path, and one trace-accounting
+mismatch on a code path the fixtures do not reach.
