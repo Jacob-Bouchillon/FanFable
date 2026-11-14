@@ -166,6 +166,54 @@ test('headings are detected in common formats', () => {
   assert.ok(names.some((n) => /Chapter 3/.test(n)));
 });
 
+// A line break inside a sentence must never start a section. The looser
+// detector matched any line opening with "book", "part", "section" or "act",
+// so a hard-wrapped "…than when the book had screamed" filed eleven passages
+// under a chapter that does not exist.
+test('prose that begins with a structural word is not a heading', () => {
+  for (const line of [
+    'book had screamed -- for he had seen not only himself in the mirror, but',
+    'part of him wanted to run',
+    'act as if nothing had happened',
+    'section of the wall was missing',
+  ]) {
+    assert.deepEqual(findHeadings(line), [], `"${line}" is prose, not a heading`);
+  }
+});
+
+test('a chapter heading still needs a count, spelled out or not', () => {
+  for (const line of ['CHAPTER SEVEN', 'Book Two', 'Part III: The Return', 'act two', 'CHAPTER 12']) {
+    assert.equal(findHeadings(line).length, 1, `"${line}" is a heading`);
+  }
+});
+
+// PDFs put a form feed directly in front of the heading that opens a page. The
+// reported offset must be the heading's own text, or a chunker looking for a
+// heading inside a passage's character span misses it and the passage keeps the
+// previous chapter's label.
+test('a heading after a page break is found inside its own block of text', () => {
+  const full = '\fCHAPTER SEVEN\nTHE SORTING HAT\ntext';
+  const { start } = findHeadings(full)[0]!;
+  // The offset counts every character of the source, including the page break,
+  // and points at the heading word itself rather than at the line start.
+  assert.equal(full.slice(start).startsWith('CHAPTER SEVEN'), true);
+});
+
+test('chunks after a page-break heading carry the new chapter', () => {
+  const para = Array.from({ length: 30 }, (_, i) => `Sentence ${i} runs on for a while.`).join(' ');
+  const chunks = chunkText(`CHAPTER SIX\n${para}\n\fCHAPTER SEVEN\nTHE SORTING HAT\n${para}`, {
+    maxWords: 60,
+    overlapWords: 10,
+  });
+  const seven = chunks.filter((c) => c.text.includes('Sentence 0 runs'));
+  assert.ok(seven.length > 0);
+  // The first passage of chapter seven, and the overlap tail that follows it.
+  const firstSeven = chunks.find((c) => c.heading === 'CHAPTER SEVEN');
+  assert.ok(firstSeven, 'chapter seven is labelled');
+  assert.ok(firstSeven!.text.includes('THE SORTING HAT'));
+  assert.equal(chunks.filter((c) => c.heading === 'CHAPTER SIX').length > 0, true);
+});
+
 test('sentence splitting and word count', () => {
   const s = splitSentences('One. Two! Three? "Four."');
   assert.equal(s.length, 4);

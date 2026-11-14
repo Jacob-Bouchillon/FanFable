@@ -98,8 +98,7 @@ export function findHeadings(text: string): { heading: string; start: number }[]
     const trimmed = line.trim();
     if (trimmed) {
       const md = /^#{1,6}\s+(.*)$/.exec(trimmed);
-      const chapter =
-        /^(chapter|book|part|section|act)\s+([0-9ivxlcdm]+|[a-z]+)\b[:.\-–—]?\s*(.*)$/i.exec(trimmed);
+      const chapter = chapterHeading(trimmed);
       // A numbered line is only a heading when it looks like a title, not a
       // numbered list item inside prose ("4. One winter cloak (black, ...)").
       const numbered = /^([0-9]{1,3})[.)]\s+(\S.*)$/.exec(trimmed);
@@ -107,11 +106,42 @@ export function findHeadings(text: string): { heading: string; start: number }[]
       if (md) heading = md[1].trim();
       else if (chapter) heading = trimmed.replace(/:$/, '').trim();
       else if (numbered && looksLikeTitle(numbered[2])) heading = numbered[2].trim();
-      if (heading) out.push({ heading, start: offset });
+      // `start` must be the offset of the heading text, not of the raw line:
+      // a PDF page break leaves a form feed in front of it, and a caller that
+      // looks for a heading inside a block's character span would otherwise
+      // miss every heading that opens a page.
+      if (heading) out.push({ heading, start: offset + (line.length - line.trimStart().length) });
     }
     offset += line.length + 1;
   }
   return out;
+}
+
+/** Spelled-out counts a chapter heading may use ("Book Two", "Part Twenty"). */
+const NUMBER_WORDS = new Set([
+  'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten',
+  'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen',
+  'eighteen', 'nineteen', 'twenty', 'thirty', 'forty', 'fifty', 'sixty',
+  'seventy', 'eighty', 'ninety', 'hundred', 'first', 'second', 'third', 'fourth',
+  'fifth', 'sixth', 'seventh', 'eighth', 'ninth', 'tenth', 'last', 'final',
+]);
+
+/**
+ * A line is a chapter heading when it opens with a structural word followed by
+ * a count. The count must be a number, a roman numeral, or a spelled-out number
+ * word — not any word at all.
+ *
+ * The looser version matched mid-sentence line breaks wherever the novel
+ * happened to use "book", "part", "section" or "act" as an ordinary noun, so
+ * "…than when the book had screamed" became a section heading and eleven
+ * passages were filed under it instead of their chapter.
+ */
+function chapterHeading(trimmed: string): RegExpExecArray | null {
+  const match = /^(chapter|book|part|section|act)\s+([0-9]+|[ivxlcdm]+|[a-z]+)\b[:.\-–—]?\s*(.*)$/i.exec(trimmed);
+  if (!match) return null;
+  const count = (match[2] ?? '').toLowerCase();
+  if (/^[0-9]+$/.test(count) || /^[ivxlcdm]+$/.test(count)) return match;
+  return NUMBER_WORDS.has(count) ? match : null;
 }
 
 /**
