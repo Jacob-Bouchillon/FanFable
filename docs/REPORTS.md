@@ -30,6 +30,7 @@ any claim stays traceable in git history (`git log -- docs/<file>`).
 | 2026-11-06 | [Baseline bank](#report-2026-11-06-12) |
 | 2026-11-06 | [Fixed extraction after the token-cap change](#report-2026-11-06-13) |
 | 2026-11-13 | [Judge re-baseline on qwen3.5:9b](#report-2026-11-13-14) |
+| 2026-11-14 | [Extraction identity: duplicate short names and graded resolution](#report-2026-11-14-15) |
 
 <a id="report-2026-10-30-1"></a>
 
@@ -2133,3 +2134,96 @@ nothing. The run then took 8.7 seconds instead of 5m49s.
 3. Given that the baseline's errors are presupposition over-reach, a variant aimed at
    *co-mention vs presupposition* is better supported by these rows than the
    identity/title variant the plan specifies.
+
+<a id="report-2026-11-14-15"></a>
+
+## 2026-11-14 — Extraction identity: duplicate short names and graded resolution
+
+Three defects in how the extractor decides *who* a name refers to, measured on the
+hp1 bank (`~/fanfable-work/hp1-full2.db`, 526 passages, one book, `qwen3.5:9b`,
+temperature 0, seed 42, `think: false`). Two are fixed; the third is measured and
+left open. Counts only; no row contents.
+
+### 1. Chapter labels were wrong on 40 of 526 passages
+
+Two chunker defects. A heading must now be followed by a count (a number, a roman
+numeral, or a spelled-out one), because a hard-wrapped prose line opening with a
+structural word was being read as a section: 11 passages were filed under a heading
+that does not exist. And the heading offset was reported at the start of the raw
+line, so a heading that opened a PDF page (behind a form feed) fell outside its own
+block's character span and 29 passages kept the previous chapter's label.
+
+Fixed in `findHeadings` / `chunkText`; four tests, three of which fail on the old
+code. `testing/scripts/repair-chapter-labels.ts` repairs banks written before the
+fix and is a dry run by default. After the repair: 0 passages disagree with their
+own text, 0 headings that are not chapters, 17 chapter windows.
+
+### 2. A stored alias is the same entity (fixed)
+
+`findEntityId` compared an incoming name against other rows' *names* only, never
+their aliases. A bank that holds a full name with the short form as an alias then
+minted a second entity whenever a window wrote the short form. The duplicate made
+the short form a direct collision, so every later relation using it was demoted to
+a hint instead of banked.
+
+An alias now resolves when exactly one entity claims it. Two owners is an identity
+question and still returns nothing. Measured on one chapter's windows, same seed:
+entities created 8 (7 duplicates) before, 0 after.
+
+### 3. Short forms resolve by leading position and dilution (fixed)
+
+Resolution treated any multi-row match as one flat collision. It now applies, in
+order: exact name or alias; a unique *leading* token (a given name opens a name);
+then the least diluted claimant, counting significant words so an article or title
+cannot make one row look thinner. A genuine tie still fails closed.
+
+Kind plays no part. A person-preferred rule was tried and removed: it would resolve
+a person-and-place collision to the person even where the passage means the place.
+
+Hints whose endpoints both resolve: **59 of 90 before, 86 of 90 after**. The four
+that stay blocked are a surname with five claimants and one name that is not an
+entity. The two pre-existing tests that require fail-closed behaviour pass
+unchanged.
+
+### Re-extraction, before and after
+
+Same windows, same seed, one run per state. Net canon change and new hints:
+
+| state | entities created | relations banked | hints created |
+|---|---:|---:|---:|
+| original | 8 | 1 | 16 |
+| alias fix alone | 0 | 5 | 4 |
+| alias + graded resolution | 0 | 5 | **0** |
+
+Second chapter, after both fixes: relations 1 -> 5, new hints 0, new entities 0.
+The two chapters tested recovered relations and lost none to identity.
+
+### 4. The default extraction path cannot publish
+
+`lore extract` without `--legacy` runs staged: it wrote 33 entities, 10 relations,
+10 facts and 19 timeline entries to the staged tables and reported that "publication
+is not implemented". Canon counts, `lore_mined` and embeddings were untouched. The
+staged contributions carry `disposition: staged` with no canon table or id. Every
+measurement above therefore used `--legacy`, which is currently the only path that
+writes canon.
+
+This is not recorded in the pipeline docs, and the failure is silent: a run looks
+successful and changes nothing.
+
+### 5. The token flag costs more than it buys
+
+`--max-tokens 8192` doubles in the entities-facts section (`min(maxTokens * 2,
+16384)`). Two calls then generated 16,384 tokens each, costing 147 s and 156 s — five
+minutes of a seven-minute run. The card was at 89% utilization and ~112 tok/s, which
+is its bandwidth ceiling for a 9B Q4 model; the cost was output volume, not hardware.
+The default budget is 3,000, which is what the bank was built with.
+
+### Open
+
+Four windows remain partial (`finish-length` on relations, `mixed-entries` on one),
+leaving 28 passages unmined. A window that needs 16k tokens to answer one section is
+a window that should be split, not given a larger ceiling. Most proposed relations
+that do not reach canon are rejected by verbatim quote verification, which is the
+canon rule working, not a defect.
+
+Gate at the end of this work: typecheck clean, 1,589 tests passing.

@@ -2,6 +2,18 @@
 
 **Recognition filter:** off by default after the 2026-11-01 benchmark (B→C was neutral on quality and cost +439 ms pooled). See `docs/RESEARCH.md` for the numbers and limitations; opt in with `project settings --recognition on`.
 
+## 0. Done 2026-11-14 — extraction identity
+
+Full numbers in the same-dated section of `REPORTS.md`. Three defects, two fixed:
+
+- **Chapter labels.** 40 of 526 passages carried the wrong chapter: a heading now needs a count after the structural word, and its offset points at the heading text rather than the raw line (a PDF page break left a form feed in front of it). Four tests; `testing/scripts/repair-chapter-labels.ts` repairs older banks.
+- **Short names minted twins.** `findEntityId` matched names only, never aliases, so "Ron" created a second entity beside "Ronald Weasley"; the duplicate then made the short form ambiguous and every relation using it was demoted to a hint.
+- **Short forms resolve by evidence.** Exact, then leading position, then least-diluted name (significant words only), then fail closed. Kind plays no part on purpose.
+
+Measured on two chapters: relations recovered, **new hints 0**, new entities 0. Hint endpoints both resolvable: 59 of 90 → 86 of 90. Gate: 1,589 tests.
+
+**Still open:** four windows truncate one section (`finish-length` on relations, one `mixed-entries`), leaving 28 passages unmined. Split those windows; do not raise the token cap.
+
 ## 1. Now: the judge fix (in order)
 
 0. **Baseline — DONE 2026-11-13.** Full numbers in the same-dated section of `REPORTS.md`. On `qwen3.5:9b`, 21 rows, `think: false`: **precision 0.81 / recall 1.00**. The identity/title variants `fixed2` and `fixed3` scored 1.00/0.38 and 0.88/0.54 — they remove the false positives by losing 6 to 8 establishment rows the baseline had right. That is a regression, so **step 1 as written below is not worth running**. The baseline's three errors are presupposition over-reach on co-mentions; the rows step 1 targets (alias pairs, kin titles) are in the missing half.
@@ -68,6 +80,9 @@ lore rulings export --out <path>; lore rulings replay --in <path> --dry-run
 Ollama must be running with `qwen3.5:9b`. One model: the judge and the extractor are the same weights, which also removes the two-model residency the older judge needed. Trial data stays local by `.gitignore`; code, tests and docs commit, run output doesn't.
 
 ## 5. Traps (each cost real time)
+
+0. **The default extraction path cannot publish.** `lore extract` without `--legacy` stages its claims and stops: "publication is not implemented". Canon, `lore_mined` and embeddings are untouched, so a run that looks successful changes nothing. `--legacy` is currently the only path that writes canon; every measurement in the 2026-11-14 report used it.
+0. **A bigger token cap buys wall-clock, not completeness.** `--max-tokens n` doubles in the entities-facts section (`min(n * 2, 16384)`), so 8192 permits 16,384-token answers. Two such calls cost 147 s and 156 s on a card running at 89% and 112 tok/s — five minutes of a seven-minute run. The default budget is 3,000; a window that needs more than that is a window to split.
 
 0. **A heading needs a count, and its offset is the heading's own** (fixed 2026-11-13, `48daa43`). Two chunker defects filed 40 of 526 passages under the wrong chapter: a hard-wrapped line opening "the book had screamed" matched the chapter pattern, and a heading that opened a PDF page sat behind a form feed so its offset fell outside its own block. Both are fixed and covered by four tests that fail on the old code; `testing/scripts/repair-chapter-labels.ts` repairs banks written before the fix.
 1. **Reasoning models share their budget with the answer.** Measured on `gpt-oss:20b`, retired 2026-11-13: at 2k–8k tokens it returned 0 characters with `done_reason: length` (29k chars of thinking), `think: false` was silently ignored, and `think: "low"` was the workaround. The model is gone; the lesson is not. Before concluding a model "returned nothing", check `done_reason` and the thinking length.
