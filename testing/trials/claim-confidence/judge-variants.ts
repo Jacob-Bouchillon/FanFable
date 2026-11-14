@@ -7,7 +7,7 @@
  * JUDGE_SEED). Scored against the three-way blind labels: "establishes" (plus
  * "reinforces" where the variant reports it) is the positive class.
  */
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { Db } from '../../../fanfable/src/core/db.ts';
 import { clientFrom } from '../../../fanfable/src/core/llm.ts';
 import { extractJson } from '../../../fanfable/src/core/json.ts';
@@ -123,8 +123,16 @@ let llm: ReturnType<typeof clientFrom> | null = null;
 
 const out: { gold: number; label: string; predicted: boolean; why: string }[] = [];
 
+let skippedMissingDb = 0;
 for (const entry of goldMap) {
   const path = `testing/trials/model-ab/${entry.db}.db`;
+  // A trial bank is local-only and may have been deleted. Skipping is the only
+  // safe answer: opening it would CREATE an empty database, and the row query
+  // would then find nothing while leaving a stray file in the tree.
+  if (!existsSync(path)) {
+    skippedMissingDb++;
+    continue;
+  }
   let db = dbCache.get(path);
   if (!db) {
     db = new Db(path);
@@ -185,10 +193,20 @@ const tp = out.filter((r) => r.label === 'establishes' && r.predicted).length;
 const fp = out.filter((r) => r.label !== 'establishes' && r.predicted).length;
 const fn = out.filter((r) => r.label === 'establishes' && !r.predicted).length;
 const tn = out.filter((r) => r.label !== 'establishes' && !r.predicted).length;
-writeFileSync(outPath, JSON.stringify({ variant, rows: out }, null, 1));
+// Record what produced the run. A judge result without its model is not a
+// result: this is how the earlier gpt-oss measurements became unreadable as
+// baselines for a different model.
+writeFileSync(outPath, JSON.stringify({
+  variant,
+  model: process.env.JUDGE_MODEL ?? 'qwen3.5:9b',
+  seed: Number(process.env.JUDGE_SEED ?? 42),
+  scored: out.length,
+  skippedMissingDb,
+  rows: out,
+}, null, 1));
 console.log(
   JSON.stringify(
-    { variant, tp, fp, fn, tn, precision: Number((tp / Math.max(tp + fp, 1)).toFixed(2)), recall: Number((tp / Math.max(tp + fn, 1)).toFixed(2)), out: outPath },
+    { variant, scored: out.length, skippedMissingDb, tp, fp, fn, tn, precision: Number((tp / Math.max(tp + fp, 1)).toFixed(2)), recall: Number((tp / Math.max(tp + fn, 1)).toFixed(2)), out: outPath },
     null,
     1,
   ),
