@@ -8,7 +8,7 @@
 import { Db, strList } from '../core/db.ts';
 import { normalise } from '../core/text.ts';
 import type { EndpointResolutionMethod, TracedEndpointResolution } from '../trace/extraction-trace.ts';
-import { canonicalName } from '../identity/names.ts';
+import { canonicalName, isTitleToken } from '../identity/names.ts';
 import type { ChunkRow, EntityKind } from '../lorebook.ts';
 
 /**
@@ -114,6 +114,20 @@ export function findEntityId(db: Db, projectId: number, kind: EntityKind, name: 
 }
 
 /**
+ * The words in a name that identify someone: not the article and not a title.
+ *
+ * "Tom the Barman" and "Tom Riddle" are both a given name plus one identifying
+ * word. Counting raw words would make the second look less diluted, which would
+ * hand every "Tom" to the wrong row.
+ */
+function significantTokens(name: string): string[] {
+  const tokens = canonicalName(name).split(' ').filter(Boolean);
+  const withoutArticle = tokens.filter((token) => token !== 'the' && token !== 'a' && token !== 'an');
+  const withoutTitles = withoutArticle.filter((token) => !isTitleToken(token));
+  return withoutTitles.length ? withoutTitles : withoutArticle.length ? withoutArticle : tokens;
+}
+
+/**
  * Resolve a relationship endpoint against the current project roster.
  *
  * Canonical exact name, then canonical exact stored alias, then the existing
@@ -157,16 +171,58 @@ export function resolveEntityDetailedFromRows(
   if (tokens.length !== 1) return { method: 'none', candidateIds: [] };
   const needle = tokens[0]!;
   if (needle.length < 3) return { method: 'none', candidateIds: [] };
-  const shortHits = rows
-    .filter((row) =>
-      [row.name, ...strList(row.aliases)].some((value) =>
-        canonicalName(value).split(' ').includes(needle),
-      ),
-    )
-    .map((row) => row.id);
-  if (shortHits.length === 1) return { id: shortHits[0], method: 'short-name', candidateIds: shortHits };
-  if (shortHits.length > 1) return { method: 'short-collision', candidateIds: shortHits };
-  return { method: 'none', candidateIds: [] };
+  const shortHits = rows.filter((row) =>
+    [row.name, ...strList(row.aliases)].some((value) =>
+      canonicalName(value).split(' ').includes(needle),
+    ),
+  );
+  if (shortHits.length === 1) {
+    return { id: shortHits[0]!.id, method: 'short-name', candidateIds: [shortHits[0]!.id] };
+  }
+  if (shortHits.length <= 1) return { method: 'none', candidateIds: [] };
+
+  // Several rows carry the word, and not every match is equally good evidence.
+  // Three successive tests, each of which can settle it on its own:
+  //
+  // 1. LEADING. In a name, the given name leads: "Harry" opens "Harry Potter".
+  //    It does not open "Happy Birthday Harry", which is a phrase about him
+  //    rather than a name for him. A single leading row is the reading.
+  // 2. DILUTION. Among the rest, a one-word query is the whole of a two-word
+  //    name and a third of a four-word one. The least diluted row is better
+  //    evidence than a row that merely contains the word.
+  // 3. Otherwise fail closed. "Tom Riddle" and "Tom the Barman" both lead with
+  //    "Tom" and neither is more diluted, and only the text can say which is
+  //    meant.
+  //
+  // Every test is measured on the name alone. What KIND of row it is plays no
+  // part: a person and a place that both carry the word stay ambiguous, because
+  // preferring the person would misread every passage that means the place.
+  const leading = shortHits.filter((row) =>
+    [row.name, ...strList(row.aliases)].some(
+      (value) => canonicalName(value).split(' ')[0] === needle,
+    ),
+  );
+  if (leading.length === 1) {
+    return { id: leading[0]!.id, method: 'short-name', candidateIds: [leading[0]!.id] };
+  }
+
+  const coverage = shortHits.map((row) => ({
+    id: row.id,
+    // Count significant words, not raw words: "Tom the Barman" is as much a
+    // two-word name as "Tom Riddle", and an article must not make one of them
+    // look less diluted than the other.
+    words: Math.min(
+      ...[row.name, ...strList(row.aliases)]
+        .filter((value) => canonicalName(value).split(' ').includes(needle))
+        .map((value) => significantTokens(value).length),
+    ),
+  }));
+  const best = Math.min(...coverage.map((entry) => entry.words));
+  const winners = coverage.filter((entry) => entry.words === best).map((entry) => entry.id);
+  if (winners.length === 1) {
+    return { id: winners[0]!, method: 'short-name', candidateIds: winners };
+  }
+  return { method: 'short-collision', candidateIds: winners };
 }
 
 export function resolveEntityDetailed(
