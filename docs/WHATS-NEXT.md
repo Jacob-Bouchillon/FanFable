@@ -69,6 +69,7 @@ Ollama must be running with `qwen3.5:9b`. One model: the judge and the extractor
 
 ## 5. Traps (each cost real time)
 
+0. **A heading needs a count, and its offset is the heading's own** (fixed 2026-11-13, `48daa43`). Two chunker defects filed 40 of 526 passages under the wrong chapter: a hard-wrapped line opening "the book had screamed" matched the chapter pattern, and a heading that opened a PDF page sat behind a form feed so its offset fell outside its own block. Both are fixed and covered by four tests that fail on the old code; `testing/scripts/repair-chapter-labels.ts` repairs banks written before the fix.
 1. **Reasoning models share their budget with the answer.** Measured on `gpt-oss:20b`, retired 2026-11-13: at 2k–8k tokens it returned 0 characters with `done_reason: length` (29k chars of thinking), `think: false` was silently ignored, and `think: "low"` was the workaround. The model is gone; the lesson is not. Before concluding a model "returned nothing", check `done_reason` and the thinking length.
 2. **Never launch a full run without a one-window smoke.** A 66-window run was wasted on a model tested only with short prompts.
 3. **Killing the shell does not kill the child.** `ps` afterwards — an orphaned extract fought a second run for the GPU for 23 minutes.
