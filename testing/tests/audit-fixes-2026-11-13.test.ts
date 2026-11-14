@@ -6,6 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { once } from 'node:events';
 import { createProject } from '../../fanfable/src/plan/controller.ts';
 import { runNameSweep } from '../../fanfable/src/extract/sweep.ts';
 import { graphContinuityChecks } from '../../fanfable/src/support/graph-checks.ts';
@@ -389,4 +390,36 @@ test('A12: the graph path does not claim the trails command\'s final accounting'
   const cli = readFileSync(resolve(import.meta.dirname, '../../fanfable/src/cli.ts'), 'utf8');
   assert.match(cli, /subject:\s*'budget:trails'/);
   assert.match(cli, /subject:\s*'trails:final'/);
+});
+
+test('C11: /api/issues respects the author\'s severity floor', async () => {
+  const { startServer } = await import('../../fanfable/src/product/server.ts');
+  const continuity = await import('../../fanfable/src/product/continuity.ts');
+  const controller = await import('../../fanfable/src/plan/controller.ts');
+
+  const { db } = tempDb();
+  const project = createProject(db, 'c11');
+  continuity.saveIssues(db, project.id, null, [
+    { severity: 'error', category: 'timeline', message: 'bad order', evidence: '', suggestion: '', resolution: 'open' },
+    { severity: 'warning', category: 'knowledge', message: 'maybe', evidence: '', suggestion: '', resolution: 'open' },
+    { severity: 'note', category: 'canon', message: 'fyi', evidence: '', suggestion: '', resolution: 'open' },
+  ] as never);
+  controller.updateProjectSettings(db, project.id, {
+    continuity: { enabled: true, modelChecks: true, minSeverity: 'error', onDraft: true },
+  });
+
+  const server = startServer({ db, projectId: project.id, port: 0 });
+  await once(server, 'listening');
+  const port = (server.address() as { port: number }).port;
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    const filtered = (await (await fetch(`${base}/api/issues`)).json()) as { issues: { severity: string }[] };
+    assert.deepEqual(filtered.issues.map((i) => i.severity), ['error'], 'only errors pass the floor');
+
+    const all = (await (await fetch(`${base}/api/issues?all=1`)).json()) as { issues: { severity: string }[] };
+    assert.equal(all.issues.length, 3, 'all=1 still shows everything');
+  } finally {
+    await new Promise<void>((res, rej) => server.close((e) => (e ? rej(e) : res())));
+    db.close();
+  }
 });

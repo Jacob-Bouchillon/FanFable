@@ -24,7 +24,7 @@ import * as memory from './memory.ts';
 import * as planner from '../plan/planner.ts';
 import * as continuity from './continuity.ts';
 import { DEFAULT_LLM_SETTINGS, clientFrom, loadGlobalConfig, saveGlobalConfig } from '../core/llm.ts';
-import { DEFAULT_CONTINUITY_SETTINGS, continuitySettings } from './continuity-settings.ts';
+import { DEFAULT_CONTINUITY_SETTINGS, continuitySettings, filterBySeverity } from './continuity-settings.ts';
 import { devGraphSummary } from './dev-summary.ts';
 import { buildWebGraph, buildWebMap, webPersonDossier, webThreadDetail } from './web3d.ts';
 import { loadBookNlp } from './booknlp.ts';
@@ -1239,7 +1239,18 @@ export function startServer(opts: ServerOptions): import('node:http').Server {
         }
         const p = project();
         const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit') ?? 200) || 200));
-        json(res, 200, { issues: continuity.listIssues(db, p.id, { openOnly: url.searchParams.get('all') !== '1' }).slice(0, limit) });
+        const all = url.searchParams.get('all') === '1';
+        // The author's chosen floor is a promise about what they are shown. The
+        // CLI applied it; this route did not, so the UI displayed every note
+        // even with "errors only" selected. `all=1` still shows everything, the
+        // same escape hatch the CLI has.
+        const settings = continuitySettings(p);
+        const listed = all ? { ...settings, minSeverity: 'note' as const } : settings;
+        const issues = filterBySeverity(
+          continuity.listIssues(db, p.id, { openOnly: !all }),
+          listed,
+        ).slice(0, limit);
+        json(res, 200, { issues });
         return;
       }
 

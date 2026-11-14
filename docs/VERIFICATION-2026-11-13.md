@@ -70,12 +70,12 @@ story and canon names they actually mention.
 | B7 | fixed | `identity/names.ts`: `TITLE_TOKENS` is now the single owner, merged from the four lists that used to disagree, with a comment saying so. |
 | B9 / C12 | **LIVE** | ten modules still have zero importers in `fanfable/src` (`veto-bridge`, `character-sweep`, `name-harvest`, `thread-worker`, `combine`, and five identity modules). Whether that is deliberate is still a question for the author. |
 | B12 | fixed | `core/json.ts`: `salvageJsonArray` only starts a candidate at depth 0, so a nested object inside a truncated root can no longer be returned as a whole object. |
-| C7 | **LIVE** | no `realpath`/`lstat` anywhere in `server.ts` or `controller.ts`. The only `realpathSync` in the tree is in `web/meetings.ts` for an unrelated purpose. |
+| C7 | fixed | `meetings.ts`: the temp check accepted the answer if any spelling was under temp, so a symlink in /tmp pointing at a production database passed. When the path exists its real form is now the only one consulted. Verified against a real /tmp → /var/tmp symlink. |
 | D3 | fixed | `sweep.ts` uses `KEEPER_STATUS_SQL` and adds `conflict_status != 'contested'`, with a comment explaining why the check is pair-wide but the pending-note check is kind-specific. |
 | D4 | fixed | no `modality` in `extract/extract-prompts.ts`; the request is gone from the prompt. |
 | D8 | fixed | `recovery.ts`: `deferStage` now requires `owner` — "a deferral expires leases and must prove ownership" — and rejects on stale fencing or non-running status. |
 | D9 | fixed | `court/claim-proof.ts`: `importClaimProofs` skips rows whose outcome is not in `STORED_OUTCOMES` and whose standard does not belong to the claim type. |
-| C11 | partly | the Continuity UI renders the `minSeverity` selector with an "errors only" option, but `filterBySeverity` is imported only by `cli.ts` in this tree. Whether the browser filters on it was not established. |
+| C11 | fixed | `/api/issues` returned every issue regardless of the author's floor; `filterBySeverity` was applied by the CLI but not the route. The route now filters, with `all=1` as the escape hatch, matching the CLI. |
 
 ## Still unverified — 9 findings
 
@@ -104,17 +104,17 @@ Final state of the pass: **all 48 findings examined.**
 
 | verdict | count | findings |
 |---|---|---|
-| fixed and verified | 39 | the 11 HIGH ones included |
+| fixed and verified | 42 | the 11 HIGH ones included |
 | documented as deliberate | 2 | B6, D6 |
-| still live | 3 | B9, C12, C7 |
-| partly addressed | 3 | A12, C11, D11 |
+| still live | 2 | B9, C12 |
+| partly addressed | 1 | D11 |
 | inconclusive | 1 | D10 |
 
 ## Third pass — the last nine
 
 | id | verdict | evidence |
 |---|---|---|
-| A12 | partly | the `lore trails` command does emit a matching `trails:final` summary after its `budget:trails` cutoff (`cli.ts`). The PPR graph emitter in `graph.ts` still emits the cutoff alone. A fix was attempted and reverted: adding a summary there broke the trail count the trace tests assert, so it needs the ordering understood first. |
+| A12 | fixed | the PPR graph path emitted `budget:trails`, a subject the audit treats as the trails command's final accounting, without the `trails:final` summary it requires. It now uses `budget:graph-trails`; its accounting was already carried by the `passages:graph` summary. A first attempt added a second summary instead, which overrode the trails command's and broke a trace assertion. |
 | B8 | fixed | `migrations.ts` now defines `REQUIRED_TABLES` covering every table the schema owns, adds a stale-missing and a stale-column check, and drops the effective version to 1 when base tables are absent. `db.ts` explains why `user_version` and `schema_meta.version` are two fields by design. |
 | C5 | fixed | `starvedWindowScores` reads the same `source_id, seq` order extraction uses, with a comment naming the defect: ordering by `seq` alone interleaves sources whose sequences overlap. |
 | C6 | fixed | `listRelationships` filters `closed = 0`; `currentStates` orders by user source first, then chapter number, then event story order, so re-approving an older chapter no longer makes its states current. |
@@ -135,6 +135,6 @@ Nothing found in three passes would justify a rewrite. Rebuilding the project to
 escape this list would rebuild work that is already done, and throw away the
 1,568 tests that are the reason the fixes could be verified at all.
 
-The live three are narrow: ten modules with no importer (a question about intent,
-not a bug), a filesystem guard on a destructive path, and one trace-accounting
-mismatch on a code path the fixtures do not reach.
+The live two are narrow: ten modules with no importer (a question about intent,
+not a bug) and one finding (C12) that is the same dead-surface question seen from
+the product side.
