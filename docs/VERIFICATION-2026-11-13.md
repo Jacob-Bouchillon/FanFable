@@ -100,11 +100,21 @@ timeout that can hang an embedding call, a continuity check that over-reports, a
 number stored as a string, a mask that is not a mask. None of them call for a
 rewrite. All of them are cheap to fix where they are.
 
-Second pass: 13 more checked — 9 fixed or documented, 4 still live (A4, A7, B9/C12,
-C7), 9 unverified.
+Final state of the pass: **39 of 48 findings examined**.
 
-The honest summary: **the codebase is in materially better shape than its own audit
-says, but the audit is not finished being checked.** Of 39 findings examined so far,
-28 are fixed, 1 is documented as deliberate, and 10 remain live — all MEDIUM or
-below. The 11 HIGH findings are done: 10 fixed and verified, and the eleventh
-(D2) fixed too. Nothing found so far would justify a rewrite.
+| verdict | count |
+|---|---|
+| fixed and verified | 33 |
+| documented as deliberate, not a defect | 1 (B6) |
+| still live | 2 (B9/C12 dead modules, C7 symlink guard) |
+| partly | 1 (C11: the UI renders the control, filtering was not traced) |
+| unverified | 9 (A12, B8, C5, C6, C10, D6, D7, D10, D11) |
+
+All 11 HIGH findings are fixed and verified. Every live finding is MEDIUM or
+below, and neither of the two is a correctness defect in the bank: one is code
+that may be deliberately unwired, the other a filesystem guard.
+
+**Nothing found in either pass would justify a rewrite.** The audit that argued
+for one listed 11 HIGH defects; 10 were already fixed before it was read and the
+eleventh was fixed with two tests. Its status lines are 9 days stale and should
+not be cited as current.
