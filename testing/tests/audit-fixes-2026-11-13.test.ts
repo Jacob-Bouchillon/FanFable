@@ -9,6 +9,7 @@ import { createServer } from 'node:http';
 import { createProject } from '../../fanfable/src/plan/controller.ts';
 import { runNameSweep } from '../../fanfable/src/extract/sweep.ts';
 import { graphContinuityChecks } from '../../fanfable/src/support/graph-checks.ts';
+import * as planner from '../../fanfable/src/plan/planner.ts';
 import { embedTexts } from '../../fanfable/src/support/embeddings.ts';
 import { maskSettingsForOutput } from '../../fanfable/src/product/server.ts';
 import { mockProvider, tempDb } from './helpers.ts';
@@ -206,5 +207,51 @@ test('A9: a note naming a character still pulls that character in', async () => 
     userInstructions: 'keep Mara quiet in this scene',
   });
   assert.ok(named.memoryText.includes('Mara'), 'the named character reaches the context');
+  db.close();
+});
+
+test('A4: a scoped revision does not rewrite chapters outside its scope', async () => {
+  const { db } = tempDb();
+  const project = createProject(db, 'a4-scope');
+  const outline = planner.saveOutline(db, project.id, {
+    premise: 'p',
+    chapters: [
+      { number: 1, title: 'One', goal: 'g1', synopsis: 's1', scenes: [], characters: [], characterArcs: '', notes: '', canonEventIds: [], targetWords: 100 },
+      { number: 2, title: 'Two', goal: 'g2', synopsis: 's2', scenes: [], characters: [], characterArcs: '', notes: '', canonEventIds: [], targetWords: 100 },
+    ],
+  });
+
+  // The model ignores "only revise chapter 2" and rewrites chapter 1 as well.
+  const llm = mockProvider(() => JSON.stringify({
+    chapters: [
+      { number: 1, title: 'HIJACKED', goal: 'evil', synopsis: 'x' },
+      { number: 2, title: 'Two revised', goal: 'g2b', synopsis: 's2b' },
+    ],
+  }));
+  const revised = await planner.reviseOutline(llm, outline, 'make chapter 2 calmer', { chapterNumber: 2 });
+
+  const one = revised.chapters.find((c) => c.number === 1)!;
+  const two = revised.chapters.find((c) => c.number === 2)!;
+  assert.equal(one.title, 'One', 'chapter 1 outside the scope keeps its title');
+  assert.equal(one.goal, 'g1');
+  assert.equal(two.title, 'Two revised', 'chapter 2 in scope is revised');
+  db.close();
+});
+
+test('A4: a canon event id that does not exist is not persisted', () => {
+  const { db } = tempDb();
+  const project = createProject(db, 'a4-canon');
+  // The project has no canon events at all, so every id is unknown.
+  const outline = planner.saveOutline(db, project.id, {
+    premise: 'p',
+    canonRefs: [7],
+    chapters: [{
+      number: 1, title: 'One', goal: 'g', synopsis: 's', scenes: [],
+      characters: [], characterArcs: '', notes: '',
+      canonEventIds: [1, 2], targetWords: 100,
+    }],
+  });
+  assert.deepEqual(outline.canonRefs, [], 'unknown outline canon refs dropped');
+  assert.deepEqual(outline.chapters[0]!.canonEventIds, [], 'unknown chapter canon ids dropped');
   db.close();
 });

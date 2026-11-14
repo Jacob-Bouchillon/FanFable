@@ -111,6 +111,21 @@ export function saveOutline(
   },
 ): Outline {
   const ts = nowIso();
+  // A canon event id is a foreign reference into the bank. The draft path
+  // already checks the ids against the index the model was shown; the revision
+  // path did not, so a revised outline could persist references to events that
+  // do not exist. Both paths go through here, so the check lives here.
+  const existing = new Set(
+    db.all<{ id: number }>('SELECT id FROM canon_event WHERE project_id = ?', projectId).map((r) => r.id),
+  );
+  const keep = (ids: number[] | undefined): number[] =>
+    (ids ?? []).filter((id) => Number.isFinite(id) && existing.has(Number(id)));
+  const canonRefs = keep(data.canonRefs);
+  const chapters = (data.chapters ?? []).map((chapter) => ({
+    ...chapter,
+    canonEventIds: keep(chapter.canonEventIds),
+    scenes: (chapter.scenes ?? []).map((scene) => ({ ...scene, canonEventIds: keep(scene.canonEventIds) })),
+  }));
   const maxV = db.get<{ v: number }>(
     'SELECT COALESCE(MAX(version), 0) AS v FROM outline WHERE project_id = ?',
     projectId,
@@ -125,9 +140,9 @@ export function saveOutline(
     data.premise ?? '',
     data.divergence ?? '',
     data.divergenceRef ?? '',
-    toJson(data.canonRefs ?? []),
+    toJson(canonRefs),
     toJson(data.structure ?? []),
-    toJson(data.chapters ?? []),
+    toJson(chapters),
     toJson(data.preferences ?? {}),
     ts,
     ts,
@@ -394,11 +409,18 @@ export async function reviseOutline(
 
   // Merge: only chapters the model returned replace the old ones; everything
   // else (including approved chapters the author did not ask to change) stays.
+  //
+  // A scoped revision must not edit outside its scope. Asking for chapter 2 did
+  // not stop a model from also returning chapter 1, and the merge would then
+  // replace the approved chapter 1 with whatever the model invented for it.
+  const inScope = opts.chapterNumber === undefined
+    ? revisedChapters
+    : revisedChapters.filter((c) => c.number === opts.chapterNumber);
   const merged = outline.chapters.map((old) => {
-    const next = revisedChapters.find((c) => c.number === old.number);
+    const next = inScope.find((c) => c.number === old.number);
     return next ?? old;
   });
-  for (const next of revisedChapters) {
+  for (const next of inScope) {
     if (!merged.some((c) => c.number === next.number)) merged.push(next);
   }
   merged.sort((a, b) => a.number - b.number);

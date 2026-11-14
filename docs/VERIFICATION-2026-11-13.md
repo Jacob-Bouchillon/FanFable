@@ -63,7 +63,7 @@ story and canon names they actually mention.
 
 | id | verdict | evidence |
 |---|---|---|
-| A4 | **LIVE** | `planner.ts`: the merge replaces an existing chapter whenever the model returns its number, so a revision of chapter 2 that also returns chapter 1 does replace it. `canonEventIds` is still `(…).map(Number)` with no lookup against the canon table. |
+| A4 | fixed | `planner.ts`: `reviseOutline` now drops returned chapters outside `chapterNumber`, and `saveOutline` filters every canon id against `canon_event`. Two regression tests, both verified to fail against the previous code. |
 | A7 | **LIVE** | `lore-diagnostics.ts`: facts store `String(fact.quote)` unverified, and `source_refs` is hardcoded to `window[0]` even when the quote came from a later passage. `knowledge` is still returned as 0. |
 | A11 | fixed | `lore.ts`: an existing `(project, source, chunk, title)` row is counted as `duplicates` and skipped before insert. |
 | B6 | not a defect | the two normalisers still differ, but `gates.ts` now states why: `proofNormalise` feeds promotion and keeps punctuation, `core/text.normalise` feeds fingerprints. The deliberate separation is documented at the definition. |
