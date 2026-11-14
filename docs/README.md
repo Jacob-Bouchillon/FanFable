@@ -17,6 +17,7 @@
 | `WHATS-NEXT.md` | ranked next steps, the classifier track, the broader roadmap, commands, and the traps |
 | `RESEARCH.md` | the complete research record: methods, measurements, intake, judgments |
 | `BENCHMARK.md` | the locked 20-pair probe that grades future extractors — read before changing extraction |
+| `CALIBRATION.md` | the published confidence table, and why the score does not currently order rows |
 | `REPORTS.md` | every dated measurement report in one file, in date order |
 | `REQUIREMENTS.md` | what FanFable needs to run |
 | `../README.md` | what FanFable is, and how to install and run it |
