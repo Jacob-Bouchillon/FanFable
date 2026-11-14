@@ -22,6 +22,7 @@ const model = flag('model') ?? 'qwen3.5:9b';
 const limit = Number(flag('limit') ?? 20) || 20;
 const write = args.includes('--write');
 const verify = args.includes('--verify');
+const clusterFilter = flag('cluster') === undefined ? undefined : Number(flag('cluster'));
 if (!dbPath || !projectName) {
   console.error('usage: resolve-nominal-clusters.ts --db <path> --project <name> [--limit n] [--write]');
   process.exit(2);
@@ -35,16 +36,63 @@ const clusters = db.prepare(
   `SELECT cluster_id, COUNT(*) n, SUM(CASE WHEN kind = 'NOM' THEN 1 ELSE 0 END) nominal
      FROM canon_mention
     WHERE project_id = ? AND entity_id IS NULL AND cluster_id IS NOT NULL
+      ${clusterFilter === undefined ? '' : 'AND cluster_id = ?'}
     GROUP BY cluster_id
    HAVING nominal = COUNT(*)
     ORDER BY n DESC
     LIMIT ?`,
-).all(project.id, limit) as Array<{ cluster_id: number; n: number }>;
+).all(...[project.id, ...(clusterFilter === undefined ? [] : [clusterFilter]), limit]) as Array<{ cluster_id: number; n: number }>;
 
 let linked = 0;
 let unknown = 0;
 let rejected = 0;
+let unverified = 0;
 const rows: string[] = [];
+
+type Verdict = 'yes' | 'no' | 'unverified';
+/** One reasoning yes/no, with a retry when the reply came back empty. */
+const verifyLink = async (surfaceForms: string[], name: string, passage: string): Promise<Verdict> => {
+  // The "answer only YES or NO" instruction belongs in the system prompt only:
+  // repeated in the user turn it makes the model deliberate until the budget.
+  const question = `Does the description ${JSON.stringify(surfaceForms.join(' / '))} refer to ${name} in this passage?`;
+  const askOnce = async (budget: number): Promise<string> => {
+    const response = await fetch(`${baseUrl}/api/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        stream: false,
+        think: true,
+        options: { temperature: 0, seed: 42, num_ctx: 4096, num_predict: budget },
+        messages: [
+          {
+            role: 'system',
+            content: 'Check one reference against one passage. Use only the passage. '
+              + 'Decide quickly and do not deliberate beyond one short paragraph. Then answer YES or NO.',
+          },
+          { role: 'user', content: `${question}\n\nPASSAGE:\n${passage}` },
+        ],
+      }),
+    });
+    const data = await response.json() as { message?: { content?: string }; error?: string };
+    if (data.error) throw new Error(data.error);
+    return String(data.message?.content ?? '').trim().toUpperCase();
+  };
+  try {
+    // A verbose deliberation can consume the whole budget and return no
+    // content, so the prompt caps it. An empty reply is retried once.
+    let answer = await askOnce(4096);
+    if (!answer) answer = await askOnce(4096);
+    if (!answer) return 'unverified';
+    // The model sometimes reasons in the content before the verdict; the last
+    // standalone YES/NO is the answer it settled on.
+    const verdicts = [...answer.matchAll(/\b(YES|NO)\b/g)].map((match) => match[1]);
+    if (!verdicts.length) return 'unverified';
+    return verdicts[verdicts.length - 1] === 'YES' ? 'yes' : 'no';
+  } catch {
+    return 'unverified';
+  }
+};
 for (const cluster of clusters) {
   const clusterId = Number(cluster.cluster_id);
   const mentions = db.prepare(
@@ -157,36 +205,16 @@ for (const cluster of clusters) {
   // Verification: a second, reasoning answer. The same model that chose can be
   // wrong; asked directly, with the sentence in front of it, it corrects.
   if (verify) {
-    // JSON mode and thinking conflict in this model: the reasoning consumes the
-    // budget and no JSON is emitted. Ask for one word instead.
-    const question = `Does the description ${JSON.stringify(surfaces.join(' / '))} refer to ${entity.name} in this passage? `
-      + 'Answer only YES or NO, using the passage alone.';
-    try {
-      const response = await fetch(`${baseUrl}/api/chat`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          model,
-          stream: false,
-          think: true,
-          options: { temperature: 0, seed: 42, num_ctx: 4096, num_predict: 1024 },
-          messages: [
-            { role: 'system', content: 'You check a reference against one passage. Use only the passage.' },
-            { role: 'user', content: `${question}\n\nPASSAGE:\n${scene.map((row) => row.text).join('\n\n')}` },
-          ],
-        }),
-      });
-      const data = await response.json() as { message?: { content?: string }; error?: string };
-      const answerText = String(data.message?.content ?? '').trim().toUpperCase();
-      if (!answerText.startsWith('YES')) {
-        rejected++;
-        rows.push(`${clusterId}: ${JSON.stringify(surfaces)} -> ${entity.name} rejected by verification (${answerText.slice(0, 40)})`);
-        console.log(`${clusterId}: ${JSON.stringify(surfaces)} -> ${entity.name} rejected by verification`);
-        continue;
-      }
-    } catch (error) {
+    const verdict = await verifyLink(surfaces, entity.name, scene.map((row) => row.text).join('\n\n'));
+    if (verdict === 'no') {
       rejected++;
-      rows.push(`${clusterId}: ${JSON.stringify(surfaces)} -> ${entity.name} unverified (${error instanceof Error ? error.message : String(error)})`);
+      rows.push(`${clusterId}: ${JSON.stringify(surfaces)} -> ${entity.name} rejected by verification (NO)`);
+      console.log(`${clusterId}: ${JSON.stringify(surfaces)} -> ${entity.name} rejected by verification`);
+      continue;
+    }
+    if (verdict === 'unverified') {
+      unverified++;
+      rows.push(`${clusterId}: ${JSON.stringify(surfaces)} -> ${entity.name} unverified (empty reply twice)`);
       console.log(`${clusterId}: ${JSON.stringify(surfaces)} -> ${entity.name} unverified`);
       continue;
     }
@@ -195,10 +223,10 @@ for (const cluster of clusters) {
   rows.push(`${clusterId}: ${JSON.stringify(surfaces)} -> ${entity.name} (${reason})`);
   console.log(`${clusterId}: ${JSON.stringify(surfaces)} -> ${entity.name}`);
   if (write) {
-    db.prepare('UPDATE canon_mention SET entity_id = ? WHERE project_id = ? AND cluster_id = ? AND entity_id IS NULL')
+    db.prepare("UPDATE canon_mention SET entity_id = ?, method = 'nominal-cluster' WHERE project_id = ? AND cluster_id = ? AND entity_id IS NULL")
       .run(entity.id, project.id, clusterId);
   }
 }
 
-console.log(`${clusters.length} nominal clusters · ${linked} linked · ${unknown} unknown · ${rejected} rejected by verification${write ? '' : ' (dry run)'}`);
+console.log(`${clusters.length} nominal clusters · ${linked} linked · ${unknown} unknown · ${rejected} rejected by verification · ${unverified} unverified${write ? '' : ' (dry run)'}`);
 for (const row of rows) console.log('  ' + row);
