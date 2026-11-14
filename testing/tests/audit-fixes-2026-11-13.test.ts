@@ -255,3 +255,50 @@ test('A4: a canon event id that does not exist is not persisted', () => {
   assert.deepEqual(outline.chapters[0]!.canonEventIds, [], 'unknown chapter canon ids dropped');
   db.close();
 });
+
+test('A7: a fact quote is resolved to its real passage, or the fact is dropped', async () => {
+  const { db } = tempDb();
+  const project = createProject(db, 'a7');
+  const sourceId = Number(db.run(
+    'INSERT INTO canon_source (project_id, path, title, sha256, imported_at) VALUES (?, ?, ?, ?, ?)',
+    project.id, '/a7', 'Probe', 'sha-a7', AT,
+  ).lastInsertRowid);
+  // Two passages in the same window, so "which one did the quote come from"
+  // is answerable and the old hardcoded window[0] is wrong for the second.
+  const first = Number(db.run(
+    `INSERT INTO canon_chunk (source_id, project_id, seq, locator, heading, text, words)
+     VALUES (?, ?, 1, 'p. 1', '', 'Asha waited by the river.', 6)`,
+    sourceId, project.id,
+  ).lastInsertRowid);
+  db.run(
+    `INSERT INTO canon_chunk (source_id, project_id, seq, locator, heading, text, words)
+     VALUES (?, ?, 2, 'p. 2', '', 'Asha watched the mill burn on the third night.', 9)`,
+    sourceId, project.id,
+  );
+  const asha = Number(db.run(
+    'INSERT INTO canon_entity (project_id, kind, name, aliases, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+    project.id, 'character', 'Asha', '[]', AT, AT,
+  ).lastInsertRowid);
+
+  const loreDiag = await import('../../fanfable/src/answer/lore-diagnostics.ts');
+  const llm = mockProvider(() => JSON.stringify({
+    relations: [],
+    facts: [
+      { statement: 'the mill burned', topic: 'mill', quote: 'the mill burn on the third night' },
+      { statement: 'a fabricated claim', topic: 'x', quote: 'Asha was crowned in the summer palace.' },
+    ],
+  }));
+
+  const result = await loreDiag.enrichEntity(db, llm, project.id, 'Asha', { maxPassages: 8 });
+  assert.equal(result.facts, 1, 'only the quotable fact is banked');
+
+  const row = db.get<{ statement: string; source_refs: string }>(
+    'SELECT statement, source_refs FROM canon_fact WHERE project_id = ?',
+    project.id,
+  )!;
+  assert.equal(row.statement, 'the mill burned');
+  const refs = JSON.parse(row.source_refs) as { locator: string }[];
+  assert.equal(refs[0]?.locator, 'p. 2', 'the reference points at the passage the quote came from, not the first one');
+  void first; void asha;
+  db.close();
+});

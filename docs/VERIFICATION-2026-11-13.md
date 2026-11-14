@@ -64,7 +64,7 @@ story and canon names they actually mention.
 | id | verdict | evidence |
 |---|---|---|
 | A4 | fixed | `planner.ts`: `reviseOutline` now drops returned chapters outside `chapterNumber`, and `saveOutline` filters every canon id against `canon_event`. Two regression tests, both verified to fail against the previous code. |
-| A7 | **LIVE** | `lore-diagnostics.ts`: facts store `String(fact.quote)` unverified, and `source_refs` is hardcoded to `window[0]` even when the quote came from a later passage. `knowledge` is still returned as 0. |
+| A7 | fixed | `lore-diagnostics.ts`: a fact's quote is now resolved to the passage containing it, exactly as a relation's is. A fact whose quote appears nowhere is dropped and counted rather than banked; a quote from passage 2 is filed against passage 2. Regression test verified against the old code. The dead `knowledge` field is **still open** — the prompt asks for it and nothing consumes it. |
 | A11 | fixed | `lore.ts`: an existing `(project, source, chunk, title)` row is counted as `duplicates` and skipped before insert. |
 | B6 | not a defect | the two normalisers still differ, but `gates.ts` now states why: `proofNormalise` feeds promotion and keeps punctuation, `core/text.normalise` feeds fingerprints. The deliberate separation is documented at the definition. |
 | B7 | fixed | `identity/names.ts`: `TITLE_TOKENS` is now the single owner, merged from the four lists that used to disagree, with a comment saying so. |
@@ -105,6 +105,6 @@ C7), 9 unverified.
 
 The honest summary: **the codebase is in materially better shape than its own audit
 says, but the audit is not finished being checked.** Of 39 findings examined so far,
-27 are fixed, 1 is documented as deliberate, and 10 remain live — all MEDIUM or
+28 are fixed, 1 is documented as deliberate, and 10 remain live — all MEDIUM or
 below. The 11 HIGH findings are done: 10 fixed and verified, and the eleventh
 (D2) fixed too. Nothing found so far would justify a rewrite.

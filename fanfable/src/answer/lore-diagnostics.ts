@@ -597,6 +597,20 @@ export async function enrichEntity(
         statement,
       );
       if (dup) continue;
+      // A fact's quote is resolved to the passage that actually contains it,
+      // exactly as a relation's is. The old code stored the model's quote
+      // unchecked and always pointed at the window's first passage, so a quote
+      // taken from passage 3 was filed against passage 1 — and a quote that
+      // appears nowhere was banked as though the book said it.
+      const quote = String(fact.quote ?? '').trim();
+      const normalizeFact = (text: string): string => (text ?? '').toLowerCase().replace(/\s+/g, ' ').trim();
+      const factPassage = quote
+        ? window.find((passage) => normalizeFact(passage.text).includes(normalizeFact(quote)))
+        : undefined;
+      if (quote && !factPassage) {
+        dropped['fact-no-ref'] = (dropped['fact-no-ref'] ?? 0) + 1;
+        continue;
+      }
       // canon_fact.review_status is advisory: facts are context, never proof of
       // a claim, and there is no promotion path by design.
       db.run(
@@ -608,8 +622,10 @@ export async function enrichEntity(
         statement,
         entity.name,
         entity.id,
-        String(fact.quote ?? '').trim(),
-        toJson([{ source: window[0].source_title, locator: window[0].locator }]),
+        quote,
+        toJson(factPassage
+          ? [{ source: factPassage.source_title, locator: factPassage.locator, chunk: factPassage.id }]
+          : []),
         0.6,
         nowIso(),
       );
