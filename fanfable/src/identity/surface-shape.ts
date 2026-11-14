@@ -1,6 +1,10 @@
 /**
  * Surface-shape classification.
  *
+ * NOT WIRED. No production module imports this file; it is exercised by tests
+ * and by the trial scripts noted here, and nothing in the running product
+ * reaches it. Read it as a built-and-tested candidate, not as live behaviour.
+ *
  * The failure this fixes: a word that only ever appears inside a capitalised
  * enumeration ("Tawny, Screech, Barn, Brown, and Snowy") was banked as an
  * individual creature. The shape of the text says otherwise: a list member

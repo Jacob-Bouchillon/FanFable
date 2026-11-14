@@ -68,7 +68,7 @@ story and canon names they actually mention.
 | A11 | fixed | `lore.ts`: an existing `(project, source, chunk, title)` row is counted as `duplicates` and skipped before insert. |
 | B6 | not a defect | the two normalisers still differ, but `gates.ts` now states why: `proofNormalise` feeds promotion and keeps punctuation, `core/text.normalise` feeds fingerprints. The deliberate separation is documented at the definition. |
 | B7 | fixed | `identity/names.ts`: `TITLE_TOKENS` is now the single owner, merged from the four lists that used to disagree, with a comment saying so. |
-| B9 / C12 | **LIVE** | ten modules still have zero importers in `fanfable/src` (`veto-bridge`, `character-sweep`, `name-harvest`, `thread-worker`, `combine`, and five identity modules). Whether that is deliberate is still a question for the author. |
+| B9 | fixed (marked, not deleted) | the ten unwired modules are not deleted — that is the author's call — but each now opens with a NOT WIRED paragraph saying nothing in the product reaches it. `veto-bridge.ts` no longer describes a call path as if it were live. Its latent defect is also fixed: null-chunk notes shared one bucket instead of each counting as independent support, so three 0.4 notes now score 0.4, not 0.784. |
 | B12 | fixed | `core/json.ts`: `salvageJsonArray` only starts a candidate at depth 0, so a nested object inside a truncated root can no longer be returned as a whole object. |
 | C7 | fixed | `meetings.ts`: the temp check accepted the answer if any spelling was under temp, so a symlink in /tmp pointing at a production database passed. When the path exists its real form is now the only one consulted. Verified against a real /tmp → /var/tmp symlink. |
 | D3 | fixed | `sweep.ts` uses `KEEPER_STATUS_SQL` and adds `conflict_status != 'contested'`, with a comment explaining why the check is pair-wide but the pending-note check is kind-specific. |
@@ -104,11 +104,11 @@ Final state of the pass: **all 48 findings examined.**
 
 | verdict | count | findings |
 |---|---|---|
-| fixed and verified | 42 | the 11 HIGH ones included |
+| fixed and verified | 45 | the 11 HIGH ones included |
 | documented as deliberate | 2 | B6, D6 |
-| still live | 2 | B9, C12 |
-| partly addressed | 1 | D11 |
-| inconclusive | 1 | D10 |
+| still live | 1 | C12 (see B9) |
+| partly addressed | 0 | — |
+| inconclusive | 0 | — |
 
 ## Third pass — the last nine
 
@@ -121,8 +121,8 @@ Final state of the pass: **all 48 findings examined.**
 | C10 | fixed | this session — see the commit. A stopword and sentence-opener test replaces the bare capitalised-word match. |
 | D6 | documented | `transitionClaim` is adopted by `lorebook.ts` and by nothing else; the architecture test enforces exactly that and keeps the legacy writers as named grandfathers with exact counts. The owner is live, not dead. |
 | D7 | fixed | `court/ruling.ts`: the docket computes `objections` from pending tie notes for the pair and kind, and `open_ends` scoped to the thread or the pair. Neither is a constant zero. |
-| D10 | inconclusive | `recovery.ts` still has three unguarded `JSON.parse` sites. Whether a wrong-shape-but-valid payload throws there was not traced. |
-| D11 | partly | `snapshotRoster` now dedupes by fingerprint and is called for its fingerprint on two paths instead of being discarded, but whether two incompatible stored formats still share the table was not confirmed. |
+| D10 | fixed | all three `recovery.ts` parse sites are guarded, and the roster one validates `Array.isArray` on both fields. No `JSON.parse` remains in `court/`. |
+| D11 | fixed | one writer (`INSERT OR IGNORE` in `recovery.ts`) behind a unique `(project_id, fingerprint)` index, one reader, and the fingerprint is taken over the canonical JSON. `snapshotRoster` is used for `stageFingerprint` rather than discarded. |
 
 ## What this changes
 
@@ -135,6 +135,6 @@ Nothing found in three passes would justify a rewrite. Rebuilding the project to
 escape this list would rebuild work that is already done, and throw away the
 1,568 tests that are the reason the fixes could be verified at all.
 
-The live two are narrow: ten modules with no importer (a question about intent,
-not a bug) and one finding (C12) that is the same dead-surface question seen from
-the product side.
+One finding (C12) remains open because it is not a code fix: it asks what the
+product surface should expose. The ten unwired modules are now marked rather than
+deleted, so the next reader cannot mistake them for live behaviour.

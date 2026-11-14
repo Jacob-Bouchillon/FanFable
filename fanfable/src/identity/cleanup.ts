@@ -1,6 +1,10 @@
 /**
  * General identity-cleanup rules.
  *
+ * NOT WIRED. No production module imports this file; it is exercised by tests
+ * and by the trial scripts noted here, and nothing in the running product
+ * reaches it. Read it as a built-and-tested candidate, not as live behaviour.
+ *
  * Every decision is derived from the bank and the source text: edit distance,
  * occurrence counts, dialogue context, ownership constructions and plurality.
  * No book-specific name lists live here.

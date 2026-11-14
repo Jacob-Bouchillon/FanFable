@@ -1,6 +1,10 @@
 /**
  * Character sweep: the web walking one character through the whole book.
  *
+ * NOT WIRED. No production module imports this file; it is exercised by tests
+ * and by the trial scripts noted here, and nothing in the running product
+ * reaches it. Read it as a built-and-tested candidate, not as live behaviour.
+ *
  * Planning and validation are read-only. applySweep inserts needs_review
  * relations and one character-sweep ruling per accepted tie.
  */

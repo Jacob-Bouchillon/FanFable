@@ -1,9 +1,16 @@
 /**
- * The veto call path: product -> bench-venv verifier, one batch per process.
+ * The veto bridge: an intended product -> bench-venv verifier call, one batch
+ * per process.
  *
- * The model is not imported into the product. A child process loads the
- * pinned checkpoint (repo branch feature/relation-verifier @ ff4ae39), scores
- * the batch, and exits. CPU only: the CUDA path raises a device-side assert
+ * NOT WIRED. No production module imports this file; it is exercised by tests
+ * and by the trial scripts noted here, and nothing in the running product
+ * reaches it. Read it as a built-and-tested candidate, not as live behaviour.
+ * The call path below describes what the bridge WOULD do, not what the product
+ * does today.
+ *
+ * The design keeps the model out of the product. A child process would load the
+ * pinned checkpoint (repo branch feature/relation-verifier @ ff4ae39), score
+ * the batch, and exit. CPU only: the CUDA path raises a device-side assert
  * (recorded in testing/trials/valve-bench/manifest.json).
  *
  * Removing this module, or setting `FANFABLE_VETO=off`, leaves the pipeline

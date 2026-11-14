@@ -423,3 +423,16 @@ test('C11: /api/issues respects the author\'s severity floor', async () => {
     db.close();
   }
 });
+
+test('B9: notes that cite no passage do not each count as independent support', async () => {
+  const { combineScore } = await import('../../fanfable/src/core/combine.ts');
+  const note = (strength: number, dedupeKey: string) => ({
+    strength, chunkId: null, dedupeKey, assessed: true, isContext: false, pairsCited: 1,
+  }) as never;
+
+  // Three unproven 0.4 notes used to score 1 - 0.6^3 = 0.784 and clear a 0.7
+  // bar. None can show it sits in a different passage, so they are one share.
+  const out = combineScore([note(0.4, 'a'), note(0.4, 'b'), note(0.4, 'c')]);
+  assert.ok(out.score < 0.7, `unproven notes must not clear the bar (got ${out.score})`);
+  assert.equal(out.independent, 1, 'they count as one share');
+});

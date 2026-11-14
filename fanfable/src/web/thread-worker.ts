@@ -1,6 +1,10 @@
 /**
  * The web's own note worker.
  *
+ * NOT WIRED. No production module imports this file; it is exercised by tests
+ * and by the trial scripts noted here, and nothing in the running product
+ * reaches it. Read it as a built-and-tested candidate, not as live behaviour.
+ *
  * Planning and retrieval are read-only; applying notes writes through the same
  * canon_thread_note shape the extraction path uses. No model calls live here.
  */

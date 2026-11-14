@@ -1,6 +1,10 @@
 /**
  * Deterministic alias-group proposals.
  *
+ * NOT WIRED. No production module imports this file; it is exercised by tests
+ * and by the trial scripts noted here, and nothing in the running product
+ * reaches it. Read it as a built-and-tested candidate, not as live behaviour.
+ *
  * Read-only: this module only reads names and aliases and returns groups that
  * two conservative rules would merge. It never writes, canonicalises or asks a
  * model.

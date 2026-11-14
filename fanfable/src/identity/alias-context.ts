@@ -1,6 +1,10 @@
 /**
  * Context alias resolution: candidates and verdict validation.
  *
+ * NOT WIRED. No production module imports this file; it is exercised by tests
+ * and by the trial scripts noted here, and nothing in the running product
+ * reaches it. Read it as a built-and-tested candidate, not as live behaviour.
+ *
  * Pure functions only. The caller supplies character entities and chunk texts;
  * this module never reads a database and never calls a model.
  */

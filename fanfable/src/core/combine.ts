@@ -1,6 +1,10 @@
 /**
  * Weak clues adding up: `score = 1 − Π(1 − sᵢ)` over separate clues.
  *
+ * NOT WIRED. No production module imports this file; it is exercised by tests
+ * and by the trial scripts noted here, and nothing in the running product
+ * reaches it. Read it as a built-and-tested candidate, not as live behaviour.
+ *
  * One loud passage is not the only way a tie gets proven. Three quiet
  * passages, each too weak to bank on its own, can add up past the author's
  * bar — provided each one stands on its own. That last part is the whole job
@@ -100,12 +104,16 @@ export function combineScore(notes: WeakNote[]): CombinedScore {
       byClue.set(key, note);
     }
   }
-  // One share per passage: the strongest clue citing it wins. A note citing
-  // no passage cannot prove it shares one, so each stands on its own.
-  let unchunked = 0;
+  // One share per passage: the strongest clue citing it wins.
+  //
+  // A note citing no passage cannot prove it stands on a different one, so all
+  // such notes share a single bucket and the strongest of them speaks for the
+  // group. Giving each its own bucket let three 0.4 unproven notes score 0.784
+  // and clear a 0.7 bar, which is exactly the "one share per passage" rule
+  // failing in the direction that manufactures support.
   const byChunk = new Map<string, WeakNote>();
   const consider = (note: WeakNote): void => {
-    const key = note.chunkId === null ? `none:${unchunked++}` : `chunk:${note.chunkId}`;
+    const key = note.chunkId === null ? 'chunk:none' : `chunk:${note.chunkId}`;
     const prev = byChunk.get(key);
     if (prev === undefined || clampShare(note.strength) > clampShare(prev.strength)) {
       byChunk.set(key, note);

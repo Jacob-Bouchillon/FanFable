@@ -1,6 +1,10 @@
 /**
  * Name-cluster mapping for reader outputs: cluster names in, bank persons out.
  *
+ * NOT WIRED. No production module imports this file; it is exercised by tests
+ * and by the trial scripts noted here, and nothing in the running product
+ * reaches it. Read it as a built-and-tested candidate, not as live behaviour.
+ *
  * A reader groups mentions into clusters ("Lah", "Captain Lah"); the bank
  * holds roster persons. This bridge walks each cluster's names through the
  * bank's own identity rules — exact stored name, then stored alias (every
