@@ -4,8 +4,10 @@
 
 ## 1. Now: the judge fix (in order)
 
-1. **One prompt variant** on the same 42 rows, same model (`gpt-oss:20b`, `think: "low"`): two names for one person are not a relationship; a family title used in the passage establishes what it names. Must move: the 2 alias false positives (`Plagueis — partner — "The Muun"`, `Palpatine — colleague of — Sidious`) and most of the 6 title misses (`Aunt Petunia`/Harry twice, `Uncle Vernon`/Harry, `Uncle Vernon`+`Aunt Petunia` together, `Dudley`/`Uncle Vernon`, `Great Auntie Enid`/`Great Uncle Algie` — every establishment miss is a title). Track separately, not decisive: the 1 reinforces miss (partnership talked *about* rather than restated) and the genitive FP (`Larsh Hill`, "son of Damask's officer" — wrong-noun attachment, no identity rule fixes it). Zero regressions on rows already correct.
-2. **Stability:** majority of three runs of the winner (6 of 42 flip = 14% noise floor).
+0. **Re-establish the baseline first.** The judge model moved from `gpt-oss:20b` to `qwen3.5:9b` on 2026-11-13, so the quoted 0.83 / 0.68 is a figure for a retired model. Run the current prompt unchanged over the same 42 rows on the new judge and record that number: it is what step 1 has to beat, and without it a variant has nothing honest to be compared against. Re-measure the identical-run flip rate at the same time.
+
+1. **One prompt variant** on the same 42 rows, same model (`qwen3.5:9b`): two names for one person are not a relationship; a family title used in the passage establishes what it names. Must move: the 2 alias false positives (`Plagueis — partner — "The Muun"`, `Palpatine — colleague of — Sidious`) and most of the 6 title misses (`Aunt Petunia`/Harry twice, `Uncle Vernon`/Harry, `Uncle Vernon`+`Aunt Petunia` together, `Dudley`/`Uncle Vernon`, `Great Auntie Enid`/`Great Uncle Algie` — every establishment miss is a title). Track separately, not decisive: the 1 reinforces miss (partnership talked *about* rather than restated) and the genitive FP (`Larsh Hill`, "son of Damask's officer" — wrong-noun attachment, no identity rule fixes it). Zero regressions on rows already correct.
+2. **Stability:** majority of three runs of the winner. Use the flip rate measured in step 0 for `qwen3.5:9b` as the noise floor; the 6-of-42 figure belongs to the retired judge.
 3. **Apply the winner** to candidate pairs — the actual deliverable.
 4. **Re-label a random sample of a whole book**, storing the relation id on *every* row (the 226-row key kept it for 42 only — that loss must not repeat), so accuracy is known beyond these 42 hard cases. Label defects to brief the labellers on: 4 past "unclear" verdicts reasoned from outside knowledge against instructions, and 2 rows matching invoice-"bill" to a character named Bill.
 
@@ -61,11 +63,11 @@ lore notes --prioritise; lore promote --dry-run; lore promote --find-evidence --
 lore rulings export --out <path>; lore rulings replay --in <path> --dry-run
 ```
 
-Ollama must be running with `qwen3.5:9b` and `gpt-oss:20b`. Trial data stays local by `.gitignore`; code, tests and docs commit, run output doesn't.
+Ollama must be running with `qwen3.5:9b`. One model: the judge and the extractor are the same weights, which also removes the two-model residency the older judge needed. Trial data stays local by `.gitignore`; code, tests and docs commit, run output doesn't.
 
 ## 5. Traps (each cost real time)
 
-1. **Reasoning models share their budget with the answer.** `gpt-oss:20b` at 2k–8k tokens returned 0 characters with `done_reason: length` (29k chars of thinking). Check `done_reason` + thinking length before concluding a model "returned nothing." `think: false` is silently ignored; `think: "low"` works.
+1. **Reasoning models share their budget with the answer.** Measured on `gpt-oss:20b`, retired 2026-11-13: at 2k–8k tokens it returned 0 characters with `done_reason: length` (29k chars of thinking), `think: false` was silently ignored, and `think: "low"` was the workaround. The model is gone; the lesson is not. Before concluding a model "returned nothing", check `done_reason` and the thinking length.
 2. **Never launch a full run without a one-window smoke.** A 66-window run was wasted on a model tested only with short prompts.
 3. **Killing the shell does not kill the child.** `ps` afterwards — an orphaned extract fought a second run for the GPU for 23 minutes.
 4. **Labels are a hypothesis.** Five "false positives" were correct under re-read labels. Score against re-reads, not first passes.

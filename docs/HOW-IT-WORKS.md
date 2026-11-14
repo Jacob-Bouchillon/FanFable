@@ -177,7 +177,7 @@ Relation, hint, note and event IDs are recorded at decision time. Later kinship 
 | no-relation control (ARF) | 50 negative chunks → 2 proposals (4%); 50 positive → 42% recall |
 | 30-row blind adjudication | 7 supported (23%), 23 context; mechanism: action verbs + coordinated lists; zero false facts (pairs real, evidence not) |
 | reader (10 priority windows ×9 models) | `qwen3.5:9b` Q4 only repeatable producer (~1 guard-eligible keeper/10 windows); Q4 is the quantization floor; NuExtract strict matched it once inside 4× rows |
-| judge (42 blind rows) | 0.83 precision / 0.68 recall counting reinforcement; 14% run-to-run flip |
+| judge (42 blind rows, `gpt-oss:20b`, retired 2026-11-13) | 0.83 precision / 0.68 recall counting reinforcement; 14% run-to-run flip. Re-measure on `qwen3.5:9b` before comparing |
 | bank (trial book) | 164 relations: 23 user_confirmed, 1 accepted, 122 provisional, 18 needs_review; queue 258 notes; 392 canon events |
 | extraction (9B, partial 31/66 windows) | 91 relations, 48 facts |
 

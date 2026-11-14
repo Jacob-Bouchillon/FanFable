@@ -6,7 +6,7 @@
 
 **What's next:** one prompt variant fixing identity + titles, measured on the same 42 rows; then majority-of-three stability; then apply the winner to candidate pairs. Longer track: recall (classifier E0–E4), bank re-measurement at threshold, canon-aware planner, second book. Full ranked list in `WHATS-NEXT.md`.
 
-**The trap that cost three hours:** `gpt-oss:20b` spends the output budget thinking and returns empty with `done_reason: length`. `think: false` is silently ignored by this Ollama build; `think: "low"` works. Always smoke-test one window before any full run, and `ps` after killing a run — orphaned processes compete for the GPU.
+**The trap that cost three hours:** a reasoning model spends the output budget thinking and returns empty with `done_reason: length` — measured on `gpt-oss:20b`, retired 2026-11-13 as the judge. Check `done_reason` and the thinking length before concluding a model returned nothing. Always smoke-test one window before any full run, and `ps` after killing a run — orphaned processes compete for the GPU.
 
 ## Start here
 

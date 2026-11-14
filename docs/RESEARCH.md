@@ -58,7 +58,16 @@ ARF (Artificial Relationships in Fiction, MIT, 95,475 annotated chunks, ~128k re
 
 ### 1.7 Stability runs
 
-Judge stability: **6 of 42 verdicts flip across identical runs (14%)** — the noise floor for judge measurements (locally measured, `gpt-oss:20b`, `think: "low"`). Prescription: majority of three runs for any judge verdict that ships. Sweep stability: two frozen passes, same model and settings — 59% agreement on *who* is connected, 25% on *what* the connection is; 16 of 58 shared claims cite the same sentence; 9 reversed direction. Shared-pair adjudication scored the same for same-citation and different-citation pairs (17.1% vs 16.2%) — a shared sentence is no evidence of correctness.
+Judge stability: **6 of 42 verdicts flip across identical runs (14%)** — the noise floor for judge measurements (locally measured, `gpt-oss:20b`, `think: "low"`; that model was retired as the judge on 2026-11-13 and the figure is not rewritten). Prescription: majority of three runs for any judge verdict that ships.
+
+> **2026-11-13 — the judge model changed to `qwen3.5:9b`.** The 14% figure above is a
+> measurement of the retired model and does not transfer. The noise floor for the new
+> judge is **unmeasured**, so the "majority of three" prescription is currently a
+> precaution rather than a calibrated one. Re-measure identical-run flips on the same
+> 42 rows before treating any single-run verdict as a result. `qwen3.5` scored 66.7%
+> agreement / 73.3% precision / 73.3% recall with the 4-category prompt in the
+> single-model judge comparison, which is joint-best agreement and the best recall of
+> the top group — the reason it replaces `gpt-oss`. Sweep stability: two frozen passes, same model and settings — 59% agreement on *who* is connected, 25% on *what* the connection is; 16 of 58 shared claims cite the same sentence; 9 reversed direction. Shared-pair adjudication scored the same for same-citation and different-citation pairs (17.1% vs 16.2%) — a shared sentence is no evidence of correctness.
 
 ### 1.8 Contamination probes
 
@@ -114,7 +123,14 @@ Differential result (same 855 candidates, same DB copy): accepts without index 1
 
 ## 3. The judge: identity, titles, stability
 
-Model: **`gpt-oss:20b` with `think: "low"`** — at 2,048 and 8,192 output tokens it produced 0 content characters with `done_reason: "length"` (29,546 chars of thinking at 8k); `think: false` is silently ignored by this Ollama build; `think: "low"` works (456 thinking / 4,480 JSON). `llm.ts` accepts `think: boolean | 'low' | 'medium' | 'high'`. Trial scripts: `judge-variants.ts`, `blind-gold.ts`, `blind-gold-cite.ts`, `calibrate.ts`, `pair-evidence.ts` (concluded: not viable, evidence too thin), `reason-check.ts` (concluded: flags everything), `three-way-sheet.ts`.
+> **2026-11-13 — the judge model is now `qwen3.5:9b`.** Everything in this section
+> was measured on `gpt-oss:20b` and is kept as written. The 0.83 / 0.68 headline and
+> every row of the table below belong to that model, so none of them is a baseline
+> for `qwen3.5:9b`. Re-establish the baseline on the same 42 rows before treating
+> any prompt variant as an improvement, and re-measure the identical-run flip rate:
+> the 14% noise floor is a property of the retired model.
+
+Model: **`gpt-oss:20b` with `think: "low"`** *(retired as the judge 2026-11-13)* — at 2,048 and 8,192 output tokens it produced 0 content characters with `done_reason: "length"` (29,546 chars of thinking at 8k); `think: false` is silently ignored by this Ollama build; `think: "low"` works (456 thinking / 4,480 JSON). `llm.ts` accepts `think: boolean | 'low' | 'medium' | 'high'`. Trial scripts: `judge-variants.ts`, `blind-gold.ts`, `blind-gold-cite.ts`, `calibrate.ts`, `pair-evidence.ts` (concluded: not viable, evidence too thin), `reason-check.ts` (concluded: flags everything), `three-way-sheet.ts`.
 
 | Prompt variant (same 42 rows) | Precision | Recall |
 |---|---|---:|
