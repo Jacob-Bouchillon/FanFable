@@ -175,7 +175,7 @@ interface OpenTerm {
 }
 
 /** Open wording detected for relationship checking, never for extraction. */
-const OPEN_TERMS: OpenTerm[] = [
+export const OPEN_TERMS: OpenTerm[] = [
   { term: 'partnership', re: /\bpartnership\b/i, kind: 'partner' },
   { term: 'partner', re: /\bpartners?\b/i, kind: 'partner' },
   { term: 'alliance', re: /\balliance\b/i, kind: 'ally of' },
@@ -188,7 +188,10 @@ const OPEN_TERMS: OpenTerm[] = [
   { term: 'student', re: /\bstudents?\b/i, kind: 'student of' },
   { term: 'family', re: /\bfamily\b/i, kind: 'relative of' },
   { term: 'related', re: /\brelated\b/i, kind: 'relative of' },
-  { term: 'married', re: /\bmarried\b/i, kind: 'married to' },
+  // `married to` was retired from the vocabulary as a duplicate of the spouse
+  // kinds. A hint naming a kind that no longer exists can never match a banked
+  // row, so "married" silently answered nothing.
+  { term: 'married', re: /\bmarried\b/i, kind: 'spouse of' },
   { term: 'friend', re: /\bfriends?\b/i, kind: 'friend of' },
   { term: 'enemy', re: /\benem(?:y|ies)\b/i, kind: 'enemy of' },
   { term: 'rival', re: /\brivals?\b/i, kind: 'rival of' },

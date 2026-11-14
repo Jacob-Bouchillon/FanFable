@@ -436,3 +436,18 @@ test('B9: notes that cite no passage do not each count as independent support', 
   assert.ok(out.score < 0.7, `unproven notes must not clear the bar (got ${out.score})`);
   assert.equal(out.independent, 1, 'they count as one share');
 });
+
+test('lore-ask hints only name kinds the bank vocabulary still has', async () => {
+  const { OPEN_TERMS } = await import('../../fanfable/src/answer/lore-ask.ts');
+  const { CLOSED_ROLE_KINDS } = await import('../../fanfable/src/lorebook.ts');
+  const known = new Set(CLOSED_ROLE_KINDS);
+  const stale = OPEN_TERMS.filter((t) => t.kind && !known.has(t.kind)).map((t) => `${t.term} -> ${t.kind}`);
+  assert.deepEqual(
+    stale,
+    [],
+    'a hint naming a retired kind can never match a banked row, so it answers nothing',
+  );
+  // "married" was the stale one; it must reach a spouse kind.
+  const married = OPEN_TERMS.find((t) => t.term === 'married');
+  assert.ok(married?.kind && known.has(married.kind));
+});
