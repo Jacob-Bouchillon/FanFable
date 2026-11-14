@@ -91,7 +91,26 @@ export function findEntityId(db: Db, projectId: number, kind: EntityKind, name: 
     projectId,
     name,
   );
-  return alias?.id;
+  if (alias) return alias.id;
+  // A stored alias is the same person under a shorter name. Without this the
+  // extractor created a second entity for every short form the model used:
+  // the book had "Ronald Weasley" with alias "Ron", and a window that wrote
+  // "Ron" found no match and banked a new character called "Ron". That pair
+  // then made the short form ambiguous for every later relation, so those
+  // relations were demoted to hints instead of being banked — which is why a
+  // fully mined chapter can end up with almost no ties.
+  //
+  // Only an unambiguous alias counts. Two entities claiming the same form is
+  // an identity question, not something to guess: the caller keeps its
+  // existing behaviour and the collision is reported.
+  const owners = db.all<{ id: number }>(
+    `SELECT e.id
+       FROM canon_entity e, json_each(CASE WHEN json_valid(e.aliases) THEN e.aliases ELSE '[]' END) a
+      WHERE e.project_id = ? AND lower(a.value) = lower(?)`,
+    projectId,
+    name,
+  );
+  return owners.length === 1 ? owners[0]!.id : undefined;
 }
 
 /**
