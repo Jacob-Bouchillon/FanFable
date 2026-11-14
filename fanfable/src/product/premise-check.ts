@@ -8,6 +8,7 @@
  * mistake rather than a choice.
  */
 import { Db } from '../core/db.ts';
+import { STOPWORDS } from '../core/vocab.ts';
 import * as lorebook from '../lorebook.ts';
 
 export interface PremiseWarning {
@@ -114,7 +115,24 @@ export function checkPremise(
     }
     return false;
   };
-  const properNames = [...text.matchAll(/\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})?)\b/g)].map((m) => m[1]);
+  // A capitalised word is not automatically a person. "The mill burned" and
+  // "When Asha arrived" both open with a capitalised common word, and the old
+  // check reported "The" as an unknown character. Position does not settle it
+  // either — a real name can open a sentence ("Wilhelmina arrives") — so the
+  // test is the word itself: ordinary words, including the ones prose uses to
+  // open a sentence, are never names.
+  const SENTENCE_OPENERS = new Set([
+    'after', 'although', 'before', 'because', 'besides', 'during', 'however',
+    'later', 'meanwhile', 'once', 'since', 'still', 'then', 'there', 'though',
+    'until', 'unless', 'while', 'yet',
+  ]);
+  const isCommonWord = (word: string): boolean => {
+    const lower = word.toLowerCase();
+    return STOPWORDS.has(lower) || SENTENCE_OPENERS.has(lower);
+  };
+  const properNames = [...text.matchAll(/\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})?)\b/g)]
+    .map((m) => m[1])
+    .filter((name) => !isCommonWord(name));
   const seen = new Set<string>();
   for (const raw of properNames) {
     const name = raw.trim();

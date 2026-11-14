@@ -302,3 +302,33 @@ test('A7: a fact quote is resolved to its real passage, or the fact is dropped',
   void first; void asha;
   db.close();
 });
+
+test('C10: a sentence-initial common word is not reported as a character', async () => {
+  const { db } = tempDb();
+  const project = createProject(db, 'c10');
+  // Three known people, so the "index is meaningful" guard does not short-circuit.
+  for (const name of ['Asha', 'Bram', 'Corin']) {
+    db.run(
+      'INSERT INTO canon_entity (project_id, kind, name, aliases, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+      project.id, 'character', name, '[]', AT, AT,
+    );
+  }
+  const { checkPremise } = await import('../../fanfable/src/product/premise-check.ts');
+  const warnings = checkPremise(
+    db,
+    project.id,
+    'The mill burned. When Asha arrived, After Bram left, The river rose.',
+    '',
+  ) as { kind: string; message: string }[];
+
+  const flagged = warnings.filter((w) => w.kind === 'unknown-character').map((w) => w.message);
+  assert.deepEqual(flagged, [], 'no common word is reported as an unknown character');
+
+  // A real unknown name is still reported.
+  const real = checkPremise(db, project.id, 'Wilhelmina arrives at the bridge.', '') as {
+    kind: string;
+    message: string;
+  }[];
+  assert.ok(real.some((w) => w.kind === 'unknown-character' && /Wilhelmina/.test(w.message)));
+  db.close();
+});
